@@ -3,3 +3,4 @@ data
 *.bib*
 *.mp4
 **/*/target/*
+build
