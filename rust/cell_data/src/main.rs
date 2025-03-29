@@ -1,83 +1,61 @@
-use ndarray::Array2;
-use std::fs::File;
-use std::io::{ BufRead, BufReader };
-use std::path::Path;
-use itertools::Itertools;
+use std::env;
+use std;
+use regex::Regex;
 
+mod server;
 mod read;
-use read::{ read_data, RegionData };
-
 mod compute;
-use compute::{ compute_center_of_mass, compute_center_of_mass_one };
-
-mod utils;
-use utils::{ list_folders, list_simulation_dirs, list_simulations };
-
+mod msd;
 mod plot;
-use plot::{ plot_center_of_mass };
+mod utils;
 
-fn compile_results() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = "E:/results/cell-sim-1600000-8000000";
-    let output_dir = Path::new("output");
-    std::fs::create_dir_all(output_dir).expect("Unable to create output directory");
+#[tokio::main]
+async fn main() {
+    let routes = server::build_server();
 
-    // let mut image_paths = Vec::new();
-
-    for motility in [/*0.006, 0.008, 0.01, */ 0.012] {
-        let simulation_path_str = format!("{}/{:.3}", directory, motility);
-        let directory = Path::new(&simulation_path_str);
-        let folders = list_folders(directory)?;
-
-        for (folder, soft, rho) in folders {
-            // Adjust the range based on your data
-            let data_path_str = format!("{}/{}", simulation_path_str, folder);
-            let data_path = Path::new(&data_path_str);
-
-            let sim_dirs = list_simulation_dirs(data_path)?;
-            for sim_index in sim_dirs.iter().filter(|index| **index == 0) {
-                let checkpoint_path_str = format!("{}/{}/checkpoint", data_path_str, sim_index);
-                let checkpoint_path = Path::new(&checkpoint_path_str);
-
-                let simulation_data = list_simulations(checkpoint_path)?;
-
-                // let mut msd_data = Vec::new();
-                let data: Result<Vec<_>, _> = simulation_data
-                    .iter()
-                    .filter(|(_, index, time_step)| *index == 0 && *time_step <= 2_000_000)
-                    .map(|(data_path_str, index, time_step)| {
-                        let file_path_str = format!("{}/{}", checkpoint_path_str, data_path_str);
-                        let file_path = Path::new(&file_path_str);
-                        match read_data(*time_step, &file_path) {
-                            Ok(data) => Ok((*time_step, *index, data)),
-                            Err(e) => Err(e),
-                        }
-                    })
-                    .collect();
-
-                let data = data?;
-                let com = data
-                    .iter()
-                    .map(|(time_step, index, data)| {
-                        let (x_center, y_center) = compute_center_of_mass_one(&data.data);
-                        let (x_0, y_0) = (data.intervals[0].0, data.intervals[1].0);
-                        (*time_step, *index, (x_0 + x_center, y_0 + y_center))
-                    })
-                    .collect::<Vec<_>>();
-
-                plot_center_of_mass(&com, "output")?;
-
-                println!("finished processing checkpoint data at {}", checkpoint_path_str);
-                // plot_contour(&data, &output_path, center_of_mass);
-            }
-            println!("finished processing everything at {}", data_path_str);
-        }
-    }
-
-    Ok(())
-
-    // create_movie(image_paths, "output/movie.gif");
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
 
-fn main() {
-    compile_results();
+fn cli() {
+    // Get the command-line arguments
+    let args: Vec<String> = env::args().collect();
+
+    // Print the command-line arguments
+    for (index, arg) in args.iter().enumerate() {
+        println!("Argument {}: {}", index, arg);
+    }
+
+    let re = match Regex::new(r"compute:(\w+)") {
+        Ok(re) => re,
+        Err(e) => {
+            eprintln!("Error creating regex: {}", e);
+            return;
+        }
+    };
+
+    let command = &args[1];
+
+    if command == "results" {
+        match msd::compile_results() {
+            Ok(_) => println!("Successfully compiled results"),
+            Err(e) => eprintln!("Error compiling results: {}", e),
+        };
+    } else if command == "plot_com" {
+        match msd::plot_coms() {
+            Ok(_) => println!("Successfully plotted center of mass"),
+            Err(e) => eprintln!("Error plotting center of mass: {}", e),
+        }
+    } else if let Some(captures) = re.captures(command) {
+        if let Some(compute_arg) = captures.get(1) {
+            if compute_arg.as_str() == "msd" {
+                match msd::compute_msd() {
+                    Ok(_) => println!("Successfully computed mean squared displacement"),
+                    Err(e) => eprintln!("Error computing mean squared displacement: {}", e),
+                }
+                println!("Computing mean squared displacement");
+            } else {
+                eprintln!("Unknown compute argument: {}", compute_arg.as_str());
+            }
+        }
+    }
 }

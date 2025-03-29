@@ -87,3 +87,31 @@ pub fn list_simulation_dirs(data_path: &Path) -> Result<Vec<u32>, Box<dyn std::e
 
     Ok(sim_dirs)
 }
+
+pub fn list_motility_dirs(
+    data_path: &Path
+) -> Result<Vec<(String, f32)>, Box<dyn std::error::Error>> {
+    let mut motility_dirs = Vec::new();
+
+    for entry in fs::read_dir(data_path)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let motility_dir_name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => {
+                continue;
+            }
+        };
+
+        if let Ok(motility_value) = motility_dir_name.parse::<f32>() {
+            motility_dirs.push((motility_dir_name.to_string(), motility_value));
+        }
+    }
+
+    Ok(motility_dirs)
+}
