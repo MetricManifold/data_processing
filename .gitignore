@@ -6,3 +6,7 @@ data
 build
 .vscode
 rust/cell_data/target/**/*
+cpp/simulation/**/*
+!cpp/simulation/CMakeLists.txt
+!cpp/simulation/include
+!cpp/simulation/src
