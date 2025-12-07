@@ -14,3 +14,5 @@ cpp/simulation/**/*
 !cpp/simulation/*.md
 !cpp/simulation/visualize.py
 !cpp/simulation/visualize_3d.py
+!cpp/simulation/analyze_trajectory.py
+!cpp/simulation/stack_videos.py
