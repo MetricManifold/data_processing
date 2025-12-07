@@ -776,4 +776,705 @@ void step_euler_3d(Domain3D &domain, float dt, float *d_work_buffer) {
   cudaDeviceSynchronize();
 }
 
+//=============================================================================
+// OPTIMIZED BATCHED 3D KERNELS
+// These kernels process all cells in a single launch for better GPU utilization
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// Compute reference points on GPU from bbox data (eliminates CPU memcpy)
+//-----------------------------------------------------------------------------
+__global__ void kernel_compute_ref_points_3d(
+    float *__restrict__ ref_x, float *__restrict__ ref_y,
+    float *__restrict__ ref_z, const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y, const int *__restrict__ offsets_z,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, int Nx, int Ny, int Nz, int num_cells) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_cells)
+    return;
+
+  // Compute bbox center from offset and dimensions
+  float rx = (float)offsets_x[i] + (float)widths[i] * 0.5f;
+  float ry = (float)offsets_y[i] + (float)heights[i] * 0.5f;
+  float rz = (float)offsets_z[i] + (float)depths[i] * 0.5f;
+
+  // Wrap to [0, N)
+  rx = fmodf(fmodf(rx, (float)Nx) + (float)Nx, (float)Nx);
+  ry = fmodf(fmodf(ry, (float)Ny) + (float)Ny, (float)Ny);
+  rz = fmodf(fmodf(rz, (float)Nz) + (float)Nz, (float)Nz);
+
+  ref_x[i] = rx;
+  ref_y[i] = ry;
+  ref_z[i] = rz;
+}
+
+//-----------------------------------------------------------------------------
+// Batched local terms: laplacian + bulk for all cells
+// Uses flattened index to parallelize all 3 dimensions
+//-----------------------------------------------------------------------------
+__global__ void kernel_fused_local_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    float dx, float dy, float dz, float bulk_coeff, int num_cells,
+    int max_field_size) {
+  // blockIdx.y indexes the cell
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int wh = w * h;
+
+  // Flattened thread index - each thread processes one 3D point
+  int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat_idx >= field_size)
+    return;
+
+  // Convert flat index to 3D coordinates
+  int lz = flat_idx / wh;
+  int rem = flat_idx % wh;
+  int ly = rem / w;
+  int lx = rem % w;
+
+  int base = cell_idx * 7 * max_field_size;
+
+  const float *phi = phi_ptrs[cell_idx];
+  float *d_laplacian = work_buffer + base;
+  float *d_bulk = work_buffer + base + max_field_size;
+
+  float inv_dx2 = 1.0f / (dx * dx);
+  float inv_dy2 = 1.0f / (dy * dy);
+  float inv_dz2 = 1.0f / (dz * dz);
+
+  // Compute laplacian (7-point stencil)
+  d_laplacian[flat_idx] = laplacian_7pt(phi, flat_idx, w, h, d, lx, ly, lz,
+                                        inv_dx2, inv_dy2, inv_dz2);
+
+  // Compute bulk term
+  d_bulk[flat_idx] = compute_bulk_term(phi[flat_idx], bulk_coeff);
+}
+
+//-----------------------------------------------------------------------------
+// Batched volume reduction: reduce φ² over all cells
+//-----------------------------------------------------------------------------
+__global__ void kernel_reduce_volumes_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ volumes,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    int halo, int num_cells) {
+  extern __shared__ float sdata[];
+
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int tid = threadIdx.x;
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int wh = w * h;
+
+  const float *phi = phi_ptrs[cell_idx];
+
+  // Grid-stride loop
+  float sum = 0.0f;
+  for (int i = blockIdx.x * blockDim.x + tid; i < field_size;
+       i += blockDim.x * gridDim.x) {
+    int lz = i / wh;
+    int rem = i % wh;
+    int ly = rem / w;
+    int lx = rem % w;
+
+    // Skip halo
+    if (lx >= halo && lx < w - halo && ly >= halo && ly < h - halo &&
+        lz >= halo && lz < d - halo) {
+      float p = phi[i];
+      sum += p * p;
+    }
+  }
+
+  sdata[tid] = sum;
+  __syncthreads();
+
+  // Reduction in shared memory
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    atomicAdd(&volumes[cell_idx], sdata[0]);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Batched centroid sum reduction: compute weighted displacement from ref point
+//-----------------------------------------------------------------------------
+__global__ void kernel_reduce_centroid_sums_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ centroid_sums,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y, const int *__restrict__ offsets_z,
+    const int *__restrict__ field_sizes, const float *__restrict__ ref_x,
+    const float *__restrict__ ref_y, const float *__restrict__ ref_z, int halo,
+    int Nx, int Ny, int Nz, int num_cells) {
+  extern __shared__ float sdata[];
+
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  float *sdx = sdata;
+  float *sdy = sdata + blockDim.x;
+  float *sdz = sdata + 2 * blockDim.x;
+  float *sw = sdata + 3 * blockDim.x;
+
+  int tid = threadIdx.x;
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int ox = offsets_x[cell_idx];
+  int oy = offsets_y[cell_idx];
+  int oz = offsets_z[cell_idx];
+  float rx = ref_x[cell_idx];
+  float ry = ref_y[cell_idx];
+  float rz = ref_z[cell_idx];
+  int wh = w * h;
+
+  const float *phi = phi_ptrs[cell_idx];
+
+  float sum_dx = 0.0f, sum_dy = 0.0f, sum_dz = 0.0f, sum_w = 0.0f;
+
+  for (int i = blockIdx.x * blockDim.x + tid; i < field_size;
+       i += blockDim.x * gridDim.x) {
+    int lz = i / wh;
+    int rem = i % wh;
+    int ly = rem / w;
+    int lx = rem % w;
+
+    if (lx >= halo && lx < w - halo && ly >= halo && ly < h - halo &&
+        lz >= halo && lz < d - halo) {
+      float p = phi[i];
+      float weight = p * p;
+
+      // Global coords
+      float gx = (float)((ox + lx) % Nx);
+      float gy = (float)((oy + ly) % Ny);
+      float gz = (float)((oz + lz) % Nz);
+
+      // Displacement from reference (with periodic wrapping)
+      float dx_disp = gx - rx;
+      float dy_disp = gy - ry;
+      float dz_disp = gz - rz;
+
+      if (dx_disp > Nx * 0.5f)
+        dx_disp -= Nx;
+      else if (dx_disp < -Nx * 0.5f)
+        dx_disp += Nx;
+      if (dy_disp > Ny * 0.5f)
+        dy_disp -= Ny;
+      else if (dy_disp < -Ny * 0.5f)
+        dy_disp += Ny;
+      if (dz_disp > Nz * 0.5f)
+        dz_disp -= Nz;
+      else if (dz_disp < -Nz * 0.5f)
+        dz_disp += Nz;
+
+      sum_dx += weight * dx_disp;
+      sum_dy += weight * dy_disp;
+      sum_dz += weight * dz_disp;
+      sum_w += weight;
+    }
+  }
+
+  sdx[tid] = sum_dx;
+  sdy[tid] = sum_dy;
+  sdz[tid] = sum_dz;
+  sw[tid] = sum_w;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdx[tid] += sdx[tid + s];
+      sdy[tid] += sdy[tid + s];
+      sdz[tid] += sdz[tid + s];
+      sw[tid] += sw[tid + s];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    atomicAdd(&centroid_sums[cell_idx * 4 + 0], sdx[0]);
+    atomicAdd(&centroid_sums[cell_idx * 4 + 1], sdy[0]);
+    atomicAdd(&centroid_sums[cell_idx * 4 + 2], sdz[0]);
+    atomicAdd(&centroid_sums[cell_idx * 4 + 3], sw[0]);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// Compute centroids and volume deviations from reduction results
+//-----------------------------------------------------------------------------
+__global__ void kernel_compute_centroids_and_deviations_3d(
+    float *__restrict__ centroids_x, float *__restrict__ centroids_y,
+    float *__restrict__ centroids_z, float *__restrict__ volume_deviations,
+    const float *__restrict__ centroid_sums, const float *__restrict__ volumes,
+    const float *__restrict__ ref_x, const float *__restrict__ ref_y,
+    const float *__restrict__ ref_z, float target_volume, float dV, int Nx,
+    int Ny, int Nz, int num_cells) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_cells)
+    return;
+
+  float sum_dx = centroid_sums[i * 4 + 0];
+  float sum_dy = centroid_sums[i * 4 + 1];
+  float sum_dz = centroid_sums[i * 4 + 2];
+  float sum_w = centroid_sums[i * 4 + 3];
+
+  float cx, cy, cz;
+  if (sum_w > 0.0f) {
+    cx = ref_x[i] + sum_dx / sum_w;
+    cy = ref_y[i] + sum_dy / sum_w;
+    cz = ref_z[i] + sum_dz / sum_w;
+
+    // Wrap to [0, N)
+    cx = fmodf(fmodf(cx, (float)Nx) + (float)Nx, (float)Nx);
+    cy = fmodf(fmodf(cy, (float)Ny) + (float)Ny, (float)Ny);
+    cz = fmodf(fmodf(cz, (float)Nz) + (float)Nz, (float)Nz);
+  } else {
+    cx = ref_x[i];
+    cy = ref_y[i];
+    cz = ref_z[i];
+  }
+
+  centroids_x[i] = cx;
+  centroids_y[i] = cy;
+  centroids_z[i] = cz;
+
+  float volume = volumes[i] * dV;
+  volume_deviations[i] = target_volume - volume;
+}
+
+//-----------------------------------------------------------------------------
+// Batched volume constraint kernel (flattened for parallelism)
+//-----------------------------------------------------------------------------
+__global__ void kernel_volume_constraint_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    const float *__restrict__ volume_deviations, float volume_coeff,
+    int num_cells, int max_field_size) {
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int wh = w * h;
+
+  int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat_idx >= field_size)
+    return;
+
+  int base = cell_idx * 7 * max_field_size;
+  float vol_dev = volume_deviations[cell_idx];
+
+  const float *phi = phi_ptrs[cell_idx];
+  float *d_constraint = work_buffer + base + 2 * max_field_size;
+
+  d_constraint[flat_idx] =
+      compute_volume_constraint_term(phi[flat_idx], vol_dev, volume_coeff);
+}
+
+//-----------------------------------------------------------------------------
+// Batched advection kernel (flattened for parallelism)
+//-----------------------------------------------------------------------------
+__global__ void kernel_advection_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    const float *__restrict__ velocities_x,
+    const float *__restrict__ velocities_y,
+    const float *__restrict__ velocities_z, float dx, float dy, float dz,
+    int num_cells, int max_field_size) {
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int wh = w * h;
+
+  int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat_idx >= field_size)
+    return;
+
+  // Convert flat index to 3D coordinates
+  int lz = flat_idx / wh;
+  int rem = flat_idx % wh;
+  int ly = rem / w;
+  int lx = rem % w;
+
+  int base = cell_idx * 7 * max_field_size;
+
+  float vx = velocities_x[cell_idx];
+  float vy = velocities_y[cell_idx];
+  float vz = velocities_z[cell_idx];
+
+  float inv_2dx = 1.0f / (2.0f * dx);
+  float inv_2dy = 1.0f / (2.0f * dy);
+  float inv_2dz = 1.0f / (2.0f * dz);
+
+  const float *phi = phi_ptrs[cell_idx];
+  float *d_advection = work_buffer + base + 3 * max_field_size;
+
+  // Compute gradient
+  float gx, gy, gz;
+  gradient_3d(phi, flat_idx, w, h, d, lx, ly, lz, inv_2dx, inv_2dy, inv_2dz, gx,
+              gy, gz);
+
+  d_advection[flat_idx] = -(vx * gx + vy * gy + vz * gz);
+}
+
+//-----------------------------------------------------------------------------
+// Batched interaction kernel (O(N²) version - all pairs, flattened)
+//-----------------------------------------------------------------------------
+__global__ void kernel_interaction_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    const int *__restrict__ offsets_x, const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z, float interaction_coeff, int Nx, int Ny,
+    int Nz, int num_cells, int max_field_size) {
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int ox_i = offsets_x[cell_idx];
+  int oy_i = offsets_y[cell_idx];
+  int oz_i = offsets_z[cell_idx];
+  int wh = w * h;
+
+  int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat_idx >= field_size)
+    return;
+
+  // Convert flat index to 3D coordinates
+  int lz = flat_idx / wh;
+  int rem = flat_idx % wh;
+  int ly = rem / w;
+  int lx = rem % w;
+
+  int base = cell_idx * 7 * max_field_size;
+
+  const float *phi_i = phi_ptrs[cell_idx];
+  float *d_repulsion = work_buffer + base + 6 * max_field_size;
+
+  // Global coords
+  int gx = ((ox_i + lx) % Nx + Nx) % Nx;
+  int gy = ((oy_i + ly) % Ny + Ny) % Ny;
+  int gz = ((oz_i + lz) % Nz + Nz) % Nz;
+
+  // Sum φ_j² over all other cells
+  float sum_phi_j_sq = 0.0f;
+  for (int j = 0; j < num_cells; ++j) {
+    if (j == cell_idx)
+      continue;
+
+    int ow = widths[j];
+    int oh = heights[j];
+    int od = depths[j];
+    int ox = offsets_x[j];
+    int oy = offsets_y[j];
+    int oz = offsets_z[j];
+
+    // Local coords in cell j
+    int ljx = ((gx - ox) % Nx + Nx) % Nx;
+    int ljy = ((gy - oy) % Ny + Ny) % Ny;
+    int ljz = ((gz - oz) % Nz + Nz) % Nz;
+
+    if (ljx < ow && ljy < oh && ljz < od) {
+      float phi_j = phi_ptrs[j][ljz * (ow * oh) + ljy * ow + ljx];
+      sum_phi_j_sq += phi_j * phi_j;
+    }
+  }
+
+  // Repulsion: 2 * κ_int * φ_i * Σ φ_j²
+  d_repulsion[flat_idx] =
+      2.0f * interaction_coeff * phi_i[flat_idx] * sum_phi_j_sq;
+}
+
+//-----------------------------------------------------------------------------
+// Batched RHS + Euler step kernel (flattened for parallelism)
+//-----------------------------------------------------------------------------
+__global__ void kernel_fused_rhs_step_batched_3d(
+    float **__restrict__ phi_ptrs, const float *__restrict__ work_buffer,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    float gamma, float dt, int num_cells, int max_field_size) {
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int wh = w * h;
+
+  int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat_idx >= field_size)
+    return;
+
+  int base = cell_idx * 7 * max_field_size;
+
+  // Buffer layout:
+  // [lap][bulk][constraint][advection][reduction][interaction][repulsion]
+  const float *d_laplacian = work_buffer + base;
+  const float *d_bulk = work_buffer + base + max_field_size;
+  const float *d_constraint = work_buffer + base + 2 * max_field_size;
+  const float *d_advection = work_buffer + base + 3 * max_field_size;
+  const float *d_repulsion = work_buffer + base + 6 * max_field_size;
+
+  float *phi = phi_ptrs[cell_idx];
+
+  // Combine RHS
+  float dphi_dt = combine_rhs_terms(
+      d_laplacian[flat_idx], d_bulk[flat_idx], d_constraint[flat_idx],
+      d_repulsion[flat_idx], d_advection[flat_idx], gamma);
+
+  // Euler step with clamping
+  float new_phi = phi[flat_idx] + dt * dphi_dt;
+  phi[flat_idx] = fmaxf(0.0f, fminf(1.0f, new_phi));
+}
+
+//-----------------------------------------------------------------------------
+// Compute velocities from polarization (constant v_A model for 3D)
+//-----------------------------------------------------------------------------
+__global__ void kernel_compute_velocities_3d(
+    float *__restrict__ velocities_x, float *__restrict__ velocities_y,
+    float *__restrict__ velocities_z, const float *__restrict__ polarizations_x,
+    const float *__restrict__ polarizations_y,
+    const float *__restrict__ polarizations_z, float v_A, int num_cells) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_cells)
+    return;
+
+  velocities_x[i] = v_A * polarizations_x[i];
+  velocities_y[i] = v_A * polarizations_y[i];
+  velocities_z[i] = v_A * polarizations_z[i];
+}
+
+//=============================================================================
+// Optimized Fused Step Function for 3D
+// Similar to step_fused_v4 in 2D: batched kernels, GPU-side reductions
+//=============================================================================
+
+void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
+                   float **d_all_phi_ptrs, int *d_all_widths,
+                   int *d_all_heights, int *d_all_depths, int *d_all_offsets_x,
+                   int *d_all_offsets_y, int *d_all_offsets_z,
+                   int *d_all_field_sizes, float *d_volumes,
+                   float *d_integrals_x, float *d_integrals_y,
+                   float *d_integrals_z, float *d_centroid_sums,
+                   float *d_volume_deviations, float *d_velocities_x,
+                   float *d_velocities_y, float *d_velocities_z, float *d_ref_x,
+                   float *d_ref_y, float *d_ref_z, float *d_polarization_x,
+                   float *d_polarization_y, float *d_polarization_z,
+                   float *d_centroids_x, float *d_centroids_y,
+                   float *d_centroids_z, bool sync_centroids) {
+  const SimParams3D &params = domain.params;
+  int num_cells = domain.num_cells();
+  if (num_cells == 0)
+    return;
+
+  // Find max dimensions
+  int max_size = 0, max_w = 0, max_h = 0;
+  for (int i = 0; i < num_cells; ++i) {
+    max_size = std::max(max_size, domain.cells[i]->field_size);
+    max_w = std::max(max_w, domain.cells[i]->width());
+    max_h = std::max(max_h, domain.cells[i]->height());
+  }
+
+  float dV = params.dx * params.dy * params.dz;
+  float target_volume = params.target_volume();
+
+  // Zero accumulators
+  cudaMemsetAsync(d_volumes, 0, num_cells * sizeof(float));
+  cudaMemsetAsync(d_centroid_sums, 0, num_cells * 4 * sizeof(float));
+
+  // Compute reference points on GPU
+  {
+    int threads = 256;
+    int blocks = (num_cells + threads - 1) / threads;
+    kernel_compute_ref_points_3d<<<blocks, threads>>>(
+        d_ref_x, d_ref_y, d_ref_z, d_all_offsets_x, d_all_offsets_y,
+        d_all_offsets_z, d_all_widths, d_all_heights, d_all_depths, params.Nx,
+        params.Ny, params.Nz, num_cells);
+  }
+
+  // Upload polarizations (computed on CPU due to RNG)
+  std::vector<float> h_pol_x(num_cells), h_pol_y(num_cells), h_pol_z(num_cells);
+  for (int i = 0; i < num_cells; ++i) {
+    h_pol_x[i] = domain.cells[i]->polarization.x;
+    h_pol_y[i] = domain.cells[i]->polarization.y;
+    h_pol_z[i] = domain.cells[i]->polarization.z;
+  }
+  cudaMemcpyAsync(d_polarization_x, h_pol_x.data(), num_cells * sizeof(float),
+                  cudaMemcpyHostToDevice);
+  cudaMemcpyAsync(d_polarization_y, h_pol_y.data(), num_cells * sizeof(float),
+                  cudaMemcpyHostToDevice);
+  cudaMemcpyAsync(d_polarization_z, h_pol_z.data(), num_cells * sizeof(float),
+                  cudaMemcpyHostToDevice);
+
+  // Flattened grid config: 1D threads, cells in y dimension
+  int threads_flat = 256;
+  dim3 block(threads_flat, 1, 1);
+  dim3 grid((max_size + threads_flat - 1) / threads_flat, num_cells, 1);
+
+  // =========================================================================
+  // PHASE 1: Batched local terms (laplacian + bulk)
+  // =========================================================================
+  kernel_fused_local_batched_3d<<<grid, block>>>(
+      d_all_phi_ptrs, d_work_buffer, d_all_widths, d_all_heights, d_all_depths,
+      d_all_field_sizes, params.dx, params.dy, params.dz, params.bulk_coeff(),
+      num_cells, max_size);
+
+  // =========================================================================
+  // PHASE 2: Batched reductions (volume + centroids)
+  // =========================================================================
+  {
+    int threads = 256;
+    int blocks_per_cell = std::min((max_size + threads - 1) / threads, 32);
+    dim3 reduce_grid(blocks_per_cell, num_cells);
+
+    kernel_reduce_volumes_batched_3d<<<reduce_grid, threads,
+                                       threads * sizeof(float)>>>(
+        d_all_phi_ptrs, d_volumes, d_all_widths, d_all_heights, d_all_depths,
+        d_all_field_sizes, params.halo_width, num_cells);
+
+    kernel_reduce_centroid_sums_batched_3d<<<reduce_grid, threads,
+                                             4 * threads * sizeof(float)>>>(
+        d_all_phi_ptrs, d_centroid_sums, d_all_widths, d_all_heights,
+        d_all_depths, d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+        d_all_field_sizes, d_ref_x, d_ref_y, d_ref_z, params.halo_width,
+        params.Nx, params.Ny, params.Nz, num_cells);
+  }
+
+  // SYNC: Wait for reductions
+  cudaDeviceSynchronize();
+
+  // =========================================================================
+  // PHASE 3: GPU-side centroid + volume deviation computation
+  // =========================================================================
+  int threads_1d = 256;
+  int blocks_1d = (num_cells + threads_1d - 1) / threads_1d;
+
+  kernel_compute_centroids_and_deviations_3d<<<blocks_1d, threads_1d>>>(
+      d_centroids_x, d_centroids_y, d_centroids_z, d_volume_deviations,
+      d_centroid_sums, d_volumes, d_ref_x, d_ref_y, d_ref_z, target_volume, dV,
+      params.Nx, params.Ny, params.Nz, num_cells);
+
+  // =========================================================================
+  // PHASE 4: Compute velocities
+  // =========================================================================
+  kernel_compute_velocities_3d<<<blocks_1d, threads_1d>>>(
+      d_velocities_x, d_velocities_y, d_velocities_z, d_polarization_x,
+      d_polarization_y, d_polarization_z, params.v_A, num_cells);
+
+  // =========================================================================
+  // PHASE 5: Batched volume constraint
+  // =========================================================================
+  kernel_volume_constraint_batched_3d<<<grid, block>>>(
+      d_all_phi_ptrs, d_work_buffer, d_all_widths, d_all_heights, d_all_depths,
+      d_all_field_sizes, d_volume_deviations, params.volume_coeff(), num_cells,
+      max_size);
+
+  // =========================================================================
+  // PHASE 6: Batched advection
+  // =========================================================================
+  kernel_advection_batched_3d<<<grid, block>>>(
+      d_all_phi_ptrs, d_work_buffer, d_all_widths, d_all_heights, d_all_depths,
+      d_all_field_sizes, d_velocities_x, d_velocities_y, d_velocities_z,
+      params.dx, params.dy, params.dz, num_cells, max_size);
+
+  // =========================================================================
+  // PHASE 7: Batched interaction (O(N²) for now)
+  // =========================================================================
+  if (num_cells > 1) {
+    kernel_interaction_batched_3d<<<grid, block>>>(
+        d_all_phi_ptrs, d_work_buffer, d_all_widths, d_all_heights,
+        d_all_depths, d_all_field_sizes, d_all_offsets_x, d_all_offsets_y,
+        d_all_offsets_z, params.interaction_coeff(), params.Nx, params.Ny,
+        params.Nz, num_cells, max_size);
+  }
+
+  // =========================================================================
+  // PHASE 8: Batched RHS + Euler step
+  // =========================================================================
+  kernel_fused_rhs_step_batched_3d<<<grid, block>>>(
+      d_all_phi_ptrs, d_work_buffer, d_all_widths, d_all_heights, d_all_depths,
+      d_all_field_sizes, params.gamma, dt, num_cells, max_size);
+
+  // =========================================================================
+  // FINAL SYNC
+  // =========================================================================
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA error in step_fused_3d: %s\n", cudaGetErrorString(err));
+    return;
+  }
+
+  // Sync centroids back to host when needed
+  if (sync_centroids) {
+    std::vector<float> h_centroids_x(num_cells), h_centroids_y(num_cells),
+        h_centroids_z(num_cells);
+    std::vector<float> h_volumes(num_cells);
+    std::vector<float> h_vx(num_cells), h_vy(num_cells), h_vz(num_cells);
+
+    cudaMemcpy(h_centroids_x.data(), d_centroids_x, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_centroids_y.data(), d_centroids_y, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_centroids_z.data(), d_centroids_z, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_volumes.data(), d_volumes, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_vx.data(), d_velocities_x, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_vy.data(), d_velocities_y, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_vz.data(), d_velocities_z, num_cells * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < num_cells; ++i) {
+      domain.cells[i]->centroid.x = h_centroids_x[i];
+      domain.cells[i]->centroid.y = h_centroids_y[i];
+      domain.cells[i]->centroid.z = h_centroids_z[i];
+      domain.cells[i]->volume = h_volumes[i] * dV;
+      domain.cells[i]->volume_deviation =
+          target_volume - domain.cells[i]->volume;
+      domain.cells[i]->velocity.x = h_vx[i];
+      domain.cells[i]->velocity.y = h_vy[i];
+      domain.cells[i]->velocity.z = h_vz[i];
+    }
+  }
+}
+
 } // namespace cellsim

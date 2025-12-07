@@ -88,7 +88,7 @@ int main(int argc, char *argv[]) {
   int random_seed = -1;         // -1 means use time-based seed
   int trajectory_samples = 100; // Number of trajectory data points to save
   int trajectory_interval =
-      0; // 0 = compute from samples, -1 = use save_interval
+      -1; // -1 = use save_interval, 0 = compute from samples, >0 = explicit
   float v_A_override = -1.0f; // -1 means use default from params
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
   bool use_fused_v2 = false;  // Use V2 batched kernels (O(N²) interaction)
@@ -421,7 +421,12 @@ int main(int argc, char *argv[]) {
   sim.save_interval = save_interval;
   sim.checkpoint_interval = checkpoint_interval;
   sim.trajectory_samples = trajectory_samples;
-  sim.trajectory_interval = trajectory_interval;
+  // Use save_interval as default for trajectory (same as 3D)
+  sim.trajectory_interval =
+      (trajectory_interval > 0) ? trajectory_interval
+      : (trajectory_interval == -1)
+          ? save_interval
+          : trajectory_interval; // 0 = compute from samples
   sim.compute_diagnostics = use_diagnostics;
   sim.save_vtk = (save_interval > 0);
   sim.save_individual_fields = save_individual_fields;

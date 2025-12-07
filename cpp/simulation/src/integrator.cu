@@ -157,8 +157,10 @@ void Integrator::allocate_work_buffer(const Domain &domain) {
     max_field_size = std::max(max_field_size, cell->field_size);
   }
 
-  // Fused kernels need 11 arrays per cell (extra for motility integrands)
-  size_t required = domain.num_cells() * 12 * max_field_size * sizeof(float);
+  // Work buffer layout per cell (9 buffers):
+  // [0] laplacian, [1] bulk, [2] constraint, [3] grad_x, [4] grad_y,
+  // [5] phi_sq, [6] repulsion, [7] integrand_x, [8] integrand_y
+  size_t required = domain.num_cells() * 9 * max_field_size * sizeof(float);
 
   if (required > work_buffer_size) {
     free_work_buffer();

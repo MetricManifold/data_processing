@@ -124,16 +124,16 @@ __global__ void kernel_fused_rhs_step_batched(
 
   int idx = ly * width + lx;
 
-  // Work buffer layout per cell: laplacian, bulk, constraint, grad_x, grad_y,
-  // phi_sq, interaction, repulsion, integrand_x, integrand_y Offsets: 0, 1, 2,
-  // 3, 4, 5, 6, 7, 8, 9 (times max_field_size)
-  int base = cell_idx * 11 * max_field_size;
+  // Work buffer layout per cell (9 buffers):
+  // [0] laplacian, [1] bulk, [2] constraint, [3] grad_x, [4] grad_y,
+  // [5] phi_sq, [6] repulsion, [7] integrand_x, [8] integrand_y
+  int base = cell_idx * 9 * max_field_size;
   const float *d_laplacian = work_buffer + base;
   const float *d_bulk = work_buffer + base + max_field_size;
   const float *d_constraint = work_buffer + base + 2 * max_field_size;
   const float *d_grad_x = work_buffer + base + 3 * max_field_size;
   const float *d_grad_y = work_buffer + base + 4 * max_field_size;
-  const float *d_repulsion = work_buffer + base + 8 * max_field_size;
+  const float *d_repulsion = work_buffer + base + 6 * max_field_size;
 
   float vx = velocities_x[cell_idx];
   float vy = velocities_y[cell_idx];
@@ -248,7 +248,7 @@ __global__ void kernel_fused_local_batched_v2(
   int idx = ly * width + lx;
   const float *phi = phi_ptrs[cell_idx];
 
-  int base = cell_idx * 11 * max_field_size;
+  int base = cell_idx * 9 * max_field_size;
   float *d_laplacian = work_buffer + base;
   float *d_bulk = work_buffer + base + max_field_size;
   float *d_grad_x = work_buffer + base + 3 * max_field_size;
@@ -304,7 +304,7 @@ __global__ void kernel_reduce_volumes_batched_v2(
 
   int field_size = field_sizes[cell_idx];
   const float *d_phi_sq =
-      work_buffer + cell_idx * 11 * max_field_size + 5 * max_field_size;
+      work_buffer + cell_idx * 9 * max_field_size + 5 * max_field_size;
 
   int tid = threadIdx.x;
   int grid_stride = blockDim.x * gridDim.x;
@@ -434,7 +434,7 @@ __global__ void kernel_volume_constraint_batched_v2(
     return;
 
   int idx = ly * width + lx;
-  int base = cell_idx * 11 * max_field_size;
+  int base = cell_idx * 9 * max_field_size;
   float *d_constraint = work_buffer + base + 2 * max_field_size;
 
   float phi_val = phi_ptrs[cell_idx][idx];
@@ -466,14 +466,14 @@ __global__ void kernel_interaction_batched_v2(
     return;
 
   int idx = ly * width + lx;
-  int base = cell_idx * 11 * max_field_size;
+  int base = cell_idx * 9 * max_field_size;
 
   const float *phi_i = phi_ptrs[cell_idx];
   const float *d_grad_x = work_buffer + base + 3 * max_field_size;
   const float *d_grad_y = work_buffer + base + 4 * max_field_size;
-  float *d_repulsion = work_buffer + base + 8 * max_field_size;
-  float *d_integrand_x = work_buffer + base + 9 * max_field_size;
-  float *d_integrand_y = work_buffer + base + 10 * max_field_size;
+  float *d_repulsion = work_buffer + base + 6 * max_field_size;
+  float *d_integrand_x = work_buffer + base + 7 * max_field_size;
+  float *d_integrand_y = work_buffer + base + 8 * max_field_size;
 
   int offset_x_i = offsets_x[cell_idx];
   int offset_y_i = offsets_y[cell_idx];
@@ -533,9 +533,9 @@ __global__ void kernel_reduce_integrals_batched_v2(
     return;
 
   int field_size = field_sizes[cell_idx];
-  int base = cell_idx * 11 * max_field_size;
-  const float *d_integrand_x = work_buffer + base + 9 * max_field_size;
-  const float *d_integrand_y = work_buffer + base + 10 * max_field_size;
+  int base = cell_idx * 9 * max_field_size;
+  const float *d_integrand_x = work_buffer + base + 7 * max_field_size;
+  const float *d_integrand_y = work_buffer + base + 8 * max_field_size;
 
   int tid = threadIdx.x;
   int grid_stride = blockDim.x * gridDim.x;

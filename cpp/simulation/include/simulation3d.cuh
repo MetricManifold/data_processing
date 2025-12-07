@@ -133,6 +133,14 @@ inline void Simulation3D::run(float t_end) {
     }
   }
 
+  // Always save final frame (regardless of save_interval alignment)
+  if (save_interval > 0 && current_step % save_interval != 0) {
+    save_checkpoint();
+    if (save_individual_fields_flag) {
+      save_individual_cell_fields();
+    }
+  }
+
   auto end_time = std::chrono::steady_clock::now();
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_time - start_time);

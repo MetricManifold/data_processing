@@ -10,3 +10,7 @@ cpp/simulation/**/*
 !cpp/simulation/CMakeLists.txt
 !cpp/simulation/include
 !cpp/simulation/src
+!cpp/simulation/scripts
+!cpp/simulation/*.md
+!cpp/simulation/visualize.py
+!cpp/simulation/visualize_3d.py

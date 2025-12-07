@@ -140,7 +140,22 @@ void compute_local_terms_3d(Cell3D &cell, const SimParams3D &params,
 // Compute interaction terms for all 3D cells
 void compute_interaction_terms_3d(Domain3D &domain, float *d_work_buffer);
 
-// Perform one Forward Euler step for all 3D cells
+// Perform one Forward Euler step for all 3D cells (legacy)
 void step_euler_3d(Domain3D &domain, float dt, float *d_work_buffer);
+
+// Optimized fused step for 3D - batched kernels, GPU-side reductions
+void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
+                   float **d_all_phi_ptrs, int *d_all_widths,
+                   int *d_all_heights, int *d_all_depths, int *d_all_offsets_x,
+                   int *d_all_offsets_y, int *d_all_offsets_z,
+                   int *d_all_field_sizes, float *d_volumes,
+                   float *d_integrals_x, float *d_integrals_y,
+                   float *d_integrals_z, float *d_centroid_sums,
+                   float *d_volume_deviations, float *d_velocities_x,
+                   float *d_velocities_y, float *d_velocities_z, float *d_ref_x,
+                   float *d_ref_y, float *d_ref_z, float *d_polarization_x,
+                   float *d_polarization_y, float *d_polarization_z,
+                   float *d_centroids_x, float *d_centroids_y,
+                   float *d_centroids_z, bool sync_centroids);
 
 } // namespace cellsim

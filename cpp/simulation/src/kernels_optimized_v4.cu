@@ -140,14 +140,14 @@ __global__ void kernel_interaction_neighborlist_v4(
     return;
 
   int idx = ly * width + lx;
-  int base = cell_idx * 11 * max_field_size;
+  int base = cell_idx * 9 * max_field_size;
 
   const float *phi_i = phi_ptrs[cell_idx];
   const float *d_grad_x = work_buffer + base + 3 * max_field_size;
   const float *d_grad_y = work_buffer + base + 4 * max_field_size;
-  float *d_repulsion = work_buffer + base + 8 * max_field_size;
-  float *d_integrand_x = work_buffer + base + 9 * max_field_size;
-  float *d_integrand_y = work_buffer + base + 10 * max_field_size;
+  float *d_repulsion = work_buffer + base + 6 * max_field_size;
+  float *d_integrand_x = work_buffer + base + 7 * max_field_size;
+  float *d_integrand_y = work_buffer + base + 8 * max_field_size;
 
   int offset_x_i = offsets_x[cell_idx];
   int offset_y_i = offsets_y[cell_idx];
