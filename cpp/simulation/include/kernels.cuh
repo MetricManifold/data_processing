@@ -10,7 +10,7 @@ namespace cellsim {
 // Constants for V4 neighbor-list optimization
 //=============================================================================
 
-#define MAX_NEIGHBORS_V4 128 // Max neighbors per cell
+#define MAX_NEIGHBORS 128 // Max neighbors per cell
 
 //=============================================================================
 // Kernel Launch Configuration
@@ -141,35 +141,24 @@ __global__ void kernel_combine_rhs(float *__restrict__ dphi_dt,
 class Integrator;
 
 //=============================================================================
-// FUSED KERNELS (optimized path)
+// MAIN SOLVER
 //=============================================================================
 
-// Fused step V2: optimized with batched final kernel and reduced syncs
+// Main solver step function with neighbor-list optimization for interaction
 // sync_centroids: if true, read centroids back to host for bbox updates
-void step_fused_v2(Domain &domain, float dt, float *d_work_buffer,
-                   float **d_all_phi_ptrs, int *d_all_widths,
-                   int *d_all_heights, int *d_all_offsets_x,
-                   int *d_all_offsets_y,
-                   int *d_all_field_sizes, // For batched reductions
-                   float *d_volumes, float *d_integrals_x, float *d_integrals_y,
-                   float *d_centroid_sums, float *d_volume_deviations,
-                   float *d_velocities_x, float *d_velocities_y, float *d_ref_x,
-                   float *d_ref_y, float *d_polarization_x,
-                   float *d_polarization_y, float *d_centroids_x,
-                   float *d_centroids_y, bool sync_centroids = true);
-
-// Fused step V4: Like V2 but with neighbor-list optimization for interaction
-// Note: MAX_NEIGHBORS_V4 defined at top of file
-void step_fused_v4(Domain &domain, float dt, float *d_work_buffer,
-                   float **d_all_phi_ptrs, int *d_all_widths,
-                   int *d_all_heights, int *d_all_offsets_x,
-                   int *d_all_offsets_y, int *d_all_field_sizes,
-                   float *d_volumes, float *d_integrals_x, float *d_integrals_y,
-                   float *d_centroid_sums, float *d_volume_deviations,
-                   float *d_velocities_x, float *d_velocities_y, float *d_ref_x,
-                   float *d_ref_y, float *d_polarization_x,
-                   float *d_polarization_y, float *d_centroids_x,
-                   float *d_centroids_y, int *d_neighbor_counts,
-                   int *d_neighbor_lists, bool sync_centroids = true);
+// rebuild_neighbors: if true, rebuild the neighbor list this step
+// Note: MAX_NEIGHBORS defined at top of file
+void step_fused(Domain &domain, float dt, float *d_work_buffer,
+                float **d_all_phi_ptrs, int *d_all_widths,
+                int *d_all_heights, int *d_all_offsets_x,
+                int *d_all_offsets_y, int *d_all_field_sizes,
+                float *d_volumes, float *d_integrals_x, float *d_integrals_y,
+                float *d_centroid_sums, float *d_volume_deviations,
+                float *d_velocities_x, float *d_velocities_y, float *d_ref_x,
+                float *d_ref_y, float *d_polarization_x,
+                float *d_polarization_y, float *d_centroids_x,
+                float *d_centroids_y, int *d_neighbor_counts,
+                int *d_neighbor_lists, bool sync_centroids = true,
+                bool rebuild_neighbors = true);
 
 } // namespace cellsim

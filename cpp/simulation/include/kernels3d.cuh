@@ -143,7 +143,10 @@ void compute_interaction_terms_3d(Domain3D &domain, float *d_work_buffer);
 // Perform one Forward Euler step for all 3D cells (legacy)
 void step_euler_3d(Domain3D &domain, float dt, float *d_work_buffer);
 
-// Optimized fused step for 3D - batched kernels, GPU-side reductions
+// MAX_NEIGHBORS_3D for neighbor list
+constexpr int MAX_NEIGHBORS_3D = 32;
+
+// Optimized fused step for 3D - batched kernels, GPU-side reductions, neighbor list
 void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
                    float **d_all_phi_ptrs, int *d_all_widths,
                    int *d_all_heights, int *d_all_depths, int *d_all_offsets_x,
@@ -156,6 +159,8 @@ void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
                    float *d_ref_y, float *d_ref_z, float *d_polarization_x,
                    float *d_polarization_y, float *d_polarization_z,
                    float *d_centroids_x, float *d_centroids_y,
-                   float *d_centroids_z, bool sync_centroids);
+                   float *d_centroids_z, int *d_neighbor_counts,
+                   int *d_neighbor_lists, bool sync_centroids,
+                   bool rebuild_neighbors);
 
 } // namespace cellsim

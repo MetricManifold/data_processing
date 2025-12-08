@@ -49,11 +49,18 @@ cmake --build . --config Debug
 
 ```powershell
 # Single cell test (validation)
-.\build\bin\Release\cell_sim.exe --3d -n 1 --size 240 -r 49 -t 10 --dt 0.01 -o agent_test_runs/test_3d_single
+.\build\bin\Release\cell_sim.exe --3d -n 1 -N 240 -r 49 -t 10 --dt 0.02 --checkpoint-interval 500 -o agent_test_runs/test_3d_single
 
-# Multi-cell test
-.\build\bin\Release\cell_sim.exe --3d -n 8 --size 150 -r 49 -t 10 --dt 0.02 -o agent_test_runs/test_3d_multi
+# Multi-cell test (16 cells at 85% confluence, R=49)
+# Confluence calculation: Domain = cbrt(n_cells * (4/3)*pi*R^3 / confluence)
+# For 16 cells, R=49, 85% confluence: N = cbrt(16 * 492807 / 0.85) ≈ 210
+.\build\bin\Release\cell_sim.exe --3d -n 16 -N 210 -r 49 -t 10 --dt 0.02 --checkpoint-interval 500 -o agent_test_runs/test_3d_multi
 ```
+
+**IMPORTANT**:
+- Use `--dt 0.02` for 3D (not 0.01) - 3D is more stable and this halves runtime
+- Use random initialization (default). Do NOT use --grid or --confluence flags
+- Calculate domain size manually: `N = cbrt(n_cells * cell_volume / target_confluence)`
 
 ### Resume from Checkpoint
 
@@ -82,8 +89,26 @@ cmake --build . --config Debug
 | `--checkpoint-interval <n>` | Steps between checkpoints | save_interval×10 |
 | `--save-final-checkpoint` | Save checkpoint at end | false |
 | `--seed <n>` | Random seed | — |
-| `--no-vtk` | Disable VTK output | false |
-| `--no-diagnostics` | Skip diagnostics | false |
+| `--subdomain-padding <f>` | Cell bbox size as multiple of R | 2.0 |
+
+---
+
+## 3D Optimization Options
+
+For faster 3D simulations:
+
+| Option | Effect | Notes |
+|--------|--------|-------|
+| `--dt 0.02` | 2× fewer steps | 3D is more stable than 2D |
+| `--checkpoint-interval 500` | Fewer disk writes | Checkpoints are large in 3D |
+| `--save-interval 0` | No VTK output | Use for benchmarking |
+| `--subdomain-padding 1.5` | Smaller cell bboxes | Reduces memory but may need more bbox updates |
+
+**Internal optimizations** (automatic):
+- Batched GPU kernels process all cells in parallel
+- Centroid sync only every 10 steps (not every step)
+- Fused kernel pipeline minimizes memory transfers
+- Work buffer: 5 buffers per cell (optimized from 7)
 
 ---
 
@@ -101,12 +126,13 @@ cmake --build . --config Debug
 # Expected: cells repel, volumes stable
 
 # Test 3: 3D single cell
-.\build\bin\Release\cell_sim.exe --3d -n 1 --size 240 -r 49 -t 10 --dt 0.01 -o agent_test_runs/validate_3d_single
+.\build\bin\Release\cell_sim.exe --3d -n 1 -N 240 -r 49 -t 10 --dt 0.02 --checkpoint-interval 500 -o agent_test_runs/validate_3d_single
 # Expected: volume ~492807, phi_max ~1.0, no NaN
 
-# Test 4: 3D multi-cell
-.\build\bin\Release\cell_sim.exe --3d -n 2 --size 240 -r 40 -t 10 --dt 0.01 -o agent_test_runs/validate_3d_multi
-# Expected: cells interact, no collapse
+# Test 4: 3D multi-cell (16 cells, 85% confluence)
+# N = cbrt(16 * 492807 / 0.85) ≈ 210
+.\build\bin\Release\cell_sim.exe --3d -n 16 -N 210 -r 49 -t 10 --dt 0.02 --checkpoint-interval 500 -o agent_test_runs/validate_3d_multi
+# Expected: cells interact and repel, no collapse
 ```
 
 ---
@@ -120,15 +146,20 @@ python visualize.py -d agent_test_runs/my_sim --last
 # 2D: Generate movie
 python visualize.py -d agent_test_runs/my_sim --movie
 
-# 3D: Isosurface
-python visualize_3d.py agent_test_runs/my_3d_sim --iso
+# 3D: Isosurface visualization
+python visualize_3d.py agent_test_runs/my_3d_sim
 
-# 3D: Generate movie
-python visualize_3d.py agent_test_runs/my_3d_sim --movie --fps 10
+# 3D: Volume rendering (preferred for dense packing)
+python visualize_3d.py agent_test_runs/my_3d_sim --volume
+
+# 3D: Generate movie with volume rendering
+python visualize_3d.py agent_test_runs/my_3d_sim --movie --volume
 
 # Trajectory analysis (MSD, autocorrelations)
 python analyze_trajectory.py agent_test_runs/my_sim --no-show
 ```
+
+**IMPORTANT**: Always use `--volume` flag for 3D visualization to see cell interiors.
 
 ---
 

@@ -23,7 +23,6 @@ public:
 
   // Phase field data (on subdomain, stored on device)
   float *d_phi;     // Device pointer to phase field φ
-  float *d_dphi_dt; // Device pointer to time derivative
   int field_size;   // Total elements in subdomain
 
   // Cell properties (computed from φ)
@@ -109,7 +108,7 @@ inline Cell3D::Cell3D(int id_, const BoundingBox3D &initial_bbox,
                       int halo_width)
     : id(id_), state(CellState::Active), bbox(initial_bbox),
       bbox_with_halo(initial_bbox.expanded(halo_width)), d_phi(nullptr),
-      d_dphi_dt(nullptr), field_size(0), volume(0), centroid{0, 0, 0},
+      field_size(0), volume(0), centroid{0, 0, 0},
       velocity{0, 0, 0}, polarization{1, 0, 0}, theta(0), phi_pol(M_PI / 2),
       volume_deviation(0) {
   // Initialize with random polarization direction on unit sphere
@@ -125,7 +124,7 @@ inline Cell3D::Cell3D(int id_, const BoundingBox3D &initial_bbox,
 inline Cell3D::Cell3D(int id_, const BoundingBox3D &bbox_,
                       const BoundingBox3D &bbox_with_halo_)
     : id(id_), state(CellState::Active), bbox(bbox_),
-      bbox_with_halo(bbox_with_halo_), d_phi(nullptr), d_dphi_dt(nullptr),
+      bbox_with_halo(bbox_with_halo_), d_phi(nullptr),
       field_size(0), volume(0), centroid{0, 0, 0}, velocity{0, 0, 0},
       polarization{1, 0, 0}, theta(0), phi_pol(M_PI / 2), volume_deviation(0) {
   allocate_device_memory();
@@ -136,12 +135,11 @@ inline Cell3D::~Cell3D() { free_device_memory(); }
 inline Cell3D::Cell3D(Cell3D &&other) noexcept
     : id(other.id), state(other.state), bbox(other.bbox),
       bbox_with_halo(other.bbox_with_halo), d_phi(other.d_phi),
-      d_dphi_dt(other.d_dphi_dt), field_size(other.field_size),
+      field_size(other.field_size),
       volume(other.volume), centroid(other.centroid), velocity(other.velocity),
       polarization(other.polarization), theta(other.theta),
       phi_pol(other.phi_pol), volume_deviation(other.volume_deviation) {
   other.d_phi = nullptr;
-  other.d_dphi_dt = nullptr;
 }
 
 inline Cell3D &Cell3D::operator=(Cell3D &&other) noexcept {
@@ -153,7 +151,6 @@ inline Cell3D &Cell3D::operator=(Cell3D &&other) noexcept {
     bbox = other.bbox;
     bbox_with_halo = other.bbox_with_halo;
     d_phi = other.d_phi;
-    d_dphi_dt = other.d_dphi_dt;
     field_size = other.field_size;
     volume = other.volume;
     centroid = other.centroid;
@@ -164,7 +161,6 @@ inline Cell3D &Cell3D::operator=(Cell3D &&other) noexcept {
     volume_deviation = other.volume_deviation;
 
     other.d_phi = nullptr;
-    other.d_dphi_dt = nullptr;
   }
   return *this;
 }
@@ -173,9 +169,7 @@ inline void Cell3D::allocate_device_memory() {
   field_size = bbox_with_halo.size();
   if (field_size > 0) {
     CUDA_MALLOC(&d_phi, field_size * sizeof(float));
-    CUDA_MALLOC(&d_dphi_dt, field_size * sizeof(float));
     cudaMemset(d_phi, 0, field_size * sizeof(float));
-    cudaMemset(d_dphi_dt, 0, field_size * sizeof(float));
   }
 }
 
@@ -183,10 +177,6 @@ inline void Cell3D::free_device_memory() {
   if (d_phi) {
     CUDA_FREE(d_phi, field_size * sizeof(float));
     d_phi = nullptr;
-  }
-  if (d_dphi_dt) {
-    CUDA_FREE(d_dphi_dt, field_size * sizeof(float));
-    d_dphi_dt = nullptr;
   }
   field_size = 0;
 }
@@ -523,7 +513,6 @@ inline bool Cell3D::update_bounding_box(const SimParams3D &params,
   allocate_device_memory();
   cudaMemcpy(d_phi, h_phi_new.data(), new_size * sizeof(float),
              cudaMemcpyHostToDevice);
-  cudaMemset(d_dphi_dt, 0, new_size * sizeof(float));
 
   return true;
 }

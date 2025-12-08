@@ -2,6 +2,7 @@
 
 #include "domain.cuh"
 #include "types.cuh"
+#include <curand_kernel.h>
 #include <vector>
 
 namespace cellsim {
@@ -57,17 +58,27 @@ public:
   float *d_ref_y;             // Reference points Y for centroid
   float *d_polarization_x;    // Polarization directions X
   float *d_polarization_y;    // Polarization directions Y
+  float *d_theta;             // Polarization angles (for GPU-side RNG)
   float *d_centroids_x;       // Computed centroids X (GPU-side)
   float *d_centroids_y;       // Computed centroids Y (GPU-side)
 
-  // Neighbor-list arrays for V4 optimization (O(N) instead of O(N²))
+  // Neighbor-list arrays for O(k) interaction instead of O(N²)
   int *d_neighbor_counts; // Number of neighbors per cell
   int *d_neighbor_lists;  // Flattened neighbor indices [MAX_NEIGHBORS *
                           // num_cells]
 
-  // Kernel mode selection
-  bool use_fused_v2; // Use optimized fused v2 with batched RHS (default)
-  bool use_fused_v4; // Use neighbor-list optimization (for benchmarking)
+  // GPU-side RNG for polarization updates (eliminates host->device transfer)
+  curandState *d_rng_states;  // One RNG state per cell
+  bool rng_initialized;       // Track if RNG states have been initialized
+
+  // Adaptive neighbor list caching (rebuilds only when cells move significantly)
+  float *d_prev_centroids_x;       // Centroids at last neighbor rebuild
+  float *d_prev_centroids_y;       // Centroids at last neighbor rebuild
+  float *d_max_displacement;       // Reduction buffer for max displacement
+  bool neighbor_list_valid;        // True if neighbor list is up-to-date
+  float neighbor_rebuild_threshold; // Rebuild when max displacement exceeds this
+  int neighbor_rebuild_count;      // Stats: how many rebuilds occurred
+  int neighbor_skip_count;         // Stats: how many rebuilds skipped
 
   // Bounding box update control (reduces GPU-CPU syncs)
   int bbox_update_interval; // Update bboxes every N steps (default: 10)

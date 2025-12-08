@@ -64,8 +64,8 @@ cpp/simulation/
 │   └── simulation3d.cuh        # Simulation3D class
 ├── src/
 │   ├── main.cu                 # Entry point (CLI parsing, runs 2D or 3D)
-│   ├── kernels_optimized_v2.cu # Fused 2D kernels (main path)
-│   ├── kernels_optimized_v4.cu # 2D kernels with neighbor-list optimization
+│   ├── kernels_shared.cu       # Shared helper kernels (reductions, local terms)
+│   ├── kernels_solver.cu       # Production 2D solver with neighbor-list optimization
 │   ├── kernels3d.cu            # 3D kernel implementations
 │   ├── integrator.cu           # 2D integrator implementation
 │   ├── io.cu                   # 2D I/O implementation
@@ -229,7 +229,9 @@ The fused kernels use 9 work buffer slots per cell:
 | 7 | interaction_sum | Σ_m φ_m² from other cells |
 | 8 | phi_sq | φ² for volume integral |
 
-### Kernel Execution Flow (step_fused_v2)
+### Kernel Execution Flow (Overview)
+
+This is a simplified overview. See **V4 Solver Algorithm (Detailed)** below for the complete data flow.
 
 ```
 1. Upload cell pointers/metadata to GPU
@@ -248,6 +250,160 @@ The fused kernels use 9 work buffer slots per cell:
 5. Update cell velocities from motility integrals
 6. Periodically update bounding boxes (every N steps)
 ```
+
+### V4 Solver Algorithm (Detailed)
+
+The production solver (`step_fused` in `kernels_solver.cu`) uses a neighbor-list optimization for O(k) interaction instead of O(N²). Understanding its data flow and synchronization points is **critical** for performance work.
+
+#### Work Buffer Layout (per cell, 9 slots × max_field_size)
+
+| Slot | Buffer | Written By | Read By |
+|------|--------|------------|---------|
+| 0 | `laplacian` | kernel_fused_local_batched | kernel_fused_rhs_step_batched |
+| 1 | `bulk` | kernel_fused_local_batched | kernel_fused_rhs_step_batched |
+| 2 | `constraint` | kernel_volume_constraint_batched | kernel_fused_rhs_step_batched |
+| 3 | `grad_x` | kernel_fused_local_batched | kernel_interaction_neighborlist, kernel_fused_rhs_step_batched |
+| 4 | `grad_y` | kernel_fused_local_batched | kernel_interaction_neighborlist, kernel_fused_rhs_step_batched |
+| 5 | `phi_sq` | kernel_fused_local_batched | kernel_reduce_volumes_batched |
+| 6 | `repulsion` | kernel_interaction_neighborlist | kernel_fused_rhs_step_batched |
+| 7 | `integrand_x` | kernel_interaction_neighborlist | kernel_reduce_integrals_batched |
+| 8 | `integrand_y` | kernel_interaction_neighborlist | kernel_reduce_integrals_batched |
+
+#### Execution Flow with Data Dependencies
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ASYNC SETUP (no dependencies, can overlap)                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  cudaMemsetAsync(d_volumes, d_integrals_x, d_integrals_y, d_centroid_sums)  │
+│  kernel_compute_ref_points → d_ref_x, d_ref_y                               │
+│  cudaMemcpyAsync(polarizations) → d_polarization_x, d_polarization_y        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 1: kernel_fused_local_batched                                          │
+│ READS:  phi[]                                                                │
+│ WRITES: laplacian[0], bulk[1], grad_x[3], grad_y[4], phi_sq[5]              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 2: Parallel reductions (both launched, use atomicAdd)                  │
+│                                                                              │
+│  kernel_reduce_volumes_batched                                              │
+│    READS:  phi_sq[5]                                                        │
+│    WRITES: d_volumes (atomicAdd across blocks)                              │
+│                                                                              │
+│  kernel_reduce_centroid_sums_batched                                        │
+│    READS:  phi[], d_ref_x, d_ref_y                                          │
+│    WRITES: d_centroid_sums (atomicAdd across blocks)                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                        ╔═══════════════════════════╗
+                        ║   SYNC #1 REQUIRED        ║
+                        ║   cudaDeviceSynchronize() ║
+                        ║                           ║
+                        ║   WHY: Multi-block        ║
+                        ║   reductions use          ║
+                        ║   atomicAdd. Results      ║
+                        ║   must be complete        ║
+                        ║   before Phase 3 reads.   ║
+                        ╚═══════════════════════════╝
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 3: kernel_compute_centroids_and_deviations                             │
+│ READS:  d_centroid_sums, d_volumes, d_ref_x, d_ref_y                        │
+│ WRITES: d_centroids_x, d_centroids_y, d_volume_deviations                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 4: kernel_volume_constraint_batched                                    │
+│ READS:  phi[], d_volume_deviations                                          │
+│ WRITES: constraint[2]                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 5: Interaction (neighbor-list based, O(k) instead of O(N²))           │
+│                                                                              │
+│  5a: kernel_build_neighbor_list                                             │
+│      READS:  d_centroids_x, d_centroids_y (from Phase 3)                    │
+│      WRITES: d_neighbor_counts, d_neighbor_lists                            │
+│      NOTE:   search_radius = 4*R (conservative)                             │
+│                                                                              │
+│  5b: kernel_interaction_neighborlist                                        │
+│      READS:  phi[], grad_x[3], grad_y[4], neighbor_counts, neighbor_lists   │
+│      WRITES: repulsion[6], integrand_x[7], integrand_y[8]                   │
+│                                                                              │
+│  5c: kernel_reduce_integrals_batched                                        │
+│      READS:  integrand_x[7], integrand_y[8]                                 │
+│      WRITES: d_integrals_x, d_integrals_y (atomicAdd)                       │
+│                                                                              │
+│  5d: kernel_compute_velocities                                               │
+│      READS:  d_integrals_x, d_integrals_y, d_polarization_x/y               │
+│      WRITES: d_velocities_x, d_velocities_y                                 │
+│                                                                              │
+│  NOTE: 5a→5b→5c→5d are in same CUDA stream, so implicit ordering applies.  │
+│        No explicit sync needed between them.                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PHASE 6: kernel_fused_rhs_step_batched (Euler integration)                   │
+│ READS:  laplacian[0], bulk[1], constraint[2], grad_x[3], grad_y[4],        │
+│         repulsion[6], d_velocities_x, d_velocities_y                        │
+│ COMPUTES: dφ/dt = -v·∇φ - 0.5 * (−2γ∇²φ + bulk + constraint + repulsion)   │
+│ WRITES: phi[] ← phi[] + dt * dφ/dt (with clamping to [0,1])                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                        ╔═══════════════════════════╗
+                        ║   SYNC #2 REQUIRED        ║
+                        ║   cudaDeviceSynchronize() ║
+                        ║                           ║
+                        ║   WHY: phi[] updated.     ║
+                        ║   Must complete before    ║
+                        ║   next timestep reads     ║
+                        ║   phi[], and before any   ║
+                        ║   host readback.          ║
+                        ╚═══════════════════════════╝
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ OPTIONAL: Host sync (if sync_centroids=true)                                 │
+│ cudaMemcpy D→H: centroids, volumes, velocities → domain.cells[]             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Why Both Syncs Are Necessary
+
+| Sync | Location | Reason | What Breaks Without It |
+|------|----------|--------|------------------------|
+| **#1** | After Phase 2 | Multi-block reductions accumulate via `atomicAdd`. All blocks must finish before reading final sum. | Phase 3 reads incomplete volumes → wrong volume_deviations → wrong constraint term → physics error |
+| **#2** | After Phase 6 | Euler step writes to `phi[]`. Next timestep's Phase 1 reads `phi[]`. | Next step reads stale phi values → simulation diverges |
+
+#### Safe Optimization Opportunities
+
+These optimizations preserve correctness:
+
+| Optimization | Impact | Sync-Safe? | Status | Notes |
+|--------------|--------|------------|--------|-------|
+| GPU-side RNG (curand) | Medium | ✅ Yes | ✅ Done | Eliminates host→device polarization copy |
+| Cache neighbor list | Medium | ✅ Yes | ✅ Done | Adaptive rebuild based on max displacement |
+| Fuse Phase 3+4 | Small | ✅ Yes | ❌ | Single kernel for centroids + constraint |
+| Fuse Phase 5a+5b | Medium | ✅ Yes | ❌ | Inline neighbor search into interaction |
+| Shared memory stencil | Small | ✅ Yes | ❌ | Cache phi[] in shared mem for Laplacian |
+
+#### Unsafe Optimizations (Do Not Attempt)
+
+| Optimization | Why It Breaks |
+|--------------|---------------|
+| Remove SYNC #1 | Reductions incomplete → wrong physics |
+| Remove SYNC #2 | Stale phi[] in next timestep |
+| Async streams for Phases 1-6 | Sequential data dependencies require ordering |
+| Skip neighbor list rebuild | Cells can move; stale list → missed interactions |
 
 ---
 
@@ -523,8 +679,40 @@ if (isnan(phi[idx]) || fabsf(phi[idx]) > 100.0f) {
 
 ### Tuning Parameters
 - `bbox_update_interval` (default 10) — How often to update bounding boxes
-- `use_fused_v2` vs `use_fused_v4` — V4 uses neighbor lists for O(N) interactions
+- `MAX_NEIGHBORS` — Maximum neighbors per cell in neighbor-list (conservative upper bound)
 - CUDA block size: 16×16 (2D), 8×8×8 (3D)
+
+### Reference Benchmarks (RTX 4090 Laptop GPU, CUDA 12.8)
+
+**2D simulations at 89% confluence (R=49, t=100, dt=0.01, 10,000 steps):**
+
+| Test | Cells | Domain | v1 (baseline) | v2 (+curand) | v3 (+neighbor cache) |
+|------|-------|--------|---------------|--------------|---------------------|
+| 89% confluence | 16 | 369×369 | 4.35 s | 4.25 s | 3.54 s |
+| 89% confluence | 72 | 782×782 | 17.89 s | 10.77 s | 10.34 s |
+| 89% confluence | 288 | 1563×1563 | 79.14 s | 41.01 s | 39.53 s |
+
+**Optimization summary:**
+- **v2 (curand):** GPU-side RNG eliminates host→device polarization transfer
+- **v3 (neighbor cache):** Adaptive neighbor list caching (99%+ cache hit rate for relaxation)
+- **Total speedup:** 1.23× (16 cells) → 1.73× (72 cells) → 2.00× (288 cells)
+
+**Neighbor list cache hit rates:**
+- Relaxation (v_A=0): ~100% (only 2 rebuilds in 10,000 steps)
+- Low motility (v_A=0.1): ~99% (81 rebuilds)  
+- High motility (v_A=1.0): ~94% (637 rebuilds)
+
+**Scaling:** ~O(n) with cell count at fixed confluence.
+
+**Domain size calculation for target confluence:**
+```
+N = ceil(sqrt(n_cells × π × R² / confluence))
+```
+
+Example for 89% confluence with R=49:
+- 16 cells: N = 369
+- 72 cells: N = 782
+- 288 cells: N = 1563
 
 ### Profiling
 ```powershell
@@ -646,8 +834,9 @@ python analyze_trajectory.py agent_test_runs/my_sim --no-show
 1. [types.cuh](include/types.cuh) — Parameters and data structures
 2. [cell.cuh](include/cell.cuh) — Cell class and phase field initialization
 3. [kernels.cuh](include/kernels.cuh) — Kernel function signatures
-4. [kernels_optimized_v2.cu](src/kernels_optimized_v2.cu) — Main kernel implementations
-5. [integrator.cuh](include/integrator.cuh) — Memory management and stepping
+4. [kernels_solver.cu](src/kernels_solver.cu) — Production solver (neighbor-list optimization)
+5. [kernels_shared.cu](src/kernels_shared.cu) — Shared helper kernels (reductions, local terms)
+6. [integrator.cuh](include/integrator.cuh) — Memory management and stepping
 
 **For 3D work:**
 1. [types3d.cuh](include/types3d.cuh) — 3D parameter extensions

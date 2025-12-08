@@ -1,4 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
+
+# Force CUDA 12.8 toolkit (driver supports up to 12.8, not 13.0)
+set(CMAKE_CUDA_COMPILER "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin/nvcc.exe")
+
 project(CellSimulation LANGUAGES CXX CUDA)
 
 # Build options
@@ -15,7 +19,8 @@ find_package(CUDAToolkit REQUIRED)
 
 # CUDA architecture (adjust for your GPU)
 # Common values: 60 (Pascal), 70 (Volta), 75 (Turing), 80 (A100), 86 (Ampere), 89 (Ada), 90 (Hopper/H100)
-set(CMAKE_CUDA_ARCHITECTURES 75 90)
+# RTX 4090 = compute capability 8.9 (Ada Lovelace)
+set(CMAKE_CUDA_ARCHITECTURES 75 86 89 90)
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -23,8 +28,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Source files
 set(SOURCES
     src/main.cu
-    src/kernels_optimized_v2.cu
-    src/kernels_optimized_v4.cu
+    src/kernels_shared.cu
+    src/kernels_solver.cu
     src/kernels3d.cu
     src/integrator.cu
     src/io.cu
@@ -52,11 +57,8 @@ set(HEADERS
 # Create executable
 add_executable(cell_sim ${SOURCES} ${HEADERS})
 
-# Link CUDA runtime
-target_link_libraries(cell_sim CUDA::cudart)
-
-# Optional: Link cuFFT if we add spectral methods later
-# target_link_libraries(cell_sim CUDA::cufft)
+# Link CUDA runtime and curand for GPU-side RNG
+target_link_libraries(cell_sim CUDA::cudart CUDA::curand)
 
 # Compiler flags
 target_compile_options(cell_sim PRIVATE

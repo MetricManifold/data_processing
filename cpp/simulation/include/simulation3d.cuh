@@ -118,6 +118,55 @@ inline void Simulation3D::run(float t_end) {
   printf("Starting 3D simulation: t_end=%.2f, dt=%.4f\n", t_end,
          domain.params.dt);
 
+  // Do first step to trigger all lazy allocations
+  step();
+
+  // Memory profiling: report GPU memory usage after allocations
+  {
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    size_t used_mem = total_mem - free_mem;
+    printf("\n=== GPU Memory Profile (after initialization) ===\n");
+    printf("  Total GPU memory:     %.2f GB\n", total_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("  Used (all processes): %.2f GB (%.1f%%)\n", 
+           used_mem / (1024.0 * 1024.0 * 1024.0),
+           100.0 * used_mem / total_mem);
+    printf("  Free:                 %.2f GB\n", free_mem / (1024.0 * 1024.0 * 1024.0));
+    
+    // Detailed breakdown
+    size_t cell_phi_mem = domain.total_gpu_memory_bytes();
+    size_t work_buffer_mem = integrator.work_buffer_size;
+    size_t reduction_mem = integrator.reduction_array_capacity * sizeof(float) * 16;
+    size_t interaction_mem = integrator.interaction_array_capacity * sizeof(float) * 8;
+    size_t neighbor_mem = domain.num_cells() * (1 + Integrator3D::MAX_NEIGHBORS_3D) * sizeof(int);
+    size_t total_sim_mem = cell_phi_mem + work_buffer_mem + reduction_mem + interaction_mem + neighbor_mem;
+    
+    printf("\n  Simulation memory breakdown:\n");
+    printf("    Cell phi fields:    %7.2f MB (%d cells)\n", 
+           cell_phi_mem / (1024.0 * 1024.0), domain.num_cells());
+    printf("    Work buffers (5x):  %7.2f MB\n", 
+           work_buffer_mem / (1024.0 * 1024.0));
+    printf("    Reduction arrays:   %7.2f MB\n", 
+           reduction_mem / (1024.0 * 1024.0));
+    printf("    Interaction arrays: %7.2f MB\n", 
+           interaction_mem / (1024.0 * 1024.0));
+    printf("    Neighbor lists:     %7.2f MB\n", 
+           neighbor_mem / (1024.0 * 1024.0));
+    printf("    ---------------------------------\n");
+    printf("    Estimated total:    %7.2f MB (%.2f GB)\n",
+           total_sim_mem / (1024.0 * 1024.0),
+           total_sim_mem / (1024.0 * 1024.0 * 1024.0));
+    
+    // Scaling estimate
+    float mem_per_cell = total_sim_mem / (float)domain.num_cells();
+    int max_cells_fit = (int)(free_mem / mem_per_cell);
+    printf("\n  Scaling estimates (current domain size):\n");
+    printf("    Memory per cell:    %7.2f MB\n", mem_per_cell / (1024.0 * 1024.0));
+    printf("    Max cells (free):   %d cells\n", max_cells_fit);
+    printf("    Max cells (total):  %d cells\n", (int)(total_mem / mem_per_cell));
+    printf("================================================\n\n");
+  }
+
   while (current_time < t_end) {
     step();
 

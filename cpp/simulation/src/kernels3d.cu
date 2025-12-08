@@ -571,9 +571,9 @@ __global__ void kernel_fused_all_local_3d_periodic(
 
 //=============================================================================
 // Host function: Compute all local terms for a single 3D cell
-// Uses super-fused kernel: 7 buffers instead of 10 (30% memory savings)
-// Buffer layout:
-// [laplacian][bulk][constraint][advection][reduction][interaction][repulsion]
+// Uses super-fused kernel: 5 buffers (optimized from 7)
+// Buffer layout: [laplacian][bulk][constraint][advection][repulsion]
+// NOTE: This is the LEGACY per-cell function. The fused batched path is preferred.
 //=============================================================================
 
 void compute_local_terms_3d(Cell3D &cell, const SimParams3D &params,
@@ -585,19 +585,25 @@ void compute_local_terms_3d(Cell3D &cell, const SimParams3D &params,
 
   KernelConfig3D cfg = KernelConfig3D::for_cell(cell);
 
-  // Partition work buffer (7 buffers now, not 10)
+  // Partition work buffer (5 buffers)
   float *d_laplacian = d_work_buffer;
   float *d_bulk = d_work_buffer + buffer_stride;
   float *d_constraint = d_work_buffer + 2 * buffer_stride;
   float *d_advection = d_work_buffer + 3 * buffer_stride;
-  float *d_reduction = d_work_buffer + 4 * buffer_stride;
-  // Buffers 5 and 6 are for interaction_sum and repulsion (used later)
+  // Buffer 4 is for repulsion (used later)
+  
+  // For volume computation, use shared memory reduction (no dedicated buffer needed)
+  // Allocate temporary buffer for reduction
+  float *d_reduction_temp;
+  cudaMalloc(&d_reduction_temp, size * sizeof(float));
 
   // Compute volume integral FIRST (needed for constraint term)
-  float volume = compute_volume_integral_3d(cell.d_phi, d_reduction, size,
+  float volume = compute_volume_integral_3d(cell.d_phi, d_reduction_temp, size,
                                             params.halo_width, w, h, d);
   cell.volume = volume * params.dx * params.dy * params.dz;
   cell.volume_deviation = params.target_volume() - cell.volume;
+  
+  cudaFree(d_reduction_temp);
 
   // Check if cell wraps around domain boundaries
   bool wrap_x = cell.wraps_x(params.Nx);
@@ -625,8 +631,8 @@ void compute_local_terms_3d(Cell3D &cell, const SimParams3D &params,
 
 //=============================================================================
 // Host function: Compute interaction terms for all 3D cells
-// Buffer layout (7 per cell):
-// [laplacian][bulk][constraint][advection][reduction][interaction][repulsion]
+// Buffer layout (5 per cell): [laplacian][bulk][constraint][advection][repulsion]
+// NOTE: This is the LEGACY function. The fused batched path is preferred.
 //=============================================================================
 
 void compute_interaction_terms_3d(Domain3D &domain, float *d_work_buffer) {
@@ -689,27 +695,31 @@ void compute_interaction_terms_3d(Domain3D &domain, float *d_work_buffer) {
              cudaMemcpyHostToDevice);
 
   // Compute interaction for each cell
-  // Buffer layout:
-  // [0:laplacian][1:bulk][2:constraint][3:advection][4:reduction][5:interaction][6:repulsion]
+  // Buffer layout: [0:laplacian][1:bulk][2:constraint][3:advection][4:repulsion]
+  // Need a temp buffer for interaction_sum since we removed it from main layout
+  float *d_interaction_temp;
+  cudaMalloc(&d_interaction_temp, max_size * sizeof(float));
+  
   for (int i = 0; i < num_cells; ++i) {
     Cell3D &cell = *domain.cells[i];
     int w = cell.width(), h = cell.height(), d = cell.depth();
 
-    float *d_interaction = d_work_buffer + i * 7 * max_size + 5 * max_size;
-    float *d_repulsion = d_work_buffer + i * 7 * max_size + 6 * max_size;
+    float *d_repulsion = d_work_buffer + i * 5 * max_size + 4 * max_size;
 
     KernelConfig3D cfg = KernelConfig3D::for_cell(cell);
 
     kernel_interaction_sum_3d<<<cfg.grid, cfg.block>>>(
-        cell.d_phi, d_interaction, w, h, d, cell.bbox_with_halo.x0,
+        cell.d_phi, d_interaction_temp, w, h, d, cell.bbox_with_halo.x0,
         cell.bbox_with_halo.y0, cell.bbox_with_halo.z0, d_phi_ptrs, d_widths,
         d_heights, d_depths, d_offsets_x, d_offsets_y, d_offsets_z, num_cells,
         domain.params.Nx, domain.params.Ny, domain.params.Nz);
 
     kernel_repulsion_3d<<<cfg.grid, cfg.block>>>(
-        cell.d_phi, d_interaction, d_repulsion, w, h, d,
+        cell.d_phi, d_interaction_temp, d_repulsion, w, h, d,
         domain.params.interaction_coeff());
   }
+  
+  cudaFree(d_interaction_temp);
 
   // Free temporary device arrays
   cudaFree(d_phi_ptrs);
@@ -725,9 +735,11 @@ void compute_interaction_terms_3d(Domain3D &domain, float *d_work_buffer) {
 
 //=============================================================================
 // Host function: Forward Euler step for all 3D cells
-// Uses 7 buffers per cell (down from 10): 30% memory savings
+// DEPRECATED: This legacy function is not used. Use step_fused_3d instead.
+// Left for reference only - would need updating to work with new buffer layout.
 //=============================================================================
 
+#if 0  // DEPRECATED - not used, step_fused_3d is the active path
 void step_euler_3d(Domain3D &domain, float dt, float *d_work_buffer) {
   int num_cells = domain.num_cells();
 
@@ -737,44 +749,38 @@ void step_euler_3d(Domain3D &domain, float dt, float *d_work_buffer) {
     max_size = max(max_size, cell->field_size);
   }
 
-  // Compute local terms for all cells IN PARALLEL (7 buffers per cell)
+  // Compute local terms for all cells IN PARALLEL (5 buffers per cell)
   for (int i = 0; i < num_cells; ++i) {
     compute_local_terms_3d(*domain.cells[i], domain.params,
-                           d_work_buffer + i * 7 * max_size, max_size);
+                           d_work_buffer + i * 5 * max_size, max_size);
   }
 
   // Compute interaction terms
   compute_interaction_terms_3d(domain, d_work_buffer);
 
   // Combine RHS and do Euler step
-  // Buffer layout:
-  // [0:laplacian][1:bulk][2:constraint][3:advection][4:reduction][5:interaction][6:repulsion]
+  // Buffer layout: [0:laplacian][1:bulk][2:constraint][3:advection][4:repulsion]
   for (int i = 0; i < num_cells; ++i) {
     Cell3D &cell = *domain.cells[i];
     int w = cell.width(), h = cell.height(), d = cell.depth();
 
-    float *d_cell_work = d_work_buffer + i * 7 * max_size;
+    float *d_cell_work = d_work_buffer + i * 5 * max_size;
     float *d_laplacian = d_cell_work;
     float *d_bulk = d_cell_work + max_size;
     float *d_constraint = d_cell_work + 2 * max_size;
     float *d_advection = d_cell_work + 3 * max_size;
-    float *d_repulsion = d_cell_work + 6 * max_size;
+    float *d_repulsion = d_cell_work + 4 * max_size;
 
     KernelConfig3D cfg = KernelConfig3D::for_cell(cell);
-
-    kernel_combine_rhs_3d<<<cfg.grid, cfg.block>>>(
-        cell.d_dphi_dt, d_laplacian, d_bulk, d_constraint, d_repulsion,
-        d_advection, w, h, d, domain.params.gamma);
-
-    // Euler step
-    int threads = 256;
-    int blocks = (cell.field_size + threads - 1) / threads;
-    kernel_euler_step_3d<<<blocks, threads>>>(cell.d_phi, cell.d_dphi_dt,
-                                              cell.field_size, dt);
+    
+    // NOTE: This would need a temp buffer for dphi_dt since it was removed from Cell3D
+    // kernel_combine_rhs_3d<<<cfg.grid, cfg.block>>>(...);
+    // kernel_euler_step_3d<<<blocks, threads>>>(...);
   }
 
   cudaDeviceSynchronize();
 }
+#endif
 
 //=============================================================================
 // OPTIMIZED BATCHED 3D KERNELS
@@ -812,6 +818,7 @@ __global__ void kernel_compute_ref_points_3d(
 //-----------------------------------------------------------------------------
 // Batched local terms: laplacian + bulk for all cells
 // Uses flattened index to parallelize all 3 dimensions
+// Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
 //-----------------------------------------------------------------------------
 __global__ void kernel_fused_local_batched_3d(
     float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
@@ -841,7 +848,7 @@ __global__ void kernel_fused_local_batched_3d(
   int ly = rem / w;
   int lx = rem % w;
 
-  int base = cell_idx * 7 * max_field_size;
+  size_t base = (size_t)cell_idx * 5 * max_field_size;
 
   const float *phi = phi_ptrs[cell_idx];
   float *d_laplacian = work_buffer + base;
@@ -1065,6 +1072,7 @@ __global__ void kernel_compute_centroids_and_deviations_3d(
 
 //-----------------------------------------------------------------------------
 // Batched volume constraint kernel (flattened for parallelism)
+// Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
 //-----------------------------------------------------------------------------
 __global__ void kernel_volume_constraint_batched_3d(
     float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
@@ -1086,7 +1094,7 @@ __global__ void kernel_volume_constraint_batched_3d(
   if (flat_idx >= field_size)
     return;
 
-  int base = cell_idx * 7 * max_field_size;
+  size_t base = (size_t)cell_idx * 5 * max_field_size;
   float vol_dev = volume_deviations[cell_idx];
 
   const float *phi = phi_ptrs[cell_idx];
@@ -1098,6 +1106,7 @@ __global__ void kernel_volume_constraint_batched_3d(
 
 //-----------------------------------------------------------------------------
 // Batched advection kernel (flattened for parallelism)
+// Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
 //-----------------------------------------------------------------------------
 __global__ void kernel_advection_batched_3d(
     float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
@@ -1127,7 +1136,7 @@ __global__ void kernel_advection_batched_3d(
   int ly = rem / w;
   int lx = rem % w;
 
-  int base = cell_idx * 7 * max_field_size;
+  size_t base = (size_t)cell_idx * 5 * max_field_size;
 
   float vx = velocities_x[cell_idx];
   float vy = velocities_y[cell_idx];
@@ -1149,7 +1158,163 @@ __global__ void kernel_advection_batched_3d(
 }
 
 //-----------------------------------------------------------------------------
+// GPU kernel to build neighbor list based on centroid distance (3D)
+//
+// Two cells can only interact if their subdomains overlap. Since subdomains
+// extend ~R+padding from the centroid, cells whose centroids are more than
+// ~2*(R+padding) apart cannot have overlapping subdomains.
+//
+// We use 4*R as a conservative search radius - this guarantees we catch all
+// potential neighbors while still providing O(k) speedup for large systems.
+//-----------------------------------------------------------------------------
+__global__ void kernel_build_neighbor_list_3d(
+    const float *__restrict__ centroids_x,
+    const float *__restrict__ centroids_y,
+    const float *__restrict__ centroids_z,
+    int *__restrict__ neighbor_counts,
+    int *__restrict__ neighbor_lists, // [MAX_NEIGHBORS_3D * num_cells]
+    int Nx, int Ny, int Nz, int num_cells,
+    float search_radius) // Should be ~4*R to be safe
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_cells)
+    return;
+
+  float cx_i = centroids_x[i];
+  float cy_i = centroids_y[i];
+  float cz_i = centroids_z[i];
+
+  // Search radius squared for comparison
+  float search_r2 = search_radius * search_radius;
+
+  int count = 0;
+  int *my_neighbors = neighbor_lists + i * MAX_NEIGHBORS_3D;
+
+  for (int j = 0; j < num_cells; ++j) {
+    if (j == i)
+      continue;
+
+    float cx_j = centroids_x[j];
+    float cy_j = centroids_y[j];
+    float cz_j = centroids_z[j];
+
+    // Compute distance with periodic wrapping
+    float dx = cx_j - cx_i;
+    float dy = cy_j - cy_i;
+    float dz = cz_j - cz_i;
+
+    // Periodic boundary: if distance > half domain, wrap
+    if (dx > Nx * 0.5f)
+      dx -= Nx;
+    else if (dx < -Nx * 0.5f)
+      dx += Nx;
+    if (dy > Ny * 0.5f)
+      dy -= Ny;
+    else if (dy < -Ny * 0.5f)
+      dy += Ny;
+    if (dz > Nz * 0.5f)
+      dz -= Nz;
+    else if (dz < -Nz * 0.5f)
+      dz += Nz;
+
+    float dist2 = dx * dx + dy * dy + dz * dz;
+
+    // Include as neighbor if within search radius
+    if (dist2 <= search_r2) {
+      if (count < MAX_NEIGHBORS_3D) {
+        my_neighbors[count] = j;
+        count++;
+      }
+    }
+  }
+
+  neighbor_counts[i] = count;
+}
+
+//-----------------------------------------------------------------------------
+// Neighbor-list version of interaction kernel (3D)
+// O(k) instead of O(N) per voxel, where k = number of neighbors
+// Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
+//-----------------------------------------------------------------------------
+__global__ void kernel_interaction_neighborlist_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    const int *__restrict__ offsets_x, const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z,
+    const int *__restrict__ neighbor_counts,
+    const int *__restrict__ neighbor_lists,
+    float interaction_coeff, int Nx, int Ny, int Nz,
+    int num_cells, int max_field_size) {
+  int cell_idx = blockIdx.y;
+  if (cell_idx >= num_cells)
+    return;
+
+  int w = widths[cell_idx];
+  int h = heights[cell_idx];
+  int d = depths[cell_idx];
+  int field_size = field_sizes[cell_idx];
+  int ox_i = offsets_x[cell_idx];
+  int oy_i = offsets_y[cell_idx];
+  int oz_i = offsets_z[cell_idx];
+  int wh = w * h;
+
+  int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (flat_idx >= field_size)
+    return;
+
+  // Convert flat index to 3D coordinates
+  int lz = flat_idx / wh;
+  int rem = flat_idx % wh;
+  int ly = rem / w;
+  int lx = rem % w;
+
+  size_t base = (size_t)cell_idx * 5 * max_field_size;
+
+  const float *phi_i = phi_ptrs[cell_idx];
+  float *d_repulsion = work_buffer + base + 4 * max_field_size;
+
+  // Global coords
+  int gx = ((ox_i + lx) % Nx + Nx) % Nx;
+  int gy = ((oy_i + ly) % Ny + Ny) % Ny;
+  int gz = ((oz_i + lz) % Nz + Nz) % Nz;
+
+  // Sum φ_j² over NEIGHBOR cells only (O(k) instead of O(N))
+  float sum_phi_j_sq = 0.0f;
+
+  int num_neighbors = neighbor_counts[cell_idx];
+  const int *my_neighbors = neighbor_lists + cell_idx * MAX_NEIGHBORS_3D;
+
+  for (int n = 0; n < num_neighbors; ++n) {
+    int j = my_neighbors[n];
+
+    int ow = widths[j];
+    int oh = heights[j];
+    int od = depths[j];
+    int ox = offsets_x[j];
+    int oy = offsets_y[j];
+    int oz = offsets_z[j];
+
+    // Local coords in cell j
+    int ljx = ((gx - ox) % Nx + Nx) % Nx;
+    int ljy = ((gy - oy) % Ny + Ny) % Ny;
+    int ljz = ((gz - oz) % Nz + Nz) % Nz;
+
+    if (ljx < ow && ljy < oh && ljz < od) {
+      float phi_j = phi_ptrs[j][ljz * (ow * oh) + ljy * ow + ljx];
+      sum_phi_j_sq += phi_j * phi_j;
+    }
+  }
+
+  // Repulsion: 2 * κ_int * φ_i * Σ φ_j²
+  d_repulsion[flat_idx] =
+      2.0f * interaction_coeff * phi_i[flat_idx] * sum_phi_j_sq;
+}
+
+//-----------------------------------------------------------------------------
 // Batched interaction kernel (O(N²) version - all pairs, flattened)
+// DEPRECATED: Use kernel_interaction_neighborlist_3d instead
+// Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
 //-----------------------------------------------------------------------------
 __global__ void kernel_interaction_batched_3d(
     float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
@@ -1181,10 +1346,10 @@ __global__ void kernel_interaction_batched_3d(
   int ly = rem / w;
   int lx = rem % w;
 
-  int base = cell_idx * 7 * max_field_size;
+  size_t base = (size_t)cell_idx * 5 * max_field_size;
 
   const float *phi_i = phi_ptrs[cell_idx];
-  float *d_repulsion = work_buffer + base + 6 * max_field_size;
+  float *d_repulsion = work_buffer + base + 4 * max_field_size;
 
   // Global coords
   int gx = ((ox_i + lx) % Nx + Nx) % Nx;
@@ -1222,6 +1387,7 @@ __global__ void kernel_interaction_batched_3d(
 
 //-----------------------------------------------------------------------------
 // Batched RHS + Euler step kernel (flattened for parallelism)
+// Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
 //-----------------------------------------------------------------------------
 __global__ void kernel_fused_rhs_step_batched_3d(
     float **__restrict__ phi_ptrs, const float *__restrict__ work_buffer,
@@ -1242,15 +1408,14 @@ __global__ void kernel_fused_rhs_step_batched_3d(
   if (flat_idx >= field_size)
     return;
 
-  int base = cell_idx * 7 * max_field_size;
+  size_t base = (size_t)cell_idx * 5 * max_field_size;
 
-  // Buffer layout:
-  // [lap][bulk][constraint][advection][reduction][interaction][repulsion]
+  // Buffer layout: [lap][bulk][constraint][advection][repulsion]
   const float *d_laplacian = work_buffer + base;
   const float *d_bulk = work_buffer + base + max_field_size;
   const float *d_constraint = work_buffer + base + 2 * max_field_size;
   const float *d_advection = work_buffer + base + 3 * max_field_size;
-  const float *d_repulsion = work_buffer + base + 6 * max_field_size;
+  const float *d_repulsion = work_buffer + base + 4 * max_field_size;
 
   float *phi = phi_ptrs[cell_idx];
 
@@ -1284,6 +1449,7 @@ __global__ void kernel_compute_velocities_3d(
 //=============================================================================
 // Optimized Fused Step Function for 3D
 // Similar to step_fused_v4 in 2D: batched kernels, GPU-side reductions
+// Now with neighbor-list based interaction (O(k) instead of O(N²))
 //=============================================================================
 
 void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
@@ -1298,7 +1464,9 @@ void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
                    float *d_ref_y, float *d_ref_z, float *d_polarization_x,
                    float *d_polarization_y, float *d_polarization_z,
                    float *d_centroids_x, float *d_centroids_y,
-                   float *d_centroids_z, bool sync_centroids) {
+                   float *d_centroids_z, int *d_neighbor_counts,
+                   int *d_neighbor_lists, bool sync_centroids,
+                   bool rebuild_neighbors) {
   const SimParams3D &params = domain.params;
   int num_cells = domain.num_cells();
   if (num_cells == 0)
@@ -1415,13 +1583,31 @@ void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
       params.dx, params.dy, params.dz, num_cells, max_size);
 
   // =========================================================================
-  // PHASE 7: Batched interaction (O(N²) for now)
+  // PHASE 7: Build neighbor list (if needed) + Interaction with neighbor list
   // =========================================================================
   if (num_cells > 1) {
-    kernel_interaction_batched_3d<<<grid, block>>>(
+    // Only rebuild neighbor list if requested (adaptive caching)
+    if (rebuild_neighbors) {
+      // Build neighbor list using centroid-based distance check
+      // Subdomains extend R+halo from centroid. Two cells interact if their
+      // subdomains overlap, requiring centroids within 2*(R+halo).
+      // With halo ~ 0.15*R, this is ~2.3*R. Use 3*R for safety margin.
+      float search_radius = 3.0f * params.target_radius;
+
+      int neighbor_threads = std::min(num_cells, 256);
+      int neighbor_blocks = (num_cells + neighbor_threads - 1) / neighbor_threads;
+      kernel_build_neighbor_list_3d<<<neighbor_blocks, neighbor_threads>>>(
+          d_centroids_x, d_centroids_y, d_centroids_z,
+          d_neighbor_counts, d_neighbor_lists,
+          params.Nx, params.Ny, params.Nz, num_cells, search_radius);
+    }
+
+    // Interaction with neighbor list (O(k) instead of O(N) per voxel)
+    kernel_interaction_neighborlist_3d<<<grid, block>>>(
         d_all_phi_ptrs, d_work_buffer, d_all_widths, d_all_heights,
         d_all_depths, d_all_field_sizes, d_all_offsets_x, d_all_offsets_y,
-        d_all_offsets_z, params.interaction_coeff(), params.Nx, params.Ny,
+        d_all_offsets_z, d_neighbor_counts, d_neighbor_lists,
+        params.interaction_coeff(), params.Nx, params.Ny,
         params.Nz, num_cells, max_size);
   }
 

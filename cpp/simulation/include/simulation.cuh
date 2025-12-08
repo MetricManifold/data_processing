@@ -346,6 +346,17 @@ inline void Simulation::run() {
     save_output(); // Save final state
   }
   printf("Simulation complete: %d steps, t=%.2f\n", current_step, current_time);
+  
+  // Print neighbor list caching stats
+  if (domain.num_cells() > 1) {
+    int rebuilds = integrator.neighbor_rebuild_count;
+    int skips = integrator.neighbor_skip_count;
+    int total = rebuilds + skips;
+    if (total > 0) {
+      printf("Neighbor list: %d rebuilds, %d cached (%.1f%% cache hit rate)\n",
+             rebuilds, skips, 100.0f * skips / total);
+    }
+  }
 }
 
 inline void Simulation::save_output() {

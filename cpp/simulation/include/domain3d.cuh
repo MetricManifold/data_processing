@@ -35,7 +35,6 @@ public:
 
   // Device arrays for batch operations
   float **d_cell_phi_ptrs;     // Array of pointers to each cell's φ
-  float **d_cell_dphi_dt_ptrs; // Array of pointers to each cell's dφ/dt
   int *d_cell_widths;          // Width of each cell's subdomain
   int *d_cell_heights;         // Height of each cell's subdomain
   int *d_cell_depths;          // Depth of each cell's subdomain
@@ -66,8 +65,8 @@ public:
   size_t total_gpu_memory_bytes() const {
     size_t total = 0;
     for (const auto &cell : cells) {
-      // Each cell has: d_phi, d_dphi_dt, d_rhs (3 buffers)
-      size_t cell_bytes = cell->bbox_with_halo.size() * sizeof(float) * 3;
+      // Each cell has: d_phi only (work buffers managed by Integrator3D)
+      size_t cell_bytes = cell->bbox_with_halo.size() * sizeof(float);
       total += cell_bytes;
     }
     return total;
@@ -103,7 +102,7 @@ private:
 
 inline Domain3D::Domain3D(const SimParams3D &p)
     : params(p), next_cell_id(0), d_cell_phi_ptrs(nullptr),
-      d_cell_dphi_dt_ptrs(nullptr), d_cell_widths(nullptr),
+      d_cell_widths(nullptr),
       d_cell_heights(nullptr), d_cell_depths(nullptr),
       d_cell_offsets_x(nullptr), d_cell_offsets_y(nullptr),
       d_cell_offsets_z(nullptr), device_arrays_dirty(true) {}
@@ -111,7 +110,6 @@ inline Domain3D::Domain3D(const SimParams3D &p)
 inline Domain3D::Domain3D(Domain3D &&other) noexcept
     : params(other.params), cells(std::move(other.cells)),
       next_cell_id(other.next_cell_id), d_cell_phi_ptrs(other.d_cell_phi_ptrs),
-      d_cell_dphi_dt_ptrs(other.d_cell_dphi_dt_ptrs),
       d_cell_widths(other.d_cell_widths), d_cell_heights(other.d_cell_heights),
       d_cell_depths(other.d_cell_depths),
       d_cell_offsets_x(other.d_cell_offsets_x),
@@ -120,7 +118,6 @@ inline Domain3D::Domain3D(Domain3D &&other) noexcept
       device_arrays_dirty(other.device_arrays_dirty) {
   // Clear other's pointers so destructor doesn't free
   other.d_cell_phi_ptrs = nullptr;
-  other.d_cell_dphi_dt_ptrs = nullptr;
   other.d_cell_widths = nullptr;
   other.d_cell_heights = nullptr;
   other.d_cell_depths = nullptr;
@@ -138,7 +135,6 @@ inline Domain3D &Domain3D::operator=(Domain3D &&other) noexcept {
     cells = std::move(other.cells);
     next_cell_id = other.next_cell_id;
     d_cell_phi_ptrs = other.d_cell_phi_ptrs;
-    d_cell_dphi_dt_ptrs = other.d_cell_dphi_dt_ptrs;
     d_cell_widths = other.d_cell_widths;
     d_cell_heights = other.d_cell_heights;
     d_cell_depths = other.d_cell_depths;
@@ -148,7 +144,6 @@ inline Domain3D &Domain3D::operator=(Domain3D &&other) noexcept {
     device_arrays_dirty = other.device_arrays_dirty;
 
     other.d_cell_phi_ptrs = nullptr;
-    other.d_cell_dphi_dt_ptrs = nullptr;
     other.d_cell_widths = nullptr;
     other.d_cell_heights = nullptr;
     other.d_cell_depths = nullptr;
@@ -248,7 +243,6 @@ inline void Domain3D::allocate_device_arrays() {
     return;
 
   cudaMalloc(&d_cell_phi_ptrs, n * sizeof(float *));
-  cudaMalloc(&d_cell_dphi_dt_ptrs, n * sizeof(float *));
   cudaMalloc(&d_cell_widths, n * sizeof(int));
   cudaMalloc(&d_cell_heights, n * sizeof(int));
   cudaMalloc(&d_cell_depths, n * sizeof(int));
@@ -261,10 +255,6 @@ inline void Domain3D::free_device_arrays() {
   if (d_cell_phi_ptrs) {
     cudaFree(d_cell_phi_ptrs);
     d_cell_phi_ptrs = nullptr;
-  }
-  if (d_cell_dphi_dt_ptrs) {
-    cudaFree(d_cell_dphi_dt_ptrs);
-    d_cell_dphi_dt_ptrs = nullptr;
   }
   if (d_cell_widths) {
     cudaFree(d_cell_widths);
@@ -303,13 +293,12 @@ inline void Domain3D::sync_device_arrays() {
   if (n == 0)
     return;
 
-  std::vector<float *> phi_ptrs(n), dphi_dt_ptrs(n);
+  std::vector<float *> phi_ptrs(n);
   std::vector<int> widths(n), heights(n), depths(n);
   std::vector<int> offsets_x(n), offsets_y(n), offsets_z(n);
 
   for (int i = 0; i < n; ++i) {
     phi_ptrs[i] = cells[i]->d_phi;
-    dphi_dt_ptrs[i] = cells[i]->d_dphi_dt;
     widths[i] = cells[i]->width();
     heights[i] = cells[i]->height();
     depths[i] = cells[i]->depth();
@@ -319,8 +308,6 @@ inline void Domain3D::sync_device_arrays() {
   }
 
   cudaMemcpy(d_cell_phi_ptrs, phi_ptrs.data(), n * sizeof(float *),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(d_cell_dphi_dt_ptrs, dphi_dt_ptrs.data(), n * sizeof(float *),
              cudaMemcpyHostToDevice);
   cudaMemcpy(d_cell_widths, widths.data(), n * sizeof(int),
              cudaMemcpyHostToDevice);

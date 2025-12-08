@@ -69,6 +69,7 @@ int main(int argc, char *argv[]) {
   // 3D-specific defaults
   bool run_3d = false;
   int Nz = -1; // -1 means use same as Nx/Ny
+  bool domain_size_set = false; // Track if user explicitly set -N
 
   int num_cells = 8;
   float radius = 20.0f;
@@ -91,8 +92,6 @@ int main(int argc, char *argv[]) {
       -1; // -1 = use save_interval, 0 = compute from samples, >0 = explicit
   float v_A_override = -1.0f; // -1 means use default from params
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
-  bool use_fused_v2 = false;  // Use V2 batched kernels (O(N²) interaction)
-  bool use_fused_v4 = true; // Use V4 neighbor-list kernels (default - fastest)
   bool safe_mode = false;   // Limit memory allocation to 1GB
   bool use_grid_init = false; // Use grid-based initialization instead of random
   float confluence = 0.85f;   // Target confluence for grid initialization
@@ -114,6 +113,7 @@ int main(int argc, char *argv[]) {
       int size = atoi(argv[++i]);
       params.Nx = size;
       params.Ny = size;
+      domain_size_set = true;
     } else if ((arg == "-t" || arg == "-T") && i + 1 < argc) {
       params.t_end = atof(argv[++i]);
     } else if ((arg == "-dt" || arg == "--dt") && i + 1 < argc) {
@@ -155,14 +155,6 @@ int main(int argc, char *argv[]) {
       use_abp = true;
     } else if (arg == "--save-individual-fields") {
       save_individual_fields = true;
-    } else if (arg == "--v4") {
-      // Use V4 neighbor-list kernels (now default)
-      use_fused_v4 = true;
-      use_fused_v2 = false;
-    } else if (arg == "--v2") {
-      // Use V2 batched kernels (O(N²) interaction, slower)
-      use_fused_v2 = true;
-      use_fused_v4 = false;
     } else if (arg == "--safe-mode") {
       // Limit memory allocation to prevent runaway GPU memory usage
       safe_mode = true;
@@ -205,11 +197,31 @@ int main(int argc, char *argv[]) {
     params.motility_model = SimParams::MotilityModel::ABP;
   }
 
-  // Print CUDA device info
-  int device;
-  cudaGetDevice(&device);
+  // Print CUDA device info with proper initialization
+  int deviceCount = 0;
+  cudaError_t err = cudaGetDeviceCount(&deviceCount);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA Error: cudaGetDeviceCount failed: %s\n", cudaGetErrorString(err));
+    return 1;
+  }
+  if (deviceCount == 0) {
+    fprintf(stderr, "No CUDA devices found!\n");
+    return 1;
+  }
+  
+  int device = 0;
+  err = cudaSetDevice(device);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA Error: cudaSetDevice failed: %s\n", cudaGetErrorString(err));
+    return 1;
+  }
+  
   cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, device);
+  err = cudaGetDeviceProperties(&prop, device);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA Error: cudaGetDeviceProperties failed: %s\n", cudaGetErrorString(err));
+    return 1;
+  }
   printf("Using GPU: %s\n", prop.name);
   printf("  Compute capability: %d.%d\n", prop.major, prop.minor);
   printf("  Memory: %.1f GB\n", prop.totalGlobalMem / 1e9);
@@ -219,6 +231,26 @@ int main(int argc, char *argv[]) {
   // 3D Simulation Branch
   //=========================================================================
   if (run_3d) {
+    // 3D defaults: R=49, 85% confluence
+    if (radius == 20.0f) {
+      radius = 49.0f; // Default radius for 3D
+    }
+    
+    // Auto-compute domain size for target confluence if not explicitly set
+    if (!domain_size_set) {
+      // confluence = (n_cells * (4/3)*pi*R^3) / N^3
+      // N^3 = n_cells * (4/3)*pi*R^3 / confluence
+      // N = cbrt(n_cells * (4/3)*pi*R^3 / confluence)
+      float cell_volume = (4.0f / 3.0f) * M_PI * radius * radius * radius;
+      float total_cell_volume = num_cells * cell_volume;
+      float domain_volume = total_cell_volume / confluence;
+      int N = static_cast<int>(ceilf(cbrtf(domain_volume)));
+      params.Nx = N;
+      params.Ny = N;
+      printf("Auto-computed domain size N=%d for %d cells, R=%.0f, confluence=%.0f%%\n",
+             N, num_cells, radius, confluence * 100.0f);
+    }
+    
     // Create 3D parameters
     SimParams3D params3d;
     params3d.Nx = params.Nx;
@@ -430,15 +462,6 @@ int main(int argc, char *argv[]) {
   sim.compute_diagnostics = use_diagnostics;
   sim.save_vtk = (save_interval > 0);
   sim.save_individual_fields = save_individual_fields;
-
-  // Set kernel mode (v4 is default and recommended)
-  sim.integrator.use_fused_v2 = use_fused_v2;
-  sim.integrator.use_fused_v4 = use_fused_v4;
-  if (use_fused_v4) {
-    printf("Using fused v4 kernels (neighbor-list) - default, fastest\n");
-  } else {
-    printf("Using fused v2 kernels (batched RHS) - O(N^2) interaction\n");
-  }
 
   // Track whether runtime options were explicitly set on command line
   bool save_interval_set = false;

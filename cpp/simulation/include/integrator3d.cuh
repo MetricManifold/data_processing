@@ -65,6 +65,12 @@ public:
   int bbox_update_interval;
   int step_counter;
 
+  // Neighbor list for interaction kernel (O(k) instead of O(N²))
+  static constexpr int MAX_NEIGHBORS_3D = 32; // Max neighbors per cell
+  int *d_neighbor_counts;  // Number of neighbors per cell [num_cells]
+  int *d_neighbor_lists;   // Flattened neighbor indices [MAX_NEIGHBORS_3D * num_cells]
+  bool neighbor_list_valid; // True if neighbor list is up-to-date
+
 public:
   Integrator3D(Method m = Method::ForwardEuler);
   ~Integrator3D();
@@ -109,7 +115,9 @@ inline Integrator3D::Integrator3D(Method m)
       d_ref_x(nullptr), d_ref_y(nullptr), d_ref_z(nullptr),
       d_polarization_x(nullptr), d_polarization_y(nullptr),
       d_polarization_z(nullptr), d_centroids_x(nullptr), d_centroids_y(nullptr),
-      d_centroids_z(nullptr), bbox_update_interval(10), step_counter(0) {}
+      d_centroids_z(nullptr), bbox_update_interval(10), step_counter(0),
+      d_neighbor_counts(nullptr), d_neighbor_lists(nullptr),
+      neighbor_list_valid(false) {}
 
 inline Integrator3D::~Integrator3D() {
   free_work_buffer();
@@ -125,17 +133,31 @@ inline void Integrator3D::allocate_work_buffer(const Domain3D &domain) {
     max_size = max(max_size, cell->field_size);
   }
 
-  // Parallel allocation: N cells × 7 buffers each (down from 10!)
-  // Buffers per cell: laplacian, bulk, constraint, advection, reduction,
-  //                   interaction_sum, repulsion
-  // Fused kernel eliminates grad_x, grad_y, grad_z → 30% memory savings
-  size_t needed = domain.num_cells() * 7 * max_size * sizeof(float);
+  // Sanity check for max_size
+  if (max_size <= 0 || max_size > 500000000) {
+    printf("ERROR: Invalid max_size=%d in allocate_work_buffer\n", max_size);
+    return;
+  }
+
+  // Parallel allocation: N cells × 5 buffers each (down from 7!)
+  // Buffer layout: [laplacian][bulk][constraint][advection][repulsion]
+  // - Removed interaction_sum (unused in fused path)
+  // - Reduction is done in shared memory, no buffer needed
+  // Memory savings: 7 → 5 buffers = 29% reduction
+  size_t needed = (size_t)domain.num_cells() * 5 * max_size * sizeof(float);
 
   if (needed > work_buffer_size) {
     free_work_buffer();
-    CUDA_MALLOC(&d_work_buffer, needed);
+    cudaError_t err = cudaMalloc(&d_work_buffer, needed);
+    if (err != cudaSuccess) {
+      printf("ERROR: cudaMalloc failed for work buffer (%.1f MB): %s\n",
+             needed / (1024.0 * 1024.0), cudaGetErrorString(err));
+      d_work_buffer = nullptr;
+      work_buffer_size = 0;
+      return;
+    }
     work_buffer_size = needed;
-    printf("3D Work buffer: %.1f MB for %d cells (7 buffers/cell)\n",
+    printf("3D Work buffer: %.1f MB for %d cells (5 buffers/cell)\n",
            needed / (1024.0 * 1024.0), domain.num_cells());
   }
 }
@@ -163,6 +185,11 @@ inline void Integrator3D::allocate_interaction_arrays(int num_cells) {
   cudaMalloc(&d_all_offsets_z, num_cells * sizeof(int));
   cudaMalloc(&d_all_field_sizes, num_cells * sizeof(int));
 
+  // Neighbor list arrays
+  cudaMalloc(&d_neighbor_counts, num_cells * sizeof(int));
+  cudaMalloc(&d_neighbor_lists, MAX_NEIGHBORS_3D * num_cells * sizeof(int));
+  neighbor_list_valid = false; // Force rebuild on first use
+
   interaction_array_capacity = num_cells;
 }
 
@@ -183,6 +210,10 @@ inline void Integrator3D::free_interaction_arrays() {
     cudaFree(d_all_offsets_z);
   if (d_all_field_sizes)
     cudaFree(d_all_field_sizes);
+  if (d_neighbor_counts)
+    cudaFree(d_neighbor_counts);
+  if (d_neighbor_lists)
+    cudaFree(d_neighbor_lists);
 
   d_all_phi_ptrs = nullptr;
   d_all_widths = nullptr;
@@ -192,6 +223,9 @@ inline void Integrator3D::free_interaction_arrays() {
   d_all_offsets_y = nullptr;
   d_all_offsets_z = nullptr;
   d_all_field_sizes = nullptr;
+  d_neighbor_counts = nullptr;
+  d_neighbor_lists = nullptr;
+  neighbor_list_valid = false;
   interaction_array_capacity = 0;
 }
 
@@ -391,7 +425,12 @@ inline void Integrator3D::step(Domain3D &domain, float dt) {
   bool sync_centroids =
       (step_counter == 1) || (step_counter % bbox_update_interval == 0);
 
-  // Use optimized fused step function
+  // Determine if neighbor list rebuild is needed
+  // Rebuild on first step, when bboxes sync, or when explicitly invalidated
+  int num_cells = domain.num_cells();
+  bool rebuild_neighbors = !neighbor_list_valid || num_cells <= 1 || sync_centroids;
+
+  // Use optimized fused step function with neighbor list
   step_fused_3d(domain, dt, d_work_buffer, d_all_phi_ptrs, d_all_widths,
                 d_all_heights, d_all_depths, d_all_offsets_x, d_all_offsets_y,
                 d_all_offsets_z, d_all_field_sizes, d_volumes, d_integrals_x,
@@ -399,7 +438,13 @@ inline void Integrator3D::step(Domain3D &domain, float dt) {
                 d_volume_deviations, d_velocities_x, d_velocities_y,
                 d_velocities_z, d_ref_x, d_ref_y, d_ref_z, d_polarization_x,
                 d_polarization_y, d_polarization_z, d_centroids_x,
-                d_centroids_y, d_centroids_z, sync_centroids);
+                d_centroids_y, d_centroids_z, d_neighbor_counts,
+                d_neighbor_lists, sync_centroids, rebuild_neighbors);
+
+  // Mark neighbor list as valid after rebuild
+  if (rebuild_neighbors && num_cells > 1) {
+    neighbor_list_valid = true;
+  }
 
   // Update bboxes periodically
   if (sync_centroids) {
@@ -411,6 +456,7 @@ inline void Integrator3D::step(Domain3D &domain, float dt) {
     }
     if (any_changed) {
       update_interaction_arrays(domain);
+      neighbor_list_valid = false; // Force rebuild after bbox changes
     }
   }
 }

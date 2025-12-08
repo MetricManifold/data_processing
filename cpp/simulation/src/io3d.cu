@@ -119,8 +119,8 @@ size_t scan_checkpoint_3d_memory(const char *filename, int &out_num_cells) {
     int d = bbox_with_halo.depth();
     int size = w * h * d;
 
-    // Each cell has 3 buffers: d_phi, d_dphi_dt, d_rhs
-    total_memory += size * sizeof(float) * 3;
+    // Each cell has 1 buffer: d_phi (d_dphi_dt removed for memory optimization)
+    total_memory += size * sizeof(float);
 
     // Skip remaining metadata (centroid, volume, theta, phi_pol, polarization,
     // velocity)
