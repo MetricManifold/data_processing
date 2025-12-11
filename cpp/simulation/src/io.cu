@@ -1,4 +1,7 @@
 #include "io.cuh"
+#ifdef STRESS_FIELDS_ENABLED
+#include "diagnostics.cuh"
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <iomanip>
@@ -624,5 +627,121 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
   }
   return true;
 }
+
+//=============================================================================
+// Stress Field VTK Export
+//=============================================================================
+
+#ifdef STRESS_FIELDS_ENABLED
+
+void export_vtk_with_stress(const Domain &domain, 
+                           const StressFieldBuffers &stress,
+                           const std::string &base_filename, int frame) {
+  std::stringstream ss;
+  ss << base_filename << "_" << std::setfill('0') << std::setw(6) << frame
+     << ".vtk";
+  std::string filename = ss.str();
+
+  int Nx = domain.params.Nx;
+  int Ny = domain.params.Ny;
+  size_t field_size = (size_t)Nx * Ny;
+
+  // Reconstruct phi field (same as export_vtk)
+  std::vector<float> full_field(field_size, 0.0f);
+
+  for (const auto &cell : domain.cells) {
+    std::vector<float> h_phi(cell->field_size);
+    cudaMemcpy(h_phi.data(), cell->d_phi, cell->field_size * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    int halo = domain.params.halo_width;
+
+    for (int ly = halo; ly < cell->height() - halo; ++ly) {
+      for (int lx = halo; lx < cell->width() - halo; ++lx) {
+        int gx, gy;
+        cell->bbox_with_halo.local_to_global(lx, ly, gx, gy, Nx, Ny);
+
+        int local_idx = ly * cell->width() + lx;
+        int global_idx = gy * Nx + gx;
+
+        full_field[global_idx] =
+            fmaxf(full_field[global_idx], h_phi[local_idx]);
+      }
+    }
+  }
+
+  // Download stress fields from GPU
+  std::vector<float> h_sigma_xx(field_size);
+  std::vector<float> h_sigma_yy(field_size);
+  std::vector<float> h_sigma_xy(field_size);
+  std::vector<float> h_pressure(field_size);
+
+  cudaMemcpy(h_sigma_xx.data(), stress.d_sigma_xx_field, 
+             field_size * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_sigma_yy.data(), stress.d_sigma_yy_field,
+             field_size * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_sigma_xy.data(), stress.d_sigma_xy_field,
+             field_size * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_pressure.data(), stress.d_pressure_field,
+             field_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Write VTK file with multiple scalar fields
+  std::ofstream file(filename);
+
+  file << "# vtk DataFile Version 3.0\n";
+  file << "Phase field simulation with stress fields, frame " << frame << "\n";
+  file << "ASCII\n";
+  file << "DATASET STRUCTURED_POINTS\n";
+  file << "DIMENSIONS " << Nx << " " << Ny << " 1\n";
+  file << "ORIGIN 0 0 0\n";
+  file << "SPACING " << domain.params.dx << " " << domain.params.dy << " 1\n";
+  file << "POINT_DATA " << field_size << "\n";
+
+  // Phase field
+  file << "SCALARS phi float 1\n";
+  file << "LOOKUP_TABLE default\n";
+  for (int y = 0; y < Ny; ++y) {
+    for (int x = 0; x < Nx; ++x) {
+      file << full_field[y * Nx + x] << "\n";
+    }
+  }
+
+  // Stress fields
+  file << "SCALARS sigma_xx float 1\n";
+  file << "LOOKUP_TABLE default\n";
+  for (int y = 0; y < Ny; ++y) {
+    for (int x = 0; x < Nx; ++x) {
+      file << h_sigma_xx[y * Nx + x] << "\n";
+    }
+  }
+
+  file << "SCALARS sigma_yy float 1\n";
+  file << "LOOKUP_TABLE default\n";
+  for (int y = 0; y < Ny; ++y) {
+    for (int x = 0; x < Nx; ++x) {
+      file << h_sigma_yy[y * Nx + x] << "\n";
+    }
+  }
+
+  file << "SCALARS sigma_xy float 1\n";
+  file << "LOOKUP_TABLE default\n";
+  for (int y = 0; y < Ny; ++y) {
+    for (int x = 0; x < Nx; ++x) {
+      file << h_sigma_xy[y * Nx + x] << "\n";
+    }
+  }
+
+  file << "SCALARS pressure float 1\n";
+  file << "LOOKUP_TABLE default\n";
+  for (int y = 0; y < Ny; ++y) {
+    for (int x = 0; x < Nx; ++x) {
+      file << h_pressure[y * Nx + x] << "\n";
+    }
+  }
+
+  file.close();
+}
+
+#endif // STRESS_FIELDS_ENABLED
 
 } // namespace cellsim

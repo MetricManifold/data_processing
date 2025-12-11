@@ -3,6 +3,13 @@
 #include "cell.cuh"
 #include "domain.cuh"
 #include "types.cuh"
+#ifdef DIAGNOSTICS_ENABLED
+#include "diagnostics.cuh"
+#endif
+// Also need diagnostics.cuh for StressFieldBuffers when stress fields enabled
+#if defined(STRESS_FIELDS_ENABLED) && !defined(DIAGNOSTICS_ENABLED)
+#include "diagnostics.cuh"
+#endif
 
 namespace cellsim {
 
@@ -160,5 +167,46 @@ void step_fused(Domain &domain, float dt, float *d_work_buffer,
                 float *d_centroids_y, int *d_neighbor_counts,
                 int *d_neighbor_lists, bool sync_centroids = true,
                 bool rebuild_neighbors = true);
+
+//=============================================================================
+// DIAGNOSTICS (optional, enabled via DIAGNOSTICS_ENABLED)
+//=============================================================================
+
+#ifdef DIAGNOSTICS_ENABLED
+#include "diagnostics.cuh"
+
+// Run diagnostic computation after a step
+// Must be called after step_fused while work_buffer still contains gradients
+void run_diagnostics(
+    Domain &domain,
+    float *d_work_buffer,
+    float **d_all_phi_ptrs,
+    int *d_all_widths,
+    int *d_all_heights,
+    int *d_all_offsets_x,
+    int *d_all_offsets_y,
+    int *d_neighbor_counts,
+    int *d_neighbor_lists,
+    DiagnosticBuffers &diag);
+#endif
+
+//=============================================================================
+// STRESS FIELDS (optional, enabled via STRESS_FIELDS_ENABLED)
+//=============================================================================
+
+#ifdef STRESS_FIELDS_ENABLED
+#include "diagnostics.cuh"
+
+// Compute stress tensor fields: σ_xx(x,y), σ_yy(x,y), σ_xy(x,y), P(x,y)
+// Call before exporting VTK if stress fields are desired
+void compute_stress_fields(
+    Domain &domain,
+    float **d_all_phi_ptrs,
+    int *d_all_widths,
+    int *d_all_heights,
+    int *d_all_offsets_x,
+    int *d_all_offsets_y,
+    StressFieldBuffers &stress);
+#endif
 
 } // namespace cellsim

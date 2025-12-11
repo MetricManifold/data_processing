@@ -1,12 +1,17 @@
 cmake_minimum_required(VERSION 3.18)
 
-# Force CUDA 12.8 toolkit (driver supports up to 12.8, not 13.0)
-set(CMAKE_CUDA_COMPILER "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin/nvcc.exe")
+# Only set CUDA compiler path on Windows
+if(WIN32)
+    set(CMAKE_CUDA_COMPILER "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin/nvcc.exe")
+    set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8")
+endif()
 
 project(CellSimulation LANGUAGES CXX CUDA)
 
 # Build options
 option(SAFE_MODE "Enable GPU memory tracking with 1GB limit (for debugging)" OFF)
+option(ENABLE_DIAGNOSTICS "Enable GPU-side diagnostic measurements (energy, stress, contacts)" OFF)
+option(ENABLE_STRESS_FIELDS "Enable stress tensor field output (σ_xx, σ_yy, σ_xy, P as spatial fields)" OFF)
 
 # C++ and CUDA standards
 set(CMAKE_CXX_STANDARD 17)
@@ -20,7 +25,10 @@ find_package(CUDAToolkit REQUIRED)
 # CUDA architecture (adjust for your GPU)
 # Common values: 60 (Pascal), 70 (Volta), 75 (Turing), 80 (A100), 86 (Ampere), 89 (Ada), 90 (Hopper/H100)
 # RTX 4090 = compute capability 8.9 (Ada Lovelace)
-set(CMAKE_CUDA_ARCHITECTURES 75 86 89 90)
+# Can be overridden via cmake -DCMAKE_CUDA_ARCHITECTURES=80 for A100
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 86 89 90)
+endif()
 
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -73,6 +81,18 @@ target_compile_options(cell_sim PRIVATE
 if(SAFE_MODE)
     target_compile_definitions(cell_sim PRIVATE SAFE_MODE)
     message(STATUS "SAFE_MODE enabled: GPU memory tracking with 1GB limit")
+endif()
+
+# Diagnostics: enable GPU-side observable computation
+if(ENABLE_DIAGNOSTICS)
+    target_compile_definitions(cell_sim PRIVATE DIAGNOSTICS_ENABLED)
+    message(STATUS "DIAGNOSTICS enabled: Energy, stress tensor, and contact measurements")
+endif()
+
+# Stress fields: enable spatial stress tensor field output
+if(ENABLE_STRESS_FIELDS)
+    target_compile_definitions(cell_sim PRIVATE STRESS_FIELDS_ENABLED)
+    message(STATUS "STRESS_FIELDS enabled: Spatial stress tensor fields in VTK output")
 endif()
 
 # Debug configuration

@@ -446,7 +446,7 @@ void Integrator::free_reduction_arrays() {
   reduction_array_capacity = 0;
 }
 
-void Integrator::step(Domain &domain, float dt) {
+void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host) {
   if (domain.num_cells() == 0)
     return;
 
@@ -500,6 +500,23 @@ void Integrator::step(Domain &domain, float dt) {
     kernel_update_polarization<<<blocks, threads>>>(
         d_rng_states, d_polarization_x, d_polarization_y, d_theta, dt,
         params.tau, motility_model, num_cells);
+    
+    // Sync polarization back to host cells ONLY if requested
+    // (only needed when saving trajectories - avoid unnecessary GPU->CPU transfer)
+    if (sync_polarization_to_host) {
+      std::vector<float> h_pol_x(num_cells), h_pol_y(num_cells), h_theta(num_cells);
+      cudaMemcpy(h_pol_x.data(), d_polarization_x, num_cells * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_pol_y.data(), d_polarization_y, num_cells * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_theta.data(), d_theta, num_cells * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+      for (int i = 0; i < num_cells; ++i) {
+        domain.cells[i]->polarization.x = h_pol_x[i];
+        domain.cells[i]->polarization.y = h_pol_y[i];
+        domain.cells[i]->theta = h_theta[i];
+      }
+    }
   }
 
   // Increment step counter and determine if we need to sync centroids
@@ -597,7 +614,8 @@ void Integrator::step(Domain &domain, float dt) {
   // Update bboxes when we sync centroids to host
   if (sync_centroids) {
     bool any_bbox_changed = false;
-    for (auto &cell : domain.cells) {
+    for (size_t i = 0; i < domain.cells.size(); ++i) {
+      auto &cell = domain.cells[i];
       if (cell->update_bounding_box(domain.params)) {
         any_bbox_changed = true;
       }
@@ -610,5 +628,54 @@ void Integrator::step(Domain &domain, float dt) {
     }
   }
 }
+
+#ifdef DIAGNOSTICS_ENABLED
+void Integrator::compute_diagnostics(Domain &domain, DiagnosticBuffers &diag) {
+  int num_cells = domain.num_cells();
+  if (num_cells == 0 || !diag.allocated) return;
+  
+  // Make sure arrays are up to date
+  if (domain.device_arrays_dirty) {
+    update_interaction_arrays(domain);
+    domain.sync_device_arrays();
+  }
+  
+  // Call the diagnostic kernels with our pre-allocated arrays
+  run_diagnostics(
+      domain,
+      d_work_buffer,
+      d_all_phi_ptrs,
+      d_all_widths,
+      d_all_heights,
+      d_all_offsets_x,
+      d_all_offsets_y,
+      d_neighbor_counts,
+      d_neighbor_lists,
+      diag);
+}
+#endif
+
+#ifdef STRESS_FIELDS_ENABLED
+void Integrator::compute_stress_fields(Domain &domain, StressFieldBuffers &stress) {
+  int num_cells = domain.num_cells();
+  if (num_cells == 0 || !stress.allocated) return;
+  
+  // Make sure arrays are up to date (check both dirty flag AND if first call)
+  if (domain.device_arrays_dirty || interaction_array_capacity == 0) {
+    update_interaction_arrays(domain);
+    domain.sync_device_arrays();
+  }
+  
+  // Call the stress field computation function
+  cellsim::compute_stress_fields(
+      domain,
+      d_all_phi_ptrs,
+      d_all_widths,
+      d_all_heights,
+      d_all_offsets_x,
+      d_all_offsets_y,
+      stress);
+}
+#endif
 
 } // namespace cellsim

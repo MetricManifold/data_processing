@@ -3,6 +3,7 @@
 #include "cell.cuh"
 #include "types.cuh"
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 #include <vector>
 

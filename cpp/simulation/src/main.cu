@@ -44,7 +44,12 @@ void print_usage(const char *program) {
          "(default: 100)\n");
   printf("  --trajectory-interval <n>  Steps between trajectory saves (-1 = "
          "use save_interval)\n");
+  printf("  --observable-interval <n>  Steps between GPU diagnostic measurements "
+         "(energy, stress, contacts; requires -DENABLE_DIAGNOSTICS=ON)\n");
+  printf("  --stress-fields  Include stress tensor fields (σ_xx, σ_yy, σ_xy, P) "
+         "in VTK output (requires -DENABLE_STRESS_FIELDS=ON)\n");
   printf("  --v-A <f>     Active motility velocity (default: from params)\n");
+  printf("  --tau <f>     Reorientation time (default: 100, use ~10-100 for visible motion)\n");
   printf("  --abp         Use Active Brownian Particle model instead of "
          "Run-and-Tumble\n");
   printf("  --save-individual-fields  Save individual cell fields for energy "
@@ -90,7 +95,10 @@ int main(int argc, char *argv[]) {
   int trajectory_samples = 100; // Number of trajectory data points to save
   int trajectory_interval =
       -1; // -1 = use save_interval, 0 = compute from samples, >0 = explicit
+  int observable_interval = 0; // 0 = disabled, >0 = GPU diagnostic measurements
+  bool stress_fields = false;  // Include stress tensor fields in VTK output
   float v_A_override = -1.0f; // -1 means use default from params
+  float tau_override = -1.0f;  // -1 means use default from params
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
   bool safe_mode = false;   // Limit memory allocation to 1GB
   bool use_grid_init = false; // Use grid-based initialization instead of random
@@ -149,8 +157,14 @@ int main(int argc, char *argv[]) {
       trajectory_samples = atoi(argv[++i]);
     } else if (arg == "--trajectory-interval" && i + 1 < argc) {
       trajectory_interval = atoi(argv[++i]);
+    } else if (arg == "--observable-interval" && i + 1 < argc) {
+      observable_interval = atoi(argv[++i]);
+    } else if (arg == "--stress-fields") {
+      stress_fields = true;
     } else if (arg == "--v-A" && i + 1 < argc) {
       v_A_override = atof(argv[++i]);
+    } else if (arg == "--tau" && i + 1 < argc) {
+      tau_override = atof(argv[++i]);
     } else if (arg == "--abp") {
       use_abp = true;
     } else if (arg == "--save-individual-fields") {
@@ -190,6 +204,11 @@ int main(int argc, char *argv[]) {
     params.v_A = 0.0f;
   } else if (v_A_override >= 0.0f) {
     params.v_A = v_A_override;
+  }
+  
+  // Apply tau override
+  if (tau_override > 0.0f) {
+    params.tau = tau_override;
   }
 
   // Apply motility model selection
@@ -290,6 +309,7 @@ int main(int argc, char *argv[]) {
     printf("  Volume constraint: mu=%.3f (coeff=%.6f)\n", params3d.mu,
            params3d.volume_coeff());
     printf("  Active velocity: v_A=%.4f\n", params3d.v_A);
+    printf("  Reorientation time: tau=%.1f\n", params3d.tau);
     printf("  Motility model: %s\n",
            params3d.motility_model == SimParams::MotilityModel::ABP
                ? "ABP (Active Brownian Particle)"
@@ -440,6 +460,7 @@ int main(int argc, char *argv[]) {
   printf("  Volume constraint: mu=%.3f (coeff=%.6f)\n", params.mu,
          params.volume_coeff());
   printf("  Active velocity: v_A=%.4f\n", params.v_A);
+  printf("  Reorientation time: tau=%.1f\n", params.tau);
   printf("  Motility model: %s\n",
          params.motility_model == SimParams::MotilityModel::ABP
              ? "ABP (Active Brownian Particle)"
@@ -459,6 +480,14 @@ int main(int argc, char *argv[]) {
       : (trajectory_interval == -1)
           ? save_interval
           : trajectory_interval; // 0 = compute from samples
+  sim.observable_interval = observable_interval;
+#ifdef STRESS_FIELDS_ENABLED
+  sim.save_stress_fields = stress_fields;
+#else
+  if (stress_fields) {
+    printf("Warning: --stress-fields requires -DENABLE_STRESS_FIELDS=ON at build time\n");
+  }
+#endif
   sim.compute_diagnostics = use_diagnostics;
   sim.save_vtk = (save_interval > 0);
   sim.save_individual_fields = save_individual_fields;

@@ -75,4 +75,19 @@ void export_vtk_individual(const Domain &domain, const std::string &filename,
 void export_energy_metrics(const Domain &domain, const std::string &filename,
                            int frame, float time);
 
+//=============================================================================
+// Stress Field Export (enabled via STRESS_FIELDS_ENABLED)
+//=============================================================================
+
+#ifdef STRESS_FIELDS_ENABLED
+// Forward declare StressFieldBuffers to avoid circular include
+struct StressFieldBuffers;
+
+// Export VTK with stress tensor fields: σ_xx, σ_yy, σ_xy, P
+// Call after compute_stress_fields() to include stress data in VTK output
+void export_vtk_with_stress(const Domain &domain, 
+                           const StressFieldBuffers &stress,
+                           const std::string &base_filename, int frame);
+#endif
+
 } // namespace cellsim

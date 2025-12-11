@@ -2,6 +2,14 @@
 
 #include "domain.cuh"
 #include "types.cuh"
+#ifdef DIAGNOSTICS_ENABLED
+#include "diagnostics.cuh"
+#endif
+#ifdef STRESS_FIELDS_ENABLED
+#ifndef DIAGNOSTICS_ENABLED
+#include "diagnostics.cuh"
+#endif
+#endif
 #include <curand_kernel.h>
 #include <vector>
 
@@ -106,7 +114,21 @@ public:
   void destroy_streams();
 
   // Perform one time step
-  void step(Domain &domain, float dt);
+  // sync_polarization_to_host: if true, copy GPU polarization back to host cells
+  //                           (only needed if saving trajectories)
+  void step(Domain &domain, float dt, bool sync_polarization_to_host = false);
+
+#ifdef DIAGNOSTICS_ENABLED
+  // Run GPU-side diagnostic measurements
+  // Must call step() first to ensure arrays are populated
+  void compute_diagnostics(Domain &domain, DiagnosticBuffers &diag);
+#endif
+
+#ifdef STRESS_FIELDS_ENABLED
+  // Compute stress tensor fields on GPU
+  // Must call step() first to ensure arrays are populated
+  void compute_stress_fields(Domain &domain, StressFieldBuffers &stress);
+#endif
 };
 
 } // namespace cellsim

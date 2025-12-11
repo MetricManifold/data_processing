@@ -6,6 +6,17 @@
 #include "io.cuh"
 #include "kernels.cuh"
 #include "types.cuh"
+#ifdef DIAGNOSTICS_ENABLED
+#include "diagnostics.cuh"
+#endif
+
+// Stress fields also uses diagnostics.cuh for StressFieldBuffers
+#ifdef STRESS_FIELDS_ENABLED
+#ifndef DIAGNOSTICS_ENABLED
+#include "diagnostics.cuh"
+#endif
+#endif
+
 #include <algorithm>
 #include <filesystem>
 #include <iomanip>
@@ -31,12 +42,24 @@ public:
   int trajectory_samples; // Number of trajectory samples to save (default: 100)
   int trajectory_interval; // Steps between trajectory saves (-1 = use
                            // save_interval, 0 = compute from samples)
+  int observable_interval; // Steps between GPU-side diagnostic measurements (0 = disabled)
   bool save_vtk;
   bool save_tracking;
   bool compute_diagnostics;     // Compute volume/shape (disable for speed)
   bool resumed_from_checkpoint; // True if initialized from checkpoint
   bool
       save_individual_fields; // Save individual cell fields for energy analysis
+
+#ifdef DIAGNOSTICS_ENABLED
+  DiagnosticBuffers diag_buffers;
+  bool diag_initialized;
+#endif
+
+#ifdef STRESS_FIELDS_ENABLED
+  StressFieldBuffers stress_buffers;
+  bool stress_initialized;
+  bool save_stress_fields;  // Whether to include stress in VTK output
+#endif
 
 public:
   Simulation(const SimParams &params);
@@ -61,7 +84,7 @@ public:
   void run();
 
   // Single step (for interactive use)
-  void step();
+  void step(bool sync_polarization = false);
 
   // Save current state
   void save_output();
@@ -81,9 +104,16 @@ inline Simulation::Simulation(const SimParams &params)
     : domain(params), integrator(Integrator::Method::ForwardEuler),
       current_time(0.0f), current_step(0), output_dir("./output"),
       save_interval(100), checkpoint_interval(-1), trajectory_samples(100),
-      trajectory_interval(0), save_vtk(true), save_tracking(true),
+      trajectory_interval(0), observable_interval(0), save_vtk(true), save_tracking(true),
       compute_diagnostics(false), resumed_from_checkpoint(false),
-      save_individual_fields(false) {}
+      save_individual_fields(false)
+#ifdef DIAGNOSTICS_ENABLED
+      , diag_buffers{}, diag_initialized(false)
+#endif
+#ifdef STRESS_FIELDS_ENABLED
+      , stress_buffers{}, stress_initialized(false), save_stress_fields(false)
+#endif
+{}
 
 inline void Simulation::initialize_random(int num_cells, float radius,
                                           float min_spacing) {
@@ -232,8 +262,8 @@ Simulation::initialize_from_checkpoint(const std::string &filename) {
   return true;
 }
 
-inline void Simulation::step() {
-  integrator.step(domain, domain.params.dt);
+inline void Simulation::step(bool sync_polarization) {
+  integrator.step(domain, domain.params.dt, sync_polarization);
   current_time += domain.params.dt;
   current_step++;
 }
@@ -248,6 +278,60 @@ inline void Simulation::run() {
     std::filesystem::create_directories(fields_dir);
     printf("Individual cell fields will be saved to: %s\n", fields_dir.c_str());
   }
+
+#ifdef DIAGNOSTICS_ENABLED
+  // Initialize GPU-side diagnostic buffers if observable_interval > 0
+  if (observable_interval > 0 && !diag_initialized) {
+    int num_cells = domain.num_cells();
+    cudaError_t err = diagnostics_allocate(diag_buffers, num_cells);
+    if (err != cudaSuccess) {
+      printf("ERROR: Failed to allocate diagnostic buffers: %s\n", 
+             cudaGetErrorString(err));
+      observable_interval = 0; // Disable diagnostics
+    } else {
+      diag_initialized = true;
+      
+      // Create/clear observables file with header
+      std::string obs_file = output_dir + "/observables.csv";
+      FILE* f = fopen(obs_file.c_str(), "w");
+      if (f) {
+        diagnostics_write_header(f);
+        fclose(f);
+      }
+      printf("GPU diagnostics enabled: every %d steps -> %s\n", 
+             observable_interval, obs_file.c_str());
+    }
+  }
+#endif
+
+#ifdef STRESS_FIELDS_ENABLED
+  // Initialize stress field buffers if stress output is enabled
+  if (save_stress_fields && !stress_initialized) {
+    // DEBUG: Check GPU state before allocation
+    cudaDeviceSynchronize();
+    cudaError_t pre_err = cudaGetLastError();
+    printf("[DEBUG] Pre-allocation GPU state: %s\n", 
+           pre_err == cudaSuccess ? "OK" : cudaGetErrorString(pre_err));
+    
+    cudaError_t err = stress_fields_allocate(stress_buffers, 
+                                             domain.params.Nx, 
+                                             domain.params.Ny);
+    if (err != cudaSuccess) {
+      printf("ERROR: Failed to allocate stress field buffers: %s\n",
+             cudaGetErrorString(err));
+      save_stress_fields = false;
+    } else {
+      // DEBUG: Check GPU state after allocation
+      cudaDeviceSynchronize();
+      cudaError_t post_err = cudaGetLastError();
+      printf("[DEBUG] Post-allocation GPU state: %s\n", 
+             post_err == cudaSuccess ? "OK" : cudaGetErrorString(post_err));
+      
+      stress_initialized = true;
+      printf("Stress field output enabled in VTK files\n");
+    }
+  }
+#endif
 
   // Compute effective checkpoint interval
   int ckpt_interval = (checkpoint_interval > 0)
@@ -312,7 +396,11 @@ inline void Simulation::run() {
   }
 
   while (current_time < domain.params.t_end) {
-    step();
+    // Determine if we need to sync polarization for trajectory output
+    // We check (current_step + 1) because we're about to increment it
+    bool need_polarization_sync = (traj_interval > 0) && 
+                                   ((current_step + 1) % traj_interval == 0);
+    step(need_polarization_sync);
 
     // Periodic checkpointing (independent of VTK saves)
     if (ckpt_interval > 0 && current_step % ckpt_interval == 0) {
@@ -323,6 +411,29 @@ inline void Simulation::run() {
     if (traj_interval > 0 && current_step % traj_interval == 0) {
       save_trajectory();
     }
+
+#ifdef DIAGNOSTICS_ENABLED
+    // GPU-side diagnostic measurements
+    if (observable_interval > 0 && current_step % observable_interval == 0) {
+      // Reset buffers
+      diagnostics_reset(diag_buffers);
+      
+      // Run GPU diagnostics through integrator (has all the device arrays)
+      integrator.compute_diagnostics(domain, diag_buffers);
+      
+      // Collect results
+      DiagnosticSample sample;
+      diagnostics_collect(diag_buffers, sample, current_time, current_step);
+      
+      // Write to file
+      std::string obs_file = output_dir + "/observables.csv";
+      FILE* f = fopen(obs_file.c_str(), "a");
+      if (f) {
+        diagnostics_write(f, sample);
+        fclose(f);
+      }
+    }
+#endif
 
     if (save_interval > 0 && current_step % save_interval == 0) {
       if (save_vtk) {
@@ -347,6 +458,24 @@ inline void Simulation::run() {
   }
   printf("Simulation complete: %d steps, t=%.2f\n", current_step, current_time);
   
+#ifdef DIAGNOSTICS_ENABLED
+  // Free diagnostic buffers
+  if (diag_initialized) {
+    diagnostics_free(diag_buffers);
+    diag_initialized = false;
+    printf("GPU diagnostic buffers freed\n");
+  }
+#endif
+
+#ifdef STRESS_FIELDS_ENABLED
+  // Free stress field buffers
+  if (stress_initialized) {
+    stress_fields_free(stress_buffers);
+    stress_initialized = false;
+    printf("Stress field buffers freed\n");
+  }
+#endif
+  
   // Print neighbor list caching stats
   if (domain.num_cells() > 1) {
     int rebuilds = integrator.neighbor_rebuild_count;
@@ -363,7 +492,17 @@ inline void Simulation::save_output() {
   std::string base = output_dir + "/frame";
 
   if (save_vtk) {
+#ifdef STRESS_FIELDS_ENABLED
+    if (save_stress_fields && stress_initialized) {
+      // Compute stress fields before export
+      integrator.compute_stress_fields(domain, stress_buffers);
+      export_vtk_with_stress(domain, stress_buffers, base, current_step);
+    } else {
+      export_vtk(domain, base, current_step);
+    }
+#else
     export_vtk(domain, base, current_step);
+#endif
   }
 
   // Save individual cell fields for energy analysis (if enabled)

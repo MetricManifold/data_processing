@@ -45,7 +45,7 @@ struct SimParams {
   // Motility
   float v_A = 0.0f;   // Active motility speed (default 0 = no motility)
   float xi = 1.5e3f;  // Friction coefficient ξ = 1.5 × 10^3
-  float tau = 1.0e4f; // Reorientation time τ = 10^4
+  float tau = 1.0e4f; // Reorientation time τ = 100 (run-and-tumble persistence)
 
   float motility_coeff() const {
     return 60.0f * kappa / (xi * lambda * lambda);
