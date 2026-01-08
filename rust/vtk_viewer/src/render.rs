@@ -3,8 +3,9 @@
 use crate::colormap::{Colormap, apply_colormap, power_normalize, symmetric_power_normalize};
 use crate::vtk::VtkData;
 use rayon::prelude::*;
+use serde::{Serialize, Deserialize};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GlowColor {
     MatchColormap,
     White,
@@ -57,12 +58,33 @@ impl GlowColor {
     }
 }
 
-#[derive(Clone)]
+/// A glow node defines a point on the value axis that glows
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GlowNode {
+    pub enabled: bool,
+    pub position: f32,  // 0.0 to 1.0 on normalized scale (0=min, 1=max)
+    pub falloff: f32,   // how quickly glow drops off (0.01 = very wide, 0.2 = sharp)
+    pub name: String,
+}
+
+impl GlowNode {
+    pub fn new(name: &str, position: f32, falloff: f32) -> Self {
+        Self {
+            enabled: true,
+            position,
+            falloff,
+            name: name.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GlowConfig {
     pub enabled: bool,
     pub intensity: f32,  // 0.0 - 2.0
     pub radius: f32,     // blur radius in pixels (1-10)
     pub color: GlowColor,
+    pub nodes: Vec<GlowNode>,
 }
 
 impl Default for GlowConfig {
@@ -72,11 +94,57 @@ impl Default for GlowConfig {
             intensity: 1.0,
             radius: 3.0,
             color: GlowColor::MatchColormap,
+            nodes: vec![
+                GlowNode::new("Max", 1.0, 0.1),
+            ],
         }
     }
 }
 
-#[derive(Clone)]
+impl GlowConfig {
+    /// Preset for sequential colormaps (glow at max only)
+    pub fn sequential() -> Self {
+        Self {
+            enabled: true,
+            intensity: 1.0,
+            radius: 4.0,
+            color: GlowColor::MatchColormap,
+            nodes: vec![
+                GlowNode::new("Max", 1.0, 0.1),
+            ],
+        }
+    }
+    
+    /// Preset for diverging colormaps (glow at both extremes)
+    pub fn diverging() -> Self {
+        Self {
+            enabled: true,
+            intensity: 1.0,
+            radius: 4.0,
+            color: GlowColor::MatchColormap,
+            nodes: vec![
+                GlowNode::new("Min", 0.0, 0.1),
+                GlowNode::new("Max", 1.0, 0.1),
+            ],
+        }
+    }
+    
+    /// Calculate glow intensity at a given normalized value t
+    pub fn intensity_at(&self, t: f32) -> f32 {
+        let mut max_intensity = 0.0f32;
+        for node in &self.nodes {
+            if !node.enabled { continue; }
+            let dist = (t - node.position).abs();
+            // atan-based falloff: 1 at node, drops to ~0.5 at falloff distance, ~0 at 2x falloff
+            // Using: 1 - (2/π) * atan(dist / falloff)
+            let contribution = 1.0 - (2.0 / std::f32::consts::PI) * (dist / node.falloff.max(0.001)).atan();
+            max_intensity = max_intensity.max(contribution.max(0.0));
+        }
+        max_intensity
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LayerConfig {
     pub name: String,
     pub field: String,
@@ -108,6 +176,7 @@ impl Default for LayerConfig {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
     pub layers: Vec<LayerConfig>,
     pub background: [u8; 4],
@@ -136,12 +205,7 @@ impl Default for RenderConfig {
                     enabled: true,
                     opacity: 1.0,
                     gamma: 0.5,
-                    glow: GlowConfig {
-                        enabled: true,
-                        intensity: 1.0,
-                        radius: 4.0,
-                        color: GlowColor::MatchColormap,
-                    },
+                    glow: GlowConfig::sequential(),
                     auto_range: true,
                     manual_min: 0.0,
                     manual_max: 1.0,
@@ -229,7 +293,7 @@ pub fn render_frame(vtk: &VtkData, config: &RenderConfig) -> Vec<u8> {
     flipped
 }
 
-fn apply_glow(layer_px: &[[u8; 4]], normalized: &[f32], width: usize, height: usize, glow: &GlowConfig, is_diverging: bool) -> Vec<[u8; 4]> {
+fn apply_glow(layer_px: &[[u8; 4]], normalized: &[f32], width: usize, height: usize, glow: &GlowConfig, _is_diverging: bool) -> Vec<[u8; 4]> {
     let n = width * height;
     let radius = glow.radius as i32;
     let kernel_size = (radius * 2 + 1) as usize;
@@ -246,28 +310,9 @@ fn apply_glow(layer_px: &[[u8; 4]], normalized: &[f32], width: usize, height: us
     }
     for k in &mut kernel { *k /= sum; }
     
-    // Weight pixels by how extreme their values are (for glow intensity)
-    // Only glow at extremes: top 20% for sequential, both ends for diverging
+    // Weight pixels by glow node contributions
     let weighted_px: Vec<[f32; 4]> = layer_px.iter().zip(normalized.iter()).map(|(px, &t)| {
-        let intensity = if is_diverging {
-            // Distance from center (0.5), scaled to 0-1
-            let dist_from_center = (t - 0.5).abs() * 2.0; // 0 at center, 1 at extremes
-            // Only glow in top 20% of distance (dist > 0.80)
-            let threshold = 0.80;
-            if dist_from_center > threshold {
-                (dist_from_center - threshold) / (1.0 - threshold)
-            } else {
-                0.0
-            }
-        } else {
-            // Only glow in top 20% of values (t > 0.80)
-            let threshold = 0.80;
-            if t > threshold {
-                (t - threshold) / (1.0 - threshold)
-            } else {
-                0.0
-            }
-        };
+        let intensity = glow.intensity_at(t);
         // Boost for visible glow effect
         let boost = intensity * 3.0;
         [

@@ -14,12 +14,14 @@ use eframe::egui;
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 
 use crate::colormap::{Colormap, generate_preview};
-use crate::render::{LayerConfig, RenderConfig, GlowColor, compute_derived_fields, render_frame};
+use crate::render::{LayerConfig, RenderConfig, GlowColor, GlowNode, compute_derived_fields, render_frame};
 use crate::vtk::{VtkData, find_vtk_frames, parse_vtk};
 
 const PREVIEW_WIDTH: usize = 150;
 const PREVIEW_HEIGHT: usize = 16;
 const MAX_RECENTS: usize = 10;
+
+// === File Path Helpers ===
 
 fn get_recents_path() -> PathBuf {
     std::env::current_exe()
@@ -28,6 +30,16 @@ fn get_recents_path() -> PathBuf {
         .unwrap_or_default()
         .join("recents.txt")
 }
+
+fn get_presets_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default()
+        .join("presets.json")
+}
+
+// === Recents ===
 
 fn load_recents() -> Vec<String> {
     let path = get_recents_path();
@@ -60,6 +72,53 @@ fn add_to_recents(recents: &mut Vec<String>, path: &str) {
     // Trim to max
     recents.truncate(MAX_RECENTS);
     save_recents(recents);
+}
+
+// === Presets ===
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Preset {
+    name: String,
+    config: RenderConfig,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PresetsFile {
+    presets: Vec<Preset>,
+}
+
+fn load_presets() -> Vec<Preset> {
+    let path = get_presets_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(file) = serde_json::from_str::<PresetsFile>(&content) {
+            return file.presets;
+        }
+    }
+    Vec::new()
+}
+
+fn save_presets(presets: &[Preset]) {
+    let path = get_presets_path();
+    let file = PresetsFile { presets: presets.to_vec() };
+    if let Ok(json) = serde_json::to_string_pretty(&file) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn save_preset(presets: &mut Vec<Preset>, name: &str, config: &RenderConfig) {
+    // Remove existing with same name (overwrite)
+    presets.retain(|p| p.name != name);
+    // Add new
+    presets.push(Preset {
+        name: name.to_string(),
+        config: config.clone(),
+    });
+    save_presets(presets);
+}
+
+fn delete_preset(presets: &mut Vec<Preset>, name: &str) {
+    presets.retain(|p| p.name != name);
+    save_presets(presets);
 }
 
 fn main() -> eframe::Result<()> {
@@ -99,6 +158,9 @@ struct App {
     loading_progress: Option<(usize, usize)>, // (loaded, total)
     // Recents
     recents: Vec<String>,
+    // Presets
+    presets: Vec<Preset>,
+    preset_name: String,
 }
 
 impl App {
@@ -120,6 +182,8 @@ impl App {
             loader_rx: None,
             loading_progress: None,
             recents: load_recents(),
+            presets: load_presets(),
+            preset_name: String::new(),
         }
     }
     
@@ -356,6 +420,54 @@ impl eframe::App for App {
                     ui.colored_label(Color32::RED, e);
                 }
             });
+            
+            // Second row - Presets
+            ui.horizontal(|ui| {
+                ui.label("💾 Presets:");
+                
+                // Load preset dropdown
+                egui::ComboBox::from_id_salt("presets_load")
+                    .selected_text("Load...")
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        let mut load_preset: Option<RenderConfig> = None;
+                        for preset in &self.presets {
+                            if ui.selectable_label(false, &preset.name).clicked() {
+                                load_preset = Some(preset.config.clone());
+                                self.preset_name = preset.name.clone();
+                            }
+                        }
+                        if let Some(config) = load_preset {
+                            self.config = config;
+                            self.cached_pixels = None;
+                        }
+                    });
+                
+                ui.separator();
+                
+                // Preset name input
+                ui.label("Name:");
+                ui.add(egui::TextEdit::singleline(&mut self.preset_name).desired_width(120.0));
+                
+                // Save button
+                if ui.button("Save").on_hover_text("Save current settings as preset").clicked() {
+                    if !self.preset_name.trim().is_empty() {
+                        save_preset(&mut self.presets, self.preset_name.trim(), &self.config);
+                    }
+                }
+                
+                // Delete button
+                if ui.button("Delete").on_hover_text("Delete preset with this name").clicked() {
+                    if !self.preset_name.trim().is_empty() {
+                        delete_preset(&mut self.presets, self.preset_name.trim());
+                    }
+                }
+                
+                if !self.presets.is_empty() {
+                    ui.separator();
+                    ui.label(format!("{} presets", self.presets.len()));
+                }
+            });
         });
         
         // Left panel - layers
@@ -479,6 +591,46 @@ impl eframe::App for App {
                                                 }
                                             });
                                     });
+                                    
+                                    // Glow nodes
+                                    ui.add_space(4.0);
+                                    ui.label("Glow Nodes:");
+                                    let mut node_to_remove = None;
+                                    for (ni, node) in layer.glow.nodes.iter_mut().enumerate() {
+                                        ui.push_id(format!("node{}_{}", i, ni), |ui| {
+                                            ui.horizontal(|ui| {
+                                                if ui.checkbox(&mut node.enabled, "").changed() { changed = true; }
+                                                ui.label(&node.name);
+                                                if ui.small_button("✕").clicked() {
+                                                    node_to_remove = Some(ni);
+                                                    changed = true;
+                                                }
+                                            });
+                                            if node.enabled {
+                                                ui.indent(format!("node_details{}_{}", i, ni), |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Position:");
+                                                        if ui.add(egui::Slider::new(&mut node.position, 0.0..=1.0)).changed() {
+                                                            changed = true;
+                                                        }
+                                                    });
+                                                    ui.horizontal(|ui| {
+                                                        ui.label("Falloff:");
+                                                        if ui.add(egui::Slider::new(&mut node.falloff, 0.01..=0.5).logarithmic(true)).changed() {
+                                                            changed = true;
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                        });
+                                    }
+                                    if let Some(idx) = node_to_remove {
+                                        layer.glow.nodes.remove(idx);
+                                    }
+                                    if ui.small_button("+ Add Node").clicked() {
+                                        layer.glow.nodes.push(GlowNode::new("Node", 0.5, 0.1));
+                                        changed = true;
+                                    }
                                 });
                             }
                         });
