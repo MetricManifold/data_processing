@@ -12,6 +12,8 @@ project(CellSimulation LANGUAGES CXX CUDA)
 option(SAFE_MODE "Enable GPU memory tracking with 1GB limit (for debugging)" OFF)
 option(ENABLE_DIAGNOSTICS "Enable GPU-side diagnostic measurements (energy, stress, contacts)" OFF)
 option(ENABLE_STRESS_FIELDS "Enable stress tensor field output (σ_xx, σ_yy, σ_xy, P as spatial fields)" OFF)
+option(USE_HALF_PRECISION_3D "Use FP16 (half-precision) storage for 3D phi fields to reduce memory by ~50%" OFF)
+option(ENABLE_KERNEL_PROFILING "Enable per-phase timing of step_fused_3d kernels" OFF)
 
 # C++ and CUDA standards
 set(CMAKE_CXX_STANDARD 17)
@@ -93,6 +95,18 @@ endif()
 if(ENABLE_STRESS_FIELDS)
     target_compile_definitions(cell_sim PRIVATE STRESS_FIELDS_ENABLED)
     message(STATUS "STRESS_FIELDS enabled: Spatial stress tensor fields in VTK output")
+endif()
+
+# Half-precision 3D: use FP16 storage for phi fields (3D only)
+if(USE_HALF_PRECISION_3D)
+    target_compile_definitions(cell_sim PRIVATE USE_HALF_PRECISION_3D)
+    message(STATUS "USE_HALF_PRECISION_3D enabled: 3D phi fields stored as FP16 (half-precision)")
+endif()
+
+# Kernel profiling: per-phase timing of step_fused_3d
+if(ENABLE_KERNEL_PROFILING)
+    target_compile_definitions(cell_sim PRIVATE ENABLE_KERNEL_PROFILING=1)
+    message(STATUS "ENABLE_KERNEL_PROFILING enabled: Per-phase timing in step_fused_3d")
 endif()
 
 # Debug configuration

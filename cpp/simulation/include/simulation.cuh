@@ -38,6 +38,7 @@ public:
   // Output settings
   std::string output_dir;
   int save_interval;
+  int print_interval;     // Steps between progress output (-1 = use save_interval)
   int checkpoint_interval; // Steps between checkpoints (-1 = save_interval*10)
   int trajectory_samples; // Number of trajectory samples to save (default: 100)
   int trajectory_interval; // Steps between trajectory saves (-1 = use
@@ -103,7 +104,7 @@ public:
 inline Simulation::Simulation(const SimParams &params)
     : domain(params), integrator(Integrator::Method::ForwardEuler),
       current_time(0.0f), current_step(0), output_dir("./output"),
-      save_interval(100), checkpoint_interval(-1), trajectory_samples(100),
+      save_interval(100), print_interval(-1), checkpoint_interval(-1), trajectory_samples(100),
       trajectory_interval(0), observable_interval(0), save_vtk(true), save_tracking(true),
       compute_diagnostics(false), resumed_from_checkpoint(false),
       save_individual_fields(false)
@@ -439,6 +440,11 @@ inline void Simulation::run() {
       if (save_vtk) {
         save_output();
       }
+    }
+    
+    // Compute effective print interval (-1 means use save_interval)
+    int effective_print_interval = (print_interval > 0) ? print_interval : save_interval;
+    if (effective_print_interval > 0 && current_step % effective_print_interval == 0) {
       if (compute_diagnostics) {
         print_diagnostics();
       } else {

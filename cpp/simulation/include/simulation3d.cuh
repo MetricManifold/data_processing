@@ -197,6 +197,9 @@ inline void Simulation3D::run(float t_end) {
   printf("\n3D Simulation complete: %d steps, t=%.2f\n", current_step,
          current_time);
   printf("Total wall time: %.3f seconds\n", elapsed.count() / 1000.0);
+  
+  // Print kernel profiling results if enabled
+  print_3d_kernel_profile();
 }
 
 // Host version of tumble check (same logic as device function)

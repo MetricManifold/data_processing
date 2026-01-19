@@ -34,13 +34,13 @@ public:
   std::vector<OverlapPair3D> overlap_pairs;
 
   // Device arrays for batch operations
-  float **d_cell_phi_ptrs;     // Array of pointers to each cell's φ
-  int *d_cell_widths;          // Width of each cell's subdomain
-  int *d_cell_heights;         // Height of each cell's subdomain
-  int *d_cell_depths;          // Depth of each cell's subdomain
-  int *d_cell_offsets_x;       // x0 of each cell's bbox
-  int *d_cell_offsets_y;       // y0 of each cell's bbox
-  int *d_cell_offsets_z;       // z0 of each cell's bbox
+  FieldType3D **d_cell_phi_ptrs; // Array of pointers to each cell's φ
+  int *d_cell_widths;            // Width of each cell's subdomain
+  int *d_cell_heights;           // Height of each cell's subdomain
+  int *d_cell_depths;            // Depth of each cell's subdomain
+  int *d_cell_offsets_x;         // x0 of each cell's bbox
+  int *d_cell_offsets_y;         // y0 of each cell's bbox
+  int *d_cell_offsets_z;         // z0 of each cell's bbox
 
   bool device_arrays_dirty; // Need to re-upload cell pointers
 
@@ -66,7 +66,7 @@ public:
     size_t total = 0;
     for (const auto &cell : cells) {
       // Each cell has: d_phi only (work buffers managed by Integrator3D)
-      size_t cell_bytes = cell->bbox_with_halo.size() * sizeof(float);
+      size_t cell_bytes = cell->bbox_with_halo.size() * FIELD3D_SIZE;
       total += cell_bytes;
     }
     return total;
@@ -242,7 +242,7 @@ inline void Domain3D::allocate_device_arrays() {
   if (n == 0)
     return;
 
-  cudaMalloc(&d_cell_phi_ptrs, n * sizeof(float *));
+  cudaMalloc(&d_cell_phi_ptrs, n * sizeof(FieldType3D *));
   cudaMalloc(&d_cell_widths, n * sizeof(int));
   cudaMalloc(&d_cell_heights, n * sizeof(int));
   cudaMalloc(&d_cell_depths, n * sizeof(int));
@@ -293,7 +293,7 @@ inline void Domain3D::sync_device_arrays() {
   if (n == 0)
     return;
 
-  std::vector<float *> phi_ptrs(n);
+  std::vector<FieldType3D *> phi_ptrs(n);
   std::vector<int> widths(n), heights(n), depths(n);
   std::vector<int> offsets_x(n), offsets_y(n), offsets_z(n);
 
@@ -307,7 +307,7 @@ inline void Domain3D::sync_device_arrays() {
     offsets_z[i] = cells[i]->bbox_with_halo.z0;
   }
 
-  cudaMemcpy(d_cell_phi_ptrs, phi_ptrs.data(), n * sizeof(float *),
+  cudaMemcpy(d_cell_phi_ptrs, phi_ptrs.data(), n * sizeof(FieldType3D *),
              cudaMemcpyHostToDevice);
   cudaMemcpy(d_cell_widths, widths.data(), n * sizeof(int),
              cudaMemcpyHostToDevice);

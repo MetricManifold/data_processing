@@ -54,11 +54,21 @@ void save_checkpoint_3d(const char *filename, const Domain3D &domain, int step,
     fwrite(&cell.polarization, sizeof(Vec3), 1, fp);
     fwrite(&cell.velocity, sizeof(Vec3), 1, fp);
 
-    // Download and write field data
+    // Download and write field data (always as float for file compatibility)
     int size = cell.width() * cell.height() * cell.depth();
     std::vector<float> host_phi(size);
+#ifdef USE_HALF_PRECISION_3D
+    // Download FP16 data and convert to FP32 for file
+    std::vector<FieldType3D> host_phi_field(size);
+    cudaMemcpy(host_phi_field.data(), cell.d_phi, size * FIELD3D_SIZE,
+               cudaMemcpyDeviceToHost);
+    for (int j = 0; j < size; ++j) {
+      host_phi[j] = field3d_to_float_host(host_phi_field[j]);
+    }
+#else
     cudaMemcpy(host_phi.data(), cell.d_phi, size * sizeof(float),
                cudaMemcpyDeviceToHost);
+#endif
     fwrite(host_phi.data(), sizeof(float), size, fp);
   }
 
@@ -201,9 +211,20 @@ bool load_checkpoint_3d(const char *filename, Domain3D &domain, int &step,
     // Read field data - use size from the stored bbox_with_halo
     int size = bbox_with_halo.size();
     std::vector<float> host_phi(size);
-    fread(host_phi.data(), sizeof(float), size, fp);
-    cudaMemcpy(cell->d_phi, host_phi.data(), size * sizeof(float),
+    fread(host_phi.data(), sizeof(float), size, fp);  // Always stored as FP32
+
+#ifdef USE_HALF_PRECISION_3D
+    // Convert FP32 file data to FP16 for GPU storage
+    std::vector<FieldType3D> host_phi_converted(size);
+    for (int j = 0; j < size; ++j) {
+      host_phi_converted[j] = FLOAT_TO_FIELD3D(host_phi[j]);
+    }
+    cudaMemcpy(cell->d_phi, host_phi_converted.data(),
+               size * sizeof(FieldType3D), cudaMemcpyHostToDevice);
+#else
+    cudaMemcpy(cell->d_phi, host_phi.data(), size * sizeof(FieldType3D),
                cudaMemcpyHostToDevice);
+#endif
 
     domain.add_cell(std::move(cell));
   }
@@ -228,9 +249,22 @@ void save_vtk_3d(const char *filename, const Domain3D &domain) {
   // Combine all cells
   for (int c = 0; c < domain.num_cells(); ++c) {
     const Cell3D &cell = *domain.cells[c];
-    std::vector<float> host_phi(cell.width() * cell.height() * cell.depth());
-    cudaMemcpy(host_phi.data(), cell.d_phi, host_phi.size() * sizeof(float),
+    int cell_size = cell.width() * cell.height() * cell.depth();
+
+#ifdef USE_HALF_PRECISION_3D
+    // Read FP16 from GPU, convert to FP32 for VTK output
+    std::vector<FieldType3D> host_phi_raw(cell_size);
+    cudaMemcpy(host_phi_raw.data(), cell.d_phi, cell_size * sizeof(FieldType3D),
                cudaMemcpyDeviceToHost);
+    std::vector<float> host_phi(cell_size);
+    for (int j = 0; j < cell_size; ++j) {
+      host_phi[j] = FIELD3D_TO_FLOAT(host_phi_raw[j]);
+    }
+#else
+    std::vector<float> host_phi(cell_size);
+    cudaMemcpy(host_phi.data(), cell.d_phi, cell_size * sizeof(FieldType3D),
+               cudaMemcpyDeviceToHost);
+#endif
 
     for (int lz = 0; lz < cell.depth(); ++lz) {
       for (int ly = 0; ly < cell.height(); ++ly) {

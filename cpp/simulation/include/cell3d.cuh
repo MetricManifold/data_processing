@@ -22,10 +22,11 @@ public:
   BoundingBox3D bbox_with_halo; // Including ghost cells
 
   // Phase field data (on subdomain, stored on device)
-  float *d_phi;     // Device pointer to phase field φ
-  int field_size;   // Total elements in subdomain
+  // Uses FieldType3D which is __half (FP16) when USE_HALF_PRECISION_3D is enabled
+  FieldType3D *d_phi;  // Device pointer to phase field φ
+  int field_size;      // Total elements in subdomain
 
-  // Cell properties (computed from φ)
+  // Cell properties (computed from φ) - always FP32
   float volume;  // ∫φ² dV (volume integral)
   Vec3 centroid; // Center of mass
   Vec3 velocity; // Cell velocity for motility
@@ -168,14 +169,14 @@ inline Cell3D &Cell3D::operator=(Cell3D &&other) noexcept {
 inline void Cell3D::allocate_device_memory() {
   field_size = bbox_with_halo.size();
   if (field_size > 0) {
-    CUDA_MALLOC(&d_phi, field_size * sizeof(float));
-    cudaMemset(d_phi, 0, field_size * sizeof(float));
+    CUDA_MALLOC(&d_phi, field_size * FIELD3D_SIZE);
+    cudaMemset(d_phi, 0, field_size * FIELD3D_SIZE);
   }
 }
 
 inline void Cell3D::free_device_memory() {
   if (d_phi) {
-    CUDA_FREE(d_phi, field_size * sizeof(float));
+    CUDA_FREE(d_phi, field_size * FIELD3D_SIZE);
     d_phi = nullptr;
   }
   field_size = 0;
@@ -184,7 +185,7 @@ inline void Cell3D::free_device_memory() {
 inline void Cell3D::initialize_spherical(float cx, float cy, float cz,
                                          float radius,
                                          const SimParams3D &params) {
-  // Allocate temporary host buffer
+  // Allocate temporary host buffer (always FP32 for computation)
   std::vector<float> h_phi(field_size);
 
   float lambda = params.lambda;
@@ -233,9 +234,18 @@ inline void Cell3D::initialize_spherical(float cx, float cy, float cz,
     }
   }
 
-  // Copy to device
+  // Convert to FieldType3D and copy to device
+#ifdef USE_HALF_PRECISION_3D
+  std::vector<FieldType3D> h_phi_field(field_size);
+  for (int i = 0; i < field_size; ++i) {
+    h_phi_field[i] = float_to_field3d_host(h_phi[i]);
+  }
+  cudaMemcpy(d_phi, h_phi_field.data(), field_size * FIELD3D_SIZE,
+             cudaMemcpyHostToDevice);
+#else
   cudaMemcpy(d_phi, h_phi.data(), field_size * sizeof(float),
              cudaMemcpyHostToDevice);
+#endif
 
   // Set initial centroid and volume
   centroid = {cx, cy, cz};
@@ -244,9 +254,20 @@ inline void Cell3D::initialize_spherical(float cx, float cy, float cz,
 
 inline void Cell3D::compute_properties(const SimParams3D &params) {
   // Copy field to host for property computation
+  // Always use FP32 for computation accuracy
+#ifdef USE_HALF_PRECISION_3D
+  std::vector<FieldType3D> h_phi_field(field_size);
+  cudaMemcpy(h_phi_field.data(), d_phi, field_size * FIELD3D_SIZE,
+             cudaMemcpyDeviceToHost);
+  std::vector<float> h_phi(field_size);
+  for (int i = 0; i < field_size; ++i) {
+    h_phi[i] = field3d_to_float_host(h_phi_field[i]);
+  }
+#else
   std::vector<float> h_phi(field_size);
   cudaMemcpy(h_phi.data(), d_phi, field_size * sizeof(float),
              cudaMemcpyDeviceToHost);
+#endif
 
   int halo = params.halo_width;
   float dV = params.dx * params.dy * params.dz;
@@ -322,10 +343,20 @@ inline void Cell3D::compute_properties(const SimParams3D &params) {
 
 inline bool Cell3D::update_bounding_box(const SimParams3D &params,
                                         float threshold) {
-  // Copy current field to host
+  // Copy current field to host (convert to FP32 for computation)
+#ifdef USE_HALF_PRECISION_3D
+  std::vector<FieldType3D> h_phi_field(field_size);
+  cudaMemcpy(h_phi_field.data(), d_phi, field_size * FIELD3D_SIZE,
+             cudaMemcpyDeviceToHost);
+  std::vector<float> h_phi(field_size);
+  for (int i = 0; i < field_size; ++i) {
+    h_phi[i] = field3d_to_float_host(h_phi_field[i]);
+  }
+#else
   std::vector<float> h_phi(field_size);
   cudaMemcpy(h_phi.data(), d_phi, field_size * sizeof(float),
              cudaMemcpyDeviceToHost);
+#endif
 
   int halo = params.halo_width;
   int old_w = width();
@@ -509,10 +540,19 @@ inline bool Cell3D::update_bounding_box(const SimParams3D &params,
   bbox_with_halo = new_bbox_with_halo;
   field_size = new_size;
 
-  // Allocate and upload new field
+  // Allocate and upload new field (convert to FieldType3D)
   allocate_device_memory();
+#ifdef USE_HALF_PRECISION_3D
+  std::vector<FieldType3D> h_phi_new_field(new_size);
+  for (int i = 0; i < new_size; ++i) {
+    h_phi_new_field[i] = float_to_field3d_host(h_phi_new[i]);
+  }
+  cudaMemcpy(d_phi, h_phi_new_field.data(), new_size * FIELD3D_SIZE,
+             cudaMemcpyHostToDevice);
+#else
   cudaMemcpy(d_phi, h_phi_new.data(), new_size * sizeof(float),
              cudaMemcpyHostToDevice);
+#endif
 
   return true;
 }

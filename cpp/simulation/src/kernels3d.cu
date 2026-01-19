@@ -5,6 +5,7 @@
 #include "types3d.cuh"
 #include <cstdio>
 #include <vector>
+#include <curand_kernel.h>
 
 namespace cellsim {
 
@@ -1236,6 +1237,13 @@ __global__ void kernel_build_neighbor_list_3d(
 // O(k) instead of O(N) per voxel, where k = number of neighbors
 // Buffer layout: [lap][bulk][constraint][advection][repulsion] (5 buffers)
 //-----------------------------------------------------------------------------
+// Structure to cache neighbor metadata in shared memory
+struct NeighborInfo {
+  float *phi_ptr;
+  int width, height, depth, wh;
+  int delta_ox, delta_oy, delta_oz;  // Precomputed offset differences
+};
+
 __global__ void kernel_interaction_neighborlist_3d(
     float **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
     const int *__restrict__ widths, const int *__restrict__ heights,
@@ -1246,69 +1254,90 @@ __global__ void kernel_interaction_neighborlist_3d(
     const int *__restrict__ neighbor_lists,
     float interaction_coeff, int Nx, int Ny, int Nz,
     int num_cells, int max_field_size) {
+  
+  // Shared memory for neighbor metadata (loaded once by thread 0)
+  __shared__ NeighborInfo s_neighbors[MAX_NEIGHBORS_3D];
+  __shared__ int s_num_neighbors;
+  __shared__ int s_ox_i, s_oy_i, s_oz_i;  // Cell i offsets
+  __shared__ int s_w, s_h, s_d, s_wh, s_field_size;
+  __shared__ float *s_phi_i;
+  __shared__ float *s_repulsion;
+  
   int cell_idx = blockIdx.y;
   if (cell_idx >= num_cells)
     return;
 
-  int w = widths[cell_idx];
-  int h = heights[cell_idx];
-  int d = depths[cell_idx];
-  int field_size = field_sizes[cell_idx];
-  int ox_i = offsets_x[cell_idx];
-  int oy_i = offsets_y[cell_idx];
-  int oz_i = offsets_z[cell_idx];
-  int wh = w * h;
+  // Thread 0 loads cell i metadata and all neighbor metadata into shared memory
+  if (threadIdx.x == 0) {
+    s_w = widths[cell_idx];
+    s_h = heights[cell_idx];
+    s_d = depths[cell_idx];
+    s_wh = s_w * s_h;
+    s_field_size = field_sizes[cell_idx];
+    s_ox_i = offsets_x[cell_idx];
+    s_oy_i = offsets_y[cell_idx];
+    s_oz_i = offsets_z[cell_idx];
+    s_phi_i = phi_ptrs[cell_idx];
+    
+    size_t base = (size_t)cell_idx * 5 * max_field_size;
+    s_repulsion = work_buffer + base + 4 * max_field_size;
+    
+    s_num_neighbors = neighbor_counts[cell_idx];
+    const int *my_neighbors = neighbor_lists + cell_idx * MAX_NEIGHBORS_3D;
+    
+    // Preload all neighbor metadata
+    for (int n = 0; n < s_num_neighbors; ++n) {
+      int j = my_neighbors[n];
+      s_neighbors[n].phi_ptr = phi_ptrs[j];
+      s_neighbors[n].width = widths[j];
+      s_neighbors[n].height = heights[j];
+      s_neighbors[n].depth = depths[j];
+      s_neighbors[n].wh = s_neighbors[n].width * s_neighbors[n].height;
+      // Precompute offset differences (cell i offset - cell j offset)
+      s_neighbors[n].delta_ox = s_ox_i - offsets_x[j];
+      s_neighbors[n].delta_oy = s_oy_i - offsets_y[j];
+      s_neighbors[n].delta_oz = s_oz_i - offsets_z[j];
+    }
+  }
+  __syncthreads();
 
   int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (flat_idx >= field_size)
+  if (flat_idx >= s_field_size)
     return;
 
-  // Convert flat index to 3D coordinates
-  int lz = flat_idx / wh;
-  int rem = flat_idx % wh;
-  int ly = rem / w;
-  int lx = rem % w;
-
-  size_t base = (size_t)cell_idx * 5 * max_field_size;
-
-  const float *phi_i = phi_ptrs[cell_idx];
-  float *d_repulsion = work_buffer + base + 4 * max_field_size;
-
-  // Global coords
-  int gx = ((ox_i + lx) % Nx + Nx) % Nx;
-  int gy = ((oy_i + ly) % Ny + Ny) % Ny;
-  int gz = ((oz_i + lz) % Nz + Nz) % Nz;
+  // Convert flat index to 3D local coordinates
+  int lz = flat_idx / s_wh;
+  int rem = flat_idx % s_wh;
+  int ly = rem / s_w;
+  int lx = rem % s_w;
 
   // Sum φ_j² over NEIGHBOR cells only (O(k) instead of O(N))
   float sum_phi_j_sq = 0.0f;
 
-  int num_neighbors = neighbor_counts[cell_idx];
-  const int *my_neighbors = neighbor_lists + cell_idx * MAX_NEIGHBORS_3D;
+  #pragma unroll 4
+  for (int n = 0; n < s_num_neighbors; ++n) {
+    const NeighborInfo &nb = s_neighbors[n];
+    
+    // Local coords in cell j = (local_in_i + delta_offset) with periodic wrap
+    // delta_ox = ox_i - ox_j, so: ljx = lx + delta_ox (mod Nx), clamped to [0, ow)
+    int ljx = lx + nb.delta_ox;
+    int ljy = ly + nb.delta_oy;
+    int ljz = lz + nb.delta_oz;
+    
+    // Periodic wrap (optimized: use branch instead of double modulo for common case)
+    if (ljx < 0) ljx += Nx; else if (ljx >= Nx) ljx -= Nx;
+    if (ljy < 0) ljy += Ny; else if (ljy >= Ny) ljy -= Ny;
+    if (ljz < 0) ljz += Nz; else if (ljz >= Nz) ljz -= Nz;
 
-  for (int n = 0; n < num_neighbors; ++n) {
-    int j = my_neighbors[n];
-
-    int ow = widths[j];
-    int oh = heights[j];
-    int od = depths[j];
-    int ox = offsets_x[j];
-    int oy = offsets_y[j];
-    int oz = offsets_z[j];
-
-    // Local coords in cell j
-    int ljx = ((gx - ox) % Nx + Nx) % Nx;
-    int ljy = ((gy - oy) % Ny + Ny) % Ny;
-    int ljz = ((gz - oz) % Nz + Nz) % Nz;
-
-    if (ljx < ow && ljy < oh && ljz < od) {
-      float phi_j = phi_ptrs[j][ljz * (ow * oh) + ljy * ow + ljx];
+    if (ljx < nb.width && ljy < nb.height && ljz < nb.depth) {
+      float phi_j = nb.phi_ptr[ljz * nb.wh + ljy * nb.width + ljx];
       sum_phi_j_sq += phi_j * phi_j;
     }
   }
 
   // Repulsion: 2 * κ_int * φ_i * Σ φ_j²
-  d_repulsion[flat_idx] =
-      2.0f * interaction_coeff * phi_i[flat_idx] * sum_phi_j_sq;
+  s_repulsion[flat_idx] =
+      2.0f * interaction_coeff * s_phi_i[flat_idx] * sum_phi_j_sq;
 }
 
 //-----------------------------------------------------------------------------
@@ -1453,7 +1482,7 @@ __global__ void kernel_compute_velocities_3d(
 //=============================================================================
 
 void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
-                   float **d_all_phi_ptrs, int *d_all_widths,
+                   FieldType3D **d_all_phi_ptrs, int *d_all_widths,
                    int *d_all_heights, int *d_all_depths, int *d_all_offsets_x,
                    int *d_all_offsets_y, int *d_all_offsets_z,
                    int *d_all_field_sizes, float *d_volumes,
@@ -1466,7 +1495,9 @@ void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
                    float *d_centroids_x, float *d_centroids_y,
                    float *d_centroids_z, int *d_neighbor_counts,
                    int *d_neighbor_lists, bool sync_centroids,
-                   bool rebuild_neighbors) {
+                   bool rebuild_neighbors,
+                   int *d_grid_counts, int *d_grid_cells,
+                   cudaTextureObject_t *d_phi_textures) {
   const SimParams3D &params = domain.params;
   int num_cells = domain.num_cells();
   if (num_cells == 0)
@@ -1661,6 +1692,138 @@ void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
       domain.cells[i]->velocity.z = h_vz[i];
     }
   }
+}
+
+//=============================================================================
+// GPU-side RNG for Polarization Updates
+//=============================================================================
+
+__global__ void kernel_init_rng_states_3d(curandState *states,
+                                          unsigned long long seed,
+                                          int num_cells) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_cells) {
+    curand_init(seed, idx, 0, &states[idx]);
+  }
+}
+
+__global__ void kernel_update_polarizations_3d(
+    curandState *states, float *polarizations_x, float *polarizations_y,
+    float *polarizations_z, float dt, float tau, bool use_abp, int num_cells) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_cells) return;
+
+  curandState local_state = states[idx];
+  
+  float px = polarizations_x[idx];
+  float py = polarizations_y[idx];
+  float pz = polarizations_z[idx];
+
+  if (use_abp) {
+    // Active Brownian Particle: rotational diffusion
+    float D_r = 1.0f / tau;
+    float sigma = sqrtf(2.0f * D_r * dt);
+    
+    // Generate random rotation angles
+    float theta = curand_normal(&local_state) * sigma;
+    float phi_angle = curand_uniform(&local_state) * 2.0f * 3.14159265f;
+    
+    // Rodrigues' rotation formula for small angles
+    float cos_t = cosf(theta);
+    float sin_t = sinf(theta);
+    
+    // Random rotation axis perpendicular to current polarization
+    float ax = -py * sinf(phi_angle) + pz * cosf(phi_angle);
+    float ay = px * sinf(phi_angle);
+    float az = -px * cosf(phi_angle);
+    float anorm = sqrtf(ax*ax + ay*ay + az*az);
+    if (anorm > 1e-6f) {
+      ax /= anorm; ay /= anorm; az /= anorm;
+    }
+    
+    // Rotate polarization
+    float dot = ax*px + ay*py + az*pz;
+    float cx = ay*pz - az*py;
+    float cy = az*px - ax*pz;
+    float cz = ax*py - ay*px;
+    
+    px = px*cos_t + cx*sin_t + ax*dot*(1.0f - cos_t);
+    py = py*cos_t + cy*sin_t + ay*dot*(1.0f - cos_t);
+    pz = pz*cos_t + cz*sin_t + az*dot*(1.0f - cos_t);
+  } else {
+    // Run-and-Tumble: Poisson tumbles with random new direction
+    float p_tumble = 1.0f - expf(-dt / tau);
+    
+    if (curand_uniform(&local_state) < p_tumble) {
+      // Generate uniform random direction on sphere
+      float u = curand_uniform(&local_state) * 2.0f - 1.0f;
+      float theta = curand_uniform(&local_state) * 2.0f * 3.14159265f;
+      float r = sqrtf(1.0f - u*u);
+      
+      px = r * cosf(theta);
+      py = r * sinf(theta);
+      pz = u;
+    }
+  }
+  
+  // Normalize
+  float norm = sqrtf(px*px + py*py + pz*pz);
+  if (norm > 1e-6f) {
+    px /= norm; py /= norm; pz /= norm;
+  }
+  
+  polarizations_x[idx] = px;
+  polarizations_y[idx] = py;
+  polarizations_z[idx] = pz;
+  states[idx] = local_state;
+}
+
+//=============================================================================
+// Kernel Profiling
+//=============================================================================
+
+#ifdef ENABLE_KERNEL_PROFILING
+static double g_phase1_time = 0, g_phase2_time = 0, g_phase34_time = 0;
+static double g_phase5_time = 0, g_phase6_time = 0, g_phase7a_time = 0;
+static double g_phase7b_time = 0, g_phase8_time = 0, g_sync_time = 0;
+static int g_profile_count = 0;
+#endif
+
+void print_3d_kernel_profile() {
+#ifdef ENABLE_KERNEL_PROFILING
+  if (g_profile_count == 0) {
+    printf("\n3D Kernel profiling not enabled or no steps recorded.\n");
+    return;
+  }
+  
+  double total = g_phase1_time + g_phase2_time + g_phase34_time + g_phase5_time +
+                 g_phase6_time + g_phase7a_time + g_phase7b_time + g_phase8_time +
+                 g_sync_time;
+  
+  printf("\n=== 3D Kernel Profile (avg over %d steps) ===\n", g_profile_count);
+  printf("Phase 1 (local terms):    %8.3f ms (%5.1f%%)\n", 
+         g_phase1_time / g_profile_count, 100.0 * g_phase1_time / total);
+  printf("Phase 2 (reductions):     %8.3f ms (%5.1f%%)\n",
+         g_phase2_time / g_profile_count, 100.0 * g_phase2_time / total);
+  printf("Phase 3+4 (centroid/vel): %8.3f ms (%5.1f%%)\n",
+         g_phase34_time / g_profile_count, 100.0 * g_phase34_time / total);
+  printf("Phase 5 (vol constraint): %8.3f ms (%5.1f%%)\n",
+         g_phase5_time / g_profile_count, 100.0 * g_phase5_time / total);
+  printf("Phase 6 (advection):      %8.3f ms (%5.1f%%)\n",
+         g_phase6_time / g_profile_count, 100.0 * g_phase6_time / total);
+  printf("Phase 7a (neighbor list): %8.3f ms (%5.1f%%)\n",
+         g_phase7a_time / g_profile_count, 100.0 * g_phase7a_time / total);
+  printf("Phase 7b (interaction):   %8.3f ms (%5.1f%%)\n",
+         g_phase7b_time / g_profile_count, 100.0 * g_phase7b_time / total);
+  printf("Phase 8 (RHS + step):     %8.3f ms (%5.1f%%)\n",
+         g_phase8_time / g_profile_count, 100.0 * g_phase8_time / total);
+  printf("SYNC overhead:            %8.3f ms (%5.1f%%)\n",
+         g_sync_time / g_profile_count, 100.0 * g_sync_time / total);
+  printf("Total per step:           %8.3f ms\n", total / g_profile_count);
+  printf("==============================================\n\n");
+#else
+  printf("\nKernel profiling disabled. Rebuild with -DENABLE_KERNEL_PROFILING=ON\n");
+#endif
 }
 
 } // namespace cellsim

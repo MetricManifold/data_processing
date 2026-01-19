@@ -1,8 +1,54 @@
 #pragma once
 
 #include "types.cuh"
+#include <cuda_fp16.h>
 
 namespace cellsim {
+
+//=============================================================================
+// Half-Precision Storage for 3D Fields
+//=============================================================================
+//
+// Enable half-precision (FP16) storage for 3D phi fields to reduce memory
+// by 50%. This allows simulating ~2x more cells in the same GPU memory.
+//
+// Build with: cmake -DUSE_HALF_PRECISION_3D=ON ..
+//
+// Notes:
+// - Storage uses FP16, but all computation is done in FP32 for accuracy
+// - Work buffers remain FP32 (no precision loss in physics)
+// - File I/O always uses FP32 for compatibility
+// - Requires compute capability 5.3+ (Maxwell or newer)
+//
+//=============================================================================
+
+#ifdef USE_HALF_PRECISION_3D
+  // Half-precision storage type
+  using FieldType3D = __half;
+  
+  // Conversion macros for kernel code
+  #define FIELD3D_TO_FLOAT(x) __half2float(x)
+  #define FLOAT_TO_FIELD3D(x) __float2half(x)
+  #define FIELD3D_SIZE sizeof(__half)
+  
+  // For host code (CPU-side conversions)
+  inline float field3d_to_float_host(FieldType3D x) { 
+    return __half2float(x); 
+  }
+  inline FieldType3D float_to_field3d_host(float x) { 
+    return __float2half(x); 
+  }
+#else
+  // Full precision (FP32) storage - default
+  using FieldType3D = float;
+  
+  #define FIELD3D_TO_FLOAT(x) (x)
+  #define FLOAT_TO_FIELD3D(x) (x)
+  #define FIELD3D_SIZE sizeof(float)
+  
+  inline float field3d_to_float_host(FieldType3D x) { return x; }
+  inline FieldType3D float_to_field3d_host(float x) { return x; }
+#endif
 
 //=============================================================================
 // 3D Vector helper

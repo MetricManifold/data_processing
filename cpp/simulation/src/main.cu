@@ -33,6 +33,8 @@ void print_usage(const char *program) {
          "default for speed)\n");
   printf("  --save-interval <n>   Steps between VTK saves (0 = no saves, "
          "default: 100)\n");
+  printf("  --print-interval <n>  Steps between progress output (-1 = use "
+         "save_interval, default: -1)\n");
   printf("  --subdomain-padding <f>  Cell window size as multiple of R "
          "(default: 2.0, use 3.0 for ~6R window)\n");
   printf(
@@ -90,6 +92,7 @@ int main(int argc, char *argv[]) {
   bool save_individual_fields =
       false; // Save individual cell fields for energy analysis
   int save_interval = 100;
+  int print_interval = -1; // -1 means use save_interval
   int checkpoint_interval = -1; // -1 means use save_interval * 10
   int random_seed = -1;         // -1 means use time-based seed
   int trajectory_samples = 100; // Number of trajectory data points to save
@@ -145,6 +148,8 @@ int main(int argc, char *argv[]) {
       use_diagnostics = true;
     } else if (arg == "--save-interval" && i + 1 < argc) {
       save_interval = atoi(argv[++i]);
+    } else if (arg == "--print-interval" && i + 1 < argc) {
+      print_interval = atoi(argv[++i]);
     } else if (arg == "--subdomain-padding" && i + 1 < argc) {
       params.subdomain_padding = atof(argv[++i]);
     } else if (arg == "--save-final-checkpoint") {
@@ -472,6 +477,7 @@ int main(int argc, char *argv[]) {
   Simulation sim(params);
   sim.output_dir = output_dir;
   sim.save_interval = save_interval;
+  sim.print_interval = print_interval;
   sim.checkpoint_interval = checkpoint_interval;
   sim.trajectory_samples = trajectory_samples;
   // Use save_interval as default for trajectory (same as 3D)
