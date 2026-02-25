@@ -32,7 +32,7 @@ public:
   Domain domain;
   Integrator integrator;
 
-  float current_time;
+  double current_time;   // double to avoid float32 precision loss at large t
   int current_step;
 
   // Output settings
@@ -50,6 +50,13 @@ public:
   bool resumed_from_checkpoint; // True if initialized from checkpoint
   bool
       save_individual_fields; // Save individual cell fields for energy analysis
+
+  std::vector<float> loaded_v_A; // Per-cell v_A loaded from checkpoint (empty if not present)
+  std::vector<float> loaded_gamma; // Per-cell gamma loaded from checkpoint
+  std::vector<SimParams::GammaOverride> gamma_overrides; // CLI --gamma V:selector overrides
+  bool gamma_overrides_set = false;
+
+  AsyncVTKWriter vtk_writer;  // Async binary VTK output (GPU scatter + background file write)
 
 #ifdef DIAGNOSTICS_ENABLED
   DiagnosticBuffers diag_buffers;
@@ -85,7 +92,7 @@ public:
   void run();
 
   // Single step (for interactive use)
-  void step(bool sync_polarization = false);
+  void step(bool sync_polarization = false, bool sync_centroids = false);
 
   // Save current state
   void save_output();
@@ -103,8 +110,8 @@ public:
 
 inline Simulation::Simulation(const SimParams &params)
     : domain(params), integrator(Integrator::Method::ForwardEuler),
-      current_time(0.0f), current_step(0), output_dir("./output"),
-      save_interval(100), print_interval(-1), checkpoint_interval(-1), trajectory_samples(100),
+      current_time(0.0), current_step(0), output_dir("./output"),
+      save_interval(0), print_interval(-1), checkpoint_interval(-1), trajectory_samples(100),
       trajectory_interval(0), observable_interval(0), save_vtk(true), save_tracking(true),
       compute_diagnostics(false), resumed_from_checkpoint(false),
       save_individual_fields(false)
@@ -119,7 +126,7 @@ inline Simulation::Simulation(const SimParams &params)
 inline void Simulation::initialize_random(int num_cells, float radius,
                                           float min_spacing) {
   domain.initialize_random_cells(num_cells, radius, min_spacing);
-  current_time = 0.0f;
+  current_time = 0.0;
   current_step = 0;
 
   printf("Initialized %d cells\n", domain.num_cells());
@@ -159,7 +166,7 @@ inline void Simulation::initialize_edge_test(float radius) {
   domain.update_overlap_pairs();
   domain.sync_device_arrays();
 
-  current_time = 0.0f;
+  current_time = 0.0;
   current_step = 0;
 
   printf("Initialized %d cells (edge test)\n", domain.num_cells());
@@ -215,7 +222,7 @@ inline void Simulation::initialize_corner_push_test(int num_cells,
   domain.update_overlap_pairs();
   domain.sync_device_arrays();
 
-  current_time = 0.0f;
+  current_time = 0.0;
   current_step = 0;
 
   printf("Initialized %d cells (corner push test)\n", domain.num_cells());
@@ -244,11 +251,13 @@ inline void Simulation::initialize_corner_push_test(int num_cells,
 inline bool
 Simulation::initialize_from_checkpoint(const std::string &filename) {
   CheckpointHeader header;
-  if (!load_checkpoint(domain, filename, header)) {
+  std::vector<float> checkpoint_v_A;
+  std::vector<float> checkpoint_gamma;
+  if (!load_checkpoint(domain, filename, header, &checkpoint_v_A, &checkpoint_gamma)) {
     return false;
   }
   current_step = header.current_step;
-  current_time = header.current_time;
+  current_time = static_cast<double>(header.current_time);
 
   // Restore runtime options from checkpoint (v3+)
   save_interval = header.save_interval;
@@ -260,18 +269,36 @@ Simulation::initialize_from_checkpoint(const std::string &filename) {
   save_individual_fields = header.save_individual_fields;
   resumed_from_checkpoint = true;
 
+  // Store loaded v_A and gamma for later upload to integrator (before first step)
+  loaded_v_A = std::move(checkpoint_v_A);
+  loaded_gamma = std::move(checkpoint_gamma);
+
   return true;
 }
 
-inline void Simulation::step(bool sync_polarization) {
-  integrator.step(domain, domain.params.dt, sync_polarization);
-  current_time += domain.params.dt;
+inline void Simulation::step(bool sync_polarization, bool sync_centroids) {
+  integrator.step(domain, domain.params.dt, sync_polarization, sync_centroids);
+  current_time += static_cast<double>(domain.params.dt);
   current_step++;
 }
 
 inline void Simulation::run() {
   printf("Starting simulation: t_end=%.2f, dt=%.4f\n", domain.params.t_end,
          domain.params.dt);
+
+  // Pass checkpoint-loaded v_A values to integrator (before first step)
+  if (!loaded_v_A.empty()) {
+    integrator.checkpoint_v_A = std::move(loaded_v_A);
+  }
+  // Pass checkpoint-loaded gamma values to integrator
+  if (!loaded_gamma.empty()) {
+    integrator.checkpoint_gamma = std::move(loaded_gamma);
+  }
+  // Pass CLI gamma overrides to integrator
+  if (gamma_overrides_set) {
+    integrator.gamma_overrides = std::move(gamma_overrides);
+    integrator.gamma_overrides_set = true;
+  }
 
   // Create fields subdirectory if saving individual fields
   if (save_individual_fields) {
@@ -375,8 +402,10 @@ inline void Simulation::run() {
       // with header
       std::ofstream traj_out(trajectory_file, std::ios::trunc);
       traj_out << "# Trajectory data for MSD computation\n";
-      traj_out << "# Format: time cell_id x y vx vy px py theta\n";
-      traj_out << "# v_A=" << domain.params.v_A << " N=" << domain.num_cells()
+      traj_out << "# Format: time cell_id x y vx vy px py theta v_A_i L_n\n";
+      traj_out << "# v_A=" << domain.params.v_A
+               << " v_A_sigma=" << domain.params.v_A_sigma
+               << " N=" << domain.num_cells()
                << " Lx=" << domain.params.Nx << " Ly=" << domain.params.Ny
                << "\n";
       traj_out.close();
@@ -391,20 +420,40 @@ inline void Simulation::run() {
     save_current_checkpoint(output_dir + "/checkpoint.bin");
   }
 
-  // Save initial trajectory point
-  if (traj_interval > 0) {
+  // Save initial trajectory point (skip on resume — L_n is 0 before first step)
+  if (traj_interval > 0 && !resumed_from_checkpoint) {
     save_trajectory();
   }
+
+  // Compute effective print interval (-1 means use save_interval)
+  int effective_print_interval = (print_interval > 0) ? print_interval : save_interval;
 
   while (current_time < domain.params.t_end) {
     // Determine if we need to sync polarization for trajectory output
     // We check (current_step + 1) because we're about to increment it
     bool need_polarization_sync = (traj_interval > 0) && 
                                    ((current_step + 1) % traj_interval == 0);
-    step(need_polarization_sync);
+    // Only sync centroids/volumes/velocities to host when actually needed
+    // (saves cudaDeviceSynchronize + 5× D→H copies on non-output steps)
+    int next_step = current_step + 1;
+    bool need_centroids = false;
+    if (traj_interval > 0 && next_step % traj_interval == 0)
+      need_centroids = true;
+    if (effective_print_interval > 0 && next_step % effective_print_interval == 0)
+      need_centroids = true;
+    if (save_interval > 0 && next_step % save_interval == 0)
+      need_centroids = true;
+    if (ckpt_interval > 0 && next_step % ckpt_interval == 0)
+      need_centroids = true;
+#ifdef DIAGNOSTICS_ENABLED
+    if (observable_interval > 0 && next_step % observable_interval == 0)
+      need_centroids = true;
+#endif
+    step(need_polarization_sync, need_centroids);
 
     // Periodic checkpointing (independent of VTK saves)
     if (ckpt_interval > 0 && current_step % ckpt_interval == 0) {
+      vtk_writer.wait();  // Ensure async VTK write done before checkpoint D→H
       save_current_checkpoint(output_dir + "/checkpoint.bin");
     }
 
@@ -442,8 +491,6 @@ inline void Simulation::run() {
       }
     }
     
-    // Compute effective print interval (-1 means use save_interval)
-    int effective_print_interval = (print_interval > 0) ? print_interval : save_interval;
     if (effective_print_interval > 0 && current_step % effective_print_interval == 0) {
       if (compute_diagnostics) {
         print_diagnostics();
@@ -462,6 +509,7 @@ inline void Simulation::run() {
   if (save_vtk) {
     save_output(); // Save final state
   }
+  vtk_writer.wait();  // Ensure all async writes complete before exit
   printf("Simulation complete: %d steps, t=%.2f\n", current_step, current_time);
   
 #ifdef DIAGNOSTICS_ENABLED
@@ -500,14 +548,48 @@ inline void Simulation::save_output() {
   if (save_vtk) {
 #ifdef STRESS_FIELDS_ENABLED
     if (save_stress_fields && stress_initialized) {
-      // Compute stress fields before export
+      // Stress fields still use the old synchronous path
       integrator.compute_stress_fields(domain, stress_buffers);
       export_vtk_with_stress(domain, stress_buffers, base, current_step);
     } else {
-      export_vtk(domain, base, current_step);
+#endif
+      // Use async binary VTK writer if Integrator arrays are ready
+      if (integrator.interaction_array_capacity > 0) {
+        // Lazy-initialize the writer on first use
+        if (!vtk_writer.is_ready()) {
+          vtk_writer.initialize(domain.params.Nx, domain.params.Ny);
+        }
+        vtk_writer.submit(
+            integrator.d_all_phi_ptrs,
+            integrator.d_all_widths, integrator.d_all_heights,
+            integrator.d_all_offsets_x, integrator.d_all_offsets_y,
+            domain.num_cells(),
+            integrator.cached_max_w, integrator.cached_max_h,
+            domain.params.Nx, domain.params.Ny, domain.params.halo_width,
+            domain.params.dx, domain.params.dy,
+            base, current_step);
+      } else {
+        // Initial save (before first step): use Domain's arrays
+        if (!vtk_writer.is_ready()) {
+          vtk_writer.initialize(domain.params.Nx, domain.params.Ny);
+        }
+        domain.sync_device_arrays();  // Ensure device arrays are up-to-date
+        int max_w = 0, max_h = 0;
+        for (const auto &cell : domain.cells) {
+          max_w = std::max(max_w, cell->width());
+          max_h = std::max(max_h, cell->height());
+        }
+        vtk_writer.submit(
+            domain.d_cell_phi_ptrs,
+            domain.d_cell_widths, domain.d_cell_heights,
+            domain.d_cell_offsets_x, domain.d_cell_offsets_y,
+            domain.num_cells(), max_w, max_h,
+            domain.params.Nx, domain.params.Ny, domain.params.halo_width,
+            domain.params.dx, domain.params.dy,
+            base, current_step);
+      }
+#ifdef STRESS_FIELDS_ENABLED
     }
-#else
-    export_vtk(domain, base, current_step);
 #endif
   }
 
@@ -530,16 +612,32 @@ inline void Simulation::save_output() {
 
 inline void Simulation::save_trajectory() {
   // Save trajectory data for MSD/diffusion computation
-  // Format: time cell_id x y vx vy px py theta
+  // Format: time cell_id x y vx vy px py theta v_A_i L_n
+  int num_cells = domain.num_cells();
+  float R = domain.params.target_radius;
+
+  // Copy per-cell v_A from GPU once per trajectory save
+  std::vector<float> h_v_A(num_cells, domain.params.v_A);
+  if (integrator.d_v_A != nullptr && num_cells > 0) {
+    cudaMemcpy(h_v_A.data(), integrator.d_v_A,
+               num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+  }
+
   std::string trajectory_file = output_dir + "/trajectory.txt";
   std::ofstream file(trajectory_file, std::ios::app);
   file << std::fixed << std::setprecision(6);
 
-  for (const auto &cell : domain.cells) {
+  for (int i = 0; i < num_cells; ++i) {
+    const auto &cell = domain.cells[i];
+    // Normalized perimeter: L_n = (1/(2πR)) ∫|∇φ| dA
+    // Factor of 2πR normalizes so L_n = 1 for perfectly circular cells
+    // (∫|∇φ| dA ≈ 2πR for a tanh-profile circle with our interface width)
+    float L_n = cell->perimeter / (2.0f * M_PI * R);
     file << current_time << " " << cell->id << " " << cell->centroid.x << " "
          << cell->centroid.y << " " << cell->velocity.x << " "
          << cell->velocity.y << " " << cell->polarization.x << " "
-         << cell->polarization.y << " " << cell->theta << "\n";
+         << cell->polarization.y << " " << cell->theta << " "
+         << h_v_A[i] << " " << L_n << "\n";
   }
   file.close();
 }
@@ -547,7 +645,7 @@ inline void Simulation::save_trajectory() {
 inline void Simulation::save_current_checkpoint(const std::string &filename) {
   CheckpointHeader header;
   header.current_step = current_step;
-  header.current_time = current_time;
+  header.current_time = static_cast<float>(current_time);  // checkpoint stores float
   header.save_interval = save_interval;
   header.checkpoint_interval = checkpoint_interval;
   header.trajectory_samples = trajectory_samples;
@@ -555,7 +653,29 @@ inline void Simulation::save_current_checkpoint(const std::string &filename) {
   header.save_tracking = save_tracking;
   header.compute_diagnostics = compute_diagnostics;
   header.save_individual_fields = save_individual_fields;
-  save_checkpoint(domain, filename, header);
+
+  // Copy per-cell v_A from GPU for checkpoint persistence
+  int num_cells = domain.num_cells();
+  std::vector<float> h_v_A;
+  if (integrator.d_v_A != nullptr && num_cells > 0) {
+    h_v_A.resize(num_cells);
+    cudaMemcpy(h_v_A.data(), integrator.d_v_A,
+               num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+  }
+
+  // Copy per-cell gamma from GPU for checkpoint persistence
+  std::vector<float> h_gamma;
+  if (integrator.d_gamma != nullptr && num_cells > 0) {
+    h_gamma.resize(num_cells);
+    cudaMemcpy(h_gamma.data(), integrator.d_gamma,
+               num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+  }
+
+  save_checkpoint(domain, filename, header,
+                  h_v_A.empty() ? nullptr : h_v_A.data(),
+                  static_cast<int>(h_v_A.size()),
+                  h_gamma.empty() ? nullptr : h_gamma.data(),
+                  static_cast<int>(h_gamma.size()));
 }
 
 inline void Simulation::print_diagnostics() const {

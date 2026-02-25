@@ -23,6 +23,7 @@ public:
   float *d_phi;     // Device pointer to phase field φ
   float *d_dphi_dt; // Device pointer to time derivative
   int field_size;   // Total elements in subdomain
+  bool pool_managed; // If true, d_phi/d_dphi_dt owned by external pool (don't cudaFree)
 
   // Cell properties (computed from φ)
   float volume;  // ∫φ² dx (area integral)
@@ -35,6 +36,9 @@ public:
 
   // Volume constraint
   float volume_deviation; // (πR² - ∫φ²) for constraint term
+
+  // Perimeter (for Palmieri L_n tracking)
+  float perimeter; // ∫|∇φ| dA, normalized L_n = perimeter / (πR)
 
 public:
   Cell(int id_, const BoundingBox &initial_bbox, int halo_width);
@@ -98,8 +102,9 @@ public:
 inline Cell::Cell(int id_, const BoundingBox &initial_bbox, int halo_width)
     : id(id_), state(CellState::Active), bbox(initial_bbox),
       bbox_with_halo(initial_bbox.expanded(halo_width)), d_phi(nullptr),
-      d_dphi_dt(nullptr), field_size(0), volume(0), centroid{0, 0},
-      velocity{0, 0}, polarization{1, 0}, theta(0), volume_deviation(0) {
+      d_dphi_dt(nullptr), field_size(0), pool_managed(false),
+      volume(0), centroid{0, 0},
+      velocity{0, 0}, polarization{1, 0}, theta(0), volume_deviation(0), perimeter(0) {
   // Initialize with random polarization direction
   theta = static_cast<float>(rand()) / RAND_MAX * 2.0f * M_PI;
   polarization.x = cosf(theta);
@@ -118,6 +123,7 @@ inline Cell::Cell(Cell &&other) noexcept
       volume_deviation(other.volume_deviation) {
   other.d_phi = nullptr;
   other.d_dphi_dt = nullptr;
+  other.pool_managed = false;
 }
 
 inline Cell &Cell::operator=(Cell &&other) noexcept {
@@ -131,6 +137,7 @@ inline Cell &Cell::operator=(Cell &&other) noexcept {
     d_phi = other.d_phi;
     d_dphi_dt = other.d_dphi_dt;
     field_size = other.field_size;
+    pool_managed = other.pool_managed;
     volume = other.volume;
     centroid = other.centroid;
     velocity = other.velocity;
@@ -155,6 +162,13 @@ inline void Cell::allocate_device_memory() {
 }
 
 inline void Cell::free_device_memory() {
+  if (pool_managed) {
+    // Memory owned by Integrator's contiguous pool — don't free
+    d_phi = nullptr;
+    d_dphi_dt = nullptr;
+    field_size = 0;
+    return;
+  }
   if (d_phi) {
     cudaFree(d_phi);
     d_phi = nullptr;
@@ -172,18 +186,16 @@ inline void Cell::initialize_circular(float cx, float cy, float radius,
   std::vector<float> h_phi(field_size);
 
   float lambda = params.lambda;
-
-  // For a tanh profile φ = 0.5(1 - tanh((r-R)/w)) with w = sqrt(2)*λ,
-  // the volume integral ∫φ² dA ≈ π*R² + π*w²/3 (due to interface contribution)
-  // To get the correct target volume, we need to use a slightly smaller radius
-  // Solve: π*R_init² + π*w²/3 = π*R_target²
-  // => R_init = sqrt(R_target² - w²/3)
   float interface_width = sqrtf(2.0f) * lambda;
-  float w2_over_3 = (interface_width * interface_width) / 3.0f;
-  float effective_radius = radius;
-  if (radius * radius > w2_over_3) {
-    effective_radius = sqrtf(radius * radius - w2_over_3);
-  }
+
+  // Use the empirical formula for effective radius that gives correct initial
+  // volume. For a circular cell with tanh profile φ = 0.5(1 - tanh((r-R_eff)/w)),
+  // the volume integral ∫φ² dA depends on the interface width.
+  // Empirical formula (fitted to numerical integration):
+  //   R_eff = R + 0.7088*λ - 0.5887*λ²/R
+  float c1 = 0.7088f;
+  float c2 = 0.5887f;
+  float effective_radius = radius + c1 * lambda - c2 * lambda * lambda / radius;
 
   for (int ly = 0; ly < height(); ++ly) {
     for (int lx = 0; lx < width(); ++lx) {
@@ -340,10 +352,14 @@ inline bool Cell::update_bounding_box(const SimParams &params,
     return false;
   }
 
-  // Add padding for cell growth and movement
-  int padding = static_cast<int>(params.target_radius *
-                                 (params.subdomain_padding - 1.0f)) +
-                halo;
+  // Adaptive padding: track actual cell shape with minimal margin.
+  // The scan above already found the true extent of the cell (max_dist_x/y).
+  // We only need enough margin for:
+  //   1. Interface tail below threshold (a few lambda beyond the 0.01 cutoff)
+  //   2. Cell growth/movement between bbox updates (~1 pixel per update interval)
+  //   3. Numerical safety for Laplacian stencil (covered by halo)
+  // Using 2*lambda captures the full interface tail, plus halo for stencil.
+  int adaptive_margin = static_cast<int>(2.0f * params.lambda) + halo;
 
   // Use the already-computed centroid (which handles periodic boundaries
   // correctly) instead of computing new center from local bounds
@@ -351,15 +367,14 @@ inline bool Cell::update_bounding_box(const SimParams &params,
   int new_cy = static_cast<int>(centroid.y);
 
   // Compute half-size from maximum periodic distance to any point with φ >
-  // threshold
-  int half_w = static_cast<int>(max_dist_x) + padding;
-  int half_h = static_cast<int>(max_dist_y) + padding;
+  // threshold, plus adaptive margin that tracks the actual cell shape
+  int half_w = static_cast<int>(max_dist_x) + adaptive_margin;
+  int half_h = static_cast<int>(max_dist_y) + adaptive_margin;
 
-  // Minimum size
-  half_w = std::max(half_w, static_cast<int>(params.target_radius *
-                                             params.subdomain_padding));
-  half_h = std::max(half_h, static_cast<int>(params.target_radius *
-                                             params.subdomain_padding));
+  // Minimum size only needs to accommodate the minimum subdomain size
+  // (no R*padding floor — let the bbox track the actual cell shape)
+  half_w = std::max(half_w, params.min_subdomain_size / 2);
+  half_h = std::max(half_h, params.min_subdomain_size / 2);
 
   // New bounding box centered on centroid
   BoundingBox new_bbox = {new_cx - half_w, new_cy - half_h, new_cx + half_w,
@@ -391,11 +406,21 @@ inline bool Cell::update_bounding_box(const SimParams &params,
   bool touching_edge = (min_lx <= halo + 1) || (max_lx >= old_w - halo - 2) ||
                        (min_ly <= halo + 1) || (max_ly >= old_h - halo - 2);
 
+  // Also check if bbox size changed significantly (e.g., initial oversized bbox
+  // should shrink to match actual cell shape on first update)
+  int new_total = new_bbox_with_halo.size();
+  int old_total = bbox_with_halo.size();
+  // Trigger resize if new bbox is >20% different in area (either direction)
+  bool size_changed = (new_total < old_total * 4 / 5) ||
+                      (new_total > old_total * 6 / 5);
+
   // Reposition if:
   // 1. Center moved significantly (conservative threshold for performance), OR
   // 2. Cell is touching window boundary (rare, but must handle to prevent
-  // cutoff)
-  if (abs(shift_x) < 5 && abs(shift_y) < 5 && !touching_edge) {
+  // cutoff), OR
+  // 3. Bbox size changed significantly (adaptive shrink/grow)
+  if (abs(shift_x) < 5 && abs(shift_y) < 5 && !touching_edge &&
+      !size_changed) {
     return false;
   }
 

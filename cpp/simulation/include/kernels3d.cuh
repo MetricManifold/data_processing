@@ -195,6 +195,137 @@ __global__ void kernel_build_neighbor_list_spatial_3d(
 // Enable with -DENABLE_KERNEL_PROFILING=ON in cmake
 void print_3d_kernel_profile();
 
+//=============================================================================
+// Batched helper kernels (used by fused path in integrator)
+//=============================================================================
+
+__global__ void kernel_compute_ref_points_3d(
+    float *__restrict__ ref_x, float *__restrict__ ref_y,
+    float *__restrict__ ref_z,
+    const int *__restrict__ offsets_x, const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths,
+    int Nx, int Ny, int Nz, int num_cells);
+
+__global__ void kernel_reduce_volumes_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ volumes,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ field_sizes,
+    int halo, int num_cells);
+
+__global__ void kernel_reduce_centroid_sums_batched_3d(
+    float **__restrict__ phi_ptrs, float *__restrict__ centroid_sums,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths, const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y, const int *__restrict__ offsets_z,
+    const int *__restrict__ field_sizes, const float *__restrict__ ref_x,
+    const float *__restrict__ ref_y, const float *__restrict__ ref_z,
+    int halo, int Nx, int Ny, int Nz, int num_cells);
+
+__global__ void kernel_compute_centroids_and_deviations_3d(
+    float *__restrict__ centroids_x, float *__restrict__ centroids_y,
+    float *__restrict__ centroids_z, float *__restrict__ volume_deviations,
+    const float *__restrict__ centroid_sums, const float *__restrict__ volumes,
+    const float *__restrict__ ref_x, const float *__restrict__ ref_y,
+    const float *__restrict__ ref_z, float target_volume, float dV,
+    int Nx, int Ny, int Nz, int num_cells);
+
+__global__ void kernel_compute_velocities_3d(
+    float *__restrict__ velocities_x, float *__restrict__ velocities_y,
+    float *__restrict__ velocities_z,
+    const float *__restrict__ integrals_x,
+    const float *__restrict__ integrals_y,
+    const float *__restrict__ integrals_z,
+    const float *__restrict__ polarizations_x,
+    const float *__restrict__ polarizations_y,
+    const float *__restrict__ polarizations_z,
+    float motility_coeff, float dV, float v_A, int num_cells);
+
+__global__ void __launch_bounds__(256, 4) kernel_velocity_integral_3d(
+    float **__restrict__ phi_ptrs,
+    const int *__restrict__ widths,
+    const int *__restrict__ heights,
+    const int *__restrict__ depths,
+    const int *__restrict__ field_sizes,
+    const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z,
+    const float *__restrict__ sum_field,
+    float *__restrict__ d_integrals_x,
+    float *__restrict__ d_integrals_y,
+    float *__restrict__ d_integrals_z,
+    float dx_grid, float dy_grid, float dz_grid,
+    int halo, int Nx, int Ny, int Nz,
+    int num_cells, int max_field_size);
+
+// Fused ref_points + centroids (velocities computed separately after scatter)
+__global__ void kernel_ref_centroid_vel_fused_3d(
+    float *__restrict__ ref_x, float *__restrict__ ref_y,
+    float *__restrict__ ref_z,
+    const int *__restrict__ offsets_x, const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ depths,
+    float *__restrict__ centroids_x, float *__restrict__ centroids_y,
+    float *__restrict__ centroids_z, float *__restrict__ volume_deviations,
+    const float *__restrict__ centroid_sums, const float *__restrict__ volumes,
+    float target_volume, float dV,
+    float *__restrict__ velocities_x, float *__restrict__ velocities_y,
+    float *__restrict__ velocities_z,
+    const float *__restrict__ polarizations_x,
+    const float *__restrict__ polarizations_y,
+    const float *__restrict__ polarizations_z,
+    float v_A,
+    int Nx, int Ny, int Nz, int num_cells);
+
+//=============================================================================
+// SCATTER: Accumulate φ²(x,y,z) from all cells onto global N³ sum field.
+// S(x,y,z) = Σ_all φ_k²(x,y,z)
+// Replaces O(k) neighbor-list interaction with O(1) sum field lookup.
+//=============================================================================
+__global__ void kernel_scatter_phi_sq_3d(
+    float **__restrict__ phi_ptrs,
+    float *__restrict__ sum_field,
+    const int *__restrict__ widths,
+    const int *__restrict__ heights,
+    const int *__restrict__ depths,
+    const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z,
+    const int *__restrict__ field_sizes,
+    int Nx, int Ny, int Nz, int num_cells);
+
+//=============================================================================
+// FUSED KERNEL: Single-pass computes laplacian + bulk + constraint +
+// interaction (via sum field) + advection + Euler step.
+// Eliminates all work buffers. Everything in registers.
+// Also accumulates volume + centroid sums via block-level shared-mem reduction.
+//=============================================================================
+__global__ void kernel_fused_step_3d(
+    float **__restrict__ phi_ptrs,
+    const int *__restrict__ widths,
+    const int *__restrict__ heights,
+    const int *__restrict__ depths,
+    const int *__restrict__ field_sizes,
+    const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y,
+    const int *__restrict__ offsets_z,
+    const float *__restrict__ sum_field,
+    const float *__restrict__ volume_deviations,
+    const float *__restrict__ velocities_x,
+    const float *__restrict__ velocities_y,
+    const float *__restrict__ velocities_z,
+    float *__restrict__ d_centroid_sums,
+    float *__restrict__ d_volumes,
+    const float *__restrict__ ref_x,
+    const float *__restrict__ ref_y,
+    const float *__restrict__ ref_z,
+    float volume_coeff, float interaction_coeff, float bulk_coeff,
+    float gamma, float dx_grid, float dy_grid, float dz_grid, float dt,
+    int halo, int Nx, int Ny, int Nz,
+    int num_cells, int max_field_size);
+
 // Optimized fused step for 3D - batched kernels, GPU-side reductions, neighbor list
 // Uses FieldType3D for phi storage (FP16 when USE_HALF_PRECISION_3D is enabled)
 // Now supports spatial hash grid for O(N) neighbor finding with large cell counts
@@ -217,21 +348,18 @@ void step_fused_3d(Domain3D &domain, float dt, float *d_work_buffer,
                    cudaTextureObject_t *d_phi_textures = nullptr);
 
 //=============================================================================
-// Texture-based Interaction Kernel (Optimization for scattered neighbor reads)
+// GPU BOUNDING BOX PIPELINE FOR 3D
+// Port of gpu_update_all_bboxes_2d — batched scan, GPU early exit,
+// batched remap, GPU-side array patching.
 //=============================================================================
 
-// Interaction kernel using 3D texture memory for neighbor phi reads
-// Provides ~30-50% speedup over direct memory access due to hardware texture cache
-__global__ void kernel_interaction_texture_3d(
-    FieldType3D **__restrict__ phi_ptrs, float *__restrict__ work_buffer,
-    const int *__restrict__ widths, const int *__restrict__ heights,
-    const int *__restrict__ depths, const int *__restrict__ field_sizes,
-    const int *__restrict__ offsets_x, const int *__restrict__ offsets_y,
-    const int *__restrict__ offsets_z,
-    const int *__restrict__ neighbor_counts,
-    const int *__restrict__ neighbor_lists,
-    const cudaTextureObject_t *__restrict__ phi_textures,
-    float interaction_coeff, int Nx, int Ny, int Nz,
-    int num_cells, int max_field_size);
+// Returns true if any cell's bbox changed
+bool gpu_update_all_bboxes_3d(
+    Domain3D &domain,
+    int *d_bbox_scan_results,
+    float *d_centroids_x, float *d_centroids_y, float *d_centroids_z,
+    float **d_phi_ptrs, int *d_widths, int *d_heights, int *d_depths,
+    int *d_offsets_x, int *d_offsets_y, int *d_offsets_z,
+    int *d_field_sizes, int max_field_size);
 
 } // namespace cellsim

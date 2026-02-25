@@ -11,6 +11,26 @@
 #include "diagnostics.cuh"
 #endif
 
+//=============================================================================
+// CUDA error checking macro — aborts with VRAM diagnostics on failure
+//=============================================================================
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = (call);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      size_t free_mem = 0, total_mem = 0;                                      \
+      cudaMemGetInfo(&free_mem, &total_mem);                                   \
+      fprintf(stderr,                                                          \
+              "CUDA ERROR at %s:%d — %s\n"                                     \
+              "  Call: %s\n"                                                    \
+              "  VRAM: %.1f MB free / %.1f MB total\n",                        \
+              __FILE__, __LINE__, cudaGetErrorString(err), #call,              \
+              free_mem / (1024.0 * 1024.0),                                    \
+              total_mem / (1024.0 * 1024.0));                                  \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
 namespace cellsim {
 
 //=============================================================================
@@ -36,111 +56,6 @@ struct KernelConfig {
 };
 
 //=============================================================================
-// Local Term Kernels (per-cell, no interaction)
-//=============================================================================
-
-// Compute Laplacian using 5-point stencil (halo provides boundary data)
-// wrap_x/wrap_y indicate if subdomain wraps around domain boundary
-__global__ void kernel_laplacian(const float *__restrict__ phi,
-                                 float *__restrict__ laplacian, int width,
-                                 int height, float dx, float dy, int halo,
-                                 bool wrap_x = false, bool wrap_y = false);
-
-// Compute bulk potential derivative: f'(φ) = (60/λ²) * φ(1-φ)(1-2φ)
-__global__ void kernel_bulk_potential(const float *__restrict__ phi,
-                                      float *__restrict__ bulk_term, int width,
-                                      int height,
-                                      float bulk_coeff // 30/λ²
-);
-
-// Compute φ² for volume integral (stores result, needs reduction)
-__global__ void kernel_phi_squared(const float *__restrict__ phi,
-                                   float *__restrict__ phi_sq, int width,
-                                   int height,
-                                   int halo // Skip halo cells in integration
-);
-
-// Parallel reduction for volume integral
-__global__ void kernel_reduce_sum(const float *__restrict__ input,
-                                  float *__restrict__ output, int n);
-
-// Compute volume constraint contribution: 2*volume_coeff*(πR² - volume)*φ
-__global__ void kernel_volume_constraint(const float *__restrict__ phi,
-                                         float *__restrict__ constraint_term,
-                                         int width, int height,
-                                         float volume_deviation, // (πR² - ∫φ²)
-                                         float volume_coeff      // μ/(πR²)
-);
-
-// Compute gradient components for advection (halo provides boundary data)
-// wrap_x/wrap_y indicate if subdomain wraps around domain boundary
-__global__ void kernel_gradient(const float *__restrict__ phi,
-                                float *__restrict__ grad_x,
-                                float *__restrict__ grad_y, int width,
-                                int height, float dx, float dy, int halo,
-                                bool wrap_x = false, bool wrap_y = false);
-
-// Compute advection term: v · ∇φ
-__global__ void kernel_advection(const float *__restrict__ grad_x,
-                                 const float *__restrict__ grad_y,
-                                 float *__restrict__ advection_term, int width,
-                                 int height, float vx, float vy);
-
-//=============================================================================
-// Motility Kernels
-//=============================================================================
-
-// Compute φ_n * ∇φ_n * Σ_m φ_m² for motility integral
-// This produces a vector field that gets integrated to find velocity
-__global__ void kernel_motility_integrand(
-    const float *__restrict__ phi, const float *__restrict__ grad_x,
-    const float *__restrict__ grad_y,
-    const float *__restrict__ interaction_sum, // Σ_m φ_m²
-    float *__restrict__ integrand_x, float *__restrict__ integrand_y, int width,
-    int height,
-    int halo // Skip halo in integration
-);
-
-//=============================================================================
-// Interaction Kernels (cell-cell repulsion)
-//=============================================================================
-
-// Compute sum of φ_j² from all other cells at each point of cell i's subdomain
-// This requires reading from potentially overlapping subdomains
-__global__ void
-kernel_interaction_sum(const float *__restrict__ phi_i,     // Current cell's φ
-                       float *__restrict__ interaction_sum, // Output: Σ_j φ_j²
-                       int width_i, int height_i, int offset_x_i,
-                       int offset_y_i,         // Cell i's bbox offset
-                       float **other_phi_ptrs, // Pointers to other cells' φ
-                       int *other_widths, int *other_heights,
-                       int *other_offsets_x, int *other_offsets_y,
-                       int num_other_cells, int Nx, int Ny // Global domain size
-);
-
-// Compute repulsion term: (60κ/λ²) * φ_i * Σ_j φ_j²
-__global__ void
-kernel_repulsion(const float *__restrict__ phi,
-                 const float *__restrict__ interaction_sum,
-                 float *__restrict__ repulsion_term, int width, int height,
-                 float interaction_coeff // 30κ/λ² (doubled in EOM)
-);
-
-//=============================================================================
-// Combined RHS Kernel
-//=============================================================================
-
-// Combine all terms into dφ/dt
-// dφ/dt = -v·∇φ - 0.5 * (-2γ∇²φ + f'(φ) + volume_constraint + repulsion)
-__global__ void kernel_combine_rhs(float *__restrict__ dphi_dt,
-                                   const float *__restrict__ laplacian,
-                                   const float *__restrict__ bulk_term,
-                                   const float *__restrict__ constraint_term,
-                                   const float *__restrict__ repulsion_term,
-                                   const float *__restrict__ advection_term,
-                                   int width, int height, float gamma);
-
-//=============================================================================
 // Host-side kernel launchers
 //=============================================================================
 
@@ -154,9 +69,11 @@ class Integrator;
 // Main solver step function with neighbor-list optimization for interaction
 // sync_centroids: if true, read centroids back to host for bbox updates
 // rebuild_neighbors: if true, rebuild the neighbor list this step
+// cached_max_size/max_w/max_h: pre-computed max dimensions (updated on bbox change)
 // Note: MAX_NEIGHBORS defined at top of file
-void step_fused(Domain &domain, float dt, float *d_work_buffer,
-                float **d_all_phi_ptrs, int *d_all_widths,
+void step_fused(Domain &domain, float dt,
+                float **d_all_phi_ptrs, float **d_all_phi_out_ptrs,
+                int *d_all_widths,
                 int *d_all_heights, int *d_all_offsets_x,
                 int *d_all_offsets_y, int *d_all_field_sizes,
                 float *d_volumes, float *d_integrals_x, float *d_integrals_y,
@@ -165,8 +82,16 @@ void step_fused(Domain &domain, float dt, float *d_work_buffer,
                 float *d_ref_y, float *d_polarization_x,
                 float *d_polarization_y, float *d_centroids_x,
                 float *d_centroids_y, int *d_neighbor_counts,
-                int *d_neighbor_lists, bool sync_centroids = true,
-                bool rebuild_neighbors = true);
+                int *d_neighbor_lists,
+                float *d_v_A,
+                float *d_gamma,
+                float *d_perimeters,
+                float *d_sum_field,
+                float *d_sum_field_linear,
+                int cached_max_size, int cached_max_w, int cached_max_h,
+                bool sync_centroids = true,
+                bool rebuild_neighbors = true,
+                bool centroid_sums_precomputed = false);
 
 //=============================================================================
 // DIAGNOSTICS (optional, enabled via DIAGNOSTICS_ENABLED)
@@ -176,10 +101,9 @@ void step_fused(Domain &domain, float dt, float *d_work_buffer,
 #include "diagnostics.cuh"
 
 // Run diagnostic computation after a step
-// Must be called after step_fused while work_buffer still contains gradients
+// Recomputes gradients from phi on-the-fly (does not need work buffer)
 void run_diagnostics(
     Domain &domain,
-    float *d_work_buffer,
     float **d_all_phi_ptrs,
     int *d_all_widths,
     int *d_all_heights,
@@ -209,4 +133,86 @@ void compute_stress_fields(
     StressFieldBuffers &stress);
 #endif
 
+//=============================================================================
+// GPU Bounding Box Scan kernel (per-cell, finds extent + edge proximity)
+// Output: d_results[7] = {max_dist_x, max_dist_y,
+//                          min_lx, max_lx, min_ly, max_ly, found_any}
+//=============================================================================
+
+__global__ void kernel_init_bbox_scan_results(int *results, int num_cells);
+
+__global__ void kernel_bbox_scan_2d(
+    const float *__restrict__ phi,
+    int width, int height,
+    int offset_x, int offset_y,
+    const float *__restrict__ d_centroids_x,
+    const float *__restrict__ d_centroids_y,
+    int cell_idx,
+    int Nx, int Ny,
+    int halo, float threshold,
+    int *__restrict__ results);
+
+// GPU remap kernel (copies phi from old bbox to new bbox, all on device)
+__global__ void kernel_bbox_remap_2d(
+    const float *__restrict__ old_phi,
+    float *__restrict__ new_phi,
+    int old_w, int old_h,
+    int old_ox, int old_oy,
+    int new_w, int new_h,
+    int new_ox, int new_oy,
+    int Nx, int Ny);
+
+// Async bbox scan + change detection. Launches scan kernels and copies the
+// change flag to pinned host memory via cudaMemcpyAsync (no pipeline drain).
+// The caller reads h_any_change_pinned on a later step.
+void gpu_launch_bbox_scan_async_2d(
+    float **d_all_phi_ptrs,
+    int *d_all_widths, int *d_all_heights,
+    int *d_all_offsets_x, int *d_all_offsets_y,
+    float *d_centroids_x, float *d_centroids_y,
+    const SimParams &params,
+    int num_cells, int max_field_size,
+    int *d_bbox_scan_results,
+    int *d_any_change_flag,
+    int *h_any_change_pinned);
+
+// Host function: GPU-accelerated bbox update for all 2D cells (every step)
+// Returns true if any bbox changed
+// Pool params: if pool is active, remap within pool slots instead of cudaMalloc/Free
+// Device arrays: phi pointers, widths, heights, offsets for batched scan kernel
+// Also patches device arrays directly on GPU (eliminates update_interaction_arrays H→D)
+bool gpu_update_all_bboxes_2d(Domain &domain, int *d_bbox_scan_results,
+                              float *d_centroids_x, float *d_centroids_y,
+                              float *d_phi_pool = nullptr,
+                              size_t pool_slot_size = 0,
+                              int pool_num_cells = 0,
+                              bool *pool_needs_grow = nullptr,
+                              float **d_all_phi_ptrs = nullptr,
+                              float **d_all_phi_out_ptrs = nullptr,
+                              int *d_all_widths = nullptr,
+                              int *d_all_heights = nullptr,
+                              int *d_all_offsets_x = nullptr,
+                              int *d_all_offsets_y = nullptr,
+                              int *d_all_field_sizes = nullptr,
+                              int max_field_size = 0);
+
+//=============================================================================
+// Narrow-Band Inline Skip (2D)
+//
+// Instead of maintaining compact active-pixel lists, each batched kernel
+// tests phi*(1-phi) < threshold and early-exits for pixels deep inside
+// the cell interior (phi≈1) or exterior (phi≈0). Only the interface band
+// where the phase field transitions needs full computation.
+//
+// For R=49, λ=7: interface band ≈ 20 pixels wide → ~22% of subdomain is
+// active. This skips ~78% of per-pixel computation with zero data-structure
+// overhead.
+//=============================================================================
+
+// Threshold for narrow-band skip: phi*(1-phi) < this value → skip.
+// Pixels deep inside cell interiors (phi≈1) or exteriors (phi≈0) have
+// negligible dynamics and can be safely skipped.
+//
+// Threshold selection: f'(phi) = (60/λ²)*phi*(1-phi)*(1-2*phi).
+//   threshold=0.10 → skip phi>0.887: |f'|=0.095, TOO AGGRESSIVE (prevents
 } // namespace cellsim

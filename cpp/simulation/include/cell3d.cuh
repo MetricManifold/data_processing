@@ -24,7 +24,9 @@ public:
   // Phase field data (on subdomain, stored on device)
   // Uses FieldType3D which is __half (FP16) when USE_HALF_PRECISION_3D is enabled
   FieldType3D *d_phi;  // Device pointer to phase field φ
+  FieldType3D *d_dphi_dt; // Second buffer for double-buffering (pool-managed)
   int field_size;      // Total elements in subdomain
+  bool pool_managed;   // True if d_phi/d_dphi_dt are in contiguous pool (don't free individually)
 
   // Cell properties (computed from φ) - always FP32
   float volume;  // ∫φ² dV (volume integral)
@@ -109,7 +111,7 @@ inline Cell3D::Cell3D(int id_, const BoundingBox3D &initial_bbox,
                       int halo_width)
     : id(id_), state(CellState::Active), bbox(initial_bbox),
       bbox_with_halo(initial_bbox.expanded(halo_width)), d_phi(nullptr),
-      field_size(0), volume(0), centroid{0, 0, 0},
+      d_dphi_dt(nullptr), field_size(0), pool_managed(false), volume(0), centroid{0, 0, 0},
       velocity{0, 0, 0}, polarization{1, 0, 0}, theta(0), phi_pol(M_PI / 2),
       volume_deviation(0) {
   // Initialize with random polarization direction on unit sphere
@@ -126,7 +128,7 @@ inline Cell3D::Cell3D(int id_, const BoundingBox3D &bbox_,
                       const BoundingBox3D &bbox_with_halo_)
     : id(id_), state(CellState::Active), bbox(bbox_),
       bbox_with_halo(bbox_with_halo_), d_phi(nullptr),
-      field_size(0), volume(0), centroid{0, 0, 0}, velocity{0, 0, 0},
+      d_dphi_dt(nullptr), field_size(0), pool_managed(false), volume(0), centroid{0, 0, 0}, velocity{0, 0, 0},
       polarization{1, 0, 0}, theta(0), phi_pol(M_PI / 2), volume_deviation(0) {
   allocate_device_memory();
 }
@@ -167,7 +169,8 @@ inline Cell3D &Cell3D::operator=(Cell3D &&other) noexcept {
 }
 
 inline void Cell3D::allocate_device_memory() {
-  field_size = bbox_with_halo.size();
+  // Use absolute values for wrapping bboxes (x0 > x1 when cell spans boundary)
+  field_size = abs(bbox_with_halo.width()) * abs(bbox_with_halo.height()) * abs(bbox_with_halo.depth());
   if (field_size > 0) {
     CUDA_MALLOC(&d_phi, field_size * FIELD3D_SIZE);
     cudaMemset(d_phi, 0, field_size * FIELD3D_SIZE);
@@ -175,11 +178,16 @@ inline void Cell3D::allocate_device_memory() {
 }
 
 inline void Cell3D::free_device_memory() {
-  if (d_phi) {
+  if (d_phi && !pool_managed) {
     CUDA_FREE(d_phi, field_size * FIELD3D_SIZE);
-    d_phi = nullptr;
   }
+  if (d_dphi_dt && !pool_managed) {
+    CUDA_FREE(d_dphi_dt, field_size * FIELD3D_SIZE);
+  }
+  d_phi = nullptr;
+  d_dphi_dt = nullptr;
   field_size = 0;
+  pool_managed = false;
 }
 
 inline void Cell3D::initialize_spherical(float cx, float cy, float cz,
@@ -426,10 +434,14 @@ inline bool Cell3D::update_bounding_box(const SimParams3D &params,
     return false;
   }
 
-  // Add padding for cell growth and movement
-  int padding = static_cast<int>(params.target_radius *
-                                 (params.subdomain_padding - 1.0f)) +
-                halo;
+  // Adaptive padding: track actual cell shape with minimal margin.
+  // The scan above already found the true extent of the cell (max_dist_x/y/z).
+  // We only need enough margin for:
+  //   1. Interface tail below threshold (a few lambda beyond the 0.01 cutoff)
+  //   2. Cell growth/movement between bbox updates (~1 pixel per update interval)
+  //   3. Numerical safety for Laplacian stencil (covered by halo)
+  // Using 2*lambda captures the full interface tail, plus halo for stencil.
+  int adaptive_margin = static_cast<int>(2.0f * params.lambda) + halo;
 
   // Use the already-computed centroid (which handles periodic boundaries
   // correctly)
@@ -438,14 +450,14 @@ inline bool Cell3D::update_bounding_box(const SimParams3D &params,
   int new_cz = static_cast<int>(centroid.z);
 
   // Compute half-size from maximum periodic distance to any point with φ >
-  // threshold
-  int half_w = static_cast<int>(max_dist_x) + padding;
-  int half_h = static_cast<int>(max_dist_y) + padding;
-  int half_d = static_cast<int>(max_dist_z) + padding;
+  // threshold, plus adaptive margin that tracks the actual cell shape
+  int half_w = static_cast<int>(max_dist_x) + adaptive_margin;
+  int half_h = static_cast<int>(max_dist_y) + adaptive_margin;
+  int half_d = static_cast<int>(max_dist_z) + adaptive_margin;
 
-  // Minimum size
-  int min_half =
-      static_cast<int>(params.target_radius * params.subdomain_padding);
+  // Minimum size only needs to accommodate the minimum subdomain size
+  // (no R*padding floor — let the bbox track the actual cell shape)
+  int min_half = params.min_subdomain_size / 2;
   half_w = max(half_w, min_half);
   half_h = max(half_h, min_half);
   half_d = max(half_d, min_half);
@@ -487,12 +499,21 @@ inline bool Cell3D::update_bounding_box(const SimParams3D &params,
                        (min_ly <= halo + 1) || (max_ly >= old_h - halo - 2) ||
                        (min_lz <= halo + 1) || (max_lz >= old_d - halo - 2);
 
+  // Also check if bbox size changed significantly (e.g., initial oversized bbox
+  // should shrink to match actual cell shape on first update)
+  int new_total = new_bbox_with_halo.size();
+  int old_total = bbox_with_halo.size();
+  // Trigger resize if new bbox is >20% different in volume (either direction)
+  bool size_changed = (new_total < old_total * 4 / 5) ||
+                      (new_total > old_total * 6 / 5);
+
   // Reposition if:
   // 1. Center moved significantly (conservative threshold for performance), OR
   // 2. Cell is touching window boundary (rare, but must handle to prevent
-  // cutoff)
+  // cutoff), OR
+  // 3. Bbox size changed significantly (adaptive shrink/grow)
   if (abs(shift_x) < 5 && abs(shift_y) < 5 && abs(shift_z) < 5 &&
-      !touching_edge) {
+      !touching_edge && !size_changed) {
     return false;
   }
 

@@ -12,9 +12,10 @@ namespace cellsim {
 //=============================================================================
 
 /**
- * Bulk potential derivative: f'(φ) = (60/λ²) * φ(1-φ)(1-2φ)
+ * Bulk potential derivative: γ * f'(φ) = γ * (60/λ²) * φ(1-φ)(1-2φ)
  *
- * The potential is f(φ) = (30/λ²) * φ²(1-φ)²
+ * The potential is γ * f(φ) = γ * (30/λ²) * φ²(1-φ)²
+ * NOTE: γ is applied in the caller (kernel), not in this function.
  * This enforces the phase field stays between 0 and 1.
  *
  * @param phi Phase field value at this point
@@ -88,7 +89,8 @@ compute_advection_term_3d(float grad_x, float grad_y, float grad_z, float vx,
 /**
  * Combine all terms into the full equation of motion.
  *
- * dφ/dt = -v·∇φ - 0.5 * (-2γ∇²φ + f'(φ) + volume_constraint + repulsion)
+ * dφ/dt = -v·∇φ - 0.5 * (γ(-2∇²φ + f'(φ)) + volume_constraint + repulsion)
+ * where f'(φ) = (60/λ²)φ(1-φ)(1-2φ) and γ multiplies the entire elastic bracket [Palmieri Eq 7]
  *
  * The 0.5 factor comes from the relaxational dynamics.
  * The -2γ is the coefficient of the Laplacian (stabilizes interface).
@@ -105,9 +107,11 @@ __device__ __forceinline__ float
 combine_rhs_terms(float laplacian, float bulk_term, float constraint_term,
                   float repulsion_term, float advection_term, float gamma) {
   // Relaxational dynamics: dφ/dt = -δF/δφ
-  // F = ∫[γ(∇φ)² + f(φ) + volume_term + interaction_term] dV
-  // -δF/δφ = 2γ∇²φ - f'(φ) - volume_term - interaction_term
-  // With advection: dφ/dt = -v·∇φ + 0.5 * (2γ∇²φ - f'(φ) - ...)
+  // F = ∫[γ((∇φ)² + (30/λ²)φ²(1-φ)²) + volume_term + interaction_term] dV
+  // γ multiplies the entire bracket (Palmieri convention).
+  // -δF/δφ = 2γ∇²φ - γ(60/λ²)φ(1-φ)(1-2φ) - volume_term - interaction_term
+  // With advection: dφ/dt = -v·∇φ - 0.5 * δF/δφ
+  // Note: bulk_term already includes γ factor from compute_bulk_term().
   float functional_derivative =
       -2.0f * gamma * laplacian + bulk_term + constraint_term + repulsion_term;
   return -advection_term - 0.5f * functional_derivative;
@@ -439,11 +443,15 @@ __device__ __host__ __forceinline__ float tanh_profile(float r, float R,
 }
 
 /**
- * Compute effective radius for initialization.
+ * Compute effective radius for 2D initialization.
  *
- * For a tanh profile, the volume integral ∫φ² dA includes interface
- * contribution. To get target volume V_target = πR², we use a smaller
- * effective radius R_eff = sqrt(R² - w²/3) for the tanh profile.
+ * For a circular cell with tanh profile φ = 0.5(1 - tanh((r-R_eff)/w)),
+ * the volume integral ∫φ² dA depends on the interface width.
+ *
+ * Empirical formula (fitted to numerical integration):
+ *   R_eff = R_target + 0.7088*λ - 0.5887*λ²/R_target
+ *
+ * This gives initial volume within 0.5% of target for R >= 30, λ = 5-10.
  *
  * @param target_radius Target cell radius
  * @param lambda Interface width parameter
@@ -451,12 +459,11 @@ __device__ __host__ __forceinline__ float tanh_profile(float r, float R,
  */
 __host__ __forceinline__ float effective_radius_2d(float target_radius,
                                                    float lambda) {
-  float w = sqrtf(2.0f) * lambda;
-  float w2_over_3 = (w * w) / 3.0f;
-  if (target_radius * target_radius > w2_over_3) {
-    return sqrtf(target_radius * target_radius - w2_over_3);
-  }
-  return target_radius;
+  // Empirical correction for 2D circular cells with tanh interface
+  // R_eff = R + c1*λ - c2*λ²/R where c1 ≈ 0.7088, c2 ≈ 0.5887
+  float c1 = 0.7088f;
+  float c2 = 0.5887f;
+  return target_radius + c1 * lambda - c2 * lambda * lambda / target_radius;
 }
 
 /**

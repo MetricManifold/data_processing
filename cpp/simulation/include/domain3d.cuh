@@ -91,6 +91,11 @@ public:
   // confluence: target packing fraction (0-1), e.g., 0.85 for 85%
   void initialize_grid(int num_cells, float radius, float confluence);
 
+  // Initialize cells on FCC lattice for target confluence
+  // FCC has the most spherical Voronoi cells (rhombic dodecahedra)
+  // of any Bravais lattice — much better than simple cubic at high confluence.
+  void initialize_grid_fcc(int num_cells, float radius, float confluence);
+
 private:
   void allocate_device_arrays();
   void free_device_arrays();
@@ -160,13 +165,21 @@ inline Domain3D::~Domain3D() {
 }
 
 inline Cell3D *Domain3D::add_cell(float cx, float cy, float cz, float radius) {
-  // Compute bounding box for this cell
-  int margin =
-      static_cast<int>(radius * params.subdomain_padding) + params.halo_width;
+  // Compute bounding box for this cell.
+  // Use adaptive margin: radius + interface tail (3*lambda) + halo.
+  // The cell profile extends ~3*lambda beyond the nominal radius at the
+  // phi=0.01 threshold level. Adding halo gives room for the Laplacian stencil.
+  // Note: Cell3D constructor expands bbox by halo_width to create bbox_with_halo,
+  // so we don't double-count halo here.
+  int adaptive_margin =
+      static_cast<int>(radius + 3.0f * params.lambda) + params.halo_width;
   BoundingBox3D bbox = {
-      static_cast<int>(cx) - margin, static_cast<int>(cy) - margin,
-      static_cast<int>(cz) - margin, static_cast<int>(cx) + margin,
-      static_cast<int>(cy) + margin, static_cast<int>(cz) + margin};
+      static_cast<int>(cx) - adaptive_margin,
+      static_cast<int>(cy) - adaptive_margin,
+      static_cast<int>(cz) - adaptive_margin,
+      static_cast<int>(cx) + adaptive_margin,
+      static_cast<int>(cy) + adaptive_margin,
+      static_cast<int>(cz) + adaptive_margin};
 
   // Ensure minimum size
   auto ensure_min = [&](int &lo, int &hi) {
@@ -537,6 +550,84 @@ inline void Domain3D::initialize_grid(int num_cells, float radius,
   }
 
   printf("  Placed %d cells\n", placed);
+
+  sync_device_arrays();
+  update_overlap_pairs();
+}
+
+inline void Domain3D::initialize_grid_fcc(int num_cells, float radius,
+                                          float confluence) {
+  // FCC lattice: 4 basis atoms per conventional cubic cell
+  // Basis vectors (in units of cell parameter a):
+  //   (0, 0, 0),  (a/2, a/2, 0),  (a/2, 0, a/2),  (0, a/2, a/2)
+  //
+  // The Voronoi cell of FCC is a rhombic dodecahedron — the most spherical
+  // Voronoi cell of any Bravais lattice. This avoids the cubic artifact
+  // that simple cubic grids produce at high confluence.
+
+  float domain_volume = static_cast<float>(params.Nx) * params.Ny * params.Nz;
+  float cell_volume = (4.0f / 3.0f) * M_PI * radius * radius * radius;
+  float total_cell_volume = num_cells * cell_volume;
+  float actual_confluence = total_cell_volume / domain_volume;
+
+  printf("FCC grid initialization:\n");
+  printf("  Domain: %d x %d x %d (volume=%.0f)\n", params.Nx, params.Ny,
+         params.Nz, domain_volume);
+  printf("  Cells: %d, radius=%.1f (cell volume=%.1f)\n", num_cells, radius,
+         cell_volume);
+  printf("  Target confluence: %.1f%%, Actual: %.1f%%\n", confluence * 100.0f,
+         actual_confluence * 100.0f);
+
+  // Determine number of conventional FCC unit cells needed.
+  // Each conventional cell has 4 atoms. Find nc such that nc^3 * 4 >= num_cells.
+  int nc = 1;
+  while (nc * nc * nc * 4 < num_cells) nc++;
+  int total_sites = nc * nc * nc * 4;
+
+  printf("  FCC unit cells: %d x %d x %d = %d (sites: %d)\n",
+         nc, nc, nc, nc * nc * nc, total_sites);
+
+  // Lattice parameter — spacing of the conventional cubic cell
+  float ax = static_cast<float>(params.Nx) / nc;
+  float ay = static_cast<float>(params.Ny) / nc;
+  float az = static_cast<float>(params.Nz) / nc;
+
+  printf("  Unit cell size: (%.2f, %.2f, %.2f)\n", ax, ay, az);
+
+  // FCC basis vectors (fractional coordinates within conventional cell)
+  const float basis[4][3] = {
+      {0.0f, 0.0f, 0.0f},
+      {0.5f, 0.5f, 0.0f},
+      {0.5f, 0.0f, 0.5f},
+      {0.0f, 0.5f, 0.5f}
+  };
+
+  // Generate all FCC sites, place cells up to num_cells
+  int placed = 0;
+  for (int iz = 0; iz < nc && placed < num_cells; ++iz) {
+    for (int iy = 0; iy < nc && placed < num_cells; ++iy) {
+      for (int ix = 0; ix < nc && placed < num_cells; ++ix) {
+        for (int b = 0; b < 4 && placed < num_cells; ++b) {
+          float cx = (ix + basis[b][0]) * ax;
+          float cy = (iy + basis[b][1]) * ay;
+          float cz = (iz + basis[b][2]) * az;
+
+          // Wrap into domain
+          cx = fmodf(cx + params.Nx, static_cast<float>(params.Nx));
+          cy = fmodf(cy + params.Ny, static_cast<float>(params.Ny));
+          cz = fmodf(cz + params.Nz, static_cast<float>(params.Nz));
+
+          add_cell(cx, cy, cz, radius);
+          placed++;
+        }
+      }
+    }
+  }
+
+  // Nearest-neighbor distance in FCC = a/sqrt(2)
+  float nn_dist = fminf(fminf(ax, ay), az) / sqrtf(2.0f);
+  printf("  Placed %d cells, nearest-neighbor distance: %.1f (diameter=%.1f)\n",
+         placed, nn_dist, 2.0f * radius);
 
   sync_device_arrays();
   update_overlap_pairs();

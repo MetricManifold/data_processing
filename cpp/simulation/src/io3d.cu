@@ -1,6 +1,9 @@
 #include "simulation3d.cuh"
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <vector>
+#include <string>
 
 namespace cellsim {
 
@@ -53,9 +56,10 @@ void save_checkpoint_3d(const char *filename, const Domain3D &domain, int step,
     fwrite(&cell.phi_pol, sizeof(float), 1, fp);
     fwrite(&cell.polarization, sizeof(Vec3), 1, fp);
     fwrite(&cell.velocity, sizeof(Vec3), 1, fp);
+    fwrite(&cell.field_size, sizeof(int), 1, fp);  // Explicit field size for wrapping bboxes
 
     // Download and write field data (always as float for file compatibility)
-    int size = cell.width() * cell.height() * cell.depth();
+    int size = cell.field_size;  // Use field_size (always positive, handles wrapping bbox)
     std::vector<float> host_phi(size);
 #ifdef USE_HALF_PRECISION_3D
     // Download FP16 data and convert to FP32 for file
@@ -73,6 +77,99 @@ void save_checkpoint_3d(const char *filename, const Domain3D &domain, int step,
   }
 
   fclose(fp);
+}
+
+//=============================================================================
+// Non-Blocking Async Checkpoint Writer for 3D
+//
+// Pipeline: D→H copy (pinned) on CUDA stream → background thread writes file
+// The GPU continues computing while the file write happens in the background.
+//=============================================================================
+
+AsyncCheckpointWriter3D::AsyncCheckpointWriter3D()
+    : h_buffer(nullptr), buffer_size(0), initialized(false) {}
+
+AsyncCheckpointWriter3D::~AsyncCheckpointWriter3D() {
+  wait();
+  if (h_buffer) { cudaFreeHost(h_buffer); h_buffer = nullptr; }
+  initialized = false;
+}
+
+void AsyncCheckpointWriter3D::ensure_buffer(size_t needed) {
+  if (needed <= buffer_size) return;
+  if (h_buffer) cudaFreeHost(h_buffer);
+  buffer_size = needed;
+  cudaMallocHost(&h_buffer, buffer_size);
+  initialized = true;
+}
+
+void AsyncCheckpointWriter3D::submit(
+    const Domain3D &domain, int step, float time,
+    const std::string &filename)
+{
+  wait();  // Ensure previous write is done
+
+  int num_cells = domain.num_cells();
+
+  // Compute total size needed
+  size_t header_size = 4 + sizeof(int) + sizeof(int) + sizeof(float) + sizeof(int) + sizeof(SimParams3D);
+  size_t per_cell_meta = sizeof(int) + sizeof(BoundingBox3D)*2 + sizeof(Vec3) + sizeof(float)*3 + sizeof(Vec3)*2 + sizeof(int);  // +field_size
+  size_t total_field = 0;
+  for (int i = 0; i < num_cells; ++i)
+    total_field += domain.cells[i]->field_size;  // field_size is always positive
+  size_t total_size = header_size + num_cells * per_cell_meta + total_field * sizeof(float);
+
+  ensure_buffer(total_size);
+
+  // Stage 1: Build header + metadata in pinned buffer
+  char *ptr = h_buffer;
+
+  memcpy(ptr, "CS3D", 4); ptr += 4;
+  int version = 1;
+  memcpy(ptr, &version, sizeof(int)); ptr += sizeof(int);
+  memcpy(ptr, &step, sizeof(int)); ptr += sizeof(int);
+  memcpy(ptr, &time, sizeof(float)); ptr += sizeof(float);
+  memcpy(ptr, &num_cells, sizeof(int)); ptr += sizeof(int);
+  memcpy(ptr, &domain.params, sizeof(SimParams3D)); ptr += sizeof(SimParams3D);
+
+  // Stage 2: Metadata + D→H copy for each cell's phi
+  for (int i = 0; i < num_cells; ++i) {
+    const Cell3D &cell = *domain.cells[i];
+
+    memcpy(ptr, &cell.id, sizeof(int)); ptr += sizeof(int);
+    memcpy(ptr, &cell.bbox, sizeof(BoundingBox3D)); ptr += sizeof(BoundingBox3D);
+    memcpy(ptr, &cell.bbox_with_halo, sizeof(BoundingBox3D)); ptr += sizeof(BoundingBox3D);
+    memcpy(ptr, &cell.centroid, sizeof(Vec3)); ptr += sizeof(Vec3);
+    memcpy(ptr, &cell.volume, sizeof(float)); ptr += sizeof(float);
+    memcpy(ptr, &cell.theta, sizeof(float)); ptr += sizeof(float);
+    memcpy(ptr, &cell.phi_pol, sizeof(float)); ptr += sizeof(float);
+    memcpy(ptr, &cell.polarization, sizeof(Vec3)); ptr += sizeof(Vec3);
+    memcpy(ptr, &cell.velocity, sizeof(Vec3)); ptr += sizeof(Vec3);
+    memcpy(ptr, &cell.field_size, sizeof(int)); ptr += sizeof(int);  // Explicit field size
+
+    int size = cell.field_size;  // Always positive, handles wrapping bbox
+    // D→H copy into pinned buffer (blocking, but fast with pinned memory)
+    cudaMemcpy(ptr, cell.d_phi, size * sizeof(float), cudaMemcpyDeviceToHost);
+    ptr += size * sizeof(float);
+  }
+
+  size_t actual_size = ptr - h_buffer;
+
+  // Stage 3: Launch background thread for file write
+  // The pinned buffer is safe — wait() is called before next submit or destructor.
+  writer_thread = std::thread([this, filename, actual_size]() {
+    FILE *fp = fopen(filename.c_str(), "wb");
+    if (fp) {
+      fwrite(this->h_buffer, 1, actual_size, fp);
+      fclose(fp);
+    }
+  });
+}
+
+void AsyncCheckpointWriter3D::wait() {
+  if (writer_thread.joinable()) {
+    writer_thread.join();
+  }
 }
 
 // Scan checkpoint file to get memory requirements without allocating
@@ -198,8 +295,11 @@ bool load_checkpoint_3d(const char *filename, Domain3D &domain, int &step,
     fread(&polarization, sizeof(Vec3), 1, fp);
     fread(&velocity, sizeof(Vec3), 1, fp);
 
+    // Read explicit field_size (added for wrapping bbox support)
+    int stored_field_size;
+    fread(&stored_field_size, sizeof(int), 1, fp);
+
     // Create cell with saved bounding boxes
-    // Note: We use bbox_with_halo from the file to ensure correct sizing
     auto cell = std::make_unique<Cell3D>(id, bbox, bbox_with_halo);
     cell->centroid = centroid;
     cell->volume = volume;
@@ -208,8 +308,9 @@ bool load_checkpoint_3d(const char *filename, Domain3D &domain, int &step,
     cell->polarization = polarization;
     cell->velocity = velocity;
 
-    // Read field data - use size from the stored bbox_with_halo
-    int size = bbox_with_halo.size();
+    // Use explicit stored_field_size (handles wrapping bboxes correctly)
+    int size = stored_field_size;
+    cell->field_size = size;  // Override the size computed by constructor
     std::vector<float> host_phi(size);
     fread(host_phi.data(), sizeof(float), size, fp);  // Always stored as FP32
 

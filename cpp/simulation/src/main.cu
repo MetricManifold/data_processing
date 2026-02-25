@@ -1,15 +1,193 @@
 #include "simulation.cuh"
 #include "simulation3d.cuh"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
+#include <string>
+#include <vector>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
 #endif
 
 using namespace cellsim;
+
+//=============================================================================
+// JSON Initial Conditions Loading (simplified for NVCC compatibility)
+//=============================================================================
+
+// Load initial conditions from JSON file
+// Returns: number of cells loaded, or -1 on error
+static int load_initial_conditions_json(const char *filename, 
+                                        SimParams &params,
+                                        std::vector<float> &cx_out,
+                                        std::vector<float> &cy_out) {
+  FILE *f = fopen(filename, "r");
+  if (!f) {
+    printf("Error: Could not open JSON file: %s\n", filename);
+    return -1;
+  }
+  
+  // Read entire file
+  fseek(f, 0, SEEK_END);
+  long file_size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  
+  char *json = (char*)malloc(file_size + 1);
+  fread(json, 1, file_size, f);
+  json[file_size] = '\0';
+  fclose(f);
+  
+  // Simple parsing using strstr
+  const char *p;
+  
+  // Extract Nx
+  p = strstr(json, "\"Nx\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.Nx = atoi(p + 1);
+  }
+  
+  // Extract Ny  
+  p = strstr(json, "\"Ny\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.Ny = atoi(p + 1);
+  }
+  
+  // Extract target_radius
+  p = strstr(json, "\"target_radius\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.target_radius = (float)atof(p + 1);
+  }
+  
+  // Extract lambda
+  p = strstr(json, "\"lambda\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.lambda = (float)atof(p + 1);
+  }
+  
+  // Extract kappa
+  p = strstr(json, "\"kappa\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.kappa = (float)atof(p + 1);
+  }
+  
+  // Extract v_A
+  p = strstr(json, "\"v_A\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.v_A = (float)atof(p + 1);
+  }
+  
+  // Extract tau
+  p = strstr(json, "\"tau\"");
+  if (p) {
+    p = strchr(p, ':');
+    if (p) params.tau = (float)atof(p + 1);
+  }
+  
+  // Find cells array and extract cx/cy pairs
+  p = strstr(json, "\"cells\"");
+  if (!p) {
+    printf("Error: No 'cells' array found in JSON\n");
+    free(json);
+    return -1;
+  }
+  
+  // Find all cx/cy pairs
+  const char *search = p;
+  while ((p = strstr(search, "\"cx\"")) != NULL) {
+    const char *colon = strchr(p, ':');
+    if (!colon) break;
+    float cx = (float)atof(colon + 1);
+    
+    // Find cy after cx
+    const char *cy_pos = strstr(p, "\"cy\"");
+    if (!cy_pos) break;
+    colon = strchr(cy_pos, ':');
+    if (!colon) break;
+    float cy = (float)atof(colon + 1);
+    
+    cx_out.push_back(cx);
+    cy_out.push_back(cy);
+    
+    search = cy_pos + 1;
+  }
+  
+  free(json);
+  
+  int num_cells = (int)cx_out.size();
+  printf("Loaded %d cells from JSON: %s\n", num_cells, filename);
+  printf("  Domain: %d x %d\n", params.Nx, params.Ny);
+  printf("  Target radius: %.1f\n", params.target_radius);
+  
+  return num_cells;
+}
+
+// Parse a --gamma argument: either bare "V" or "V:selector"
+// selector is "N%" for fraction or "cellN" / "cellN,M,..." for specific cells.
+// Returns true on success, false on parse error.
+static bool parse_gamma_arg(const char *arg, cellsim::SimParams &params,
+                           std::vector<cellsim::SimParams::GammaOverride> &overrides,
+                           bool &overrides_set) {
+  std::string s(arg);
+  auto colon = s.find(':');
+  if (colon == std::string::npos) {
+    // Bare value: set base gamma
+    params.gamma = static_cast<float>(atof(arg));
+    return true;
+  }
+  // Value:Selector
+  float value = static_cast<float>(atof(s.substr(0, colon).c_str()));
+  std::string selector = s.substr(colon + 1);
+  if (selector.empty()) {
+    fprintf(stderr, "Error: --gamma %s has empty selector after ':'\n", arg);
+    return false;
+  }
+  cellsim::SimParams::GammaOverride ov;
+  ov.value = value;
+  ov.fraction = 0.0f;
+  if (selector.back() == '%') {
+    // Fraction selector: "20%"
+    ov.type = cellsim::SimParams::GammaOverride::Type::Fraction;
+    ov.fraction = static_cast<float>(atof(selector.c_str())) / 100.0f;
+    if (ov.fraction <= 0.0f || ov.fraction > 1.0f) {
+      fprintf(stderr, "Error: --gamma %s fraction must be 0-100%%\n", arg);
+      return false;
+    }
+  } else if (selector.substr(0, 4) == "cell") {
+    // Cell selector: "cell0" or "cell0,5,12"
+    ov.type = cellsim::SimParams::GammaOverride::Type::Cells;
+    std::string ids_str = selector.substr(4);
+    // Split on commas
+    size_t pos = 0;
+    while (pos < ids_str.size()) {
+      size_t comma = ids_str.find(',', pos);
+      if (comma == std::string::npos) comma = ids_str.size();
+      int id = atoi(ids_str.substr(pos, comma - pos).c_str());
+      ov.cell_ids.push_back(id);
+      pos = comma + 1;
+    }
+    if (ov.cell_ids.empty()) {
+      fprintf(stderr, "Error: --gamma %s has no cell IDs after 'cell'\n", arg);
+      return false;
+    }
+  } else {
+    fprintf(stderr, "Error: --gamma %s unknown selector '%s' (use N%% or cellN)\n",
+            arg, selector.c_str());
+    return false;
+  }
+  overrides.push_back(ov);
+  overrides_set = true;
+  return true;
+}
 
 void print_usage(const char *program) {
   printf("Usage: %s [options]\n", program);
@@ -24,6 +202,7 @@ void print_usage(const char *program) {
   printf("  -dt <step>    Time step (default: 0.01)\n");
   printf("  -o <dir>      Output directory (default: ./output)\n");
   printf("  -c <file>     Load from checkpoint (resume simulation)\n");
+  printf("  -i <file>     Load initial conditions from JSON file\n");
   printf(
       "  --edge-test   Place 3 cells at edges/corners for boundary testing\n");
   printf("  --corner-push-test  Stress test: corner cell + clustered cells "
@@ -51,16 +230,30 @@ void print_usage(const char *program) {
   printf("  --stress-fields  Include stress tensor fields (σ_xx, σ_yy, σ_xy, P) "
          "in VTK output (requires -DENABLE_STRESS_FIELDS=ON)\n");
   printf("  --v-A <f>     Active motility velocity (default: from params)\n");
-  printf("  --tau <f>     Reorientation time (default: 100, use ~10-100 for visible motion)\n");
+  printf("  --tau <f>     Reorientation time (default: 10000)\n");
+  printf("  --gamma <f[:selector]>  Stiffness / gradient coefficient (default: 1.0).\n"
+         "                          Repeat with selector for heterogeneous populations:\n"
+         "                            --gamma 1.0           Base value for all cells\n"
+         "                            --gamma 0.35:20%%      20%% of cells get gamma=0.35\n"
+         "                            --gamma 0.35:cell0     Cell 0 gets gamma=0.35\n"
+         "                            --gamma 0.35:cell0,5   Cells 0 and 5 get gamma=0.35\n"
+         "                          Processing order: base -> fractions (random) -> cells\n");
+  printf("  --soft-cell <id>  [Deprecated: use --gamma V:cellN] Make cell <id> soft\n");
+  printf("  --gamma-soft <f>  [Deprecated: use --gamma V:cellN] Stiffness for soft cell (default: 0.35)\n");
+  printf("  --kappa <f>   Interaction strength (default: 10.0)\n");
+  printf("  --mu <f>      Volume constraint strength (default: 1.0)\n");
+  printf("  --xi <f>      Friction coefficient (default: 1500)\n");
   printf("  --abp         Use Active Brownian Particle model instead of "
          "Run-and-Tumble\n");
+  printf("  --adhesion <J>  Adhesion strength J (default: 0 = off). "
+         "Adds -J*Σφ_j attraction.\n");
   printf("  --save-individual-fields  Save individual cell fields for energy "
          "analysis\n");
-  printf("  --grid        Use grid-based cell initialization (for high "
+  printf("  --grid        Use FCC lattice initialization (for high "
          "confluence)\n");
-  printf("  --confluence <f>  Target confluence 0-1 (implies --grid, default: "
-         "0.85)\n");
-  printf("  --legacy      Use legacy kernels (slow, for reference only)\n");
+  printf("  --sc-grid     Use simple cubic grid instead of FCC lattice\n");
+  printf("  --confluence <f>  Target confluence 0-1 (default: 0.85). Works with "
+         "random or grid init\n");
   printf("  -h            Show this help\n");
 }
 
@@ -69,7 +262,7 @@ int main(int argc, char *argv[]) {
   SimParams params;
   params.Nx = 256;
   params.Ny = 256;
-  params.dt = 0.01f;
+  params.dt = 0.02f;
   params.t_end = 100.0f;
   params.target_radius = 20.0f;
 
@@ -84,6 +277,7 @@ int main(int argc, char *argv[]) {
       -1.0f; // -1 means auto-calculate based on radius and cell count
   std::string output_dir = "./output";
   std::string checkpoint_file = "";
+  std::string init_file = "";  // JSON initial conditions file
   bool edge_test = false;
   bool corner_push_test = false;
   bool no_self_propulsion = false;
@@ -105,7 +299,11 @@ int main(int argc, char *argv[]) {
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
   bool safe_mode = false;   // Limit memory allocation to 1GB
   bool use_grid_init = false; // Use grid-based initialization instead of random
+  bool use_fcc = true;        // Use FCC lattice (default) vs simple cubic
   float confluence = 0.85f;   // Target confluence for grid initialization
+  bool subdomain_padding_set = false; // Track if user explicitly set padding
+  std::vector<cellsim::SimParams::GammaOverride> gamma_overrides;
+  bool gamma_overrides_set = false;
 
   // Parse command line
   for (int i = 1; i < argc; ++i) {
@@ -135,8 +333,10 @@ int main(int argc, char *argv[]) {
       output_dir = argv[++i];
     } else if ((arg == "-s" || arg == "--min-spacing") && i + 1 < argc) {
       min_spacing = atof(argv[++i]);
-    } else if (arg == "-c" && i + 1 < argc) {
+    } else if ((arg == "-c" || arg == "--load") && i + 1 < argc) {
       checkpoint_file = argv[++i];
+    } else if (arg == "-i" && i + 1 < argc) {
+      init_file = argv[++i];
     } else if (arg == "--edge-test") {
       edge_test = true;
       num_cells = 3;
@@ -152,6 +352,7 @@ int main(int argc, char *argv[]) {
       print_interval = atoi(argv[++i]);
     } else if (arg == "--subdomain-padding" && i + 1 < argc) {
       params.subdomain_padding = atof(argv[++i]);
+      subdomain_padding_set = true;
     } else if (arg == "--save-final-checkpoint") {
       save_final_checkpoint = true;
     } else if (arg == "--checkpoint-interval" && i + 1 < argc) {
@@ -168,25 +369,71 @@ int main(int argc, char *argv[]) {
       stress_fields = true;
     } else if (arg == "--v-A" && i + 1 < argc) {
       v_A_override = atof(argv[++i]);
+    } else if (arg == "--v-A-sigma" && i + 1 < argc) {
+      params.v_A_sigma = atof(argv[++i]);
     } else if (arg == "--tau" && i + 1 < argc) {
       tau_override = atof(argv[++i]);
     } else if (arg == "--abp") {
       use_abp = true;
+    } else if (arg == "--gamma" && i + 1 < argc) {
+      if (!parse_gamma_arg(argv[++i], params, gamma_overrides, gamma_overrides_set)) {
+        return 1;
+      }
+    } else if (arg == "--soft-cell" && i + 1 < argc) {
+      // Deprecated: convert to gamma_override internally
+      params.soft_cell_id = atoi(argv[++i]);
+    } else if (arg == "--gamma-soft" && i + 1 < argc) {
+      // Deprecated: will be combined with --soft-cell after arg parsing
+      params.gamma_soft = atof(argv[++i]);
+    } else if (arg == "--kappa" && i + 1 < argc) {
+      params.kappa = atof(argv[++i]);
+    } else if (arg == "--mu" && i + 1 < argc) {
+      params.mu = atof(argv[++i]);
+    } else if (arg == "--xi" && i + 1 < argc) {
+      params.xi = atof(argv[++i]);
+    } else if (arg == "--adhesion" && i + 1 < argc) {
+      params.adhesion_J = atof(argv[++i]);
     } else if (arg == "--save-individual-fields") {
       save_individual_fields = true;
     } else if (arg == "--safe-mode") {
       // Limit memory allocation to prevent runaway GPU memory usage
       safe_mode = true;
     } else if (arg == "--grid") {
-      // Use grid-based initialization for high confluence
+      // Use FCC grid-based initialization for high confluence
       use_grid_init = true;
+    } else if (arg == "--sc-grid") {
+      // Use simple cubic grid (legacy)
+      use_grid_init = true;
+      use_fcc = false;
     } else if (arg == "--confluence" && i + 1 < argc) {
       confluence = atof(argv[++i]);
-      use_grid_init = true; // --confluence implies --grid
+      // --confluence no longer implies --grid; it just sets the target confluence
+      // for domain size calculation. Use --grid or --sc-grid to select lattice init.
     } else if (arg == "-h") {
       print_usage(argv[0]);
       return 0;
+    } else {
+      fprintf(stderr, "ERROR: Unrecognized argument '%s'\n", argv[i]);
+      fprintf(stderr, "Use -h for usage information.\n");
+      return 1;
     }
+  }
+
+  // gamma_overrides live outside SimParams (SimParams is raw-serialized in
+  // checkpoints and can't contain std::vector).
+
+  // Convert deprecated --soft-cell/--gamma-soft to gamma_overrides
+  if (params.soft_cell_id >= 0 && !gamma_overrides_set) {
+    cellsim::SimParams::GammaOverride ov;
+    ov.value = params.gamma_soft;
+    ov.type = cellsim::SimParams::GammaOverride::Type::Cells;
+    ov.fraction = 0.0f;
+    ov.cell_ids.push_back(params.soft_cell_id);
+    gamma_overrides.push_back(ov);
+    gamma_overrides_set = true;
+    printf("Note: --soft-cell/--gamma-soft is deprecated. "
+           "Use --gamma %.4f:cell%d instead.\n",
+           params.gamma_soft, params.soft_cell_id);
   }
 
 // Create output directory
@@ -294,9 +541,13 @@ int main(int argc, char *argv[]) {
                        : (v_A_override >= 0.0f ? v_A_override : params.v_A);
     params3d.xi = params.xi;
     params3d.tau = params.tau;
-    params3d.subdomain_padding = params.subdomain_padding;
     params3d.motility_model = use_abp ? SimParams::MotilityModel::ABP
                                       : SimParams::MotilityModel::RunAndTumble;
+    // Note: params3d.subdomain_padding uses its own default (1.4 for tight bbox)
+    // Only override if user explicitly set it on command line
+    if (subdomain_padding_set) {
+      params3d.subdomain_padding = params.subdomain_padding;
+    }
 
     printf("3D Simulation Parameters:\n");
     printf("  Domain: %d x %d x %d\n", params3d.Nx, params3d.Ny, params3d.Nz);
@@ -383,8 +634,13 @@ int main(int argc, char *argv[]) {
 
     if (!resumed) {
       if (use_grid_init) {
-        // Grid-based initialization for target confluence
-        sim3d.initialize_grid(num_cells, radius, confluence);
+        if (use_fcc) {
+          // FCC lattice — most spherical Voronoi cells
+          sim3d.initialize_grid_fcc(num_cells, radius, confluence);
+        } else {
+          // Simple cubic grid (legacy)
+          sim3d.initialize_grid(num_cells, radius, confluence);
+        }
       } else {
         // Random placement mode
         if (min_spacing < 0) {
@@ -450,33 +706,27 @@ int main(int argc, char *argv[]) {
   // 2D Simulation (original code)
   //=========================================================================
 
-  // Print simulation parameters
-  printf("Simulation Parameters:\n");
-  printf("  Domain: %d x %d\n", params.Nx, params.Ny);
-  printf("  Grid spacing: dx=%.3f, dy=%.3f\n", params.dx, params.dy);
-  printf("  Time step: dt=%.4f\n", params.dt);
-  printf("  End time: t_end=%.1f\n", params.t_end);
-  printf("  Interface width: lambda=%.3f\n", params.lambda);
-  printf("  Gradient coeff: gamma=%.3f\n", params.gamma);
-  printf("  Bulk coeff (30/λ²): %.3f\n", params.bulk_coeff());
-  printf("  Interaction coeff (30κ/λ²): %.3f\n", params.interaction_coeff());
-  printf("  Target radius: R=%.1f (area=%.1f)\n", params.target_radius,
-         params.target_area());
-  printf("  Volume constraint: mu=%.3f (coeff=%.6f)\n", params.mu,
-         params.volume_coeff());
-  printf("  Active velocity: v_A=%.4f\n", params.v_A);
-  printf("  Reorientation time: tau=%.1f\n", params.tau);
-  printf("  Motility model: %s\n",
-         params.motility_model == SimParams::MotilityModel::ABP
-             ? "ABP (Active Brownian Particle)"
-             : "Run-and-Tumble");
-  printf("  Cells: %d\n", num_cells);
-  printf("\n");
+  // Load initial conditions from JSON if specified
+  std::vector<float> init_cx, init_cy;
+  if (!init_file.empty()) {
+    int loaded_cells = load_initial_conditions_json(init_file.c_str(), params, init_cx, init_cy);
+    if (loaded_cells < 0) {
+      printf("Error: Failed to load initial conditions from %s\n", init_file.c_str());
+      return 1;
+    }
+    num_cells = loaded_cells;
+    radius = params.target_radius;
+  }
 
   // Create simulation
   Simulation sim(params);
   sim.output_dir = output_dir;
   sim.save_interval = save_interval;
+  // Pass gamma overrides (live on Simulation, not SimParams)
+  if (gamma_overrides_set) {
+    sim.gamma_overrides = gamma_overrides;
+    sim.gamma_overrides_set = true;
+  }
   sim.print_interval = print_interval;
   sim.checkpoint_interval = checkpoint_interval;
   sim.trajectory_samples = trajectory_samples;
@@ -502,6 +752,7 @@ int main(int argc, char *argv[]) {
   bool save_interval_set = false;
   bool checkpoint_interval_set = false;
   bool trajectory_samples_set = false;
+  bool trajectory_interval_set = false;
 
   // Re-parse to detect explicit settings (bit of a hack, but simple)
   for (int i = 1; i < argc; ++i) {
@@ -512,6 +763,8 @@ int main(int argc, char *argv[]) {
       checkpoint_interval_set = true;
     else if (arg == "--trajectory-samples")
       trajectory_samples_set = true;
+    else if (arg == "--trajectory-interval")
+      trajectory_interval_set = true;
   }
 
   // Initialize
@@ -521,16 +774,16 @@ int main(int argc, char *argv[]) {
     // params)
     float cmd_t_end = params.t_end;
     float cmd_v_A = params.v_A; // Save v_A in case user overrode it
+    float cmd_adhesion_J = params.adhesion_J; // Save adhesion in case user overrode it
     int cmd_save_interval = save_interval;
     int cmd_checkpoint_interval = checkpoint_interval;
     int cmd_trajectory_samples = trajectory_samples;
 
-    printf("DEBUG: About to load checkpoint from: %s\n",
-           checkpoint_file.c_str());
+    printf("Loading checkpoint: %s\n", checkpoint_file.c_str());
     fflush(stdout);
 
     if (sim.initialize_from_checkpoint(checkpoint_file)) {
-      printf("DEBUG: Checkpoint loaded successfully\n");
+      printf("Checkpoint loaded successfully.\n");
       fflush(stdout);
       resumed = true;
 
@@ -557,11 +810,34 @@ int main(int argc, char *argv[]) {
       // time)
       sim.domain.params.t_end = cmd_t_end;
 
+      // Restore adhesion_J from command line (checkpoint stores J=0 from
+      // equilibration, but quench experiments need the CLI-specified value)
+      if (cmd_adhesion_J > 0.0f) {
+        sim.domain.params.adhesion_J = cmd_adhesion_J;
+      }
+
       // Restore v_A if user explicitly overrode it
       if (no_self_propulsion) {
         sim.domain.params.v_A = 0.0f;
       } else if (v_A_override >= 0.0f) {
         sim.domain.params.v_A = v_A_override;
+      }
+
+      // If user specified --v-A or --v-A-sigma on command line, regenerate
+      // per-cell v_A instead of using checkpoint values (needed when starting
+      // production from an equilibration checkpoint with v_A=0)
+      if (v_A_override >= 0.0f || params.v_A_sigma > 0.0f) {
+        sim.loaded_v_A.clear();
+        sim.domain.params.v_A_sigma = params.v_A_sigma;
+        printf("  Per-cell v_A will be regenerated (--v-A or --v-A-sigma specified)\n");
+      }
+
+      // If user specified gamma overrides (or deprecated --soft-cell), regenerate per-cell gamma
+      if (gamma_overrides_set) {
+        sim.loaded_gamma.clear();
+        sim.gamma_overrides = gamma_overrides;
+        sim.gamma_overrides_set = true;
+        printf("  Per-cell gamma will be regenerated (--gamma overrides specified)\n");
       }
 
       // Apply command-line overrides for runtime options if specified
@@ -572,8 +848,18 @@ int main(int argc, char *argv[]) {
       if (checkpoint_interval_set) {
         sim.checkpoint_interval = cmd_checkpoint_interval;
       }
+      if (trajectory_interval_set) {
+        sim.trajectory_interval = trajectory_interval;
+      }
       if (trajectory_samples_set) {
         sim.trajectory_samples = cmd_trajectory_samples;
+        // Reset trajectory_interval to "compute from samples" mode unless the
+        // user also explicitly passed --trajectory-interval. Without this, the
+        // pre-checkpoint trajectory_interval (= save_interval) would take
+        // precedence over trajectory_samples in run().
+        if (!trajectory_interval_set) {
+          sim.trajectory_interval = 0;
+        }
       }
       if (use_diagnostics) {
         sim.compute_diagnostics = true;
@@ -581,13 +867,7 @@ int main(int argc, char *argv[]) {
 
       printf("Resumed from checkpoint: step=%d, t=%.4f, target t_end=%.4f\n",
              sim.current_step, sim.current_time, cmd_t_end);
-      printf("  Domain: %d x %d, R=%.1f, cells=%d\n", sim.domain.params.Nx,
-             sim.domain.params.Ny, sim.domain.params.target_radius,
-             sim.domain.num_cells());
-      printf("  Using: v_A=%.4f, save_interval=%d, checkpoint_interval=%d, "
-             "trajectory_samples=%d\n",
-             sim.domain.params.v_A, sim.save_interval, sim.checkpoint_interval,
-             sim.trajectory_samples);
+      fflush(stdout);
 
       // Check if we've already reached the target time
       if (sim.current_time >= cmd_t_end) {
@@ -600,8 +880,55 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  // Print effective simulation parameters AFTER checkpoint load + CLI overrides
+  // (so the log always shows what the simulation is actually using)
+  {
+    const SimParams &p = sim.domain.params;
+    printf("\nEffective Simulation Parameters:\n");
+    printf("  Domain: %d x %d\n", p.Nx, p.Ny);
+    printf("  Grid spacing: dx=%.3f, dy=%.3f\n", p.dx, p.dy);
+    printf("  Time step: dt=%.4f\n", p.dt);
+    printf("  End time: t_end=%.1f\n", p.t_end);
+    printf("  Interface width: lambda=%.3f\n", p.lambda);
+    printf("  Gradient coeff: gamma=%.3f\n", p.gamma);
+    printf("  Bulk coeff (30/lambda^2): %.3f\n", p.bulk_coeff());
+    printf("  Interaction coeff (30*kappa/lambda^2): %.3f\n", p.interaction_coeff());
+    printf("  Target radius: R=%.1f (area=%.1f)\n", p.target_radius, p.target_area());
+    printf("  Volume constraint: mu=%.3f (coeff=%.6f)\n", p.mu, p.volume_coeff());
+    printf("  Active velocity: v_A=%.4f\n", p.v_A);
+    if (p.v_A_sigma > 0.0f) {
+      printf("  v_A disorder: sigma=%.4f (log-normal)\n", p.v_A_sigma);
+    }
+    printf("  Reorientation time: tau=%.1f\n", p.tau);
+    printf("  Motility model: %s\n",
+           p.motility_model == SimParams::MotilityModel::ABP
+               ? "ABP (Active Brownian Particle)"
+               : "Run-and-Tumble");
+    if (p.adhesion_J > 0.0f) {
+      printf("  Adhesion: J=%.4f (J/kappa=%.4f)\n", p.adhesion_J,
+             p.adhesion_J / p.kappa);
+    }
+    printf("  Friction: xi=%.1f\n", p.xi);
+    printf("  Interaction: kappa=%.1f\n", p.kappa);
+    printf("  Cells: %d\n", sim.domain.num_cells());
+    printf("  I/O: save_interval=%d, checkpoint_interval=%d, "
+           "trajectory_interval=%d, trajectory_samples=%d\n",
+           sim.save_interval, sim.checkpoint_interval,
+           sim.trajectory_interval, sim.trajectory_samples);
+    printf("\n");
+    fflush(stdout);
+  }
+
   if (!resumed) {
-    if (edge_test) {
+    if (!init_file.empty()) {
+      // Initialize from JSON positions
+      printf("Initializing %d cells from JSON positions...\n", (int)init_cx.size());
+      for (size_t i = 0; i < init_cx.size(); ++i) {
+        sim.domain.add_cell(init_cx[i], init_cy[i], radius);
+      }
+      sim.domain.update_overlap_pairs();
+      sim.domain.sync_device_arrays();
+    } else if (edge_test) {
       sim.initialize_edge_test(radius);
     } else if (corner_push_test) {
       sim.initialize_corner_push_test(num_cells, radius);

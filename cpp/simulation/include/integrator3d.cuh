@@ -73,6 +73,37 @@ public:
   int *d_neighbor_lists;   // Flattened neighbor indices [MAX_NEIGHBORS_3D * num_cells]
   bool neighbor_list_valid; // True if neighbor list is up-to-date
 
+  // GPU bounding box scan buffer (10 ints per cell for 3D)
+  int *d_bbox_scan_results;
+  size_t bbox_scan_capacity;
+
+  // Global sum field for O(1) interaction (replaces neighbor-list interaction)
+  // S(x,y,z) = Σ_all φ_k²(x,y,z) — scatter, then each cell reads S - φ_i²
+  // Ping-pong: two buffers for async clear on separate stream
+  float *d_sum_field;
+  float *d_sum_field_b;           // Second buffer for ping-pong
+  size_t sum_field_capacity;      // Allocated bytes per buffer
+  cudaStream_t sum_field_clear_stream;   // Async clear stream
+  cudaEvent_t sum_field_read_done_event; // Signals fused kernel done reading
+  cudaEvent_t sum_field_clear_done_event;// Signals async clear complete
+  bool use_fused_kernel;          // True when sum field is available
+
+  // Cached max dimensions (avoids per-step host loop over cells)
+  int cached_max_size;
+  bool cached_dims_valid;
+
+  // Fused kernel centroid sums precomputed flag
+  bool centroid_sums_ready;
+
+  // Contiguous phi pool: single cudaMalloc for ALL cells (phi + dphi_dt)
+  // Eliminates per-cell malloc/free on bbox resize.
+  // Layout: [phi_0][phi_1]...[phi_N-1][out_0][out_1]...[out_N-1]
+  // Each slot = pool_slot_size floats (fixed page, never regrows).
+  float *d_phi_pool;
+  size_t pool_slot_size;  // Floats per slot (max possible field_size)
+  int pool_num_cells;     // Capacity in cells
+  bool pool_active;       // True after first allocation
+
   // Spatial hash grid for O(N) neighbor list building (large cell counts)
   static constexpr int MAX_GRID_CELLS = 512;   // Max spatial grid cells (8x8x8)
   static constexpr int MAX_CELLS_PER_GRID = 16; // Max cells per grid cell
@@ -83,27 +114,6 @@ public:
   curandState *d_rng_states;  // RNG state per cell [num_cells]
   size_t rng_states_capacity; // Allocated capacity
   bool rng_initialized;       // True if RNG states are seeded
-
-  // =========================================================================
-  // Texture Memory for Interaction Kernel Optimization
-  // =========================================================================
-  // 3D textures provide hardware-cached spatial locality reads for neighbor φ values.
-  // This significantly improves scattered memory access patterns in the interaction kernel.
-  //
-  // Structure:
-  // - d_phi_textures[i] = texture object for cell i's phi field
-  // - d_phi_arrays[i] = CUDA 3D array backing the texture
-  // - We update textures by copying from cell phi fields each step
-  //
-  // Note: Texture updates cost ~0.5ms per step for 32 cells, but the interaction
-  // kernel speedup (30-50%) more than compensates.
-  // =========================================================================
-  cudaTextureObject_t *h_phi_textures;  // HOST array of texture objects [num_cells]
-  cudaTextureObject_t *d_phi_textures;  // DEVICE array of texture objects [num_cells]
-  cudaArray_t *d_phi_arrays;            // 3D CUDA arrays [num_cells] (host ptrs)
-  size_t texture_array_capacity;         // Number of textures allocated
-  int *texture_dims;                     // [3*num_cells] = {w0,h0,d0, w1,h1,d1, ...}
-  bool textures_valid;                   // True if textures match current phi fields
 
 public:
   Integrator3D(Method m = Method::ForwardEuler);
@@ -126,13 +136,17 @@ public:
   void create_streams(int n = MAX_STREAMS);
   void destroy_streams();
 
-  // Texture memory management for interaction kernel optimization
-  void allocate_textures(const Domain3D &domain);
-  void free_textures();
-  void update_textures(const Domain3D &domain);
-
   // Perform one time step
-  void step(Domain3D &domain, float dt);
+  // sync_to_host: if true, sync centroids/volumes/velocities back to host cells
+  //               (needed for printing, checkpointing, trajectory output)
+  //               In steady state, pass false for maximum GPU throughput.
+  void step(Domain3D &domain, float dt, bool sync_to_host = false);
+
+  // Allocate contiguous phi pool and migrate cells into it
+  void allocate_phi_pool(Domain3D &domain);
+
+  // Compute max possible page size for phi pool (from physics params)
+  static size_t compute_max_page_size_3d(const SimParams3D &params);
 
   // Update cell velocities (motility model)
   void update_velocities(Domain3D &domain);
@@ -154,18 +168,22 @@ inline Integrator3D::Integrator3D(Method m)
       d_ref_x(nullptr), d_ref_y(nullptr), d_ref_z(nullptr),
       d_polarization_x(nullptr), d_polarization_y(nullptr),
       d_polarization_z(nullptr), d_centroids_x(nullptr), d_centroids_y(nullptr),
-      d_centroids_z(nullptr), bbox_update_interval(10), step_counter(0),
+      d_centroids_z(nullptr), bbox_update_interval(4), step_counter(0),
       d_neighbor_counts(nullptr), d_neighbor_lists(nullptr),
-      neighbor_list_valid(false), d_grid_counts(nullptr), d_grid_cells(nullptr),
-      d_rng_states(nullptr), rng_states_capacity(0), rng_initialized(false),
-      h_phi_textures(nullptr), d_phi_textures(nullptr), d_phi_arrays(nullptr), 
-      texture_array_capacity(0), texture_dims(nullptr), textures_valid(false) {}
+      neighbor_list_valid(false),
+      d_bbox_scan_results(nullptr), bbox_scan_capacity(0),
+      d_sum_field(nullptr), d_sum_field_b(nullptr), sum_field_capacity(0),
+      sum_field_clear_stream(nullptr), sum_field_read_done_event(nullptr),
+      sum_field_clear_done_event(nullptr), use_fused_kernel(false),
+      cached_max_size(0), cached_dims_valid(false), centroid_sums_ready(false),
+      d_phi_pool(nullptr), pool_slot_size(0), pool_num_cells(0), pool_active(false),
+      d_grid_counts(nullptr), d_grid_cells(nullptr),
+      d_rng_states(nullptr), rng_states_capacity(0), rng_initialized(false) {}
 
 inline Integrator3D::~Integrator3D() {
   free_work_buffer();
   free_interaction_arrays();
   free_reduction_arrays();
-  free_textures();
   destroy_streams();
   // Free spatial grid buffers
   if (d_grid_counts) {
@@ -176,6 +194,15 @@ inline Integrator3D::~Integrator3D() {
     cudaFree(d_grid_cells);
     d_grid_cells = nullptr;
   }
+  // Free sum field (both ping-pong buffers + stream/events)
+  if (d_sum_field) { cudaFree(d_sum_field); d_sum_field = nullptr; }
+  if (d_sum_field_b) { cudaFree(d_sum_field_b); d_sum_field_b = nullptr; }
+  if (d_bbox_scan_results) { cudaFree(d_bbox_scan_results); d_bbox_scan_results = nullptr; }
+  if (sum_field_clear_stream) { cudaStreamDestroy(sum_field_clear_stream); sum_field_clear_stream = nullptr; }
+  if (sum_field_read_done_event) { cudaEventDestroy(sum_field_read_done_event); sum_field_read_done_event = nullptr; }
+  if (sum_field_clear_done_event) { cudaEventDestroy(sum_field_clear_done_event); sum_field_clear_done_event = nullptr; }
+  // Free phi pool
+  if (d_phi_pool) { cudaFree(d_phi_pool); d_phi_pool = nullptr; pool_active = false; }
   // Free RNG states
   if (d_rng_states) {
     cudaFree(d_rng_states);
@@ -447,207 +474,92 @@ inline void Integrator3D::destroy_streams() {
 }
 
 //=============================================================================
-// Texture Memory Management for Interaction Kernel Optimization
+// Contiguous Phi Pool
 //=============================================================================
 
-inline void Integrator3D::allocate_textures(const Domain3D &domain) {
+inline size_t Integrator3D::compute_max_page_size_3d(const SimParams3D &params) {
+  // Theoretical maximum bbox size for any cell.
+  // half = max_dist + adaptive_margin + overshoot + safety
+  int halo = params.halo_width;
+  int adaptive_margin = static_cast<int>(2.0f * params.lambda) + halo;
+  int overshoot = static_cast<int>(0.25f * adaptive_margin);
+  int max_dist = static_cast<int>(params.target_radius + 3.0f * params.lambda) + 1;
+  int max_half = max_dist + adaptive_margin + overshoot + 10;
+  int max_side = 2 * max_half + 2 * halo;
+  return static_cast<size_t>(max_side) * max_side * max_side;
+}
+
+inline void Integrator3D::allocate_phi_pool(Domain3D &domain) {
   int num_cells = domain.num_cells();
   if (num_cells == 0) return;
-  
-  // Check if we need to reallocate (cell count changed or first allocation)
-  if (num_cells != (int)texture_array_capacity) {
-    free_textures();
-    
-    // Allocate HOST arrays for texture objects and CUDA arrays (management)
-    h_phi_textures = new cudaTextureObject_t[num_cells];
-    d_phi_arrays = new cudaArray_t[num_cells];
-    texture_dims = new int[3 * num_cells];
-    
-    // Allocate DEVICE array for texture objects (passed to kernel)
-    cudaMalloc(&d_phi_textures, num_cells * sizeof(cudaTextureObject_t));
-    
-    for (int i = 0; i < num_cells; ++i) {
-      h_phi_textures[i] = 0;
-      d_phi_arrays[i] = nullptr;
-    }
-    
-    texture_array_capacity = num_cells;
+
+  size_t max_page = compute_max_page_size_3d(domain.params);
+  for (int i = 0; i < num_cells; ++i)
+    max_page = std::max(max_page, static_cast<size_t>(domain.cells[i]->field_size));
+
+  if (pool_active && num_cells == pool_num_cells && max_page <= pool_slot_size)
+    return;  // Already allocated
+
+  if (pool_active) cudaDeviceSynchronize();  // Sync before realloc
+
+  float *old_pool = d_phi_pool;
+  pool_slot_size = max_page;
+  pool_num_cells = num_cells;
+
+  size_t total_floats = 2 * static_cast<size_t>(num_cells) * pool_slot_size;
+  size_t alloc_bytes = total_floats * sizeof(float);
+
+  {
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    printf("3D Phi pool %s: %d cells x %zu slot = %.1f MB  "
+           "(VRAM: %.1f MB free / %.1f MB total)\n",
+           pool_active ? "REALLOC" : "INIT", num_cells, pool_slot_size,
+           alloc_bytes / (1024.0 * 1024.0),
+           free_mem / (1024.0 * 1024.0),
+           total_mem / (1024.0 * 1024.0));
   }
-  
-  // Create/recreate textures for each cell
+
+  cudaMalloc(&d_phi_pool, alloc_bytes);
+  cudaMemset(d_phi_pool, 0, alloc_bytes);
+
+  // Migrate cells into pool
   for (int i = 0; i < num_cells; ++i) {
-    const Cell3D *cell = domain.cells[i].get();
-    int w = cell->width();
-    int h = cell->height();
-    int d = cell->depth();
-    
-    // Check if dimensions changed (bbox resize)
-    bool dims_changed = (texture_dims[3*i] != w || 
-                         texture_dims[3*i+1] != h || 
-                         texture_dims[3*i+2] != d);
-    
-    if (d_phi_arrays[i] != nullptr && !dims_changed) {
-      // Already allocated with correct size
-      continue;
+    auto &cell = domain.cells[i];
+    float *pool_phi = d_phi_pool + static_cast<size_t>(i) * pool_slot_size;
+    float *pool_out = d_phi_pool + static_cast<size_t>(num_cells + i) * pool_slot_size;
+
+    if (cell->d_phi && cell->field_size > 0) {
+      cudaMemcpy(pool_phi, cell->d_phi, cell->field_size * sizeof(float),
+                 cudaMemcpyDeviceToDevice);
     }
-    
-    // Destroy old texture/array if exists
-    if (h_phi_textures[i] != 0) {
-      cudaDestroyTextureObject(h_phi_textures[i]);
-      h_phi_textures[i] = 0;
+
+    if (!cell->pool_managed) {
+      if (cell->d_phi) cudaFree(cell->d_phi);
+      if (cell->d_dphi_dt) cudaFree(cell->d_dphi_dt);
     }
-    if (d_phi_arrays[i] != nullptr) {
-      cudaFreeArray(d_phi_arrays[i]);
-      d_phi_arrays[i] = nullptr;
-    }
-    
-    // Store dimensions
-    texture_dims[3*i] = w;
-    texture_dims[3*i+1] = h;
-    texture_dims[3*i+2] = d;
-    
-    // Create 3D CUDA array
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
-    cudaExtent extent = make_cudaExtent(w, h, d);
-    
-    cudaError_t err = cudaMalloc3DArray(&d_phi_arrays[i], &channelDesc, extent);
-    if (err != cudaSuccess) {
-      printf("ERROR: cudaMalloc3DArray failed for cell %d (%dx%dx%d): %s\n",
-             i, w, h, d, cudaGetErrorString(err));
-      continue;
-    }
-    
-    // Create texture object
-    cudaResourceDesc resDesc;
-    memset(&resDesc, 0, sizeof(resDesc));
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = d_phi_arrays[i];
-    
-    cudaTextureDesc texDesc;
-    memset(&texDesc, 0, sizeof(texDesc));
-    texDesc.addressMode[0] = cudaAddressModeClamp; // Clamp at boundaries
-    texDesc.addressMode[1] = cudaAddressModeClamp;
-    texDesc.addressMode[2] = cudaAddressModeClamp;
-    texDesc.filterMode = cudaFilterModePoint; // No interpolation (nearest)
-    texDesc.readMode = cudaReadModeElementType; // Read as float
-    texDesc.normalizedCoords = 0; // Use unnormalized (integer) coordinates
-    
-    err = cudaCreateTextureObject(&h_phi_textures[i], &resDesc, &texDesc, nullptr);
-    if (err != cudaSuccess) {
-      printf("ERROR: cudaCreateTextureObject failed for cell %d: %s\n",
-             i, cudaGetErrorString(err));
-    }
+
+    cell->d_phi = reinterpret_cast<FieldType3D *>(pool_phi);
+    cell->d_dphi_dt = reinterpret_cast<FieldType3D *>(pool_out);
+    cell->pool_managed = true;
   }
-  
-  // Copy texture handles from host to device array (kernel needs device pointers)
-  cudaMemcpy(d_phi_textures, h_phi_textures, 
-             num_cells * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice);
-  
-  textures_valid = false; // Need to update texture contents
+
+  if (pool_active && old_pool) {
+    cudaDeviceSynchronize();
+    cudaFree(old_pool);
+  }
+
+  pool_active = true;
 }
 
-inline void Integrator3D::free_textures() {
-  if (h_phi_textures != nullptr && d_phi_arrays != nullptr) {
-    for (size_t i = 0; i < texture_array_capacity; ++i) {
-      if (h_phi_textures[i] != 0) {
-        cudaDestroyTextureObject(h_phi_textures[i]);
-      }
-      if (d_phi_arrays[i] != nullptr) {
-        cudaFreeArray(d_phi_arrays[i]);
-      }
-    }
-    delete[] h_phi_textures;
-    delete[] d_phi_arrays;
-    h_phi_textures = nullptr;
-    d_phi_arrays = nullptr;
-  }
-  if (d_phi_textures != nullptr) {
-    cudaFree(d_phi_textures);
-    d_phi_textures = nullptr;
-  }
-  if (texture_dims != nullptr) {
-    delete[] texture_dims;
-    texture_dims = nullptr;
-  }
-  texture_array_capacity = 0;
-  textures_valid = false;
-}
-
-inline void Integrator3D::update_textures(const Domain3D &domain) {
-  int num_cells = domain.num_cells();
-  if (num_cells == 0 || d_phi_arrays == nullptr || texture_dims == nullptr) return;
-  
-  // Copy phi data from device linear memory to 3D CUDA arrays
-  for (int i = 0; i < num_cells; ++i) {
-    const Cell3D *cell = domain.cells[i].get();
-    int w = cell->width();
-    int h = cell->height();
-    int d = cell->depth();
-    
-    if (d_phi_arrays[i] == nullptr) continue;
-    
-    // Use the ALLOCATED texture dimensions, not current cell dimensions
-    // If they don't match, the texture needs reallocation (handled by allocate_textures)
-    int tex_w = texture_dims[3*i];
-    int tex_h = texture_dims[3*i+1];
-    int tex_d = texture_dims[3*i+2];
-    
-    // Skip if dimensions mismatch (texture needs reallocation)
-    if (w != tex_w || h != tex_h || d != tex_d) {
-      // Don't report error - this is expected when bbox changes
-      continue;
-    }
-    
-    // Handle FP16 storage: need to convert to FP32 for texture
-#ifdef USE_HALF_PRECISION_3D
-    // For FP16, we need to convert to float first
-    // This adds overhead but maintains texture cache benefits
-    size_t num_elements = (size_t)w * h * d;
-    float *h_temp = new float[num_elements];
-    __half *d_half_temp = cell->d_phi;
-    
-    // Convert on GPU and copy
-    // For now, use a simpler approach: copy half to host, convert, copy to array
-    std::vector<__half> h_half(num_elements);
-    cudaMemcpy(h_half.data(), d_half_temp, num_elements * sizeof(__half), cudaMemcpyDeviceToHost);
-    for (size_t j = 0; j < num_elements; ++j) {
-      h_temp[j] = __half2float(h_half[j]);
-    }
-    
-    cudaMemcpy3DParms copyParams = {0};
-    copyParams.srcPtr = make_cudaPitchedPtr(h_temp, w * sizeof(float), w, h);
-    copyParams.dstArray = d_phi_arrays[i];
-    copyParams.extent = make_cudaExtent(w, h, d);
-    copyParams.kind = cudaMemcpyHostToDevice;
-    cudaMemcpy3D(&copyParams);
-    
-    delete[] h_temp;
-#else
-    // FP32: Direct device-to-device copy (fast)
-    cudaMemcpy3DParms copyParams = {0};
-    copyParams.srcPtr = make_cudaPitchedPtr(
-        (void*)cell->d_phi, w * sizeof(float), w, h);
-    copyParams.dstArray = d_phi_arrays[i];
-    copyParams.extent = make_cudaExtent(w, h, d);
-    copyParams.kind = cudaMemcpyDeviceToDevice;
-    
-    cudaError_t err = cudaMemcpy3D(&copyParams);
-    if (err != cudaSuccess) {
-      printf("ERROR: cudaMemcpy3D failed for cell %d: %s\n", 
-             i, cudaGetErrorString(err));
-    }
-#endif
-  }
-  
-  textures_valid = true;
-}
-
-inline void Integrator3D::step(Domain3D &domain, float dt) {
+inline void Integrator3D::step(Domain3D &domain, float dt, bool sync_to_host) {
   if (domain.num_cells() == 0)
     return;
 
-  allocate_work_buffer(domain);
   allocate_reduction_arrays(domain.num_cells());
+
+  // Allocate contiguous phi pool (migrates cells on first call, no-op after)
+  allocate_phi_pool(domain);
 
   // Only update interaction arrays when bboxes change
   // (first call sets capacity=0 triggering initial update)
@@ -655,14 +567,44 @@ inline void Integrator3D::step(Domain3D &domain, float dt) {
     update_interaction_arrays(domain);
   }
 
-  // Texture memory optimization DISABLED
-  // Analysis showed the per-step copy overhead (500MB+ D2D via cudaMemcpy3D)
-  // exceeds any benefit from texture cache. Texture memory is better suited for
-  // static/infrequently-updated data, not phi fields that change every step.
-  // allocate_textures(domain);
-
   const SimParams3D &params = domain.params;
   int num_cells = domain.num_cells();
+
+  // Allocate sum field for O(1) interaction — ping-pong with async clear
+  {
+    size_t needed = (size_t)params.Nx * params.Ny * params.Nz * sizeof(float);
+    if (needed > sum_field_capacity) {
+      if (d_sum_field) cudaFree(d_sum_field);
+      if (d_sum_field_b) cudaFree(d_sum_field_b);
+      cudaMalloc(&d_sum_field, needed);
+      cudaMalloc(&d_sum_field_b, needed);
+      cudaMemset(d_sum_field, 0, needed);
+      cudaMemset(d_sum_field_b, 0, needed);
+      sum_field_capacity = needed;
+      if (!sum_field_clear_stream) {
+        cudaStreamCreate(&sum_field_clear_stream);
+        cudaEventCreateWithFlags(&sum_field_read_done_event, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&sum_field_clear_done_event, cudaEventDisableTiming);
+        cudaEventRecord(sum_field_clear_done_event, sum_field_clear_stream);
+      }
+      use_fused_kernel = true;
+      printf("3D Sum field: %.1f MB x2 ping-pong (%dx%dx%d) — fused kernel enabled\n",
+             needed / (1024.0 * 1024.0), params.Nx, params.Ny, params.Nz);
+    }
+  }
+
+  // Allocate work buffer only if NOT using fused kernel
+  if (!use_fused_kernel) {
+    allocate_work_buffer(domain);
+  }
+
+  // Cache max dimensions (avoids host loop every step)
+  if (!cached_dims_valid) {
+    cached_max_size = 0;
+    for (int i = 0; i < num_cells; ++i)
+      cached_max_size = std::max(cached_max_size, domain.cells[i]->field_size);
+    cached_dims_valid = true;
+  }
 
   // Initialize RNG states on first use (GPU-side curand)
   if (!rng_initialized && d_rng_states != nullptr) {
@@ -695,53 +637,316 @@ inline void Integrator3D::step(Domain3D &domain, float dt) {
         dt, params.tau, use_abp, num_cells);
   }
 
-  // Update texture contents with current phi fields
-  // This copies phi data to 3D CUDA arrays for hardware-cached reads
-  // Note: This is done every step since phi fields change
-  if (d_phi_textures != nullptr) {
-    update_textures(domain);
-  }
-
-  // Increment step counter and determine if we need to sync centroids
+  // Increment step counter
   step_counter++;
-  bool sync_centroids =
-      (step_counter == 1) || (step_counter % bbox_update_interval == 0);
+  // Bbox check interval: when to check if cells need resizing
+  bool do_bbox_check = (step_counter == 1) || (step_counter % bbox_update_interval == 0);
 
-  // Determine if neighbor list rebuild is needed
-  // Rebuild on first step, when bboxes sync, or when explicitly invalidated
-  bool rebuild_neighbors = !neighbor_list_valid || num_cells <= 1 || sync_centroids;
+  if (use_fused_kernel) {
+    // =====================================================================
+    // FUSED KERNEL PATH — matches 2D pattern: ~zero host blocking
+    //
+    // Per-step flow (steady state):
+    //   1. ref_points kernel (tiny)
+    //   2. centroids+deviations+velocities kernel (tiny, reads precomputed sums)
+    //   3. zero centroid/volume accumulators (async)
+    //   4. ping-pong sum_field select + wait for async clear
+    //   5. scatter kernel (writes to sum_field)
+    //   6. fused kernel (reads sum_field, writes phi in-place, accumulates sums)
+    //   7. async clear of used sum_field on side stream
+    //
+    // NO cudaDeviceSynchronize in steady state.
+    // D→H copies only when caller requests (save/print steps).
+    // =====================================================================
 
-  // Use optimized fused step function with neighbor list
-  // Note: polarizations are already on GPU, step_fused_3d skips the upload
-  // Pass spatial grid buffers for O(N) neighbor finding with large cell counts
-  // Pass texture objects for optimized interaction kernel (nullptr = fallback to direct access)
-  step_fused_3d(domain, dt, d_work_buffer, d_all_phi_ptrs, d_all_widths,
-                d_all_heights, d_all_depths, d_all_offsets_x, d_all_offsets_y,
-                d_all_offsets_z, d_all_field_sizes, d_volumes, d_integrals_x,
-                d_integrals_y, d_integrals_z, d_centroid_sums,
-                d_volume_deviations, d_velocities_x, d_velocities_y,
-                d_velocities_z, d_ref_x, d_ref_y, d_ref_z, d_polarization_x,
-                d_polarization_y, d_polarization_z, d_centroids_x,
-                d_centroids_y, d_centroids_z, d_neighbor_counts,
-                d_neighbor_lists, sync_centroids, rebuild_neighbors,
-                d_grid_counts, d_grid_cells, d_phi_textures);
+    float dV = params.dx * params.dy * params.dz;
+    float target_volume = params.target_volume();
+    int max_size = cached_max_size;
 
-  // Mark neighbor list as valid after rebuild
-  if (rebuild_neighbors && num_cells > 1) {
-    neighbor_list_valid = true;
-  }
+    int threads_flat = 256;
+    dim3 block(threads_flat, 1, 1);
+    dim3 grid((max_size + threads_flat - 1) / threads_flat, num_cells, 1);
+    int threads_1d = 256;
+    int blocks_1d = (num_cells + threads_1d - 1) / threads_1d;
 
-  // Update bboxes periodically
-  if (sync_centroids) {
-    bool any_changed = false;
-    for (auto &cell : domain.cells) {
-      if (cell->update_bounding_box(params)) {
-        any_changed = true;
+#ifdef ENABLE_KERNEL_PROFILING
+    static cudaEvent_t ev[10];
+    static bool ev_created = false;
+    static double t_ref=0, t_centroid=0, t_zero=0, t_scatter=0, t_fused=0, t_clear=0, t_total=0;
+    static int prof_n = 0;
+    if (!ev_created) {
+      for (int i=0;i<10;i++) cudaEventCreate(&ev[i]);
+      ev_created = true;
+    }
+    cudaEventRecord(ev[0]); // start
+#endif
+
+    // 1-3. Reference points + centroids + velocities
+    if (!centroid_sums_ready) {
+      // First step or after bbox change: separate kernels with explicit reduction
+      kernel_compute_ref_points_3d<<<blocks_1d, threads_1d>>>(
+          d_ref_x, d_ref_y, d_ref_z, d_all_offsets_x, d_all_offsets_y,
+          d_all_offsets_z, d_all_widths, d_all_heights, d_all_depths,
+          params.Nx, params.Ny, params.Nz, num_cells);
+
+      cudaMemsetAsync(d_volumes, 0, num_cells * sizeof(float));
+      cudaMemsetAsync(d_centroid_sums, 0, num_cells * 4 * sizeof(float));
+
+      int blocks_per_cell = std::min((max_size + 255) / 256, 32);
+      dim3 reduce_grid(blocks_per_cell, num_cells);
+      kernel_reduce_volumes_batched_3d<<<reduce_grid, 256,
+                                         256 * sizeof(float)>>>(
+          d_all_phi_ptrs, d_volumes, d_all_widths, d_all_heights, d_all_depths,
+          d_all_field_sizes, params.halo_width, num_cells);
+      kernel_reduce_centroid_sums_batched_3d<<<reduce_grid, 256,
+                                               4 * 256 * sizeof(float)>>>(
+          d_all_phi_ptrs, d_centroid_sums, d_all_widths, d_all_heights,
+          d_all_depths, d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+          d_all_field_sizes, d_ref_x, d_ref_y, d_ref_z, params.halo_width,
+          params.Nx, params.Ny, params.Nz, num_cells);
+
+      kernel_compute_centroids_and_deviations_3d<<<blocks_1d, threads_1d>>>(
+          d_centroids_x, d_centroids_y, d_centroids_z, d_volume_deviations,
+          d_centroid_sums, d_volumes, d_ref_x, d_ref_y, d_ref_z,
+          target_volume, dV, params.Nx, params.Ny, params.Nz, num_cells);
+      // Velocity will be computed after scatter + velocity_integral (below)
+      // For now, just zero the integrals so compute_velocities gives v_A only
+      cudaMemsetAsync(d_integrals_x, 0, num_cells * sizeof(float));
+      cudaMemsetAsync(d_integrals_y, 0, num_cells * sizeof(float));
+      cudaMemsetAsync(d_integrals_z, 0, num_cells * sizeof(float));
+      kernel_compute_velocities_3d<<<blocks_1d, threads_1d>>>(
+          d_velocities_x, d_velocities_y, d_velocities_z,
+          d_integrals_x, d_integrals_y, d_integrals_z,
+          d_polarization_x, d_polarization_y, d_polarization_z,
+          params.motility_coeff(), dV, params.v_A, num_cells);
+    } else {
+      // Steady state: single fused kernel (eliminates 2 kernel launch bubbles)
+      kernel_ref_centroid_vel_fused_3d<<<blocks_1d, threads_1d>>>(
+          d_ref_x, d_ref_y, d_ref_z,
+          d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+          d_all_widths, d_all_heights, d_all_depths,
+          d_centroids_x, d_centroids_y, d_centroids_z,
+          d_volume_deviations, d_centroid_sums, d_volumes,
+          target_volume, dV,
+          d_velocities_x, d_velocities_y, d_velocities_z,
+          d_polarization_x, d_polarization_y, d_polarization_z,
+          params.v_A,
+          params.Nx, params.Ny, params.Nz, num_cells);
+    }
+
+#ifdef ENABLE_KERNEL_PROFILING
+    cudaEventRecord(ev[1]); // after ref+centroid+vel
+#endif
+
+    // 4. Zero accumulators for fused kernel (async, no blocking)
+    cudaMemsetAsync(d_centroid_sums, 0, num_cells * 4 * sizeof(float));
+    cudaMemsetAsync(d_volumes, 0, num_cells * sizeof(float));
+
+    // 5. Ping-pong sum field: select buffer, wait for async clear
+    float *current_sum_field = (step_counter % 2 == 0) ? d_sum_field : d_sum_field_b;
+    if (sum_field_clear_done_event) {
+      cudaStreamWaitEvent(0, sum_field_clear_done_event, 0);
+    }
+
+#ifdef ENABLE_KERNEL_PROFILING
+    cudaEventRecord(ev[2]); // after zero+wait
+#endif
+
+    // 6. Scatter phi² to sum_field
+    if (num_cells > 1) {
+      kernel_scatter_phi_sq_3d<<<grid, block>>>(
+          (float **)d_all_phi_ptrs, current_sum_field,
+          d_all_widths, d_all_heights, d_all_depths,
+          d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+          d_all_field_sizes,
+          params.Nx, params.Ny, params.Nz, num_cells);
+    }
+
+#ifdef ENABLE_KERNEL_PROFILING
+    cudaEventRecord(ev[3]); // after scatter
+#endif
+
+    // 6b. VELOCITY INTEGRAL: Compute v_I from current phi + sum field
+    //     so the fused kernel uses CURRENT velocity for advection (no lag).
+    if (num_cells > 1 && current_sum_field) {
+      cudaMemsetAsync(d_integrals_x, 0, num_cells * sizeof(float));
+      cudaMemsetAsync(d_integrals_y, 0, num_cells * sizeof(float));
+      cudaMemsetAsync(d_integrals_z, 0, num_cells * sizeof(float));
+
+      kernel_velocity_integral_3d<<<grid, block>>>(
+          (float **)d_all_phi_ptrs,
+          d_all_widths, d_all_heights, d_all_depths, d_all_field_sizes,
+          d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+          current_sum_field,
+          d_integrals_x, d_integrals_y, d_integrals_z,
+          params.dx, params.dy, params.dz,
+          params.halo_width, params.Nx, params.Ny, params.Nz,
+          num_cells, max_size);
+
+      float dV = params.dx * params.dy * params.dz;
+      kernel_compute_velocities_3d<<<blocks_1d, threads_1d>>>(
+          d_velocities_x, d_velocities_y, d_velocities_z,
+          d_integrals_x, d_integrals_y, d_integrals_z,
+          d_polarization_x, d_polarization_y, d_polarization_z,
+          params.motility_coeff(), dV, params.v_A, num_cells);
+    }
+
+    // 7. FUSED KERNEL: Euler step + centroid/volume accumulation
+    kernel_fused_step_3d<<<grid, block>>>(
+        (float **)d_all_phi_ptrs,
+        d_all_widths, d_all_heights, d_all_depths, d_all_field_sizes,
+        d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+        (num_cells > 1) ? current_sum_field : nullptr,
+        d_volume_deviations,
+        d_velocities_x, d_velocities_y, d_velocities_z,
+        d_centroid_sums, d_volumes,
+        d_ref_x, d_ref_y, d_ref_z,
+        params.volume_coeff(), params.interaction_coeff(), params.bulk_coeff(),
+        params.gamma, params.dx, params.dy, params.dz, dt,
+        params.halo_width, params.Nx, params.Ny, params.Nz,
+        num_cells, max_size);
+
+#ifdef ENABLE_KERNEL_PROFILING
+    cudaEventRecord(ev[4]); // after fused kernel
+#endif
+
+    // 8. Async clear of used sum field on side stream (hides latency)
+    if (num_cells > 1) {
+      cudaEventRecord(sum_field_read_done_event, 0);
+      cudaStreamWaitEvent(sum_field_clear_stream, sum_field_read_done_event, 0);
+      cudaMemsetAsync(current_sum_field, 0, sum_field_capacity, sum_field_clear_stream);
+      cudaEventRecord(sum_field_clear_done_event, sum_field_clear_stream);
+    }
+
+    // Fused kernel populated centroid_sums for next step
+    centroid_sums_ready = true;
+
+#ifdef ENABLE_KERNEL_PROFILING
+    cudaEventRecord(ev[5]); // after async clear enqueue
+    cudaEventSynchronize(ev[5]);
+    float dt_ref, dt_zero, dt_scatter, dt_fused, dt_clear, dt_all;
+    cudaEventElapsedTime(&dt_ref, ev[0], ev[1]);
+    cudaEventElapsedTime(&dt_zero, ev[1], ev[2]);
+    cudaEventElapsedTime(&dt_scatter, ev[2], ev[3]);
+    cudaEventElapsedTime(&dt_fused, ev[3], ev[4]);
+    cudaEventElapsedTime(&dt_clear, ev[4], ev[5]);
+    cudaEventElapsedTime(&dt_all, ev[0], ev[5]);
+    t_ref += dt_ref; t_zero += dt_zero; t_scatter += dt_scatter;
+    t_fused += dt_fused; t_clear += dt_clear; t_total += dt_all;
+    prof_n++;
+    if (prof_n % 50 == 0) {
+      float n = (float)prof_n;
+      printf("\n=== 3D Fused Profile (avg %d steps, %d cells, max_fs=%d) ==="
+             "\n  ref+cent+vel: %7.3f ms (%5.1f%%)"
+             "\n  zero+wait:    %7.3f ms (%5.1f%%)"
+             "\n  scatter:      %7.3f ms (%5.1f%%)"
+             "\n  FUSED:        %7.3f ms (%5.1f%%)"
+             "\n  async_clear:  %7.3f ms (%5.1f%%)"
+             "\n  TOTAL:        %7.3f ms"
+             "\n  grid: (%d, %d), block: %d\n",
+             prof_n, num_cells, max_size,
+             t_ref/n, 100*t_ref/t_total,
+             t_zero/n, 100*t_zero/t_total,
+             t_scatter/n, 100*t_scatter/t_total,
+             t_fused/n, 100*t_fused/t_total,
+             t_clear/n, 100*t_clear/t_total,
+             t_total/n,
+             grid.x, grid.y, threads_flat);
+      t_ref=t_zero=t_scatter=t_fused=t_clear=t_total=0; prof_n=0;
+    }
+#endif
+
+    // =====================================================================
+    // CONDITIONAL SYNC: Only when caller needs host data (print/save steps)
+    // In steady state, nothing below this point runs → zero blocking.
+    // =====================================================================
+    if (sync_to_host) {
+      cudaDeviceSynchronize();
+      std::vector<float> h_cx(num_cells), h_cy(num_cells), h_cz(num_cells);
+      std::vector<float> h_vol(num_cells);
+      std::vector<float> h_vx(num_cells), h_vy(num_cells), h_vz(num_cells);
+      cudaMemcpy(h_cx.data(), d_centroids_x, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_cy.data(), d_centroids_y, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_cz.data(), d_centroids_z, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_vol.data(), d_volumes, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_vx.data(), d_velocities_x, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_vy.data(), d_velocities_y, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(h_vz.data(), d_velocities_z, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+      for (int i = 0; i < num_cells; ++i) {
+        domain.cells[i]->centroid.x = h_cx[i];
+        domain.cells[i]->centroid.y = h_cy[i];
+        domain.cells[i]->centroid.z = h_cz[i];
+        domain.cells[i]->volume = h_vol[i] * dV;
+        domain.cells[i]->volume_deviation = target_volume - domain.cells[i]->volume;
+        domain.cells[i]->velocity.x = h_vx[i];
+        domain.cells[i]->velocity.y = h_vy[i];
+        domain.cells[i]->velocity.z = h_vz[i];
       }
     }
-    if (any_changed) {
-      update_interaction_arrays(domain);
-      neighbor_list_valid = false; // Force rebuild after bbox changes
+
+    // =====================================================================
+    // GPU-ACCELERATED BBOX UPDATE
+    // Uses GPU scan + GPU early exit — NO cudaDeviceSynchronize in steady state.
+    // Only syncs to host + CPU decision when cells actually need resize.
+    // =====================================================================
+    if (do_bbox_check) {
+      // Allocate scan results buffer if needed
+      if (bbox_scan_capacity < (size_t)num_cells) {
+        if (d_bbox_scan_results) cudaFree(d_bbox_scan_results);
+        bbox_scan_capacity = num_cells;
+        cudaMalloc(&d_bbox_scan_results, num_cells * 10 * sizeof(int));
+      }
+
+      bool any_changed = gpu_update_all_bboxes_3d(
+          domain, d_bbox_scan_results,
+          d_centroids_x, d_centroids_y, d_centroids_z,
+          (float **)d_all_phi_ptrs,
+          d_all_widths, d_all_heights, d_all_depths,
+          d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
+          d_all_field_sizes, max_size);
+
+      if (any_changed) {
+        // GPU arrays already patched by gpu_update_all_bboxes_3d.
+        // Only need to re-upload phi pointers (new allocations).
+        update_interaction_arrays(domain);
+        centroid_sums_ready = false;
+        cached_dims_valid = false;
+      }
+    }
+
+  } else {
+    // =====================================================================
+    // LEGACY 8-PHASE PATH (fallback when sum field not available)
+    // =====================================================================
+    bool rebuild_neighbors = !neighbor_list_valid || num_cells <= 1 || do_bbox_check;
+
+    step_fused_3d(domain, dt, d_work_buffer, d_all_phi_ptrs, d_all_widths,
+                  d_all_heights, d_all_depths, d_all_offsets_x, d_all_offsets_y,
+                  d_all_offsets_z, d_all_field_sizes, d_volumes, d_integrals_x,
+                  d_integrals_y, d_integrals_z, d_centroid_sums,
+                  d_volume_deviations, d_velocities_x, d_velocities_y,
+                  d_velocities_z, d_ref_x, d_ref_y, d_ref_z, d_polarization_x,
+                  d_polarization_y, d_polarization_z, d_centroids_x,
+                  d_centroids_y, d_centroids_z, d_neighbor_counts,
+                  d_neighbor_lists, sync_to_host, rebuild_neighbors,
+                  d_grid_counts, d_grid_cells, nullptr /* textures removed */);
+
+    if (rebuild_neighbors && num_cells > 1) {
+      neighbor_list_valid = true;
+    }
+
+    // Update bboxes periodically
+    if (do_bbox_check) {
+      bool any_changed = false;
+      for (auto &cell : domain.cells) {
+        if (cell->update_bounding_box(params)) {
+          any_changed = true;
+        }
+      }
+      if (any_changed) {
+        update_interaction_arrays(domain);
+        neighbor_list_valid = false;
+      }
     }
   }
 }

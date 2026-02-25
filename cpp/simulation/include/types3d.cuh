@@ -126,7 +126,12 @@ struct BoundingBox3D {
   __host__ __device__ int width() const { return x1 - x0; }
   __host__ __device__ int height() const { return y1 - y0; }
   __host__ __device__ int depth() const { return z1 - z0; }
-  __host__ __device__ int size() const { return width() * height() * depth(); }
+  // abs_size: always positive, handles wrapping bboxes (x0 > x1)
+  __host__ __device__ int size() const {
+    int w = x1 - x0; int h = y1 - y0; int d = z1 - z0;
+    if (w < 0) w = -w; if (h < 0) h = -h; if (d < 0) d = -d;
+    return w * h * d;
+  }
 
   // 3D index from local coordinates
   __host__ __device__ int index(int lx, int ly, int lz) const {
@@ -231,7 +236,7 @@ struct SimParams3D {
   float dz = 1.0f; // Grid spacing z
 
   // Time stepping
-  float dt = 0.01f;        // Time step
+  float dt = 0.02f;        // Time step
   float t_end = 100.0f;    // End time
   int save_interval = 100; // Steps between saves
 
@@ -273,7 +278,7 @@ struct SimParams3D {
   // Subdomain management
   int halo_width = 4;
   int min_subdomain_size = 16;
-  float subdomain_padding = 2.0f;
+  float subdomain_padding = 1.4f;  // Tighter bounding boxes for overlap optimization
 
   // Motility model
   SimParams::MotilityModel motility_model =

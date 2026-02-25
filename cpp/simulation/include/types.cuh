@@ -3,6 +3,7 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <cstdint>
+#include <vector>
 #include <cuda_runtime.h>
 
 #ifndef M_PI
@@ -11,10 +12,28 @@
 
 namespace cellsim {
 
+// Adhesion h(φ) exponent: h(φ) = φ²(1-φ)^ADHESION_N, peaks at φ* = 2/(N+2).
+// "φ² matching" normalization: h_norm(φ*) = φ*² (adhesion density matches
+// repulsion density at the h peak). For n=4: norm = 1/(2/3)^4 = 81/16.
+// Compile-time tunable — update both N and H_PEAK_INV together.
+#define ADHESION_N 4
+// h_peak_inv = 1/(N/(N+2))^N = ((N+2)/N)^N.  For n=4: (3/2)^4 = 81/16 = 5.0625
+#define ADHESION_H_PEAK_INV 5.0625f
+
 //=============================================================================
 // Simulation Parameters
 //=============================================================================
 
+// CHECKPOINT COMPATIBILITY RULE:
+// SimParams is serialized via raw memcpy in checkpoints. To maintain backward
+// compatibility with old checkpoints:
+//   1. ONLY append new fields at the END of this struct
+//   2. NEVER reorder, remove, or change the type of existing fields
+//   3. New fields MUST have sensible zero-initialized defaults (0.0f, 0, -1)
+//      because old checkpoints will have zeros in those positions
+//   4. sizeof(SimParams) is recorded in the checkpoint header as sim_params_size
+//   5. On load, io.cu reads min(stored_size, current_size) and zero-inits the rest
+// If you need a non-zero default for a new field, add a fixup in io.cu's load path.
 struct SimParams {
   // Domain size
   int Nx = 800;    // Global domain width
@@ -23,7 +42,7 @@ struct SimParams {
   float dy = 1.0f; // Grid spacing y
 
   // Time stepping
-  float dt = 0.01f;        // Time step
+  float dt = 0.02f;        // Time step
   float t_end = 100.0f;    // End time
   int save_interval = 100; // Steps between saves
 
@@ -43,9 +62,9 @@ struct SimParams {
   float volume_coeff() const { return mu / target_area(); }
 
   // Motility
-  float v_A = 0.0f;   // Active motility speed (default 0 = no motility)
-  float xi = 1.5e3f;  // Friction coefficient ξ = 1.5 × 10^3
-  float tau = 1.0e4f; // Reorientation time τ = 100 (run-and-tumble persistence)
+  float v_A = 0.0f;       // Active motility speed (default 0 = no motility)
+  float xi = 1.5e3f;     // Friction coefficient ξ = 1.5 × 10^3
+  float tau = 1.0e4f;    // Reorientation time τ = 10000 (run-and-tumble persistence)
 
   float motility_coeff() const {
     return 60.0f * kappa / (xi * lambda * lambda);
@@ -55,7 +74,7 @@ struct SimParams {
   int halo_width = 4;          // Ghost cell width for periodic BC
   int min_subdomain_size = 16; // Minimum subdomain dimension
   float subdomain_padding =
-      2.0f; // Expand bbox by this factor (needs to capture neighbors)
+      2.5f; // Expand bbox by this factor (5R total, matching Palmieri SI Sec S5)
 
   // Motility model: Run-and-Tumble (discrete Poisson reorientations) or
   // Active Brownian Particle (continuous rotational diffusion)
@@ -63,6 +82,34 @@ struct SimParams {
   // with v3 checkpoints that didn't have this field.
   enum class MotilityModel { RunAndTumble, ABP };
   MotilityModel motility_model = MotilityModel::RunAndTumble;
+
+  // Per-cell motility disorder (added after MotilityModel for checkpoint compat)
+  // Not stored in checkpoint — set via CLI only. Old checkpoints read v_A_sigma=0.
+  float v_A_sigma = 0.0f; // Std dev for per-cell v_A (log-normal disorder, 0 = uniform)
+
+  // Per-cell stiffness overrides (population or per-cell)
+  // Parsed from repeated --gamma flags: --gamma 1.0 --gamma 0.35:20% --gamma 0.5:cell0
+  struct GammaOverride {
+    float value;
+    enum class Type { Fraction, Cells } type;
+    float fraction;             // used when type == Fraction (0-1)
+    std::vector<int> cell_ids;  // used when type == Cells
+  };
+  // NOTE: gamma_overrides live on Simulation/Integrator, NOT here,
+  // because SimParams is raw-serialized in checkpoints (no std::vector allowed).
+
+  // Legacy: --soft-cell / --gamma-soft (backward compat, maps to gamma_overrides)
+  int soft_cell_id = -1;
+  float gamma_soft = 0.35f;
+
+  // Cell-cell adhesion: gradient coupling (surface tension reduction)
+  // F_adh = J Σ_{i<j} ∫ ∇φ_i·∇φ_j dA  (negative at shared interfaces → favorable)
+  // δF/δφ_i = -J Σ_{j≠i} ∇²φ_j
+  // Implemented via sum field: scatter Σφ_k, compute ∇²(Σφ_k) - ∇²φ_i in fused kernel.
+  // Attractive from afar + repulsive at deep overlap → equilibrium at d ≈ 2R.
+  // No nucleation, no bulk force, no squishing.  Standard in Nonomura/Löber models.
+  // J=0 (default): adhesion disabled.
+  float adhesion_J = 0.0f;
 };
 
 //=============================================================================
