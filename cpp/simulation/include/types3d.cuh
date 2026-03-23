@@ -236,7 +236,7 @@ struct SimParams3D {
   float dz = 1.0f; // Grid spacing z
 
   // Time stepping
-  float dt = 0.02f;        // Time step
+  float dt = 0.01f;        // Time step (Palmieri SI S5: dt = 0.01)
   float t_end = 100.0f;    // End time
   int save_interval = 100; // Steps between saves
 

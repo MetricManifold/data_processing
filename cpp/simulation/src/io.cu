@@ -479,7 +479,8 @@ void export_energy_metrics(const Domain &domain, const std::string &filename,
 void save_checkpoint(const Domain &domain, const std::string &filename,
                      const CheckpointHeader &header,
                      const float *h_v_A, int num_v_A,
-                     const float *h_gamma, int num_gamma) {
+                     const float *h_gamma, int num_gamma,
+                     const float *h_target_radius, int num_target_radius) {
   // Write to temporary file first, then rename atomically
   // This prevents corruption if process is killed mid-write
   std::string temp_filename = filename + ".tmp";
@@ -541,6 +542,17 @@ void save_checkpoint(const Domain &domain, const std::string &filename,
                num_gamma * sizeof(float));
   }
 
+  // Write per-cell target radius for polydispersity preservation
+  // Magic marker: 0x52414449 = "RADI" followed by count and data
+  if (h_target_radius != nullptr && num_target_radius > 0) {
+    uint32_t radius_magic = 0x52414449; // "RADI"
+    file.write(reinterpret_cast<const char *>(&radius_magic), sizeof(uint32_t));
+    int32_t radius_count = num_target_radius;
+    file.write(reinterpret_cast<const char *>(&radius_count), sizeof(int32_t));
+    file.write(reinterpret_cast<const char *>(h_target_radius),
+               num_target_radius * sizeof(float));
+  }
+
   file.close();
 
   // Atomic rename: if this fails, the old checkpoint is still valid
@@ -560,7 +572,8 @@ void save_checkpoint(const Domain &domain, const std::string &filename,
 bool load_checkpoint(Domain &domain, const std::string &filename,
                      CheckpointHeader &out_header,
                      std::vector<float> *out_v_A,
-                     std::vector<float> *out_gamma) {
+                     std::vector<float> *out_gamma,
+                     std::vector<float> *out_target_radius) {
   std::ifstream file(filename, std::ios::binary);
   if (!file.is_open()) {
     printf("Warning: Could not open checkpoint file: %s\n", filename.c_str());
@@ -779,6 +792,22 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
         file.read(reinterpret_cast<char *>(out_gamma->data()),
                   gamma_count * sizeof(float));
         printf("  Loaded per-cell gamma: %d values from checkpoint\n", gamma_count);
+      }
+    }
+  }
+
+  // Try to read per-cell target radius values (appended after gamma data)
+  if (out_target_radius != nullptr && file.good()) {
+    uint32_t radius_magic = 0;
+    file.read(reinterpret_cast<char *>(&radius_magic), sizeof(uint32_t));
+    if (file.good() && radius_magic == 0x52414449) { // "RADI"
+      int32_t radius_count = 0;
+      file.read(reinterpret_cast<char *>(&radius_count), sizeof(int32_t));
+      if (file.good() && radius_count > 0 && radius_count <= num_cells) {
+        out_target_radius->resize(radius_count);
+        file.read(reinterpret_cast<char *>(out_target_radius->data()),
+                  radius_count * sizeof(float));
+        printf("  Loaded per-cell radius: %d values from checkpoint\n", radius_count);
       }
     }
   }

@@ -1497,12 +1497,6 @@ __global__ void kernel_ref_centroid_vel_fused_3d(
     float *__restrict__ centroids_z, float *__restrict__ volume_deviations,
     const float *__restrict__ centroid_sums, const float *__restrict__ volumes,
     float target_volume, float dV,
-    float *__restrict__ velocities_x, float *__restrict__ velocities_y,
-    float *__restrict__ velocities_z,
-    const float *__restrict__ polarizations_x,
-    const float *__restrict__ polarizations_y,
-    const float *__restrict__ polarizations_z,
-    float v_A,
     int Nx, int Ny, int Nz, int num_cells) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_cells) return;
@@ -1746,6 +1740,7 @@ __global__ void __launch_bounds__(256, 4) kernel_velocity_integral_3d(
 //=============================================================================
 __global__ void __launch_bounds__(256, 4) kernel_fused_step_3d(
     float **__restrict__ phi_ptrs,
+    float **__restrict__ phi_out_ptrs,
     const int *__restrict__ widths,
     const int *__restrict__ heights,
     const int *__restrict__ depths,
@@ -1817,8 +1812,11 @@ __global__ void __launch_bounds__(256, 4) kernel_fused_step_3d(
 
     float new_phi = phi_val;  // Default for skipped voxels
 
-    // Only compute dynamics for non-trivial phi
-    if (phi_val * (1.0f - phi_val) >= 1e-8f) {
+    // Compute dynamics for all active voxels (no skip_dynamics check).
+    // The old `phi*(1-phi) >= 1e-8` guard was removed because without
+    // clamping, phi can transiently exceed 1.0, making phi*(1-phi) negative
+    // and permanently freezing those voxels. Same fix as applied to 2D.
+    {
       // --- FUSED stencil: load 7 neighbors ONCE, compute both laplacian and gradient ---
       float inv_dx2 = 1.0f / (dx_grid * dx_grid);
       float inv_dy2 = 1.0f / (dy_grid * dy_grid);
@@ -1902,15 +1900,15 @@ __global__ void __launch_bounds__(256, 4) kernel_fused_step_3d(
       float vz = velocities_z[cell_idx];
       float advection = vx * grad_x + vy * grad_y + vz * grad_z;
 
-      // Full RHS + Euler step
+      // Palmieri Eq. 1: ∂φ/∂t + v·∇φ = -(1/2) δF/δφ
       float var_deriv = -2.0f * gamma * laplacian + bulk + constraint + repulsion;
       float dphi_dt_val = -0.5f * var_deriv - advection;
 
       new_phi = phi_val + dt * dphi_dt_val;
     }
 
-    // Write updated phi in-place
-    phi_ptrs[cell_idx][flat_idx] = new_phi;
+    // Write updated phi to output buffer (double-buffered, no read-after-write race)
+    phi_out_ptrs[cell_idx][flat_idx] = new_phi;
 
     // Centroid sums of NEW phi (for next step's volume/centroid)
     if (in_inner) {
@@ -2724,6 +2722,13 @@ bool gpu_update_all_bboxes_3d(
     int half_w = std::max(max_dist_x + adaptive_margin, params.min_subdomain_size/2);
     int half_h = std::max(max_dist_y + adaptive_margin, params.min_subdomain_size/2);
     int half_d = std::max(max_dist_z + adaptive_margin, params.min_subdomain_size/2);
+
+    // Cap to theoretical max (prevents runaway growth at high confluence)
+    int max_half_cap = static_cast<int>(params.target_radius + 3.0f * params.lambda)
+                       + adaptive_margin + 4;
+    half_w = std::min(half_w, max_half_cap);
+    half_h = std::min(half_h, max_half_cap);
+    half_d = std::min(half_d, max_half_cap);
 
     int new_cx = (int)h_cx[i], new_cy = (int)h_cy[i], new_cz = (int)h_cz[i];
 

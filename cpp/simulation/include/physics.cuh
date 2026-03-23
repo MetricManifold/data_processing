@@ -89,14 +89,12 @@ compute_advection_term_3d(float grad_x, float grad_y, float grad_z, float vx,
 /**
  * Combine all terms into the full equation of motion.
  *
- * dφ/dt = -v·∇φ - 0.5 * (γ(-2∇²φ + f'(φ)) + volume_constraint + repulsion)
- * where f'(φ) = (60/λ²)φ(1-φ)(1-2φ) and γ multiplies the entire elastic bracket [Palmieri Eq 7]
- *
- * The 0.5 factor comes from the relaxational dynamics.
- * The -2γ is the coefficient of the Laplacian (stabilizes interface).
+ * Palmieri Eq. 1: ∂φ/∂t + v·∇φ = -(1/2) δF/δφ
+ * δF/δφ = -2γ∇²φ + (60γ/λ²)φ(1-φ)(1-2φ) + volume_constraint + repulsion
+ * The 1/2 prefactor is the relaxational dynamics coefficient (Model A convention).
  *
  * @param laplacian ∇²φ at this point
- * @param bulk_term f'(φ)
+ * @param bulk_term f'(φ) including γ
  * @param constraint_term Volume constraint contribution
  * @param repulsion_term Cell-cell repulsion contribution
  * @param advection_term v·∇φ
@@ -106,12 +104,8 @@ compute_advection_term_3d(float grad_x, float grad_y, float grad_z, float vx,
 __device__ __forceinline__ float
 combine_rhs_terms(float laplacian, float bulk_term, float constraint_term,
                   float repulsion_term, float advection_term, float gamma) {
-  // Relaxational dynamics: dφ/dt = -δF/δφ
+  // Palmieri Eq. 1: ∂φ/∂t + v·∇φ = -(1/2) δF/δφ
   // F = ∫[γ((∇φ)² + (30/λ²)φ²(1-φ)²) + volume_term + interaction_term] dV
-  // γ multiplies the entire bracket (Palmieri convention).
-  // -δF/δφ = 2γ∇²φ - γ(60/λ²)φ(1-φ)(1-2φ) - volume_term - interaction_term
-  // With advection: dφ/dt = -v·∇φ - 0.5 * δF/δφ
-  // Note: bulk_term already includes γ factor from compute_bulk_term().
   float functional_derivative =
       -2.0f * gamma * laplacian + bulk_term + constraint_term + repulsion_term;
   return -advection_term - 0.5f * functional_derivative;

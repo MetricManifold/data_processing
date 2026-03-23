@@ -45,7 +45,8 @@ struct CheckpointHeader {
 void save_checkpoint(const Domain &domain, const std::string &filename,
                      const CheckpointHeader &header,
                      const float *h_v_A = nullptr, int num_v_A = 0,
-                     const float *h_gamma = nullptr, int num_gamma = 0);
+                     const float *h_gamma = nullptr, int num_gamma = 0,
+                     const float *h_target_radius = nullptr, int num_target_radius = 0);
 
 // Load state from checkpoint, returns header with step, time, and runtime
 // options. If out_v_A is provided and the checkpoint contains per-cell v_A
@@ -54,7 +55,8 @@ void save_checkpoint(const Domain &domain, const std::string &filename,
 bool load_checkpoint(Domain &domain, const std::string &filename,
                      CheckpointHeader &out_header,
                      std::vector<float> *out_v_A = nullptr,
-                     std::vector<float> *out_gamma = nullptr);
+                     std::vector<float> *out_gamma = nullptr,
+                     std::vector<float> *out_target_radius = nullptr);
 
 // Export single frame for visualization (simple text format)
 void export_frame_txt(const Domain &domain, const std::string &filename,

@@ -18,8 +18,12 @@
 #endif
 
 #include <algorithm>
+#include <csignal>
 #include <filesystem>
 #include <iomanip>
+
+// Defined in main.cu — set by SIGTERM handler for clean SLURM shutdown
+extern volatile std::sig_atomic_t g_shutdown_requested;
 
 namespace cellsim {
 
@@ -53,8 +57,11 @@ public:
 
   std::vector<float> loaded_v_A; // Per-cell v_A loaded from checkpoint (empty if not present)
   std::vector<float> loaded_gamma; // Per-cell gamma loaded from checkpoint
+  std::vector<float> loaded_target_radius; // Per-cell radius loaded from checkpoint
   std::vector<SimParams::GammaOverride> gamma_overrides; // CLI --gamma V:selector overrides
   bool gamma_overrides_set = false;
+  std::vector<SimParams::RadiusOverride> radius_overrides; // CLI --radius V:selector overrides
+  bool radius_overrides_set = false;
 
   AsyncVTKWriter vtk_writer;  // Async binary VTK output (GPU scatter + background file write)
 
@@ -253,7 +260,8 @@ Simulation::initialize_from_checkpoint(const std::string &filename) {
   CheckpointHeader header;
   std::vector<float> checkpoint_v_A;
   std::vector<float> checkpoint_gamma;
-  if (!load_checkpoint(domain, filename, header, &checkpoint_v_A, &checkpoint_gamma)) {
+  std::vector<float> checkpoint_target_radius;
+  if (!load_checkpoint(domain, filename, header, &checkpoint_v_A, &checkpoint_gamma, &checkpoint_target_radius)) {
     return false;
   }
   current_step = header.current_step;
@@ -269,9 +277,10 @@ Simulation::initialize_from_checkpoint(const std::string &filename) {
   save_individual_fields = header.save_individual_fields;
   resumed_from_checkpoint = true;
 
-  // Store loaded v_A and gamma for later upload to integrator (before first step)
+  // Store loaded v_A, gamma, and radius for later upload to integrator (before first step)
   loaded_v_A = std::move(checkpoint_v_A);
   loaded_gamma = std::move(checkpoint_gamma);
+  loaded_target_radius = std::move(checkpoint_target_radius);
 
   return true;
 }
@@ -294,10 +303,19 @@ inline void Simulation::run() {
   if (!loaded_gamma.empty()) {
     integrator.checkpoint_gamma = std::move(loaded_gamma);
   }
+  // Pass checkpoint-loaded radius values to integrator
+  if (!loaded_target_radius.empty()) {
+    integrator.checkpoint_target_radius = std::move(loaded_target_radius);
+  }
   // Pass CLI gamma overrides to integrator
   if (gamma_overrides_set) {
     integrator.gamma_overrides = std::move(gamma_overrides);
     integrator.gamma_overrides_set = true;
+  }
+  // Pass CLI radius overrides to integrator
+  if (radius_overrides_set) {
+    integrator.radius_overrides = std::move(radius_overrides);
+    integrator.radius_overrides_set = true;
   }
 
   // Create fields subdirectory if saving individual fields
@@ -335,12 +353,6 @@ inline void Simulation::run() {
 #ifdef STRESS_FIELDS_ENABLED
   // Initialize stress field buffers if stress output is enabled
   if (save_stress_fields && !stress_initialized) {
-    // DEBUG: Check GPU state before allocation
-    cudaDeviceSynchronize();
-    cudaError_t pre_err = cudaGetLastError();
-    printf("[DEBUG] Pre-allocation GPU state: %s\n", 
-           pre_err == cudaSuccess ? "OK" : cudaGetErrorString(pre_err));
-    
     cudaError_t err = stress_fields_allocate(stress_buffers, 
                                              domain.params.Nx, 
                                              domain.params.Ny);
@@ -349,12 +361,6 @@ inline void Simulation::run() {
              cudaGetErrorString(err));
       save_stress_fields = false;
     } else {
-      // DEBUG: Check GPU state after allocation
-      cudaDeviceSynchronize();
-      cudaError_t post_err = cudaGetLastError();
-      printf("[DEBUG] Post-allocation GPU state: %s\n", 
-             post_err == cudaSuccess ? "OK" : cudaGetErrorString(post_err));
-      
       stress_initialized = true;
       printf("Stress field output enabled in VTK files\n");
     }
@@ -367,22 +373,21 @@ inline void Simulation::run() {
                           : (save_interval > 0 ? save_interval * 10 : 1000);
 
   // Compute trajectory save interval
-  // trajectory_interval: -1 = use save_interval, 0 = compute from samples, >0 =
-  // use directly
+  // trajectory_interval: -1 = auto, 0 = compute from samples, >0 = use directly
   int total_steps =
       static_cast<int>((domain.params.t_end - current_time) / domain.params.dt);
   int traj_interval;
-  if (trajectory_interval == -1) {
-    // Use save_interval
-    traj_interval = save_interval;
-  } else if (trajectory_interval > 0) {
-    // Use the explicitly set interval
+  if (trajectory_interval > 0) {
+    // Explicit interval set by user
     traj_interval = trajectory_interval;
-  } else {
-    // Compute from trajectory_samples
+  } else if (trajectory_interval == 0 || (trajectory_interval == -1 && trajectory_samples > 0)) {
+    // Compute from samples (either explicitly requested or auto with samples set)
     traj_interval = (trajectory_samples > 0)
                         ? std::max(1, total_steps / trajectory_samples)
                         : 0;
+  } else {
+    // -1 with no samples: fall back to save_interval
+    traj_interval = save_interval;
   }
 
   // Setup trajectory file
@@ -395,6 +400,38 @@ inline void Simulation::run() {
     check_file.close();
 
     if (resumed_from_checkpoint && file_exists) {
+      // Truncate to the last complete line — removes any partial writes or
+      // null bytes left by a previous SIGTERM at a chain-job boundary.
+      {
+        std::fstream repair(trajectory_file,
+                            std::ios::in | std::ios::out | std::ios::binary);
+        if (repair.good()) {
+          repair.seekg(0, std::ios::end);
+          long long fsize = static_cast<long long>(repair.tellg());
+          if (fsize > 0) {
+            // Scan backwards to find the last newline preceded by valid data
+            long long scan_limit = std::min(fsize, (long long)8192);
+            std::vector<char> tail(scan_limit);
+            repair.seekg(fsize - scan_limit);
+            repair.read(tail.data(), scan_limit);
+            long long good_end = 0;
+            for (long long i = scan_limit - 1; i >= 0; --i) {
+              if (tail[i] == '\n' && i > 0 && tail[i - 1] != '\0') {
+                // Found a newline preceded by a non-null byte — this is
+                // the end of the last complete, uncorrupted line.
+                good_end = (fsize - scan_limit) + i + 1;
+                break;
+              }
+            }
+            if (good_end > 0 && good_end < fsize) {
+              std::filesystem::resize_file(trajectory_file, good_end);
+              printf("Trajectory repair: truncated from %lld to %lld bytes "
+                     "(removed %lld bytes of partial/corrupt data)\n",
+                     fsize, good_end, fsize - good_end);
+            }
+          }
+        }
+      }
       // Append to existing trajectory file
       printf("Trajectory output: appending (every %d steps)\n", traj_interval);
     } else {
@@ -429,6 +466,13 @@ inline void Simulation::run() {
   int effective_print_interval = (print_interval > 0) ? print_interval : save_interval;
 
   while (current_time < domain.params.t_end) {
+    // Check for SIGTERM (SLURM walltime limit) — clean shutdown
+    if (g_shutdown_requested) {
+      printf("\nSIGTERM received — shutting down cleanly at step %d, t=%.4f\n",
+             current_step, current_time);
+      fflush(stdout);
+      break;
+    }
     // Determine if we need to sync polarization for trajectory output
     // We check (current_step + 1) because we're about to increment it
     bool need_polarization_sync = (traj_interval > 0) && 
@@ -506,11 +550,21 @@ inline void Simulation::run() {
     save_trajectory();
   }
 
+  // Always save a final checkpoint for chain resumability
+  vtk_writer.wait();
+  save_current_checkpoint(output_dir + "/checkpoint.bin");
+
   if (save_vtk) {
     save_output(); // Save final state
   }
   vtk_writer.wait();  // Ensure all async writes complete before exit
-  printf("Simulation complete: %d steps, t=%.2f\n", current_step, current_time);
+  if (g_shutdown_requested) {
+    printf("Clean shutdown complete: checkpoint + trajectory saved at step %d, t=%.2f\n",
+           current_step, current_time);
+  } else {
+    printf("Simulation complete: %d steps, t=%.2f\n", current_step, current_time);
+  }
+  fflush(stdout);
   
 #ifdef DIAGNOSTICS_ENABLED
   // Free diagnostic buffers
@@ -639,6 +693,7 @@ inline void Simulation::save_trajectory() {
          << cell->polarization.y << " " << cell->theta << " "
          << h_v_A[i] << " " << L_n << "\n";
   }
+  file.flush();  // Explicit flush before close — survives SIGTERM between flush and destructor
   file.close();
 }
 
@@ -671,11 +726,21 @@ inline void Simulation::save_current_checkpoint(const std::string &filename) {
                num_cells * sizeof(float), cudaMemcpyDeviceToHost);
   }
 
+  // Copy per-cell target radius from GPU for checkpoint persistence
+  std::vector<float> h_target_radius;
+  if (integrator.d_target_radius != nullptr && num_cells > 0) {
+    h_target_radius.resize(num_cells);
+    cudaMemcpy(h_target_radius.data(), integrator.d_target_radius,
+               num_cells * sizeof(float), cudaMemcpyDeviceToHost);
+  }
+
   save_checkpoint(domain, filename, header,
                   h_v_A.empty() ? nullptr : h_v_A.data(),
                   static_cast<int>(h_v_A.size()),
                   h_gamma.empty() ? nullptr : h_gamma.data(),
-                  static_cast<int>(h_gamma.size()));
+                  static_cast<int>(h_gamma.size()),
+                  h_target_radius.empty() ? nullptr : h_target_radius.data(),
+                  static_cast<int>(h_target_radius.size()));
 }
 
 inline void Simulation::print_diagnostics() const {

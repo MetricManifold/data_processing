@@ -172,6 +172,7 @@ Integrator::Integrator(Method m)
       d_polarization_x(nullptr), d_polarization_y(nullptr), d_theta(nullptr),
       d_v_A(nullptr),
       d_gamma(nullptr),
+      d_target_radius(nullptr), d_target_area(nullptr), d_volume_coeff(nullptr),
       d_centroids_x(nullptr), d_centroids_y(nullptr),
       d_perimeters(nullptr),
       d_neighbor_counts(nullptr), d_neighbor_lists(nullptr),
@@ -321,7 +322,7 @@ size_t Integrator::compute_max_page_size(const SimParams &params) {
   // This is determined by the physics parameters and bbox update logic:
   //   half_size = max_dist + adaptive_margin + overshoot
   //   max_dist  = R + 3*lambda  (phi > threshold extent)
-  //   adaptive_margin = int(2*lambda) + halo
+  //   adaptive_margin = int(3*lambda) + halo   *** MUST match kernels_solver.cu ***
   //   overshoot = int(0.25 * adaptive_margin)  (emergency grow case)
   //   bbox_with_halo adds +halo to each side
   // We add an extra safety margin of 10 pixels.
@@ -336,7 +337,7 @@ size_t Integrator::compute_max_page_size(const SimParams &params) {
     lambda_eff = params.lambda * sqrtf(params.gamma / (params.gamma - params.adhesion_J / 2.0f));
   }
   int halo = params.halo_width;
-  int adaptive_margin = static_cast<int>(2.0f * lambda_eff) + halo;
+  int adaptive_margin = static_cast<int>(3.0f * lambda_eff) + halo;
   int overshoot = static_cast<int>(0.25f * adaptive_margin);
   int max_dist = static_cast<int>(params.target_radius + 3.0f * lambda_eff) + 1;
   int max_half = max_dist + adaptive_margin + overshoot + 10; // safety
@@ -564,6 +565,9 @@ void Integrator::allocate_reduction_arrays(int num_cells) {
   CUDA_CHECK(cudaMalloc(&d_theta, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_v_A, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_gamma, new_capacity * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_target_radius, new_capacity * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_target_area, new_capacity * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_volume_coeff, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_centroids_x, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_centroids_y, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_perimeters, new_capacity * sizeof(float)));
@@ -679,6 +683,18 @@ void Integrator::free_reduction_arrays() {
   if (d_gamma) {
     cudaFree(d_gamma);
     d_gamma = nullptr;
+  }
+  if (d_target_radius) {
+    cudaFree(d_target_radius);
+    d_target_radius = nullptr;
+  }
+  if (d_target_area) {
+    cudaFree(d_target_area);
+    d_target_area = nullptr;
+  }
+  if (d_volume_coeff) {
+    cudaFree(d_volume_coeff);
+    d_volume_coeff = nullptr;
   }
   if (d_rng_states) {
     cudaFree(d_rng_states);
@@ -913,18 +929,104 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
       }
       cudaMemcpy(d_gamma, h_gamma.data(), num_cells * sizeof(float),
                  cudaMemcpyHostToDevice);
+    }
 
-      // Diagnostic: verify d_gamma is correct on GPU
-      {
-        std::vector<float> verify(num_cells);
-        cudaMemcpy(verify.data(), d_gamma, num_cells * sizeof(float), cudaMemcpyDeviceToHost);
-        int bad = 0;
+    // Initialize per-cell target radius and derived arrays (target_area, volume_coeff)
+    // Priority: checkpoint values > radius_overrides > uniform params.target_radius
+    {
+      std::vector<float> h_radius(num_cells);
+      if (!checkpoint_target_radius.empty() &&
+          static_cast<int>(checkpoint_target_radius.size()) == num_cells) {
+        h_radius = checkpoint_target_radius;
+        printf("Per-cell radius: restored %d values from checkpoint\n", num_cells);
+        float r_min = *std::min_element(h_radius.begin(), h_radius.end());
+        float r_max = *std::max_element(h_radius.begin(), h_radius.end());
+        printf("  Restored range: [%.2f, %.2f]\n", r_min, r_max);
+        checkpoint_target_radius.clear();
+      } else if (radius_overrides_set) {
+        // Start with base radius for all cells
         for (int i = 0; i < num_cells; ++i) {
-          if (verify[i] != h_gamma[i]) { bad++; if (bad <= 5) printf("  GAMMA MISMATCH cell %d: expected %.4f got %.4f\n", i, h_gamma[i], verify[i]); }
+          h_radius[i] = params.target_radius;
         }
-        if (bad > 0) printf("  GAMMA VERIFY: %d/%d cells MISMATCHED!\n", bad, num_cells);
-        else printf("  GAMMA VERIFY: all %d cells correct (%.4f)\n", num_cells, h_gamma[0]);
+        std::vector<bool> assigned(num_cells, false);
+
+        // Pass 1: CV type — Gaussian distribution (overrides all cells)
+        for (const auto &ov : radius_overrides) {
+          if (ov.type != SimParams::RadiusOverride::Type::CV) continue;
+          float mean = ov.value;
+          float sigma = mean * ov.cv;
+          printf("Per-cell radius: Gaussian(mean=%.2f, CV=%.2f, sigma=%.2f)\n",
+                 mean, ov.cv, sigma);
+          for (int i = 0; i < num_cells; ++i) {
+            float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+            float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+            float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI * u2);
+            float r = mean + sigma * z;
+            // Clamp to [0.5*mean, 1.5*mean] to avoid pathological sizes
+            r = fmaxf(0.5f * mean, fminf(1.5f * mean, r));
+            h_radius[i] = r;
+            assigned[i] = true;
+          }
+        }
+
+        // Pass 2: Fraction-based overrides (random selection)
+        for (const auto &ov : radius_overrides) {
+          if (ov.type != SimParams::RadiusOverride::Type::Fraction) continue;
+          int count = static_cast<int>(ov.fraction * num_cells + 0.5f);
+          std::vector<int> eligible;
+          for (int i = 0; i < num_cells; ++i) {
+            if (!assigned[i]) eligible.push_back(i);
+          }
+          int n = std::min(count, static_cast<int>(eligible.size()));
+          for (int i = 0; i < n; ++i) {
+            int j = i + rand() % (static_cast<int>(eligible.size()) - i);
+            std::swap(eligible[i], eligible[j]);
+          }
+          for (int i = 0; i < n; ++i) {
+            h_radius[eligible[i]] = ov.value;
+            assigned[eligible[i]] = true;
+          }
+          printf("Per-cell radius: %.1f%% (%d cells) set to %.2f\n",
+                 ov.fraction * 100.0f, n, ov.value);
+        }
+
+        // Pass 3: Cell-specific overrides (highest priority)
+        for (const auto &ov : radius_overrides) {
+          if (ov.type != SimParams::RadiusOverride::Type::Cells) continue;
+          for (int id : ov.cell_ids) {
+            if (id >= 0 && id < num_cells) {
+              h_radius[id] = ov.value;
+            }
+          }
+          printf("Per-cell radius: %d specific cell(s) set to %.2f\n",
+                 static_cast<int>(ov.cell_ids.size()), ov.value);
+        }
+
+        float r_min = *std::min_element(h_radius.begin(), h_radius.end());
+        float r_max = *std::max_element(h_radius.begin(), h_radius.end());
+        printf("Per-cell radius: range [%.2f, %.2f]\n", r_min, r_max);
+      } else {
+        // Uniform: all cells get params.target_radius
+        for (int i = 0; i < num_cells; ++i) {
+          h_radius[i] = params.target_radius;
+        }
       }
+
+      // Compute derived arrays
+      std::vector<float> h_target_area(num_cells);
+      std::vector<float> h_volume_coeff(num_cells);
+      for (int i = 0; i < num_cells; ++i) {
+        h_target_area[i] = static_cast<float>(M_PI) * h_radius[i] * h_radius[i];
+        h_volume_coeff[i] = params.mu / h_target_area[i];
+      }
+
+      // Upload all three arrays
+      cudaMemcpy(d_target_radius, h_radius.data(), num_cells * sizeof(float),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_target_area, h_target_area.data(), num_cells * sizeof(float),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_volume_coeff, h_volume_coeff.data(), num_cells * sizeof(float),
+                 cudaMemcpyHostToDevice);
     }
 
     // Initialize RNG states with time-based seed
@@ -1055,9 +1157,12 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
              d_neighbor_counts, d_neighbor_lists,
              d_v_A,
              d_gamma,
+             d_target_area,
+             d_volume_coeff,
              d_perimeters,
              current_sum_field,
              current_sum_field_linear,
+             nullptr,  // next_sum_field disabled (fused scatter was 37% slower)
              cached_max_size, cached_max_w, cached_max_h,
              sync_centroids,
              rebuild_neighbors,

@@ -2,6 +2,7 @@
 #include "simulation3d.cuh"
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -14,6 +15,20 @@
 #endif
 
 using namespace cellsim;
+
+//=============================================================================
+// Graceful shutdown on SIGTERM (SLURM walltime limit)
+//=============================================================================
+
+// Global flag checked by simulation run loops.  When set, the current step
+// completes, a final checkpoint + trajectory flush is written, and the
+// process exits cleanly.  This prevents null-byte corruption in trajectory
+// files at SLURM chain-job boundaries.
+volatile std::sig_atomic_t g_shutdown_requested = 0;
+
+static void sigterm_handler(int /*sig*/) {
+  g_shutdown_requested = 1;
+}
 
 //=============================================================================
 // JSON Initial Conditions Loading (simplified for NVCC compatibility)
@@ -189,80 +204,154 @@ static bool parse_gamma_arg(const char *arg, cellsim::SimParams &params,
   return true;
 }
 
+static bool parse_radius_arg(const char *arg, cellsim::SimParams &params,
+                            std::vector<cellsim::SimParams::RadiusOverride> &overrides,
+                            bool &overrides_set) {
+  std::string s(arg);
+  auto colon = s.find(':');
+  if (colon == std::string::npos) {
+    // Bare value: set base target_radius (used for unassigned cells)
+    params.target_radius = static_cast<float>(atof(arg));
+    return true;
+  }
+  // Value:Selector
+  float value = static_cast<float>(atof(s.substr(0, colon).c_str()));
+  std::string selector = s.substr(colon + 1);
+  if (selector.empty()) {
+    fprintf(stderr, "Error: --radius %s has empty selector after ':'\n", arg);
+    return false;
+  }
+  cellsim::SimParams::RadiusOverride ov;
+  ov.value = value;
+  ov.fraction = 0.0f;
+  ov.cv = 0.0f;
+  if (selector.substr(0, 2) == "cv") {
+    // CV selector: "cv0.10" → Gaussian with coefficient of variation
+    ov.type = cellsim::SimParams::RadiusOverride::Type::CV;
+    ov.cv = static_cast<float>(atof(selector.substr(2).c_str()));
+    if (ov.cv <= 0.0f || ov.cv > 1.0f) {
+      fprintf(stderr, "Error: --radius %s CV must be 0-1 (got %.3f)\n", arg, ov.cv);
+      return false;
+    }
+  } else if (selector.back() == '%') {
+    // Fraction selector: "20%"
+    ov.type = cellsim::SimParams::RadiusOverride::Type::Fraction;
+    ov.fraction = static_cast<float>(atof(selector.c_str())) / 100.0f;
+    if (ov.fraction <= 0.0f || ov.fraction > 1.0f) {
+      fprintf(stderr, "Error: --radius %s fraction must be 0-100%%\n", arg);
+      return false;
+    }
+  } else if (selector.substr(0, 4) == "cell") {
+    // Cell selector: "cell0" or "cell0,5,12"
+    ov.type = cellsim::SimParams::RadiusOverride::Type::Cells;
+    std::string ids_str = selector.substr(4);
+    size_t pos = 0;
+    while (pos < ids_str.size()) {
+      size_t comma = ids_str.find(',', pos);
+      if (comma == std::string::npos) comma = ids_str.size();
+      int id = atoi(ids_str.substr(pos, comma - pos).c_str());
+      ov.cell_ids.push_back(id);
+      pos = comma + 1;
+    }
+    if (ov.cell_ids.empty()) {
+      fprintf(stderr, "Error: --radius %s has no cell IDs after 'cell'\n", arg);
+      return false;
+    }
+  } else {
+    fprintf(stderr, "Error: --radius %s unknown selector '%s' (use N%%, cellN, or cvN)\n",
+            arg, selector.c_str());
+    return false;
+  }
+  overrides.push_back(ov);
+  overrides_set = true;
+  return true;
+}
+
 void print_usage(const char *program) {
+  // Construct defaults from the same sources main() uses, so help can never drift.
+  cellsim::SimParams p;    // struct defaults (gamma, kappa, mu, xi, tau, v_A, lambda, ...)
+  // main() overrides these before arg parsing:
+  p.Nx = 256; p.Ny = 256; p.dt = 0.01f; p.t_end = 100.0f; p.target_radius = 20.0f;
+  int    def_n_cells             = 8;
+  int    def_save_interval       = 100;
+  int    def_trajectory_samples  = 100;
+  float  def_confluence          = 0.85f;
+
   printf("Usage: %s [options]\n", program);
-  printf("Options:\n");
-  printf("  --3d          Run 3D simulation (default: 2D)\n");
-  printf("  -n <num>      Number of cells (default: 8)\n");
-  printf("  -r <radius>   Cell radius (default: 20)\n");
-  printf("  -s <space>    Minimum spacing between cells (default: auto)\n");
-  printf("  -N <size>     Domain size NxN (2D) or NxNxN (3D) (default: 256)\n");
-  printf("  -Nz <size>    Z dimension for 3D (default: same as N)\n");
-  printf("  -t <time>     End time (default: 100)\n");
-  printf("  -dt <step>    Time step (default: 0.01)\n");
-  printf("  -o <dir>      Output directory (default: ./output)\n");
-  printf("  -c <file>     Load from checkpoint (resume simulation)\n");
-  printf("  -i <file>     Load initial conditions from JSON file\n");
-  printf(
-      "  --edge-test   Place 3 cells at edges/corners for boundary testing\n");
-  printf("  --corner-push-test  Stress test: corner cell + clustered cells "
-         "pushing it\n");
-  printf("  --no-self-propulsion  Disable active self-propulsion (v_A = 0)\n");
-  printf("  --use-diagnostics     Enable volume/shape computation (disabled by "
-         "default for speed)\n");
-  printf("  --save-interval <n>   Steps between VTK saves (0 = no saves, "
-         "default: 100)\n");
-  printf("  --print-interval <n>  Steps between progress output (-1 = use "
-         "save_interval, default: -1)\n");
-  printf("  --subdomain-padding <f>  Cell window size as multiple of R "
-         "(default: 2.0, use 3.0 for ~6R window)\n");
-  printf(
-      "  --save-final-checkpoint  Save checkpoint at end (for job chaining)\n");
-  printf("  --checkpoint-interval <n>  Steps between checkpoints (default: "
-         "save_interval*10)\n");
-  printf("  --seed <n>    Random seed for reproducible initial conditions\n");
-  printf("  --trajectory-samples <n>  Number of trajectory samples to save "
-         "(default: 100)\n");
-  printf("  --trajectory-interval <n>  Steps between trajectory saves (-1 = "
-         "use save_interval)\n");
-  printf("  --observable-interval <n>  Steps between GPU diagnostic measurements "
-         "(energy, stress, contacts; requires -DENABLE_DIAGNOSTICS=ON)\n");
-  printf("  --stress-fields  Include stress tensor fields (σ_xx, σ_yy, σ_xy, P) "
-         "in VTK output (requires -DENABLE_STRESS_FIELDS=ON)\n");
-  printf("  --v-A <f>     Active motility velocity (default: from params)\n");
-  printf("  --tau <f>     Reorientation time (default: 10000)\n");
-  printf("  --gamma <f[:selector]>  Stiffness / gradient coefficient (default: 1.0).\n"
-         "                          Repeat with selector for heterogeneous populations:\n"
-         "                            --gamma 1.0           Base value for all cells\n"
-         "                            --gamma 0.35:20%%      20%% of cells get gamma=0.35\n"
-         "                            --gamma 0.35:cell0     Cell 0 gets gamma=0.35\n"
-         "                            --gamma 0.35:cell0,5   Cells 0 and 5 get gamma=0.35\n"
-         "                          Processing order: base -> fractions (random) -> cells\n");
-  printf("  --soft-cell <id>  [Deprecated: use --gamma V:cellN] Make cell <id> soft\n");
-  printf("  --gamma-soft <f>  [Deprecated: use --gamma V:cellN] Stiffness for soft cell (default: 0.35)\n");
-  printf("  --kappa <f>   Interaction strength (default: 10.0)\n");
-  printf("  --mu <f>      Volume constraint strength (default: 1.0)\n");
-  printf("  --xi <f>      Friction coefficient (default: 1500)\n");
-  printf("  --abp         Use Active Brownian Particle model instead of "
-         "Run-and-Tumble\n");
-  printf("  --adhesion <J>  Adhesion strength J (default: 0 = off). "
-         "Adds -J*Σφ_j attraction.\n");
-  printf("  --save-individual-fields  Save individual cell fields for energy "
-         "analysis\n");
-  printf("  --grid        Use FCC lattice initialization (for high "
-         "confluence)\n");
-  printf("  --sc-grid     Use simple cubic grid instead of FCC lattice\n");
-  printf("  --confluence <f>  Target confluence 0-1 (default: 0.85). Works with "
-         "random or grid init\n");
-  printf("  -h            Show this help\n");
+  printf("\nPhase field cell simulation (2D/3D). GPU-accelerated with CUDA.\n");
+  printf("Checkpoint-compatible across resume, chain jobs, and CUDA/MPI backends.\n\n");
+
+  printf("  -n <num>        Number of cells (default: %d)\n", def_n_cells);
+  printf("  -r <radius>     Cell target radius R (default: %.0f). Production: 49\n", p.target_radius);
+  printf("  -N <size>       Domain size LxL (2D) or LxLxL (3D) (default: %d)\n", p.Nx);
+  printf("                  Production formula: L = 1562 * sqrt(N_cells / 288) for R=49 at 89%% confluence\n");
+  printf("  -Nz <size>      Z dimension for 3D (default: same as -N)\n");
+  printf("  -s <space>      Minimum spacing between cells (default: auto)\n");
+  printf("  --3d            Run 3D simulation (default: 2D)\n");
+  printf("  --confluence <f>  Target packing fraction 0-1 (default: %.2f). Standard production: 0.89\n", def_confluence);
+  printf("  -t <time>       End time (default: %.0f). Equilibration: 80000, production: 880000\n", p.t_end);
+  printf("  -dt <step>      Time step (default: %.2f). Smaller = more accurate but slower\n", p.dt);
+  printf("  --v-A <f>       Active motility velocity (default: %.1f). Typical: 0.004-0.05\n", p.v_A);
+  printf("  --v-A-sigma <f> Std dev for per-cell v_A disorder (default: %.1f). Griffiths studies\n", p.v_A_sigma);
+  printf("  --tau <f>       Reorientation/persistence time (default: %.0f)\n", p.tau);
+  printf("  --gamma <f[:selector]>  Gradient coefficient gamma (default: %.1f).\n", p.gamma);
+  printf("                  Controls cell stiffness. Palmieri: 1.0, Bresler: 3.75\n");
+  printf("                  Repeat for heterogeneous populations:\n");
+  printf("                    --gamma 1.0           Base value for all cells\n");
+  printf("                    --gamma 0.35:20%%      20%% of cells get gamma=0.35\n");
+  printf("                    --gamma 0.35:cell0,5   Cells 0 and 5 get gamma=0.35\n");
+  printf("                  Order: base -> fractions (random assign) -> cells (override)\n");
+  printf("  --radius <f[:selector]>  Per-cell target radius (default: same as -r).\n");
+  printf("                  Enables polydisperse populations (different-sized cells).\n");
+  printf("                  Each cell gets its own target_area = pi*R^2 and volume_coeff = mu/A0.\n");
+  printf("                  Repeat for heterogeneous populations:\n");
+  printf("                    --radius 20           Base radius for all cells\n");
+  printf("                    --radius 15:25%%       25%% of cells get R=15\n");
+  printf("                    --radius 20:cv0.10    Gaussian dist with mean=20, CV=10%%\n");
+  printf("                    --radius 15:cell0     Cell 0 gets R=15\n");
+  printf("                  Order: cv (all) -> fractions (random) -> cells (override)\n");
+  printf("  --kappa <f>     Cell-cell repulsion kappa (default: %.1f)\n", p.kappa);
+  printf("  --mu <f>        Volume constraint strength mu (default: %.1f). Bresler: 0.5\n", p.mu);
+  printf("  --xi <f>        Friction coefficient xi (default: %.0f). Bresler: 1000\n", p.xi);
+  printf("  --adhesion <J>  Adhesion strength J (default: %.1f, 0 = off). Adds -J*sum(phi_j)\n", p.adhesion_J);
+  printf("  --abp           Use Active Brownian Particle model instead of Run-and-Tumble\n");
+  printf("  -o <dir>        Output directory (default: ./output)\n");
+  printf("  -c <file>       Resume from checkpoint file (inherits geometry + physics)\n");
+  printf("  -i <file>       Load initial conditions from JSON file\n");
+  printf("  --save-interval <n>   Steps between VTK frame saves (default: %d, 0 = disabled)\n", def_save_interval);
+  printf("                        Production: use 0 (VTK disabled). Trajectory data is sufficient.\n");
+  printf("  --print-interval <n>  Steps between progress output (default: -1 = use save_interval)\n");
+  printf("  --save-final-checkpoint  Save checkpoint.bin at simulation end (for job chaining)\n");
+  printf("  --checkpoint-interval <n>  Steps between checkpoint saves (default: -1 = save_interval * 10)\n");
+  printf("  --trajectory-samples <n>  Total trajectory snapshots over the run (default: %d). Production: 2000\n", def_trajectory_samples);
+  printf("  --trajectory-interval <n>  Steps between trajectory saves (default: -1 = auto from samples)\n");
+  printf("  --seed <n>      Random seed (default: time-based). For reproducible runs\n");
+  printf("  --use-diagnostics       Enable volume/shape computation (slower)\n");
+  printf("  --observable-interval <n>  Steps between GPU diagnostic measurements\n");
+  printf("                            (energy, stress, contacts; requires -DENABLE_DIAGNOSTICS=ON)\n");
+  printf("  --stress-fields         Include stress tensor fields in VTK output\n");
+  printf("                          (requires -DENABLE_STRESS_FIELDS=ON)\n");
+  printf("  --save-individual-fields  Save per-cell phi fields for energy analysis\n");
+  printf("  --subdomain-padding <f>  Cell window size as multiple of R (default: %.1f)\n", p.subdomain_padding);
+  printf("  --safe-mode     Limit memory allocation to prevent runaway VRAM usage\n");
+  printf("\nParameter set reference:\n");
+  printf("  Palmieri:  --gamma 1.0 --kappa 10 --mu 1.0 --xi 1500 (binary defaults)\n");
+  printf("  Bresler:   --gamma 3.75 --kappa 10 --mu 0.5 --xi 1000\n");
+  printf("  Production (288c, R=49, phi=0.89):  -n 288 -r 49 --confluence 0.89\n");
+  printf("  Equilibration:  --v-A 0 -t 80000 --save-interval 0 --trajectory-samples 0\n");
+  printf("  Motility run:   --v-A 0.008 -t 880000 --trajectory-samples 2000 --save-interval 0\n");
+  printf("\n  -h            Show this help\n");
 }
 
 int main(int argc, char *argv[]) {
+  // Register SIGTERM handler for clean SLURM chain-job transitions
+  std::signal(SIGTERM, sigterm_handler);
+
   // Default parameters
   SimParams params;
   params.Nx = 256;
   params.Ny = 256;
-  params.dt = 0.02f;
+  params.dt = 0.01f;
   params.t_end = 100.0f;
   params.target_radius = 20.0f;
 
@@ -270,9 +359,9 @@ int main(int argc, char *argv[]) {
   bool run_3d = false;
   int Nz = -1; // -1 means use same as Nx/Ny
   bool domain_size_set = false; // Track if user explicitly set -N
+  bool confluence_set = false;  // Track if user explicitly set --confluence
 
   int num_cells = 8;
-  float radius = 20.0f;
   float min_spacing =
       -1.0f; // -1 means auto-calculate based on radius and cell count
   std::string output_dir = "./output";
@@ -280,30 +369,36 @@ int main(int argc, char *argv[]) {
   std::string init_file = "";  // JSON initial conditions file
   bool edge_test = false;
   bool corner_push_test = false;
-  bool no_self_propulsion = false;
   bool use_diagnostics = false;
   bool save_final_checkpoint = false;
   bool save_individual_fields =
       false; // Save individual cell fields for energy analysis
   int save_interval = 100;
+  bool save_interval_set = false;
   int print_interval = -1; // -1 means use save_interval
   int checkpoint_interval = -1; // -1 means use save_interval * 10
+  bool checkpoint_interval_set = false;
   int random_seed = -1;         // -1 means use time-based seed
   int trajectory_samples = 100; // Number of trajectory data points to save
+  bool trajectory_samples_set = false;
   int trajectory_interval =
       -1; // -1 = use save_interval, 0 = compute from samples, >0 = explicit
+  bool trajectory_interval_set = false;
   int observable_interval = 0; // 0 = disabled, >0 = GPU diagnostic measurements
   bool stress_fields = false;  // Include stress tensor fields in VTK output
   float v_A_override = -1.0f; // -1 means use default from params
   float tau_override = -1.0f;  // -1 means use default from params
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
   bool safe_mode = false;   // Limit memory allocation to 1GB
-  bool use_grid_init = false; // Use grid-based initialization instead of random
   bool use_fcc = true;        // Use FCC lattice (default) vs simple cubic
-  float confluence = 0.85f;   // Target confluence for grid initialization
+  float confluence = -1.0f;   // -1 = not set (must provide -N or --confluence)
   bool subdomain_padding_set = false; // Track if user explicitly set padding
+  bool adhesion_J_set = false; // Track if user explicitly set --adhesion
+  bool gamma_base_set = false; // Track if bare --gamma was already set
   std::vector<cellsim::SimParams::GammaOverride> gamma_overrides;
   bool gamma_overrides_set = false;
+  std::vector<cellsim::SimParams::RadiusOverride> radius_overrides;
+  bool radius_overrides_set = false;
 
   // Parse command line
   for (int i = 1; i < argc; ++i) {
@@ -315,9 +410,13 @@ int main(int argc, char *argv[]) {
       Nz = atoi(argv[++i]);
     } else if (arg == "-n" && i + 1 < argc) {
       num_cells = atoi(argv[++i]);
+    } else if (arg == "--radius" && i + 1 < argc) {
+      if (!parse_radius_arg(argv[++i], params, radius_overrides, radius_overrides_set)) {
+        return 1;
+      }
     } else if (arg == "-r" && i + 1 < argc) {
-      radius = atof(argv[++i]);
-      params.target_radius = radius;
+      // -r is shorthand for --radius (bare value only)
+      params.target_radius = static_cast<float>(atof(argv[++i]));
     } else if (arg == "-N" && i + 1 < argc) {
       int size = atoi(argv[++i]);
       params.Nx = size;
@@ -342,12 +441,11 @@ int main(int argc, char *argv[]) {
       num_cells = 3;
     } else if (arg == "--corner-push-test") {
       corner_push_test = true;
-    } else if (arg == "--no-self-propulsion") {
-      no_self_propulsion = true;
     } else if (arg == "--use-diagnostics") {
       use_diagnostics = true;
     } else if (arg == "--save-interval" && i + 1 < argc) {
       save_interval = atoi(argv[++i]);
+      save_interval_set = true;
     } else if (arg == "--print-interval" && i + 1 < argc) {
       print_interval = atoi(argv[++i]);
     } else if (arg == "--subdomain-padding" && i + 1 < argc) {
@@ -357,12 +455,15 @@ int main(int argc, char *argv[]) {
       save_final_checkpoint = true;
     } else if (arg == "--checkpoint-interval" && i + 1 < argc) {
       checkpoint_interval = atoi(argv[++i]);
+      checkpoint_interval_set = true;
     } else if (arg == "--seed" && i + 1 < argc) {
       random_seed = atoi(argv[++i]);
     } else if (arg == "--trajectory-samples" && i + 1 < argc) {
       trajectory_samples = atoi(argv[++i]);
+      trajectory_samples_set = true;
     } else if (arg == "--trajectory-interval" && i + 1 < argc) {
       trajectory_interval = atoi(argv[++i]);
+      trajectory_interval_set = true;
     } else if (arg == "--observable-interval" && i + 1 < argc) {
       observable_interval = atoi(argv[++i]);
     } else if (arg == "--stress-fields") {
@@ -376,15 +477,18 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--abp") {
       use_abp = true;
     } else if (arg == "--gamma" && i + 1 < argc) {
-      if (!parse_gamma_arg(argv[++i], params, gamma_overrides, gamma_overrides_set)) {
+      // Check for duplicate bare --gamma (conflict)
+      const char *gval = argv[++i];
+      std::string gs(gval);
+      bool is_bare = (gs.find(':') == std::string::npos);
+      if (is_bare && gamma_base_set) {
+        fprintf(stderr, "ERROR: --gamma base value specified multiple times. Use a single bare --gamma for the base.\n");
         return 1;
       }
-    } else if (arg == "--soft-cell" && i + 1 < argc) {
-      // Deprecated: convert to gamma_override internally
-      params.soft_cell_id = atoi(argv[++i]);
-    } else if (arg == "--gamma-soft" && i + 1 < argc) {
-      // Deprecated: will be combined with --soft-cell after arg parsing
-      params.gamma_soft = atof(argv[++i]);
+      if (!parse_gamma_arg(gval, params, gamma_overrides, gamma_overrides_set)) {
+        return 1;
+      }
+      if (is_bare) gamma_base_set = true;
     } else if (arg == "--kappa" && i + 1 < argc) {
       params.kappa = atof(argv[++i]);
     } else if (arg == "--mu" && i + 1 < argc) {
@@ -393,22 +497,14 @@ int main(int argc, char *argv[]) {
       params.xi = atof(argv[++i]);
     } else if (arg == "--adhesion" && i + 1 < argc) {
       params.adhesion_J = atof(argv[++i]);
+      adhesion_J_set = true;
     } else if (arg == "--save-individual-fields") {
       save_individual_fields = true;
     } else if (arg == "--safe-mode") {
-      // Limit memory allocation to prevent runaway GPU memory usage
       safe_mode = true;
-    } else if (arg == "--grid") {
-      // Use FCC grid-based initialization for high confluence
-      use_grid_init = true;
-    } else if (arg == "--sc-grid") {
-      // Use simple cubic grid (legacy)
-      use_grid_init = true;
-      use_fcc = false;
     } else if (arg == "--confluence" && i + 1 < argc) {
       confluence = atof(argv[++i]);
-      // --confluence no longer implies --grid; it just sets the target confluence
-      // for domain size calculation. Use --grid or --sc-grid to select lattice init.
+      confluence_set = true;
     } else if (arg == "-h") {
       print_usage(argv[0]);
       return 0;
@@ -419,22 +515,32 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // gamma_overrides live outside SimParams (SimParams is raw-serialized in
-  // checkpoints and can't contain std::vector).
+  // =========================================================================
+  // Post-parse validation: detect conflicting flags
+  // =========================================================================
 
-  // Convert deprecated --soft-cell/--gamma-soft to gamma_overrides
-  if (params.soft_cell_id >= 0 && !gamma_overrides_set) {
-    cellsim::SimParams::GammaOverride ov;
-    ov.value = params.gamma_soft;
-    ov.type = cellsim::SimParams::GammaOverride::Type::Cells;
-    ov.fraction = 0.0f;
-    ov.cell_ids.push_back(params.soft_cell_id);
-    gamma_overrides.push_back(ov);
-    gamma_overrides_set = true;
-    printf("Note: --soft-cell/--gamma-soft is deprecated. "
-           "Use --gamma %.4f:cell%d instead.\n",
-           params.gamma_soft, params.soft_cell_id);
+  // #1: -N and --confluence are mutually exclusive
+  if (domain_size_set && confluence_set) {
+    fprintf(stderr, "ERROR: Both -N (domain size) and --confluence specified. Use one or the other.\n");
+    return 1;
   }
+
+  // #5: --trajectory-samples and --trajectory-interval are mutually exclusive
+  if (trajectory_samples_set && trajectory_interval_set) {
+    fprintf(stderr, "ERROR: Both --trajectory-samples and --trajectory-interval specified. Use one or the other.\n");
+    return 1;
+  }
+
+  // #10: For fresh starts (no checkpoint), require -N or --confluence
+  if (checkpoint_file.empty() && init_file.empty() && !domain_size_set && !confluence_set) {
+    // No domain size info provided — use default confluence
+    confluence = 0.85f;
+    confluence_set = true;
+    printf("Note: No -N or --confluence specified. Using default confluence=0.85.\n");
+  }
+
+  // Use target_radius for local radius variable (used in domain sizing)
+  float radius = params.target_radius;
 
 // Create output directory
 #ifdef _WIN32
@@ -451,10 +557,8 @@ int main(int argc, char *argv[]) {
     srand(static_cast<unsigned>(time(nullptr)));
   }
 
-  // Apply no-self-propulsion flag or v_A override
-  if (no_self_propulsion) {
-    params.v_A = 0.0f;
-  } else if (v_A_override >= 0.0f) {
+  // Apply v_A override
+  if (v_A_override >= 0.0f) {
     params.v_A = v_A_override;
   }
   
@@ -535,10 +639,9 @@ int main(int argc, char *argv[]) {
     params3d.lambda = params.lambda;
     params3d.gamma = params.gamma;
     params3d.kappa = params.kappa;
+    params3d.mu = params.mu;
     params3d.target_radius = radius;
-    params3d.v_A = no_self_propulsion
-                       ? 0.0f
-                       : (v_A_override >= 0.0f ? v_A_override : params.v_A);
+    params3d.v_A = (v_A_override >= 0.0f) ? v_A_override : params.v_A;
     params3d.xi = params.xi;
     params3d.tau = params.tau;
     params3d.motility_model = use_abp ? SimParams::MotilityModel::ABP
@@ -596,8 +699,10 @@ int main(int argc, char *argv[]) {
     Simulation3D sim3d(params3d);
     sim3d.output_dir = output_dir;
     sim3d.save_interval = save_interval;
-    sim3d.trajectory_interval =
-        (trajectory_interval > 0) ? trajectory_interval : save_interval;
+    sim3d.print_interval = print_interval;
+    sim3d.checkpoint_interval = checkpoint_interval;
+    sim3d.trajectory_samples = trajectory_samples;
+    sim3d.trajectory_interval = trajectory_interval;
     sim3d.save_individual_fields_flag = save_individual_fields;
 
     // Initialize or load checkpoint
@@ -625,23 +730,39 @@ int main(int argc, char *argv[]) {
 
       if (sim3d.load_checkpoint(checkpoint_file.c_str())) {
         resumed = true;
+        sim3d.resumed_from_checkpoint = true;
         printf("Resumed 3D from checkpoint: step=%d, t=%.4f\n",
                sim3d.current_step, sim3d.current_time);
+
+        // Apply CLI overrides (same logic as 2D)
+        sim3d.domain.params.t_end = params.t_end;
+
+        if (v_A_override >= 0.0f) {
+          sim3d.domain.params.v_A = v_A_override;
+        }
+
+        // Override physics from CLI
+        sim3d.domain.params.gamma = params.gamma;
+        sim3d.domain.params.kappa = params.kappa;
+        sim3d.domain.params.mu = params.mu;
+        sim3d.domain.params.xi = params.xi;
+        sim3d.domain.params.tau = params.tau;
+
+        // Restore save/trajectory settings from CLI
+        sim3d.save_interval = save_interval;
+        sim3d.print_interval = print_interval;
+        sim3d.checkpoint_interval = checkpoint_interval;
+        sim3d.trajectory_samples = trajectory_samples;
+        sim3d.trajectory_interval = trajectory_interval;
+
+        fflush(stdout);
       } else {
         printf("Warning: Could not load 3D checkpoint, starting fresh\n");
       }
     }
 
     if (!resumed) {
-      if (use_grid_init) {
-        if (use_fcc) {
-          // FCC lattice — most spherical Voronoi cells
-          sim3d.initialize_grid_fcc(num_cells, radius, confluence);
-        } else {
-          // Simple cubic grid (legacy)
-          sim3d.initialize_grid(num_cells, radius, confluence);
-        }
-      } else {
+      {
         // Random placement mode
         if (min_spacing < 0) {
           // Auto-calculate min_spacing based on domain and cell count
@@ -718,6 +839,18 @@ int main(int argc, char *argv[]) {
     radius = params.target_radius;
   }
 
+  // #10: Auto-compute 2D domain size from confluence if not explicitly set
+  if (!domain_size_set && confluence_set && checkpoint_file.empty()) {
+    float cell_area = M_PI * radius * radius;
+    float total_area = num_cells * cell_area;
+    float domain_area = total_area / confluence;
+    int N = static_cast<int>(ceilf(sqrtf(domain_area)));
+    params.Nx = N;
+    params.Ny = N;
+    printf("Auto-computed 2D domain size N=%d for %d cells, R=%.0f, confluence=%.0f%%\n",
+           N, num_cells, radius, confluence * 100.0f);
+  }
+
   // Create simulation
   Simulation sim(params);
   sim.output_dir = output_dir;
@@ -726,6 +859,11 @@ int main(int argc, char *argv[]) {
   if (gamma_overrides_set) {
     sim.gamma_overrides = gamma_overrides;
     sim.gamma_overrides_set = true;
+  }
+  // Pass radius overrides (live on Simulation, not SimParams)
+  if (radius_overrides_set) {
+    sim.radius_overrides = radius_overrides;
+    sim.radius_overrides_set = true;
   }
   sim.print_interval = print_interval;
   sim.checkpoint_interval = checkpoint_interval;
@@ -748,33 +886,14 @@ int main(int argc, char *argv[]) {
   sim.save_vtk = (save_interval > 0);
   sim.save_individual_fields = save_individual_fields;
 
-  // Track whether runtime options were explicitly set on command line
-  bool save_interval_set = false;
-  bool checkpoint_interval_set = false;
-  bool trajectory_samples_set = false;
-  bool trajectory_interval_set = false;
-
-  // Re-parse to detect explicit settings (bit of a hack, but simple)
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    if (arg == "--save-interval")
-      save_interval_set = true;
-    else if (arg == "--checkpoint-interval")
-      checkpoint_interval_set = true;
-    else if (arg == "--trajectory-samples")
-      trajectory_samples_set = true;
-    else if (arg == "--trajectory-interval")
-      trajectory_interval_set = true;
-  }
-
   // Initialize
   bool resumed = false;
   if (!checkpoint_file.empty()) {
     // Save command-line overrides before loading checkpoint (which overwrites
     // params)
     float cmd_t_end = params.t_end;
-    float cmd_v_A = params.v_A; // Save v_A in case user overrode it
-    float cmd_adhesion_J = params.adhesion_J; // Save adhesion in case user overrode it
+    float cmd_dt = params.dt;
+    float cmd_v_A = params.v_A;
     int cmd_save_interval = save_interval;
     int cmd_checkpoint_interval = checkpoint_interval;
     int cmd_trajectory_samples = trajectory_samples;
@@ -810,17 +929,45 @@ int main(int argc, char *argv[]) {
       // time)
       sim.domain.params.t_end = cmd_t_end;
 
-      // Restore adhesion_J from command line (checkpoint stores J=0 from
-      // equilibration, but quench experiments need the CLI-specified value)
-      if (cmd_adhesion_J > 0.0f) {
-        sim.domain.params.adhesion_J = cmd_adhesion_J;
+      // #8: Always restore physics parameters from CLI (checkpoint stores
+      // equilibration values; production runs may use different params).
+      // Print info when overriding.
+      auto &cp = sim.domain.params;
+      if (cp.dt != cmd_dt) {
+        printf("  Override dt: %.4f -> %.4f\n", cp.dt, cmd_dt);
+        cp.dt = cmd_dt;
+      }
+      if (cp.gamma != params.gamma) {
+        printf("  Override gamma: %.4f -> %.4f\n", cp.gamma, params.gamma);
+        cp.gamma = params.gamma;
+      }
+      if (cp.kappa != params.kappa) {
+        printf("  Override kappa: %.4f -> %.4f\n", cp.kappa, params.kappa);
+        cp.kappa = params.kappa;
+      }
+      if (cp.mu != params.mu) {
+        printf("  Override mu: %.4f -> %.4f\n", cp.mu, params.mu);
+        cp.mu = params.mu;
+      }
+      if (cp.xi != params.xi) {
+        printf("  Override xi: %.1f -> %.1f\n", cp.xi, params.xi);
+        cp.xi = params.xi;
+      }
+
+      // #7: Restore adhesion_J unconditionally when explicitly set (allows --adhesion 0)
+      if (adhesion_J_set) {
+        if (cp.adhesion_J != params.adhesion_J) {
+          printf("  Override adhesion_J: %.4f -> %.4f\n", cp.adhesion_J, params.adhesion_J);
+        }
+        cp.adhesion_J = params.adhesion_J;
       }
 
       // Restore v_A if user explicitly overrode it
-      if (no_self_propulsion) {
-        sim.domain.params.v_A = 0.0f;
-      } else if (v_A_override >= 0.0f) {
-        sim.domain.params.v_A = v_A_override;
+      if (v_A_override >= 0.0f) {
+        if (cp.v_A != v_A_override) {
+          printf("  Override v_A: %.6f -> %.6f\n", cp.v_A, v_A_override);
+        }
+        cp.v_A = v_A_override;
       }
 
       // If user specified --v-A or --v-A-sigma on command line, regenerate
@@ -832,12 +979,20 @@ int main(int argc, char *argv[]) {
         printf("  Per-cell v_A will be regenerated (--v-A or --v-A-sigma specified)\n");
       }
 
-      // If user specified gamma overrides (or deprecated --soft-cell), regenerate per-cell gamma
+      // If user specified gamma overrides, regenerate per-cell gamma
       if (gamma_overrides_set) {
         sim.loaded_gamma.clear();
         sim.gamma_overrides = gamma_overrides;
         sim.gamma_overrides_set = true;
         printf("  Per-cell gamma will be regenerated (--gamma overrides specified)\n");
+      }
+
+      // If user specified radius overrides, regenerate per-cell radius
+      if (radius_overrides_set) {
+        sim.loaded_target_radius.clear();
+        sim.radius_overrides = radius_overrides;
+        sim.radius_overrides_set = true;
+        printf("  Per-cell radius will be regenerated (--radius overrides specified)\n");
       }
 
       // Apply command-line overrides for runtime options if specified

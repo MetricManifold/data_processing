@@ -31,6 +31,7 @@ public:
 
   // Pre-allocated device arrays for interaction computation
   FieldType3D **d_all_phi_ptrs;
+  FieldType3D **d_all_phi_out_ptrs;  // Double-buffer output pointers
   int *d_all_widths;
   int *d_all_heights;
   int *d_all_depths;
@@ -90,6 +91,7 @@ public:
 
   // Cached max dimensions (avoids per-step host loop over cells)
   int cached_max_size;
+  int cached_max_w, cached_max_h, cached_max_d;
   bool cached_dims_valid;
 
   // Fused kernel centroid sums precomputed flag
@@ -158,7 +160,8 @@ public:
 
 inline Integrator3D::Integrator3D(Method m)
     : method(m), d_work_buffer(nullptr), work_buffer_size(0), num_streams(0),
-      d_all_phi_ptrs(nullptr), d_all_widths(nullptr), d_all_heights(nullptr),
+      d_all_phi_ptrs(nullptr), d_all_phi_out_ptrs(nullptr),
+      d_all_widths(nullptr), d_all_heights(nullptr),
       d_all_depths(nullptr), d_all_offsets_x(nullptr), d_all_offsets_y(nullptr),
       d_all_offsets_z(nullptr), d_all_field_sizes(nullptr),
       interaction_array_capacity(0), d_volumes(nullptr), d_integrals_x(nullptr),
@@ -175,7 +178,8 @@ inline Integrator3D::Integrator3D(Method m)
       d_sum_field(nullptr), d_sum_field_b(nullptr), sum_field_capacity(0),
       sum_field_clear_stream(nullptr), sum_field_read_done_event(nullptr),
       sum_field_clear_done_event(nullptr), use_fused_kernel(false),
-      cached_max_size(0), cached_dims_valid(false), centroid_sums_ready(false),
+      cached_max_size(0), cached_max_w(0), cached_max_h(0), cached_max_d(0),
+      cached_dims_valid(false), centroid_sums_ready(false),
       d_phi_pool(nullptr), pool_slot_size(0), pool_num_cells(0), pool_active(false),
       d_grid_counts(nullptr), d_grid_cells(nullptr),
       d_rng_states(nullptr), rng_states_capacity(0), rng_initialized(false) {}
@@ -261,6 +265,7 @@ inline void Integrator3D::allocate_interaction_arrays(int num_cells) {
   free_interaction_arrays();
 
   cudaMalloc(&d_all_phi_ptrs, num_cells * sizeof(FieldType3D *));
+  cudaMalloc(&d_all_phi_out_ptrs, num_cells * sizeof(FieldType3D *));
   cudaMalloc(&d_all_widths, num_cells * sizeof(int));
   cudaMalloc(&d_all_heights, num_cells * sizeof(int));
   cudaMalloc(&d_all_depths, num_cells * sizeof(int));
@@ -295,6 +300,8 @@ inline void Integrator3D::allocate_interaction_arrays(int num_cells) {
 inline void Integrator3D::free_interaction_arrays() {
   if (d_all_phi_ptrs)
     cudaFree(d_all_phi_ptrs);
+  if (d_all_phi_out_ptrs)
+    cudaFree(d_all_phi_out_ptrs);
   if (d_all_widths)
     cudaFree(d_all_widths);
   if (d_all_heights)
@@ -315,6 +322,7 @@ inline void Integrator3D::free_interaction_arrays() {
     cudaFree(d_neighbor_lists);
 
   d_all_phi_ptrs = nullptr;
+  d_all_phi_out_ptrs = nullptr;
   d_all_widths = nullptr;
   d_all_heights = nullptr;
   d_all_depths = nullptr;
@@ -333,12 +341,14 @@ inline void Integrator3D::update_interaction_arrays(const Domain3D &domain) {
   allocate_interaction_arrays(n);
 
   std::vector<FieldType3D *> phi_ptrs(n);
+  std::vector<FieldType3D *> phi_out_ptrs(n);
   std::vector<int> widths(n), heights(n), depths(n);
   std::vector<int> offsets_x(n), offsets_y(n), offsets_z(n);
   std::vector<int> field_sizes(n);
 
   for (int i = 0; i < n; ++i) {
     phi_ptrs[i] = domain.cells[i]->d_phi;
+    phi_out_ptrs[i] = domain.cells[i]->d_dphi_dt;  // Output buffer (second half of pool)
     widths[i] = domain.cells[i]->width();
     heights[i] = domain.cells[i]->height();
     depths[i] = domain.cells[i]->depth();
@@ -349,6 +359,8 @@ inline void Integrator3D::update_interaction_arrays(const Domain3D &domain) {
   }
 
   cudaMemcpy(d_all_phi_ptrs, phi_ptrs.data(), n * sizeof(FieldType3D *),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(d_all_phi_out_ptrs, phi_out_ptrs.data(), n * sizeof(FieldType3D *),
              cudaMemcpyHostToDevice);
   cudaMemcpy(d_all_widths, widths.data(), n * sizeof(int),
              cudaMemcpyHostToDevice);
@@ -601,8 +613,13 @@ inline void Integrator3D::step(Domain3D &domain, float dt, bool sync_to_host) {
   // Cache max dimensions (avoids host loop every step)
   if (!cached_dims_valid) {
     cached_max_size = 0;
-    for (int i = 0; i < num_cells; ++i)
+    cached_max_w = 0; cached_max_h = 0; cached_max_d = 0;
+    for (int i = 0; i < num_cells; ++i) {
       cached_max_size = std::max(cached_max_size, domain.cells[i]->field_size);
+      cached_max_w = std::max(cached_max_w, domain.cells[i]->width());
+      cached_max_h = std::max(cached_max_h, domain.cells[i]->height());
+      cached_max_d = std::max(cached_max_d, domain.cells[i]->depth());
+    }
     cached_dims_valid = true;
   }
 
@@ -728,9 +745,6 @@ inline void Integrator3D::step(Domain3D &domain, float dt, bool sync_to_host) {
           d_centroids_x, d_centroids_y, d_centroids_z,
           d_volume_deviations, d_centroid_sums, d_volumes,
           target_volume, dV,
-          d_velocities_x, d_velocities_y, d_velocities_z,
-          d_polarization_x, d_polarization_y, d_polarization_z,
-          params.v_A,
           params.Nx, params.Ny, params.Nz, num_cells);
     }
 
@@ -794,6 +808,7 @@ inline void Integrator3D::step(Domain3D &domain, float dt, bool sync_to_host) {
     // 7. FUSED KERNEL: Euler step + centroid/volume accumulation
     kernel_fused_step_3d<<<grid, block>>>(
         (float **)d_all_phi_ptrs,
+        (float **)d_all_phi_out_ptrs,
         d_all_widths, d_all_heights, d_all_depths, d_all_field_sizes,
         d_all_offsets_x, d_all_offsets_y, d_all_offsets_z,
         (num_cells > 1) ? current_sum_field : nullptr,
@@ -809,6 +824,15 @@ inline void Integrator3D::step(Domain3D &domain, float dt, bool sync_to_host) {
 #ifdef ENABLE_KERNEL_PROFILING
     cudaEventRecord(ev[4]); // after fused kernel
 #endif
+
+    // Double-buffer swap: fused kernel wrote new phi to phi_out_ptrs.
+    // Swap so d_phi points to updated data for next step's reads.
+    {
+      int swap_threads = 256;
+      int swap_blocks = (num_cells + swap_threads - 1) / swap_threads;
+      kernel_swap_phi_ptrs<<<swap_blocks, swap_threads>>>(
+          (float **)d_all_phi_ptrs, (float **)d_all_phi_out_ptrs, num_cells);
+    }
 
     // 8. Async clear of used sum field on side stream (hides latency)
     if (num_cells > 1) {

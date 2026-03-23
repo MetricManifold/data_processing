@@ -271,12 +271,6 @@ __global__ void kernel_ref_centroid_vel_fused_3d(
     float *__restrict__ centroids_z, float *__restrict__ volume_deviations,
     const float *__restrict__ centroid_sums, const float *__restrict__ volumes,
     float target_volume, float dV,
-    float *__restrict__ velocities_x, float *__restrict__ velocities_y,
-    float *__restrict__ velocities_z,
-    const float *__restrict__ polarizations_x,
-    const float *__restrict__ polarizations_y,
-    const float *__restrict__ polarizations_z,
-    float v_A,
     int Nx, int Ny, int Nz, int num_cells);
 
 //=============================================================================
@@ -302,8 +296,15 @@ __global__ void kernel_scatter_phi_sq_3d(
 // Eliminates all work buffers. Everything in registers.
 // Also accumulates volume + centroid sums via block-level shared-mem reduction.
 //=============================================================================
+// GPU-side phi pointer swap (shared with 2D, declared in kernels_shared.cu)
+__global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs, int num_cells);
+
+//=============================================================================
+// Fused step kernel for 3D
+//=============================================================================
 __global__ void kernel_fused_step_3d(
     float **__restrict__ phi_ptrs,
+    float **__restrict__ phi_out_ptrs,
     const int *__restrict__ widths,
     const int *__restrict__ heights,
     const int *__restrict__ depths,

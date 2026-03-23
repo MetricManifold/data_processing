@@ -455,12 +455,21 @@ inline bool Cell3D::update_bounding_box(const SimParams3D &params,
   int half_h = static_cast<int>(max_dist_y) + adaptive_margin;
   int half_d = static_cast<int>(max_dist_z) + adaptive_margin;
 
-  // Minimum size only needs to accommodate the minimum subdomain size
-  // (no R*padding floor — let the bbox track the actual cell shape)
+  // Minimum size
   int min_half = params.min_subdomain_size / 2;
   half_w = max(half_w, min_half);
   half_h = max(half_h, min_half);
   half_d = max(half_d, min_half);
+
+  // Cap bbox to theoretical maximum: R + 3λ + adaptive_margin + safety.
+  // Interaction tails beyond this are captured by the sum field and don't
+  // need their own bbox voxels. This prevents runaway bbox growth at high
+  // confluence (which penalizes ALL cells via max_field_size kernel launch).
+  int max_half = static_cast<int>(params.target_radius + 3.0f * params.lambda)
+                 + adaptive_margin + 4;
+  half_w = min(half_w, max_half);
+  half_h = min(half_h, max_half);
+  half_d = min(half_d, max_half);
 
   // New bounding box centered on centroid
   BoundingBox3D new_bbox = {new_cx - half_w, new_cy - half_h, new_cz - half_d,

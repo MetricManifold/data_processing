@@ -73,6 +73,12 @@ public:
   std::vector<float> checkpoint_gamma; // Per-cell gamma loaded from checkpoint
   std::vector<SimParams::GammaOverride> gamma_overrides; // CLI --gamma V:selector overrides
   bool gamma_overrides_set = false;
+  float *d_target_radius;     // Per-cell target radius
+  float *d_target_area;       // Per-cell target area = π*R²
+  float *d_volume_coeff;      // Per-cell volume constraint coefficient = μ/A₀
+  std::vector<float> checkpoint_target_radius; // Per-cell radius from checkpoint
+  std::vector<SimParams::RadiusOverride> radius_overrides; // CLI --radius V:selector overrides
+  bool radius_overrides_set = false;
   float *d_centroids_x;       // Computed centroids X (GPU-side)
   float *d_centroids_y;       // Computed centroids Y (GPU-side)
   float *d_perimeters;        // Per-cell ∫|∇φ| dA (for normalized perimeter L_n)

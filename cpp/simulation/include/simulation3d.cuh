@@ -4,9 +4,17 @@
 #include "integrator3d.cuh"
 #include "types3d.cuh"
 #include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <string>
 #include <thread>
+#include <vector>
+
+// Defined in main.cu — set by SIGTERM handler for clean SLURM shutdown
+extern volatile std::sig_atomic_t g_shutdown_requested;
 
 namespace cellsim {
 
@@ -62,13 +70,17 @@ public:
 
   // Simulation state
   int current_step;
-  float current_time;
+  double current_time;  // double to avoid float32 precision loss at large t
 
   // Output settings
   std::string output_dir;
   int save_interval;
-  int trajectory_interval;
+  int print_interval;         // Steps between progress output (-1 = use save_interval)
+  int checkpoint_interval;    // Steps between checkpoints (-1 = save_interval*10)
+  int trajectory_samples;     // Number of trajectory data points to save
+  int trajectory_interval;    // Steps between trajectory saves (-1 = auto, 0 = from samples)
   bool save_individual_fields_flag;
+  bool resumed_from_checkpoint;
 
   // Timing
   std::chrono::steady_clock::time_point start_time;
@@ -94,6 +106,7 @@ public:
   void save_checkpoint();
   void save_vtk();
   void save_individual_cell_fields();
+  void save_trajectory();
 
   // Print status
   void print_status();
@@ -104,8 +117,10 @@ public:
 //=============================================================================
 
 inline Simulation3D::Simulation3D(const SimParams3D &params)
-    : domain(params), current_step(0), current_time(0), save_interval(100),
-      trajectory_interval(100), save_individual_fields_flag(false) {}
+    : domain(params), current_step(0), current_time(0.0), save_interval(100),
+      print_interval(-1), checkpoint_interval(-1), trajectory_samples(100),
+      trajectory_interval(-1), save_individual_fields_flag(false),
+      resumed_from_checkpoint(false) {}
 
 inline void Simulation3D::initialize_random(int num_cells, float radius,
                                             float min_spacing) {
@@ -154,7 +169,10 @@ inline void Simulation3D::initialize_grid(int num_cells, float radius,
 }
 
 inline bool Simulation3D::load_checkpoint(const char *filename) {
-  return load_checkpoint_3d(filename, domain, current_step, current_time);
+  float loaded_time = 0.0f;
+  bool ok = load_checkpoint_3d(filename, domain, current_step, loaded_time);
+  current_time = static_cast<double>(loaded_time);
+  return ok;
 }
 
 inline void Simulation3D::run(float t_end) {
@@ -162,6 +180,77 @@ inline void Simulation3D::run(float t_end) {
 
   printf("Starting 3D simulation: t_end=%.2f, dt=%.4f\n", t_end,
          domain.params.dt);
+
+  // Compute trajectory save interval (same logic as 2D)
+  // trajectory_interval: -1 = auto, 0 = compute from samples, >0 = use directly
+  int total_steps =
+      static_cast<int>((t_end - current_time) / domain.params.dt);
+  int traj_interval;
+  if (trajectory_interval > 0) {
+    traj_interval = trajectory_interval;
+  } else if (trajectory_interval == 0 || (trajectory_interval == -1 && trajectory_samples > 0)) {
+    traj_interval = (trajectory_samples > 0)
+                        ? std::max(1, total_steps / trajectory_samples)
+                        : 0;
+  } else {
+    traj_interval = save_interval;
+  }
+
+  // Setup trajectory file
+  if (traj_interval > 0) {
+    std::string trajectory_file = output_dir + "/trajectory.txt";
+    std::ifstream check_file(trajectory_file);
+    if (check_file.good() && resumed_from_checkpoint) {
+      check_file.close();
+      // Truncate to the last complete line — removes any partial writes or
+      // null bytes left by a previous SIGTERM at a chain-job boundary.
+      {
+        std::fstream repair(trajectory_file,
+                            std::ios::in | std::ios::out | std::ios::binary);
+        if (repair.good()) {
+          repair.seekg(0, std::ios::end);
+          long long fsize = static_cast<long long>(repair.tellg());
+          if (fsize > 0) {
+            long long scan_limit = std::min(fsize, (long long)8192);
+            std::vector<char> tail(scan_limit);
+            repair.seekg(fsize - scan_limit);
+            repair.read(tail.data(), scan_limit);
+            long long good_end = 0;
+            for (long long i = scan_limit - 1; i >= 0; --i) {
+              if (tail[i] == '\n' && i > 0 && tail[i - 1] != '\0') {
+                good_end = (fsize - scan_limit) + i + 1;
+                break;
+              }
+            }
+            if (good_end > 0 && good_end < fsize) {
+              std::filesystem::resize_file(trajectory_file, good_end);
+              printf("Trajectory repair: truncated from %lld to %lld bytes "
+                     "(removed %lld bytes of partial/corrupt data)\n",
+                     fsize, good_end, fsize - good_end);
+            }
+          }
+        }
+      }
+      printf("Trajectory output: appending (every %d steps)\n", traj_interval);
+    } else {
+      std::ofstream hdr(trajectory_file, std::ios::trunc);
+      hdr << "# 3D Trajectory data\n";
+      hdr << "# Format: time cell_id x y z vx vy vz px py pz theta phi_pol v_A_i\n";
+      hdr << "# dim=3"
+          << " v_A=" << domain.params.v_A
+          << " N=" << domain.num_cells()
+          << " Lx=" << domain.params.Nx
+          << " Ly=" << domain.params.Ny
+          << " Lz=" << domain.params.Nz
+          << "\n";
+      hdr.close();
+      printf("Trajectory output: every %d steps\n", traj_interval);
+    }
+  }
+
+  // Print interval (same as 2D: use print_interval if set, else save_interval, else 10000)
+  int effective_print_interval = (print_interval > 0) ? print_interval
+                                  : (save_interval > 0) ? save_interval : 10000;
 
   // Do first step to trigger all lazy allocations
   step(true);  // Sync on first step for memory profiling
@@ -212,36 +301,46 @@ inline void Simulation3D::run(float t_end) {
     printf("================================================\n\n");
   }
 
-  // Timing analysis: measure true per-step throughput
-  static int timing_count = 0;
-  static double timing_total_ms = 0;
-  auto last_step_time = std::chrono::steady_clock::now();
+  // Checkpoint interval (same as 2D: default = save_interval*10, or 50000 if save_interval=0)
+  int ckpt_interval = (checkpoint_interval > 0) ? checkpoint_interval
+                       : (save_interval > 0) ? save_interval * 10 : 50000;
+
+  // Save initial trajectory point (same as 2D)
+  if (traj_interval > 0 && !resumed_from_checkpoint) {
+    save_trajectory();
+  }
 
   while (current_time < t_end) {
-    // Determine if we need host data this step (for print/save)
+    // Check for SIGTERM (SLURM walltime limit) — clean shutdown
+    if (g_shutdown_requested) {
+      printf("\nSIGTERM received — shutting down cleanly at step %d, t=%.4f\n",
+             current_step, current_time);
+      fflush(stdout);
+      break;
+    }
+    // Determine if we need host data this step
     int next_step = current_step + 1;
-    bool need_host_sync = (next_step % 50 == 0) ||  // print_status
-                          (save_interval > 0 && next_step % save_interval == 0);  // checkpoint
+    bool need_host_sync = (effective_print_interval > 0 && next_step % effective_print_interval == 0) ||
+                          (save_interval > 0 && next_step % save_interval == 0) ||
+                          (traj_interval > 0 && next_step % traj_interval == 0) ||
+                          (ckpt_interval > 0 && next_step % ckpt_interval == 0);
 
     step(need_host_sync);
 
-    // Periodic timing measurement
-    timing_count++;
-    if (timing_count % 100 == 0) {
-      cudaDeviceSynchronize();
-      auto now = std::chrono::steady_clock::now();
-      double ms = std::chrono::duration_cast<std::chrono::microseconds>(now - last_step_time).count() / 1000.0;
-      printf("[TIMING] Last 100 steps: %.1f ms total = %.2f ms/step (%.1f steps/s)\n",
-             ms, ms/100.0, 100000.0/ms);
-      last_step_time = now;
-    }
-
-    if (current_step % 50 == 0) {
+    if (effective_print_interval > 0 && current_step % effective_print_interval == 0) {
       print_status();
     }
 
-    if (save_interval > 0 && current_step % save_interval == 0) {
+    if (traj_interval > 0 && current_step % traj_interval == 0) {
+      save_trajectory();
+    }
+
+    // Periodic checkpoint (independent of VTK, for chain reliability)
+    if (ckpt_interval > 0 && current_step % ckpt_interval == 0) {
       save_checkpoint();
+    }
+
+    if (save_interval > 0 && current_step % save_interval == 0) {
       save_vtk();
       if (save_individual_fields_flag) {
         save_individual_cell_fields();
@@ -249,9 +348,13 @@ inline void Simulation3D::run(float t_end) {
     }
   }
 
-  // Always save final frame (regardless of save_interval alignment)
+  // Always save final trajectory + checkpoint
+  if (traj_interval > 0 && current_step % traj_interval != 0) {
+    save_trajectory();
+  }
+  // Always save checkpoint for chain resumability
+  save_checkpoint();
   if (save_interval > 0 && current_step % save_interval != 0) {
-    save_checkpoint();
     save_vtk();
     if (save_individual_fields_flag) {
       save_individual_cell_fields();
@@ -265,9 +368,15 @@ inline void Simulation3D::run(float t_end) {
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       end_time - start_time);
 
-  printf("\n3D Simulation complete: %d steps, t=%.2f\n", current_step,
-         current_time);
+  if (g_shutdown_requested) {
+    printf("\nClean shutdown complete: checkpoint + trajectory saved at step %d, t=%.2f\n",
+           current_step, current_time);
+  } else {
+    printf("\n3D Simulation complete: %d steps, t=%.2f\n", current_step,
+           current_time);
+  }
   printf("Total wall time: %.3f seconds\n", elapsed.count() / 1000.0);
+  fflush(stdout);
   
   // Print kernel profiling results if enabled
   print_3d_kernel_profile();
@@ -281,19 +390,17 @@ inline void Simulation3D::step(bool sync_to_host) {
   integrator.step(domain, dt, sync_to_host);
 
   current_step++;
-  current_time += dt;
+  current_time += static_cast<double>(dt);  // double avoids precision loss at large t
 }
 
 inline void Simulation3D::save_checkpoint() {
   if (output_dir.empty())
     return;
 
-  char filename[256];
-  snprintf(filename, sizeof(filename), "%s/checkpoint_3d_%06d.bin",
-           output_dir.c_str(), current_step);
-
-  // Use async writer: D→H copy blocks briefly, then file write overlaps with GPU
-  async_writer.submit(domain, current_step, current_time, std::string(filename));
+  // Always overwrite checkpoint.bin (same as 2D, for chain resumability)
+  std::string filename = output_dir + "/checkpoint.bin";
+  async_writer.submit(domain, current_step, static_cast<float>(current_time),
+                      filename);
   printf("Saved 3D checkpoint: step=%d, t=%.4f, cells=%d\n", current_step,
          current_time, domain.num_cells());
 }
@@ -318,6 +425,27 @@ inline void Simulation3D::save_individual_cell_fields() {
              output_dir.c_str(), domain.cells[i]->id, current_step);
     save_cell_vtk_3d(filename, *domain.cells[i], domain.params);
   }
+}
+
+inline void Simulation3D::save_trajectory() {
+  if (output_dir.empty()) return;
+  int num_cells = domain.num_cells();
+  std::string trajectory_file = output_dir + "/trajectory.txt";
+
+  std::ofstream file(trajectory_file, std::ios::app);
+  file << std::fixed << std::setprecision(6);
+  for (int i = 0; i < num_cells; ++i) {
+    const auto &cell = domain.cells[i];
+    file << current_time << " " << cell->id
+         << " " << cell->centroid.x << " " << cell->centroid.y << " " << cell->centroid.z
+         << " " << cell->velocity.x << " " << cell->velocity.y << " " << cell->velocity.z
+         << " " << cell->polarization.x << " " << cell->polarization.y << " " << cell->polarization.z
+         << " " << cell->theta << " " << cell->phi_pol
+         << " " << domain.params.v_A
+         << "\n";
+  }
+  file.flush();  // Explicit flush before close — survives SIGTERM between flush and destructor
+  file.close();
 }
 
 inline void Simulation3D::print_status() {

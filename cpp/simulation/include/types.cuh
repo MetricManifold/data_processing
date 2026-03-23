@@ -42,7 +42,7 @@ struct SimParams {
   float dy = 1.0f; // Grid spacing y
 
   // Time stepping
-  float dt = 0.02f;        // Time step
+  float dt = 0.01f;        // Time step (Palmieri SI S5: dt = 0.01)
   float t_end = 100.0f;    // End time
   int save_interval = 100; // Steps between saves
 
@@ -97,6 +97,17 @@ struct SimParams {
   };
   // NOTE: gamma_overrides live on Simulation/Integrator, NOT here,
   // because SimParams is raw-serialized in checkpoints (no std::vector allowed).
+
+  // Per-cell radius overrides (population or per-cell)
+  // Parsed from repeated --radius flags: --radius 49 --radius 40:20% --radius 49:cv0.10
+  struct RadiusOverride {
+    float value;
+    enum class Type { Fraction, Cells, CV } type;
+    float fraction;             // used when type == Fraction (0-1)
+    std::vector<int> cell_ids;  // used when type == Cells
+    float cv;                   // used when type == CV (coefficient of variation)
+  };
+  // NOTE: radius_overrides live on Simulation/Integrator, NOT here.
 
   // Legacy: --soft-cell / --gamma-soft (backward compat, maps to gamma_overrides)
   int soft_cell_id = -1;
