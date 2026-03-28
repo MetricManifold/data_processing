@@ -166,7 +166,9 @@ Integrator::Integrator(Method m)
       d_all_offsets_x(nullptr), d_all_offsets_y(nullptr),
       d_all_field_sizes(nullptr), interaction_array_capacity(0),
       d_volumes(nullptr), d_integrals_x(nullptr), d_integrals_y(nullptr),
-      d_centroid_sums(nullptr), reduction_array_capacity(0),
+      d_centroid_sums(nullptr), d_reduction_block(nullptr),
+      d_block_arrival(nullptr),
+      reduction_block_floats(0), reduction_array_capacity(0),
       d_volume_deviations(nullptr), d_velocities_x(nullptr),
       d_velocities_y(nullptr), d_ref_x(nullptr), d_ref_y(nullptr),
       d_polarization_x(nullptr), d_polarization_y(nullptr), d_theta(nullptr),
@@ -549,15 +551,24 @@ void Integrator::allocate_reduction_arrays(int num_cells) {
   new_capacity = std::max(new_capacity, static_cast<size_t>(16));
 
   CUDA_CHECK(cudaMalloc(&d_volumes, new_capacity * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_integrals_x, new_capacity * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_integrals_y, new_capacity * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_centroid_sums,
-             new_capacity * 3 * sizeof(float))); // 3 values per cell
+
+  // Allocate reduction arrays as one contiguous block for single-memset zeroing.
+  // Layout: [integrals_x (N) | integrals_y (N) | perimeters (N) | block_arrival (N) | centroid_sums (3N)]
+  reduction_block_floats = 7 * new_capacity;
+  CUDA_CHECK(cudaMalloc(&d_reduction_block, reduction_block_floats * sizeof(float)));
+  d_integrals_x  = d_reduction_block;
+  d_integrals_y  = d_reduction_block + new_capacity;
+  d_perimeters   = d_reduction_block + 2 * new_capacity;
+  d_block_arrival = reinterpret_cast<int*>(d_reduction_block + 3 * new_capacity);
+  d_centroid_sums = d_reduction_block + 4 * new_capacity;
 
   // Additional arrays for GPU-side computation
   CUDA_CHECK(cudaMalloc(&d_volume_deviations, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_velocities_x, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_velocities_y, new_capacity * sizeof(float)));
+  // Zero-init: first step uses v=0 for advection before velocity integral runs
+  cudaMemset(d_velocities_x, 0, new_capacity * sizeof(float));
+  cudaMemset(d_velocities_y, 0, new_capacity * sizeof(float));
   CUDA_CHECK(cudaMalloc(&d_ref_x, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_ref_y, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_polarization_x, new_capacity * sizeof(float)));
@@ -570,7 +581,7 @@ void Integrator::allocate_reduction_arrays(int num_cells) {
   CUDA_CHECK(cudaMalloc(&d_volume_coeff, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_centroids_x, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_centroids_y, new_capacity * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_perimeters, new_capacity * sizeof(float)));
+  // d_perimeters is already allocated as part of d_reduction_block above
 
   // Neighbor list arrays for V4 optimization
   CUDA_CHECK(cudaMalloc(&d_neighbor_counts, new_capacity * sizeof(int)));
@@ -611,21 +622,15 @@ void Integrator::free_reduction_arrays() {
     cudaFree(d_volumes);
     d_volumes = nullptr;
   }
-  if (d_integrals_x) {
-    cudaFree(d_integrals_x);
+  // d_integrals_x/y, d_perimeters, d_block_arrival, d_centroid_sums are aliases into d_reduction_block
+  if (d_reduction_block) {
+    cudaFree(d_reduction_block);
+    d_reduction_block = nullptr;
     d_integrals_x = nullptr;
-  }
-  if (d_integrals_y) {
-    cudaFree(d_integrals_y);
     d_integrals_y = nullptr;
-  }
-  if (d_centroid_sums) {
-    cudaFree(d_centroid_sums);
     d_centroid_sums = nullptr;
-  }
-  if (d_perimeters) {
-    cudaFree(d_perimeters);
     d_perimeters = nullptr;
+    d_block_arrival = nullptr;
   }
   // Free persistent kernel arrays
   if (d_volume_deviations) {
@@ -1138,15 +1143,21 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     }
   }
 
+  // Ping-pong sum field: for small cell counts, the fused kernel scatters NEW phi²
+  // to next_sum_field inline (saves a kernel launch). For large cell counts,
+  // atomicAdd contention makes inline scatter slower — use standalone kernel instead.
+  float *next_sum_field_for_scatter = nullptr;
+  bool use_inline_scatter = (num_cells <= 2048);
+  if (d_sum_field && use_inline_scatter) {
+    next_sum_field_for_scatter = (step_counter % 2 == 0) ? d_sum_field_b : d_sum_field;
+  }
+
   // Ping-pong linear sum field (adhesion): same strategy, nullptr when J=0
   float *current_sum_field_linear = nullptr;
   if (d_sum_field_linear && params.adhesion_J > 0.0f) {
     current_sum_field_linear = (step_counter % 2 == 0) ? d_sum_field_linear : d_sum_field_linear_b;
-    // Uses same clear stream/events as quadratic field — both cleared together
   }
 
-  // V4 path: neighbor-list optimization (O(k) instead of O(N²))
-  // Inline narrow-band skip in batched kernels handles interior/exterior skipping.
   step_fused(domain, dt, d_all_phi_ptrs, d_all_phi_out_ptrs,
              d_all_widths,
              d_all_heights, d_all_offsets_x, d_all_offsets_y,
@@ -1160,9 +1171,10 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
              d_target_area,
              d_volume_coeff,
              d_perimeters,
+             d_block_arrival,
              current_sum_field,
              current_sum_field_linear,
-             nullptr,  // next_sum_field disabled (fused scatter was 37% slower)
+             next_sum_field_for_scatter,
              cached_max_size, cached_max_w, cached_max_h,
              sync_centroids,
              rebuild_neighbors,

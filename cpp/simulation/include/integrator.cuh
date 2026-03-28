@@ -53,9 +53,12 @@ public:
 
   // Device arrays for fused reduction outputs
   float *d_volumes;       // Volume integral per cell
-  float *d_integrals_x;   // Motility integral X per cell
-  float *d_integrals_y;   // Motility integral Y per cell
-  float *d_centroid_sums; // Centroid sums: [dx*phi², dy*phi², phi²] per cell
+  float *d_integrals_x;   // Motility integral X per cell (alias into d_reduction_block)
+  float *d_integrals_y;   // Motility integral Y per cell (alias into d_reduction_block)
+  float *d_centroid_sums; // Centroid sums: [dx*phi², dy*phi², phi²] per cell (alias)
+  float *d_reduction_block; // Contiguous block: [integrals_x | integrals_y | perimeters | block_arrival | centroid_sums]
+  size_t reduction_block_floats; // Total floats in the block (7 * capacity)
+  int *d_block_arrival;   // Block arrival counter per cell (alias into d_reduction_block)
   size_t reduction_array_capacity; // Capacity for reduction arrays
 
   // Additional arrays for GPU-side computation
