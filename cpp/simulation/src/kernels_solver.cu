@@ -33,9 +33,20 @@ __global__ void kernel_pre_step(
     float *__restrict__ volume_deviations, float *__restrict__ volumes,
     float *__restrict__ centroid_sums,
     const float *__restrict__ d_target_area, float dA,
+    int *__restrict__ d_bbox_results,
     int Nx, int Ny, int num_cells) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_cells) return;
+
+  // 0. Init bbox scan results for this cell (for inline scan in fused kernel)
+  if (d_bbox_results) {
+    int *res = d_bbox_results + i * 9;
+    res[0] = 0; res[1] = 0;           // max_dist_x/y
+    res[2] = 0x7FFFFFFF; res[3] = 0;  // min/max_lx
+    res[4] = 0x7FFFFFFF; res[5] = 0;  // min/max_ly
+    res[6] = 0;                        // found_any
+    // res[7], res[8] will be set below (centroids)
+  }
 
   // 1. Compute ref points (bbox center, wrapped)
   float rx = (float)offsets_x[i] + (float)widths[i] * 0.5f;
@@ -67,6 +78,12 @@ __global__ void kernel_pre_step(
     cy = fmodf(fmodf(cy, (float)Ny) + (float)Ny, (float)Ny);
     centroids_x[i] = cx;
     centroids_y[i] = cy;
+    // Embed centroids in bbox results (for change detection)
+    if (d_bbox_results) {
+      int *res = d_bbox_results + i * 9;
+      res[7] = __float_as_int(cx);
+      res[8] = __float_as_int(cy);
+    }
   }
 }
 
@@ -221,6 +238,7 @@ __global__ void kernel_fused_step(
     const float *__restrict__ velocities_y,
     float *__restrict__ d_centroid_sums,
     float *__restrict__ d_perimeters,
+    int *__restrict__ d_bbox_results,
     const float *__restrict__ ref_x,
     const float *__restrict__ ref_y,
     const float *__restrict__ d_volume_coeff,
@@ -301,6 +319,7 @@ void step_fused(Domain &domain, float dt,
                    float *d_volume_coeff,
                    float *d_perimeters,
                    int *d_block_arrival,
+                   int *d_bbox_scan_results,
                    float *d_sum_field,
                    float *d_sum_field_linear,
                    float *d_next_sum_field,
@@ -381,6 +400,7 @@ void step_fused(Domain &domain, float dt,
       d_all_widths, d_all_heights,
       d_centroids_x, d_centroids_y, d_volume_deviations, d_volumes,
       d_centroid_sums, d_target_area, dA,
+      d_bbox_scan_results,
       params.Nx, params.Ny, num_cells);
 
 #ifdef ENABLE_KERNEL_PROFILING
@@ -451,6 +471,7 @@ void step_fused(Domain &domain, float dt,
       d_sum_field, d_sum_field_linear, d_next_sum_field,
       d_volume_deviations, d_velocities_x, d_velocities_y,
       d_centroid_sums, d_perimeters,
+      d_bbox_scan_results,
       d_ref_x, d_ref_y,
       d_volume_coeff, params.interaction_coeff(),
       params.adhesion_J, params.bulk_coeff(),

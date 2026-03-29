@@ -6,6 +6,16 @@
 #include <cstdio>
 #include <vector>
 
+// Forward declaration for bbox change detection kernel (defined in kernels_solver.cu)
+namespace cellsim {
+__global__ void kernel_bbox_check_any_change(
+    const int *__restrict__ results, const int *__restrict__ widths,
+    const int *__restrict__ heights, const int *__restrict__ offsets_x,
+    const int *__restrict__ offsets_y, int halo, int Nx, int Ny,
+    float lambda, int min_subdomain_size, int *__restrict__ any_change_flag,
+    int num_cells);
+}
+
 namespace cellsim {
 
 // Forward declaration: GPU pointer swap (defined in kernels_shared.cu)
@@ -1192,6 +1202,7 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
              d_volume_coeff,
              d_perimeters,
              d_block_arrival,
+             d_bbox_scan_results,
              current_sum_field,
              current_sum_field_linear,
              next_sum_field_for_scatter,
@@ -1258,6 +1269,8 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   // The rare flag=1 case triggers a full synchronous rescan + remap.
   // =========================================================================
   bool do_bbox_update = (step_counter == 1) || (step_counter % 2 == 0);
+  // Full scan (includes shrink/recenter) every 100 steps; inline edge check every 2
+  bool use_full_scan = (step_counter == 1) || (step_counter % 100 == 0);
 
   if (do_bbox_update) {
     // --- Phase 1: Read result of PREVIOUS async bbox check ---
@@ -1313,16 +1326,32 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
       // If event not ready yet, leave bbox_async_pending true and retry next step
     }
 
-    // --- Phase 2: Launch new async bbox scan (only if no pending check) ---
+    // --- Phase 2: Check bbox changes ---
     if (!bbox_async_pending) {
       *h_bbox_any_change = 0;
-      gpu_launch_bbox_scan_async_2d(
-          d_all_phi_ptrs, d_all_widths, d_all_heights,
-          d_all_offsets_x, d_all_offsets_y,
-          d_centroids_x, d_centroids_y,
-          domain.params, num_cells, cached_max_size,
-          d_bbox_scan_results, d_bbox_any_change_flag,
-          h_bbox_any_change);
+      if (use_full_scan) {
+        // Full scan: launch separate scan kernels for shrink/recenter detection
+        gpu_launch_bbox_scan_async_2d(
+            d_all_phi_ptrs, d_all_widths, d_all_heights,
+            d_all_offsets_x, d_all_offsets_y,
+            d_centroids_x, d_centroids_y,
+            domain.params, num_cells, cached_max_size,
+            d_bbox_scan_results, d_bbox_any_change_flag,
+            h_bbox_any_change);
+      } else {
+        // Edge-only check: results already populated by inline scan in fused kernel
+        cudaMemsetAsync(d_bbox_any_change_flag, 0, sizeof(int));
+        int eval_threads = 256;
+        int eval_blocks = (num_cells + eval_threads - 1) / eval_threads;
+        kernel_bbox_check_any_change<<<eval_blocks, eval_threads>>>(
+            d_bbox_scan_results, d_all_widths, d_all_heights,
+            d_all_offsets_x, d_all_offsets_y,
+            domain.params.halo_width, domain.params.Nx, domain.params.Ny,
+            domain.params.lambda, domain.params.min_subdomain_size,
+            d_bbox_any_change_flag, num_cells);
+        cudaMemcpyAsync(h_bbox_any_change, d_bbox_any_change_flag, sizeof(int),
+                        cudaMemcpyDeviceToHost);
+      }
       cudaEventRecord(bbox_check_event);
       bbox_async_pending = true;
     }

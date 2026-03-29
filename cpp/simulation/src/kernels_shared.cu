@@ -538,6 +538,7 @@ __global__ void kernel_fused_step(
     const float *__restrict__ velocities_y,
     float *__restrict__ d_centroid_sums,
     float *__restrict__ d_perimeters,
+    int *__restrict__ d_bbox_results,
     const float *__restrict__ ref_x,
     const float *__restrict__ ref_y,
     const float *__restrict__ d_volume_coeff,
@@ -694,6 +695,22 @@ __global__ void kernel_fused_step(
 
     // --- Write Euler output to double buffer ---
     phi_out_ptrs[cell_idx][idx] = new_phi;
+
+    // --- Inline bbox edge check: detect if phi is near subdomain edges ---
+    // Only checks edge pixels — interior can't cause bbox issues.
+    // Full bbox scan (for shrink/recentering) done periodically by host.
+    if (d_bbox_results && new_phi > 0.01f) {
+      bool near_edge = (lx <= halo + 2) || (lx >= width - halo - 3) ||
+                       (ly <= halo + 2) || (ly >= height - halo - 3);
+      if (near_edge) {
+        int *res = d_bbox_results + cell_idx * 9;
+        atomicMin(&res[2], lx);
+        atomicMax(&res[3], lx);
+        atomicMin(&res[4], ly);
+        atomicMax(&res[5], ly);
+        atomicMax(&res[6], 1);
+      }
+    }
 
     // --- Scatter new_phi² to NEXT step's sum field (eliminates standalone scatter kernel) ---
     if (next_sum_field) {
