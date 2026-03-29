@@ -1,7 +1,9 @@
 #include "integrator.cuh"
 #include "kernels.cuh"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 namespace cellsim {
@@ -751,6 +753,16 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   if (domain.num_cells() == 0)
     return;
 
+#ifdef ENABLE_STEP_PROFILING
+  static auto t_start = std::chrono::high_resolution_clock::now();
+  static double acc_alloc = 0, acc_dims = 0, acc_polar = 0, acc_sumfield = 0;
+  static double acc_step_fused = 0, acc_clear = 0, acc_bbox = 0, acc_swap = 0, acc_total = 0;
+  static int prof_count = 0;
+  auto tp0 = std::chrono::high_resolution_clock::now();
+#define PROF_LAP(var) { auto _now = std::chrono::high_resolution_clock::now(); \
+  var += std::chrono::duration<double, std::micro>(_now - tp0).count(); tp0 = _now; }
+#endif
+
   // Ensure buffers are allocated
   allocate_reduction_arrays(domain.num_cells());
 
@@ -785,6 +797,10 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
 
   const SimParams &params = domain.params;
   int num_cells = domain.num_cells();
+
+#ifdef ENABLE_STEP_PROFILING
+  PROF_LAP(acc_alloc);
+#endif
 
   // Initialize GPU RNG states if needed (first call or after reallocation)
   if (!rng_initialized) {
@@ -1075,6 +1091,10 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   // Increment step counter
   step_counter++;
 
+#ifdef ENABLE_STEP_PROFILING
+  PROF_LAP(acc_polar);
+#endif
+
   // =========================================================================
   // GPU Bounding Box Updates (every step)
   // =========================================================================
@@ -1137,10 +1157,6 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   float *current_sum_field = nullptr;
   if (d_sum_field) {
     current_sum_field = (step_counter % 2 == 0) ? d_sum_field : d_sum_field_b;
-    // Ensure the async clear of this buffer is complete before scatter writes
-    if (sum_field_clear_done_event) {
-      cudaStreamWaitEvent(0, sum_field_clear_done_event, 0);
-    }
   }
 
   // Ping-pong sum field: for small cell counts, the fused kernel scatters NEW phi²
@@ -1157,6 +1173,10 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   if (d_sum_field_linear && params.adhesion_J > 0.0f) {
     current_sum_field_linear = (step_counter % 2 == 0) ? d_sum_field_linear : d_sum_field_linear_b;
   }
+
+#ifdef ENABLE_STEP_PROFILING
+  PROF_LAP(acc_sumfield);
+#endif
 
   step_fused(domain, dt, d_all_phi_ptrs, d_all_phi_out_ptrs,
              d_all_widths,
@@ -1183,23 +1203,23 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   // Fused kernel populated centroid_sums for next step
   centroid_sums_ready = true;
 
-  // =========================================================================
-  // Async sum field clear: now that fused kernel is done reading
-  // current_sum_field, zero it in a background stream for reuse in step+2.
-  // This hides the memset latency behind the next step's compute work.
-  // =========================================================================
-  if (current_sum_field && sum_field_clear_stream) {
-    cudaEventRecord(sum_field_read_done_event, 0); // default stream
-    cudaStreamWaitEvent(sum_field_clear_stream, sum_field_read_done_event, 0);
-    cudaMemsetAsync(current_sum_field, 0, sum_field_size * sizeof(float),
-                    sum_field_clear_stream);
-    // Also clear linear sum field if active (piggyback on same stream)
+#ifdef ENABLE_STEP_PROFILING
+  PROF_LAP(acc_step_fused);
+#endif
+
+  // Clear sum field for reuse in step+2. The memset is small enough (<1 MB)
+  // that it completes before the next step's scatter kernels, so no event
+  // synchronization is needed — just queue it on the default stream.
+  if (current_sum_field) {
+    cudaMemsetAsync(current_sum_field, 0, sum_field_size * sizeof(float));
     if (current_sum_field_linear) {
-      cudaMemsetAsync(current_sum_field_linear, 0, sum_field_size * sizeof(float),
-                      sum_field_clear_stream);
+      cudaMemsetAsync(current_sum_field_linear, 0, sum_field_size * sizeof(float));
     }
-    cudaEventRecord(sum_field_clear_done_event, sum_field_clear_stream);
   }
+
+#ifdef ENABLE_STEP_PROFILING
+  PROF_LAP(acc_clear);
+#endif
 
   // Double-buffer swap: fused kernel wrote new phi to phi_out_ptrs.
   // GPU-side pointer swap (avoids synchronous H→D memcpy each step)
@@ -1320,6 +1340,25 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     }
     host_ptrs_stale = false;
   }
+
+#ifdef ENABLE_STEP_PROFILING
+  PROF_LAP(acc_bbox);
+  auto tp_end = std::chrono::high_resolution_clock::now();
+  acc_total += std::chrono::duration<double, std::micro>(tp_end - tp0).count() + acc_alloc + acc_polar + acc_sumfield + acc_step_fused + acc_clear + acc_bbox;
+  prof_count++;
+  if (prof_count % 10000 == 0) {
+    double n = (double)prof_count;
+    printf("\n=== Step Profiling (avg over %d steps, us) ===\n", prof_count);
+    printf("  alloc+dims:   %.1f (%.1f%%)\n", acc_alloc/n, 100*acc_alloc/(acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox));
+    printf("  polarization: %.1f (%.1f%%)\n", acc_polar/n, 100*acc_polar/(acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox));
+    printf("  sumfield:     %.1f (%.1f%%)\n", acc_sumfield/n, 100*acc_sumfield/(acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox));
+    printf("  step_fused:   %.1f (%.1f%%)\n", acc_step_fused/n, 100*acc_step_fused/(acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox));
+    printf("  async_clear:  %.1f (%.1f%%)\n", acc_clear/n, 100*acc_clear/(acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox));
+    printf("  bbox+swap:    %.1f (%.1f%%)\n", acc_bbox/n, 100*acc_bbox/(acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox));
+    printf("  TOTAL:        %.1f us/step\n\n", (acc_alloc+acc_polar+acc_sumfield+acc_step_fused+acc_clear+acc_bbox)/n);
+    fflush(stdout);
+  }
+#endif
 }
 
 #ifdef DIAGNOSTICS_ENABLED
