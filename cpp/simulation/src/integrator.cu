@@ -1269,8 +1269,10 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
   // The rare flag=1 case triggers a full synchronous rescan + remap.
   // =========================================================================
   bool do_bbox_update = (step_counter == 1) || (step_counter % 2 == 0);
-  // Full scan (includes shrink/recenter) every 100 steps; inline edge check every 2
-  bool use_full_scan = (step_counter == 1) || (step_counter % 100 == 0);
+  // Full scan (includes shrink/recenter) every 100 steps
+  // For small N: inline edge flag in fused kernel is cheap (1 atomicMax)
+  // For large N: use full scan every time (inline atomicMax causes contention)
+  bool use_full_scan = (step_counter == 1) || (step_counter % 100 == 0) || (num_cells > 200);
 
   if (do_bbox_update) {
     // --- Phase 1: Read result of PREVIOUS async bbox check ---
@@ -1338,22 +1340,16 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
             domain.params, num_cells, cached_max_size,
             d_bbox_scan_results, d_bbox_any_change_flag,
             h_bbox_any_change);
+        cudaEventRecord(bbox_check_event);
+        bbox_async_pending = true;
       } else {
-        // Edge-only check: results already populated by inline scan in fused kernel
-        cudaMemsetAsync(d_bbox_any_change_flag, 0, sizeof(int));
-        int eval_threads = 256;
-        int eval_blocks = (num_cells + eval_threads - 1) / eval_threads;
-        kernel_bbox_check_any_change<<<eval_blocks, eval_threads>>>(
-            d_bbox_scan_results, d_all_widths, d_all_heights,
-            d_all_offsets_x, d_all_offsets_y,
-            domain.params.halo_width, domain.params.Nx, domain.params.Ny,
-            domain.params.lambda, domain.params.min_subdomain_size,
-            d_bbox_any_change_flag, num_cells);
-        cudaMemcpyAsync(h_bbox_any_change, d_bbox_any_change_flag, sizeof(int),
+        // Edge-only: the fused kernel wrote 1 to d_bbox_scan_results[0] if
+        // any cell's phi touched its subdomain edge. Just async-copy that flag.
+        cudaMemcpyAsync(h_bbox_any_change, d_bbox_scan_results, sizeof(int),
                         cudaMemcpyDeviceToHost);
+        cudaEventRecord(bbox_check_event);
+        bbox_async_pending = true;
       }
-      cudaEventRecord(bbox_check_event);
-      bbox_async_pending = true;
     }
   }
 

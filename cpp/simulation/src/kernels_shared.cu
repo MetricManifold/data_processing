@@ -696,19 +696,13 @@ __global__ void kernel_fused_step(
     // --- Write Euler output to double buffer ---
     phi_out_ptrs[cell_idx][idx] = new_phi;
 
-    // --- Inline bbox edge check: detect if phi is near subdomain edges ---
-    // Only checks edge pixels — interior can't cause bbox issues.
-    // Full bbox scan (for shrink/recentering) done periodically by host.
+    // --- Inline bbox edge flag: is phi dangerously close to subdomain edge? ---
+    // Single atomicMax to global flag — essentially free. Full scan periodically.
     if (d_bbox_results && new_phi > 0.01f) {
-      bool near_edge = (lx <= halo + 2) || (lx >= width - halo - 3) ||
-                       (ly <= halo + 2) || (ly >= height - halo - 3);
-      if (near_edge) {
-        int *res = d_bbox_results + cell_idx * 9;
-        atomicMin(&res[2], lx);
-        atomicMax(&res[3], lx);
-        atomicMin(&res[4], ly);
-        atomicMax(&res[5], ly);
-        atomicMax(&res[6], 1);
+      if (lx <= halo + 1 || lx >= width - halo - 2 ||
+          ly <= halo + 1 || ly >= height - halo - 2) {
+        // d_bbox_results[0] is used as a global "any edge touched" flag
+        atomicMax(&d_bbox_results[0], 1);
       }
     }
 

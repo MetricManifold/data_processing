@@ -38,14 +38,9 @@ __global__ void kernel_pre_step(
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_cells) return;
 
-  // 0. Init bbox scan results for this cell (for inline scan in fused kernel)
-  if (d_bbox_results) {
-    int *res = d_bbox_results + i * 9;
-    res[0] = 0; res[1] = 0;           // max_dist_x/y
-    res[2] = 0x7FFFFFFF; res[3] = 0;  // min/max_lx
-    res[4] = 0x7FFFFFFF; res[5] = 0;  // min/max_ly
-    res[6] = 0;                        // found_any
-    // res[7], res[8] will be set below (centroids)
+  // 0. Init bbox edge flag (global flag in d_bbox_results[0])
+  if (d_bbox_results && i == 0) {
+    d_bbox_results[0] = 0;  // Reset global "edge touched" flag
   }
 
   // 1. Compute ref points (bbox center, wrapped)
@@ -78,12 +73,6 @@ __global__ void kernel_pre_step(
     cy = fmodf(fmodf(cy, (float)Ny) + (float)Ny, (float)Ny);
     centroids_x[i] = cx;
     centroids_y[i] = cy;
-    // Embed centroids in bbox results (for change detection)
-    if (d_bbox_results) {
-      int *res = d_bbox_results + i * 9;
-      res[7] = __float_as_int(cx);
-      res[8] = __float_as_int(cy);
-    }
   }
 }
 
