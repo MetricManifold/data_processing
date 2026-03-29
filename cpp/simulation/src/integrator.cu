@@ -1201,17 +1201,14 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     cudaEventRecord(sum_field_clear_done_event, sum_field_clear_stream);
   }
 
-  // Double-buffer swap: fused kernel wrote new phi to d_dphi_dt (via phi_out_ptrs).
-  // Swap so d_phi points to the updated data for subsequent reads (bbox, centroid).
+  // Double-buffer swap: fused kernel wrote new phi to phi_out_ptrs.
   // GPU-side pointer swap (avoids synchronous H→D memcpy each step)
   {
     int nc = domain.num_cells();
-    // GPU-side swap of the pointer arrays (no H→D memcpy needed)
     int swap_threads = 256;
     int swap_blocks = (nc + swap_threads - 1) / swap_threads;
     kernel_swap_phi_ptrs<<<swap_blocks, swap_threads>>>(
         d_all_phi_ptrs, d_all_phi_out_ptrs, nc);
-    // Mark host-side pointers as stale (defer swap to when actually needed)
     host_ptrs_stale = true;
   }
 
@@ -1313,8 +1310,10 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
 
   // Lazy host pointer flush: ensure host Cell structs have correct d_phi/d_dphi_dt
   // before returning (callers may access them for checkpoints, VTK saves, etc.).
-  // This only runs on steps where bbox update didn't already flush (~50% of steps).
-  if (host_ptrs_stale) {
+  // Lazy host pointer flush: only swap when caller actually needs host Cell
+  // pointers (checkpoints, VTK saves, trajectory). Skip on pure compute steps.
+  // The GPU-side kernel_swap_phi_ptrs already handles the double buffer swap.
+  if (host_ptrs_stale && (sync_centroids_to_host || sync_polarization_to_host)) {
     int nc = domain.num_cells();
     for (int i = 0; i < nc; ++i) {
       std::swap(domain.cells[i]->d_phi, domain.cells[i]->d_dphi_dt);

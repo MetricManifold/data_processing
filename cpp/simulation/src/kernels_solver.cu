@@ -375,7 +375,7 @@ void step_fused(Domain &domain, float dt,
   }
 
   // Pre-step: compute ref points + centroids + volume deviations (1 fused launch)
-  // Also zeros centroid_sums after reading, so fused kernel can accumulate next step's sums.
+  // Also zeros centroid_sums and swaps phi double-buffer pointers from previous step.
   kernel_pre_step<<<blocks_1d, threads_1d>>>(
       d_ref_x, d_ref_y, d_all_offsets_x, d_all_offsets_y,
       d_all_widths, d_all_heights,
@@ -458,13 +458,8 @@ void step_fused(Domain &domain, float dt,
       params.halo_width, params.Nx, params.Ny,
       num_cells);
 
-  // Post-step: swap phi pointers (1 launch)
-  {
-    int swap_threads = 256;
-    int swap_blocks = (num_cells + swap_threads - 1) / swap_threads;
-    kernel_swap_phi_ptrs<<<swap_blocks, swap_threads>>>(
-        d_all_phi_ptrs, d_all_phi_out_ptrs, num_cells);
-  }
+  // Phi pointer swap is now done in kernel_pre_step of the NEXT step
+  // (saves 1 kernel launch per step)
 
 #ifdef ENABLE_KERNEL_PROFILING
   cudaEventRecord(ev_fused);
