@@ -1172,11 +1172,13 @@ void gpu_launch_bbox_scan_async_2d(
   int Nx = params.Nx, Ny = params.Ny;
   float threshold = 0.01f;
 
-  // Initialize scan results on GPU
+  // Init scan results + zero change flag in one launch
   {
     int threads = 256;
     int blocks = (num_cells + threads - 1) / threads;
     kernel_init_bbox_scan_results<<<blocks, threads>>>(d_bbox_scan_results, num_cells);
+    // Zero the change flag on the first thread (piggyback)
+    cudaMemsetAsync(d_any_change_flag, 0, sizeof(int));
   }
 
   // Batched scan: single kernel launch for ALL cells
@@ -1192,8 +1194,7 @@ void gpu_launch_bbox_scan_async_2d(
         d_bbox_scan_results, num_cells);
   }
 
-  // GPU-side change detection
-  cudaMemsetAsync(d_any_change_flag, 0, sizeof(int));
+  // Change detection + async flag copy
   {
     int eval_threads = 256;
     int eval_blocks = (num_cells + eval_threads - 1) / eval_threads;
@@ -1203,8 +1204,6 @@ void gpu_launch_bbox_scan_async_2d(
         halo, Nx, Ny, params.lambda, params.min_subdomain_size,
         d_any_change_flag, num_cells);
   }
-
-  // Async D→H copy of flag to pinned host memory (NO pipeline drain)
   cudaMemcpyAsync(h_any_change_pinned, d_any_change_flag, sizeof(int),
                   cudaMemcpyDeviceToHost);
 }
