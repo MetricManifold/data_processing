@@ -381,6 +381,27 @@ void print_usage(const char *program) {
   printf("  --save-individual-fields  Save per-cell phi fields for energy analysis\n");
   printf("  --subdomain-padding <f>  Cell window size as multiple of R (default: %.1f)\n", p.subdomain_padding);
   printf("  --safe-mode     Limit memory allocation to prevent runaway VRAM usage\n");
+  printf("  --batch <file>  Run multiple independent systems from a JSON config file.\n");
+  printf("                  Each system resumes from its own checkpoint with independent\n");
+  printf("                  v_A, gamma, and RNG seed. All systems share one GPU process.\n");
+  printf("                  Periodic per-system checkpoints enable resume after interruption.\n");
+  printf("                  JSON format:\n");
+  printf("                    {\n");
+  printf("                      \"t_end\": 1000,\n");
+  printf("                      \"trajectory_samples\": 2000,\n");
+  printf("                      \"checkpoint_interval\": 500000,\n");
+  printf("                      \"print_interval\": 50000,\n");
+  printf("                      \"systems\": [\n");
+  printf("                        {\n");
+  printf("                          \"checkpoint\": \"path/to/checkpoint.bin\",\n");
+  printf("                          \"output\": \"path/to/output_dir\",\n");
+  printf("                          \"v_A\": 0.004,\n");
+  printf("                          \"gamma\": \"0.35:cell0\",\n");
+  printf("                          \"seed_offset\": 42\n");
+  printf("                        }\n");
+  printf("                      ]\n");
+  printf("                    }\n");
+  printf("                  To resume a batch: point checkpoints at previous output dirs.\n");
   printf("\nParameter set reference:\n");
   printf("  Palmieri:  --gamma 1.0 --kappa 10 --mu 1.0 --xi 1500 (binary defaults)\n");
   printf("  Bresler:   --gamma 3.75 --kappa 10 --mu 0.5 --xi 1000\n");
@@ -631,14 +652,19 @@ static int run_batch(const BatchConfig &config, int base_seed) {
     traj_intervals[s] = std::max(1, total_steps / config.trajectory_samples);
   }
 
+  // Checkpoint interval (from config or default)
+  int ckpt_interval = (config.checkpoint_interval > 0) ? config.checkpoint_interval : 8000000;
+
   int step_count = 0;
   while (sims[0]->current_time < t_end && !g_shutdown_requested) {
     step_count++;
     bool is_print_step = (step_count % config.print_interval == 0);
+    bool is_ckpt_step = (step_count % ckpt_interval == 0);
 
     for (int s = 0; s < num_systems; ++s) {
       bool save_traj = (step_count % traj_intervals[s] == 0);
-      sims[s]->integrator.step(sims[s]->domain, dt, save_traj, save_traj || is_print_step);
+      bool need_sync = save_traj || is_print_step || is_ckpt_step;
+      sims[s]->integrator.step(sims[s]->domain, dt, save_traj, need_sync);
       sims[s]->current_time += dt;
       sims[s]->current_step++;
 
@@ -651,6 +677,20 @@ static int run_batch(const BatchConfig &config, int base_seed) {
       printf("Step %7d | t=%.4f\n", sims[0]->current_step, sims[0]->current_time);
       fflush(stdout);
     }
+
+    // Periodic per-system checkpoints (enables batch resume)
+    if (is_ckpt_step) {
+      printf("Checkpoint at step %d (t=%.2f)...\n", sims[0]->current_step, sims[0]->current_time);
+      for (int s = 0; s < num_systems; ++s) {
+        sims[s]->save_current_checkpoint(config.systems[s].output + "/checkpoint.bin");
+      }
+      fflush(stdout);
+    }
+  }
+
+  // Save on SIGTERM (clean shutdown for SLURM chain jobs)
+  if (g_shutdown_requested) {
+    printf("\nSIGTERM received — saving checkpoints for resume...\n");
   }
 
   double elapsed = std::chrono::duration<double>(
