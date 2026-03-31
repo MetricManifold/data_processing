@@ -235,7 +235,7 @@ __global__ void kernel_fused_step(
     float adhesion_J,
     float bulk_coeff,
     const float *__restrict__ d_gamma,
-    float dx_grid, float dy_grid,
+    float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
     int num_cells);
@@ -454,6 +454,10 @@ void step_fused(Domain &domain, float dt,
 #endif
 
   // Launch fused kernel (uses CURRENT velocity for advection)
+  // Precompute stencil constants (avoids per-thread FP division)
+  float inv_h2 = 1.0f / (params.dx * params.dx);
+  float inv_2dx = 0.5f / params.dx;
+  float inv_2dy = 0.5f / params.dy;
   kernel_fused_step<<<grid, block, smem_fused>>>(
       d_all_phi_ptrs, d_all_phi_out_ptrs, d_all_widths, d_all_heights,
       d_all_offsets_x, d_all_offsets_y, d_neighbor_counts, d_neighbor_lists,
@@ -464,7 +468,7 @@ void step_fused(Domain &domain, float dt,
       d_ref_x, d_ref_y,
       d_volume_coeff, params.interaction_coeff(),
       params.adhesion_J, params.bulk_coeff(),
-      d_gamma, params.dx, params.dy, dt,
+      d_gamma, inv_h2, inv_2dx, inv_2dy, dt,
       params.halo_width, params.Nx, params.Ny,
       num_cells);
 

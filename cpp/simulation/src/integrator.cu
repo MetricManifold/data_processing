@@ -883,36 +883,56 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     }
 
     // Initialize per-cell gamma values
-    // Priority: checkpoint values > gamma_overrides > legacy soft_cell_id > uniform gamma
+    // Priority: gamma_overrides APPLIED ON TOP OF checkpoint values > legacy soft_cell_id > uniform gamma
     {
       std::vector<float> h_gamma(num_cells);
+      bool loaded_from_checkpoint = false;
       if (!checkpoint_gamma.empty() &&
           static_cast<int>(checkpoint_gamma.size()) == num_cells) {
         h_gamma = checkpoint_gamma;
+        loaded_from_checkpoint = true;
         printf("Per-cell gamma: restored %d values from checkpoint\n", num_cells);
         float g_min = *std::min_element(h_gamma.begin(), h_gamma.end());
         float g_max = *std::max_element(h_gamma.begin(), h_gamma.end());
         printf("  Restored range: [%.4f, %.4f]\n", g_min, g_max);
         checkpoint_gamma.clear();
-      } else if (gamma_overrides_set) {
-        // Start with base gamma for all cells
-        for (int i = 0; i < num_cells; ++i) {
-          h_gamma[i] = params.gamma;
+      } else if (!gamma_overrides_set) {
+        // No checkpoint and no overrides: use uniform or legacy
+        if (params.soft_cell_id >= 0 && params.soft_cell_id < num_cells) {
+          for (int i = 0; i < num_cells; ++i) {
+            h_gamma[i] = params.gamma;
+          }
+          h_gamma[params.soft_cell_id] = params.gamma_soft;
+          printf("Per-cell gamma: cell %d is soft (gamma=%.4f), rest normal (gamma=%.4f)\n",
+                 params.soft_cell_id, params.gamma_soft, params.gamma);
+        } else {
+          for (int i = 0; i < num_cells; ++i) {
+            h_gamma[i] = params.gamma;
+          }
         }
-        // Track which cells have been assigned by a more-specific override
+      } else {
+        // gamma_overrides_set but no checkpoint: start from uniform base
+        if (!loaded_from_checkpoint) {
+          for (int i = 0; i < num_cells; ++i) {
+            h_gamma[i] = params.gamma;
+          }
+        }
+      }
+
+      // Apply gamma overrides ON TOP of whatever base was loaded
+      // (checkpoint values, uniform, or legacy)
+      if (gamma_overrides_set) {
         std::vector<bool> assigned(num_cells, false);
 
         // Pass 1: fraction-based overrides (random selection)
         for (const auto &ov : gamma_overrides) {
           if (ov.type != SimParams::GammaOverride::Type::Fraction) continue;
           int count = static_cast<int>(ov.fraction * num_cells + 0.5f);
-          // Collect eligible (unassigned) cell indices
           std::vector<int> eligible;
           eligible.reserve(num_cells);
           for (int i = 0; i < num_cells; ++i) {
             if (!assigned[i]) eligible.push_back(i);
           }
-          // Fisher-Yates partial shuffle to select 'count' cells
           int n = std::min(count, static_cast<int>(eligible.size()));
           for (int i = 0; i < n; ++i) {
             int j = i + rand() % (static_cast<int>(eligible.size()) - i);
@@ -944,20 +964,9 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
 
         float g_min = *std::min_element(h_gamma.begin(), h_gamma.end());
         float g_max = *std::max_element(h_gamma.begin(), h_gamma.end());
-        printf("Per-cell gamma: range [%.4f, %.4f]\n", g_min, g_max);
-      } else if (params.soft_cell_id >= 0 && params.soft_cell_id < num_cells) {
-        // Legacy path (backward compat for old checkpoints/scripts)
-        for (int i = 0; i < num_cells; ++i) {
-          h_gamma[i] = params.gamma;
-        }
-        h_gamma[params.soft_cell_id] = params.gamma_soft;
-        printf("Per-cell gamma: cell %d is soft (gamma=%.4f), rest normal (gamma=%.4f)\n",
-               params.soft_cell_id, params.gamma_soft, params.gamma);
-      } else {
-        for (int i = 0; i < num_cells; ++i) {
-          h_gamma[i] = params.gamma;
-        }
+        printf("Per-cell gamma: final range [%.4f, %.4f]\n", g_min, g_max);
       }
+
       cudaMemcpy(d_gamma, h_gamma.data(), num_cells * sizeof(float),
                  cudaMemcpyHostToDevice);
     }

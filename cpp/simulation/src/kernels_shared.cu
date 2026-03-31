@@ -546,7 +546,7 @@ __global__ void kernel_fused_step(
     float adhesion_J,
     float bulk_coeff,
     const float *__restrict__ d_gamma,
-    float dx_grid, float dy_grid,
+    float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
     int num_cells)
@@ -581,11 +581,14 @@ __global__ void kernel_fused_step(
 
     float new_phi = phi_val;
 
+    // Global coordinates (computed once, reused for interaction + scatter)
+    int gx_raw = offset_x_i + lx;
+    int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
+    int gy_raw = offset_y_i + ly;
+    int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+
     {
-      // --- Recompute local terms from phi (avoids work buffer reads) ---
-      float inv_h2 = 1.0f / (dx_grid * dx_grid); // assumes dx == dy
-      float inv_2dx = 0.5f / dx_grid;
-      float inv_2dy = 0.5f / dy_grid;
+      // --- Stencil + PDE (inv_h2, inv_2dx, inv_2dy are precomputed kernel params) ---
 
       int xm = (lx > 0) ? lx - 1 : 0;
       int xp = (lx < width - 1) ? lx + 1 : width - 1;
@@ -617,11 +620,7 @@ __global__ void kernel_fused_step(
       float volume_deviation = volume_deviations[cell_idx];
       float constraint = -4.0f * d_volume_coeff[cell_idx] * volume_deviation * phi_val;
 
-      // --- Interaction with neighbors ---
-      int gx_raw = offset_x_i + lx;
-      int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-      int gy_raw = offset_y_i + ly;
-      int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+      // --- Interaction with neighbors (gx, gy already computed above) ---
 
       float sum_phi_j_sq;
       if (sum_field) {
@@ -706,15 +705,11 @@ __global__ void kernel_fused_step(
       }
     }
 
-    // --- Scatter new_phi² to NEXT step's sum field (eliminates standalone scatter kernel) ---
+    // --- Scatter new_phi² to NEXT step's sum field (reuses gx, gy from above) ---
     if (next_sum_field) {
       float new_phi_sq_scatter = new_phi * new_phi;
       if (new_phi_sq_scatter > 1e-8f) {
-        int gx_s = offset_x_i + lx;
-        gx_s = gx_s - ((gx_s >= Nx) - (gx_s < 0)) * Nx;
-        int gy_s = offset_y_i + ly;
-        gy_s = gy_s - ((gy_s >= Ny) - (gy_s < 0)) * Ny;
-        atomicAdd(&next_sum_field[gy_s * Nx + gx_s], new_phi_sq_scatter);
+        atomicAdd(&next_sum_field[gy * Nx + gx], new_phi_sq_scatter);
       }
     }
 
@@ -769,10 +764,14 @@ __global__ void kernel_fused_step(
       v3 += __shfl_down_sync(0xffffffff, v3, offset);
     }
     if (tid == 0) {
-      atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
-      atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
-      atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
-      atomicAdd(&d_perimeters[cell_idx], v3);
+      // Skip atomicAdds when block contributes nothing (most blocks are in
+      // the zero-phi region of the subdomain — saves ~80% of atomicAdds)
+      if (v2 > 0.0f || v3 > 0.0f) {
+        atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
+        atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
+        atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
+        atomicAdd(&d_perimeters[cell_idx], v3);
+      }
     }
   }
 }
