@@ -66,51 +66,68 @@ def get_polarization_for_frame(trajectory_data, frame_time):
 
 
 def read_vtk_structured_points(filename):
-    """Read a legacy VTK structured points file."""
-    with open(filename, 'r') as f:
-        lines = f.readlines()
-    
-    # Parse header
+    """Read a legacy VTK structured points file (handles ASCII and BINARY)."""
+    import struct
+
     dims = None
     origin = None
     spacing = None
     n_points = 0
-    
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        
-        if line.startswith('DIMENSIONS'):
-            parts = line.split()
-            dims = (int(parts[1]), int(parts[2]), int(parts[3]))
-        elif line.startswith('ORIGIN'):
-            parts = line.split()
-            origin = (float(parts[1]), float(parts[2]), float(parts[3]))
-        elif line.startswith('SPACING'):
-            parts = line.split()
-            spacing = (float(parts[1]), float(parts[2]), float(parts[3]))
-        elif line.startswith('POINT_DATA'):
-            n_points = int(line.split()[1])
-        elif line.startswith('SCALARS'):
-            # Skip LOOKUP_TABLE line
-            i += 2  # Skip SCALARS and LOOKUP_TABLE lines
-            break
-        i += 1
-    
+    is_binary = False
+    binary_data_offset = None
+
+    # Read header lines as bytes (works for both ASCII and binary files)
+    with open(filename, 'rb') as f:
+        while True:
+            line = f.readline().decode('ascii', errors='ignore').strip()
+            if not line:
+                break
+
+            if line.startswith('DIMENSIONS'):
+                parts = line.split()
+                dims = (int(parts[1]), int(parts[2]), int(parts[3]))
+            elif line.startswith('ORIGIN'):
+                parts = line.split()
+                origin = (float(parts[1]), float(parts[2]), float(parts[3]))
+            elif line.startswith('SPACING'):
+                parts = line.split()
+                spacing = (float(parts[1]), float(parts[2]), float(parts[3]))
+            elif line == 'BINARY':
+                is_binary = True
+            elif line.startswith('POINT_DATA'):
+                n_points = int(line.split()[1])
+            elif line.startswith('LOOKUP_TABLE'):
+                binary_data_offset = f.tell()
+                break
+
     if dims is None:
         raise ValueError("Could not parse VTK dimensions")
-    
-    # Read scalar data
-    values = []
-    while len(values) < n_points and i < len(lines):
-        data_line = lines[i].strip()
-        if data_line:
-            values.extend([float(x) for x in data_line.split()])
-        i += 1
-    
-    # Reshape to 2D (assuming z=1)
-    data = np.array(values).reshape((dims[1], dims[0]))
-    
+
+    if is_binary:
+        # Binary: read big-endian floats from the data offset
+        with open(filename, 'rb') as f:
+            f.seek(binary_data_offset)
+            raw = f.read(n_points * 4)
+        data = np.frombuffer(raw, dtype='>f4').astype(np.float32)
+    else:
+        # ASCII: re-read and parse text values
+        with open(filename, 'r') as f:
+            lines = f.readlines()
+        # Find data start (after LOOKUP_TABLE line)
+        i = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('LOOKUP_TABLE'):
+                i += 1
+                break
+        values = []
+        while len(values) < n_points and i < len(lines):
+            data_line = lines[i].strip()
+            if data_line:
+                values.extend([float(x) for x in data_line.split()])
+            i += 1
+        data = np.array(values)
+
+    data = data.reshape((dims[1], dims[0]))
     return dims, origin, spacing, {'phi': data}
 
 

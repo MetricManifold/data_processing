@@ -72,6 +72,27 @@ public:
   bool wraps_y(int Ny) const {
     return bbox_with_halo.y0 < 0 || bbox_with_halo.y1 > Ny;
   }
+  
+  // Accessors for MPI communication
+  const BoundingBox& get_bbox() const { return bbox; }
+  const BoundingBox& get_bbox_with_halo() const { return bbox_with_halo; }
+  int get_field_size() const { return field_size; }
+  float cx() const { return centroid.x; }
+  float cy() const { return centroid.y; }
+  float vx() const { return velocity.x; }
+  float vy() const { return velocity.y; }
+  float px() const { return polarization.x; }
+  float py() const { return polarization.y; }
+  
+  // Copy phi to host buffer (for CPU version, just copy)
+  void copy_phi_to_host(float* dest) const {
+    std::copy(phi.begin(), phi.end(), dest);
+  }
+  
+  // Update phi from host buffer (for receiving ghost cells)
+  void update_phi_from_host(const float* src) {
+    std::copy(src, src + field_size, phi.begin());
+  }
 };
 
 } // namespace cellsim

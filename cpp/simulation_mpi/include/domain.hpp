@@ -8,7 +8,7 @@
 namespace cellsim {
 
 //=============================================================================
-// Domain - Manages global domain and cell collection (CPU/MPI version)
+// Domain - Manages global domain and cell collection (CPU/OpenMP version)
 //=============================================================================
 
 class Domain {
@@ -28,9 +28,18 @@ public:
   void remove_cell(int cell_id);
   Cell *get_cell(int cell_id);
   int num_cells() const { return static_cast<int>(cells.size()); }
+  
+  // Access cell by index (const and non-const)
+  const Cell& cell(int idx) const { return *cells[idx]; }
+  Cell& cell(int idx) { return *cells[idx]; }
 
   // Update all cell bounding boxes
   void update_all_bounding_boxes();
+  
+  // Update ghost cell data (received from MPI)
+  void update_ghost_cell(int cell_id, const float* phi_data,
+                         float volume, float cx, float cy,
+                         float vx, float vy, float theta, float px, float py);
 
   // Initialize random cell configuration
   void initialize_random_cells(int num_cells, float radius, float min_spacing);

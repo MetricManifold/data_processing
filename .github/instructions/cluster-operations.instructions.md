@@ -4,374 +4,303 @@ applyTo: "cpp/simulation/cluster/**"
 
 # Cluster Operations - Copilot Instructions
 
-This document describes operations on the Nibi cluster (nibi.alliancecan.ca) for running cell simulations at scale.
+> **When to consult this file:** You are working with simulation jobs on Alliance Canada HPC clusters. This file covers domain knowledge the MCP tool doesn't encode: physics context for equilibration, I/O budgets, MPI fallback, and analysis job submission. For simulation physics, CLI options, or local builds, see [cell-simulation.instructions.md](cell-simulation.instructions.md). For analyzing output data, see [postprocessing.instructions.md](postprocessing.instructions.md).
 
-## Overview
+## Related Instructions
 
-- **Cluster**: Nibi (Compute Canada / Alliance Canada)
-- **Account**: `rrg-mkarttu-ab`
-- **Username**: `ssilber`
-- **Scratch storage**: `/scratch/ssilber/`
-- **Home directory**: `~/cell_simulation/` (code), `~/cell_sim_logs/` (logs)
+| Task | Instruction File |
+|------|-----------------|
+| **Building & running simulations locally** | [cell-simulation.instructions.md](cell-simulation.instructions.md) |
+| **Post-processing output (visualization, MSD)** | [postprocessing.instructions.md](postprocessing.instructions.md) |
+| **Developing analysis tools for cluster** | [cluster-postprocessing.instructions.md](cluster-postprocessing.instructions.md) |
 
-## SSH Connection Management
+---
 
-### The MFA Problem
-Nibi requires Duo MFA for every SSH connection. To avoid repeated authentication, use SSH ControlMaster to maintain a persistent connection.
+## Primary Interface: `compute-canad` MCP Tool
 
-### Establish Persistent Connection (Do This First)
-```powershell
-# From Windows PowerShell, via WSL
-# This will prompt for MFA ONCE, then persist for 4 hours
+**All cluster operations go through the `compute-canad` MCP tool.** The tool's schema is self-documenting — parameter descriptions, defaults, and validation are built into each tool. See `tools/compute_canada_mcp/DESIGN.md` for the full reference.
 
-wsl bash -c "mkdir -p ~/.ssh/sockets"
-wsl ssh -M -S ~/.ssh/sockets/nibi -o ControlPersist=4h -o ServerAliveInterval=60 -o ServerAliveCountMax=3 ssilber@nibi.alliancecan.ca "echo 'Connection established'; hostname"
-```
+### Tool → Task Mapping
 
-**What the flags do:**
-- `-M`: Creates a master connection
-- `-S ~/.ssh/sockets/nibi`: Socket file for multiplexing
-- `-o ControlPersist=4h`: Keep connection alive for 4 hours
-- `-o ServerAliveInterval=60`: Send keepalive every 60 seconds
-- `-o ServerAliveCountMax=3`: Disconnect after 3 missed keepalives
+| Task | MCP Tool | NOT this |
+|------|----------|----------|
+| Check/establish SSH | `connect` | Manual `wsl ssh` commands |
+| Build binary on cluster | `sync_and_build` | `build_on_cluster.sh`, manual tar/scp/make |
+| Verify binary exists | `check_binary` | Manual `ls`, `ldd` commands |
+| Submit fresh simulation | `start_simulation` | `submit_job.sh` |
+| Resume from checkpoint | `resume_simulation` | `submit_job.sh --continue` |
+| Check job queue | `list_jobs` | `squeue` via `run_command` |
+| Check GPU availability | `check_queues` | `sinfo` via `run_command` |
+| Monitor run progress | `check_progress` | `find`/`tail` via `run_command` |
+| Read job logs | `get_job_logs` | `cat` via `run_command` |
+| Cancel jobs | `cancel_jobs` | `scancel` via `run_command` |
+| Find existing data | `discover` | `find`/`ls` via `run_command` |
+| Download results | `download_results` | Manual `scp` |
+| Estimate cost | `estimate_cost` | Manual calculation |
+| Benchmark cluster perf | `benchmark_cluster` | Manual `sbatch` timing |
+| Quick inspection | `run_command` | Shell scripts |
+| Admin/diagnostic shell | `inspect_cluster` | N/A |
+| Tag existing directory | `create_marker` | N/A |
 
-### Using the Persistent Connection
+---
 
-Once the master connection is established, all subsequent commands use it automatically:
+### ⚠️ CRITICAL: Auto-Computed SLURM Resources — Do NOT Manually Override
 
-```powershell
-# Run commands (no MFA needed)
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "command here"
+**`start_simulation` and `resume_simulation` automatically compute ALL scheduling parameters.** Do NOT manually specify any of the following:
 
-# File transfer (no MFA needed)
-wsl scp -o "ControlPath=~/.ssh/sockets/nibi" local_file ssilber@nibi.alliancecan.ca:/scratch/ssilber/
+| Parameter | Auto-Selection Method | Why manual is worse |
+|-----------|----------------------|---------------------|
+| **account** | Tests ALL GPU accounts with `sbatch --test-only`, picks earliest start | You can't know scheduler state without probing it |
+| **walltime** | Computed from `~/cell_sim_calibration.json` benchmark data × safety factor | Hand-picked walltimes are either too short (timeouts) or too long (scheduling delays) |
+| **num_chains** | Computed from calibration rate × t_end | Over-chains waste scheduler slots; under-chains cause incomplete runs |
+| **gres** | Matched to cluster GPU type from config | Already optimal per cluster |
+| **memory** | Scaled from n_cells | Already optimal per system size |
 
-# Download files
-wsl scp -o "ControlPath=~/.ssh/sockets/nibi" ssilber@nibi.alliancecan.ca:/scratch/ssilber/results.tar ./
-```
+**The only parameters you need to provide are physics parameters:**
+- `n_cells`, `radius`, `confluence`, `t_end` (for start)
+- `checkpoints`, `t_end`, `n_cells` hint (for resume)
+- Physics overrides: `v_A`, `gamma`, `kappa`, `mu`, `xi`, `adhesion_J`, etc.
+- I/O: `trajectory_samples`, `save_interval`
+- `output_dir`, `study_tag`, `seed`
 
-### Check Connection Status
-```powershell
-# Check if socket exists and connection is alive
-wsl ssh -S ~/.ssh/sockets/nibi -O check ssilber@nibi.alliancecan.ca
-```
+**Calibration:** Run `benchmark_cluster(cluster='nibi', action='submit')` then `benchmark_cluster(action='collect')` to measure actual performance. This writes `~/cell_sim_calibration.json` on the cluster, which all submission tools read automatically. If calibration is missing, the tools fall back to hardcoded estimates from `gpu_decision_rules`.
 
-### Refresh/Reconnect When Expired
-```powershell
-# If connection died, clear socket and reconnect
-wsl bash -c "rm -f ~/.ssh/sockets/nibi"
-wsl ssh -M -S ~/.ssh/sockets/nibi -o ControlPersist=4h -o ServerAliveInterval=60 ssilber@nibi.alliancecan.ca "hostname"
-```
+---
 
-### Recommended: Add to ~/.ssh/config (in WSL)
+### ⚠️ `run_command` is Restricted
+
+`run_command` **blocks** the following and returns an error:
+- `sbatch`, `submit_job.sh` → use `start_simulation` / `resume_simulation`
+- `scancel` → use `cancel_jobs`
+- `squeue` → use `list_jobs`
+- `sinfo` → use `check_queues`
+- `cell_sim` → use `start_simulation` / `resume_simulation`
+- Multi-line commands, heredocs, shell loops, commands over 500 characters
+
+`run_command` is for **quick single-line inspection only**: sacctmgr, module list, df, stat, wc, ls.
+
+For system administration tasks requiring unrestricted shell access, use `inspect_cluster` instead. It requires a `justification` parameter explaining why no dedicated tool covers the task.
+
+### Auto-Reconnect Protocol
+
+When `connect` returns `connected: false`:
+
+1. **Immediately** call `connect` again with `reconnect: true`.
+2. Tell the user: *"Reconnecting — please approve the Duo push on your phone."*
+3. The tool auto-sends "1" (Duo Push) and waits up to 60 s for approval.
+4. If it returns `connected: true`, proceed with the original task.
+5. If it fails, tell the user to check their phone or try again.
+
+**Do not** ask the user to run manual SSH commands — `reconnect` handles everything.
+
+---
+
+## ⚠️ CRITICAL: Never Run Compute on Login Nodes
+
+**DO NOT run computationally intensive jobs on login nodes** — not even via `run_command`.
+
+This includes:
+- Processing large trajectory files
+- Running simulations
+- Heavy I/O operations
+- Any job expected to take more than a few seconds
+
+Login nodes are shared. Use them only for: file management, job submission, quick status checks. Submit compute work via SLURM (use `start_simulation` / `resume_simulation`, or `run_command` with `sbatch` for analysis jobs).
+
+---
+
+## Equilibration: Physics Context
+
+**Equilibration = v_A=0 (no motility)** — cells relax into a static configuration from random initial conditions.
+
+### Why Equilibrate?
+
+Production runs should start from an equilibrated state:
+1. Ensures fair comparison between different v_A values
+2. Removes transient effects from random initialization
+3. Allows studying the effect of "suddenly turning on" motility
+
+### Packing Fraction & Domain Size
+
+**⚠️ NEVER hardcode domain sizes. NEVER copy domain sizes from tables or examples.** The ONLY source of truth is the target packing fraction $\rho$ and the formula:
+
+$$L = \lceil\sqrt{N \pi R^2 / \rho}\rceil$$
+
+When using MCP tools, pass `confluence` as a parameter — the tool computes $L$ automatically. When running manually, always compute $L$ at submission time from $N$, $R$, and $\rho$.
+
+The target confluence depends on the study:
+- **Palmieri validation:** $\rho \in \{0.85, 0.90\}$
+- **Adhesion / Griffiths:** $\rho = 0.89$
+- **Palmieri extension:** $\rho \in \{0.70 \ldots 1.00\}$ (see study-specific instructions)
+
+### Equilibration Parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `v_A` | 0 | No self-propulsion |
+| `t_end` | 80,000 | Sufficient for relaxation |
+
+Physics parameters ($\gamma$, $\kappa$, $\mu$, $\xi$) depend on the study. Check the study-specific instruction file:
+- **Palmieri extension:** Uses binary defaults (no overrides needed)
+- **Adhesion study / Griffiths study:** Uses Bresler parameters — set `gamma=3.75`, `mu=0.5`, `xi=1000` via the MCP tool's native parameters (not `extra_cli_flags`). See the study-specific instruction files for details.
+
+See [cell-simulation.instructions.md → Parameter Sets](cell-simulation.instructions.md) for the full comparison.
+
+### Equilibration I/O
+
+Equilibration needs **minimal output**:
+- ~10 VTK frames to visually confirm convergence
+- No trajectory or tracking data (`trajectory_samples=0`)
+- Frequent checkpoints for chain reliability
+
+#### ⚠️ Per-Cell v_A Regeneration on Resume
+
+> See [cell-simulation.instructions.md → v_A Regeneration on Resume](cell-simulation.instructions.md) for full details.
+
+When resuming from an equilibration checkpoint (where all v_A=0), you **must** specify `v_A` (and optionally `v_A_sigma`) to regenerate per-cell values. Without this, cells won't move. The MCP tool's `resume_simulation` passes these as override flags automatically.
+
+---
+
+## 3D Simulations
+
+### 3D vs 2D Defaults
+
+| Parameter | 2D | 3D |
+|-----------|----|----|
+| Cells | 288 | 100 (configurable) |
+| Radius | 49 | 36 |
+| Domain | Computed from confluence | Computed: L = ∛(N × (4/3)πR³ / φ) |
+| Memory | 8–16 GB | 64 GB |
+| Default t_end | 880,000 | 4,000 |
+| Equilibration t_end | 80,000 | 60,000 |
+
+### 3D Domain Reference (85% confluence)
+
+| Cells | Domain (L³) |
+|-------|-------------|
+| 100 | 284³ |
+| 200 | 358³ |
+| 400 | 451³ |
+
+---
+
+## MPI/CPU Version (Fallback)
+
+The MCP tool does not manage MPI builds or submissions. When GPU queues are heavily congested, the MPI/CPU version is a manual alternative.
+
+### Key Facts
+
+- Source: `~/cell_simulation_mpi/`, binary: `~/cell_simulation_mpi/build/cell_sim_mpi`
+- Build: `module load cmake/3.27 gcc/12.3 openmpi/4.1 && cmake .. -DCMAKE_CXX_COMPILER=mpicxx && make -j8`
+- **Checkpoint cross-compatible** with CUDA version (identical format v4) — can start on GPU, continue on CPU, or vice versa
+- ~4× slower than GPU for small systems; use when queue wait > 24 hours
+
+### MPI Job Template
+
 ```bash
-# Run: wsl nano ~/.ssh/config
-# Add these lines:
+#!/bin/bash
+#SBATCH --account=<your-account>   # Use list_jobs or check_queues to find the correct account
+#SBATCH --job-name=cell_sim_mpi
+#SBATCH --nodes=1 --ntasks=1 --cpus-per-task=32
+#SBATCH --mem=32G --time=12:00:00
+#SBATCH --output=%x_%j.out --error=%x_%j.err
 
-Host nibi
-    HostName nibi.alliancecan.ca
-    User ssilber
-    ControlMaster auto
-    ControlPath ~/.ssh/sockets/%r@%h-%p
-    ControlPersist 4h
-    ServerAliveInterval 60
-    ServerAliveCountMax 3
+module load gcc/12.3 openmpi/4.1
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+# Domain size MUST be computed at submission time: L = ceil(sqrt(N * pi * R^2 / rho))
+# Example: python3 -c "import math; print(math.ceil(math.sqrt(72 * math.pi * 49**2 / 0.90)))"
+L=$(python3 -c "import math; print(math.ceil(math.sqrt(72 * math.pi * 49**2 / 0.90)))")
+~/cell_simulation_mpi/build/cell_sim_mpi -n 72 -N $L -r 49 -t 1000 --dt 0.01 \
+    -o /scratch/ssilber/cell_sim_results_mpi/run_001
 ```
 
-Then you can simply use:
-```powershell
-wsl ssh nibi "command"
-wsl scp file nibi:/scratch/ssilber/
-```
+---
 
-## Key Cluster Paths
+## ⚠️ I/O Intervals & Data Budget
 
-| Path | Purpose |
-|------|---------|
-| `~/cell_simulation/` | Main codebase (home directory) |
-| `~/cell_simulation/build/bin/cell_sim` | Compiled executable |
-| `~/cell_simulation/cluster/` | Job scripts |
-| `~/cell_sim_logs/` | Job output logs (.out, .err) |
-| `~/cell_sim_logs/submitted_jobs.txt` | **Submission log** (job IDs) |
-| `~/cell_sim_logs/job_status.txt` | Job status history |
-| `/scratch/ssilber/cell_sim_results/` | Simulation output |
-| `/scratch/ssilber/jamming_study/` | Active production runs |
+**Trajectory files dominate storage.** Saving too frequently creates multi-TB datasets that exceed scratch quota. Always compute the data budget before running production.
 
-## Building on Cluster
+### Current Production I/O Settings
 
-### Full Build (First Time)
-```bash
-# SSH into cluster first
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca
+| Parameter | Value (steps) | Time between saves | Purpose |
+|-----------|--------------|--------------------|---------|
+| `save_interval` | **0** | — | VTK disabled — **never save VTK in production** |
+| `trajectory_samples` | **2000** | ~360 time units | ~2000 data points over production |
+| `checkpoint_interval` | **50000–75000** | ~1000–1500 t.u. | Recovery checkpoints |
 
-# On cluster:
-module load cuda/12.2 cmake/3.27 gcc/12.3
-cd ~/cell_simulation
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=80
-make -j8
-```
+### Data Budget (288c, t=80k→880k = 720k production time)
 
-### Quick Rebuild After Code Changes
-```bash
-cd ~/cell_simulation/build
-make -j8
-```
+| trajectory_samples | Interval (steps) | File size/run | Total (1000 runs) |
+|----|----|----|---|
+| 36,000 | 1000 | ~2.8 GB | **~2.8 TB** ❌ |
+| 2,000 | 18000 | ~47 MB | **~47 GB** ✓ |
+| 1,000 | 36000 | ~24 MB | ~24 GB ✓ |
+| 500 | 72000 | ~12 MB | ~12 GB ✓ |
 
-### Build Script (Automated)
-```bash
-# Run the build script
-cd ~/cell_simulation/cluster
-./build_on_cluster.sh
-```
+Formula: `saves = production_time / (interval × dt)`, `lines = saves × N_cells`, `bytes ≈ lines × 86`
 
-### Uploading Code Changes
-```powershell
-# From local Windows machine
-cd C:\Users\stevensilber\source\repos\data_processing\cpp\simulation
+### Guidelines
 
-# Create tarball of source
-tar -cvf simulation_src.tar src include cluster CMakeLists.txt
+- **Never use VTK saves in production** — each frame for 288c on 1600² is ~10 MB
+- **Target 500–2000 trajectory data points.** 2000 points gives excellent resolution for MSD at all timescales
+- **Rule of thumb**: `trajectory_interval = total_steps / desired_data_points`
+- **Scratch quota is 1 TB.** Budget trajectory + checkpoints + tracking within this
+- For dense short-time data (ballistic regime), use a separate short diagnostic run
 
-# Upload via persistent connection
-wsl scp -o "ControlPath=~/.ssh/sockets/nibi" simulation_src.tar ssilber@nibi.alliancecan.ca:~/
+### Simulation Parameters (Paper Target)
 
-# Extract and rebuild on cluster
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cd ~ && tar -xf simulation_src.tar -C cell_simulation && cd cell_simulation/build && make -j8"
-```
+> **Note:** These are the general jamming study targets. Each study has its own parameter requirements — see the study-specific instruction files. Binary defaults (dt, tau, kappa, etc.) do not need to be specified — run `cell_sim -h` for current values.
 
-## Submitting Jobs
+| Parameter | Value |
+|-----------|-------|
+| `T_END` | 880,000 |
+| `v_A` values | 0.004–0.013 (10 points, step 0.001) |
+| Cells | 288 (standard), 1152 / 4608 (finite-size) |
+| Confluence | 89% |
+| Replicates | 100 per condition (jamming), 3 per condition (Griffiths) |
 
-### Using the Submit Script (Recommended)
+---
 
-The `submit.sh` script handles job creation, logging, and parameter tracking:
+## Analysis Jobs (Post-Processing on Cluster)
+
+The MCP tool does not handle analysis job submission. For heavy post-processing, submit SLURM jobs manually.
+
+### Available Analysis Tools
+
+| Tool | Purpose | Usage |
+|------|---------|-------|
+| `msd_calculator.c` + `msd_job.sh` | MSD/diffusion analysis | `sbatch msd_job.sh 96000` |
+| `energy_analyzer.c` + `energy_job.sh` | Kinetic energy analysis | `sbatch energy_job.sh` |
+| `plot_jamming_transition.py` | Plot D vs v_A | Python script |
+
+### Template for New Analysis Jobs
 
 ```bash
-# From cluster: ~/cell_simulation/cluster/
-./submit.sh quick_test           # 8 cells, t=10, 30 min
-./submit.sh small                # 32 cells, t=100, 6 hr
-./submit.sh medium               # 64 cells, t=100, 12 hr
-./submit.sh large                # 128 cells, t=100, R=32, 24 hr
-./submit.sh xl                   # 200 cells, t=100, R=32, 48 hr
+#!/bin/bash
+#SBATCH --account=<your-account>   # Varies by cluster — check cluster_config.json or list_jobs
+#SBATCH --job-name=my_analysis
+#SBATCH --nodes=1 --ntasks=1 --cpus-per-task=1
+#SBATCH --mem=8G --time=02:00:00
+#SBATCH --output=%x_%j.out --error=%x_%j.err
 
-# Custom cell count
-./submit.sh 48                   # 48 cells with defaults
-./submit.sh 48 -r 32 -t 200      # 48 cells, R=32, t=200
+module load gcc/12.3
+./my_analysis_program /scratch/ssilber/data output.txt
 ```
 
-### From Windows (via persistent connection)
-```powershell
-# Submit a job remotely
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cd ~/cell_simulation/cluster && ./submit.sh medium"
-```
+**Workflow:** Test locally with small data first → upload via SCP (no MCP upload tool exists yet) → submit analysis job via `run_command` with `sbatch`.
 
-### Manual SBATCH Submission
-```bash
-# For custom jobs, create a script or use job_3d.sh
-sbatch job_3d.sh 64 49 100 my_custom_run
-# Args: n_cells radius t_end output_name
-```
+> **Note on `run_command` for analysis jobs:** Submitting non-simulation SLURM jobs (C/Python analysis tools) via `run_command` + `sbatch` is acceptable — the MCP submission tools (`start_simulation`, `resume_simulation`) are only for the cell_sim binary. Do NOT use `run_command` for simulation submission, job monitoring, or file inspection — use the dedicated MCP tools for those.
 
-### Job Presets Reference
-
-| Preset | Cells | Radius | Time | Wall Time | Use Case |
-|--------|-------|--------|------|-----------|----------|
-| `quick_test` | 8 | 49 | 10 | 30 min | Verify build works |
-| `small` | 32 | 49 | 100 | 6 hr | Development testing |
-| `medium` | 64 | 49 | 100 | 12 hr | Standard runs |
-| `large` | 128 | 32 | 100 | 24 hr | High cell count |
-| `xl` | 200 | 32 | 100 | 48 hr | Production scale |
-
-### SLURM Resource Configuration
-
-Standard job resources (in job scripts):
-```bash
-#SBATCH --account=rrg-mkarttu-ab
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gpus-per-node=1        # 1 GPU (A100)
-#SBATCH --mem=32G
-```
-
-For larger jobs:
-```bash
-#SBATCH --mem=64G                # More memory for large domains
-#SBATCH --time=48:00:00          # Up to 48 hours
-```
-
-## Submission Log System
-
-### How It Works
-
-Every job submission is logged to `~/cell_sim_logs/submitted_jobs.txt`:
-```
-<job_id> <run_name>
-```
-
-Example contents:
-```
-5516400 quick_test_n8_r49_20251208_181408
-5517005 quick_test_n8_r49_20251208_182333
-5517273 medium_64c_n64_r49_20251208_182711
-```
-
-### Viewing the Submission Log
-```powershell
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cat ~/cell_sim_logs/submitted_jobs.txt"
-```
-
-### Status History
-
-Job lifecycle events are logged to `~/cell_sim_logs/job_status.txt`:
-```
-QUEUED: 5516400 quick_test_n8_r49_20251208_181408 submitted Mon Dec  8 18:14:08 EST 2025
-RUNNING: 5516400 quick_test_n8_r49_20251208_181408 started Mon Dec  8 18:15:01 EST 2025
-COMPLETED: 5516400 quick_test_n8_r49_20251208_181408 finished Mon Dec  8 18:15:01 EST 2025
-```
-
-### Extracting Job Parameters
-
-Each completed job saves a `run_info.json` in its output directory:
-```json
-{
-  "job_id": "5517273",
-  "run_name": "medium_64c_n64_r49_20251208_182711",
-  "n_cells": 64,
-  "radius": 49,
-  "t_end": 100,
-  "status": "completed",
-  "completed_at": "2025-12-08T18:47:23-05:00"
-}
-```
-
-### Query All Job Parameters
-```powershell
-# List all run_info.json files and their contents
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "for d in /scratch/ssilber/cell_sim_results/*/; do [ -f \"\$d/run_info.json\" ] && echo '=== '\$d && cat \"\$d/run_info.json\"; done"
-```
-
-### Get Parameters for Specific Job
-```powershell
-# By job ID
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "grep 5517273 ~/cell_sim_logs/submitted_jobs.txt && find /scratch/ssilber/cell_sim_results -name run_info.json -exec grep -l 5517273 {} \; -exec cat {} \;"
-```
-
-## Monitoring Jobs
-
-### Check Queue Status
-```powershell
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "squeue -u ssilber"
-```
-
-### View Job Output (Live)
-```powershell
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "tail -f ~/cell_sim_logs/*.out"
-```
-
-### Check Recent Completed Jobs
-```powershell
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "sacct -u ssilber --starttime=\$(date -d '24 hours ago' +%Y-%m-%d) --format=JobID,JobName%30,State,Elapsed"
-```
-
-### Full Status Report
-```powershell
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cd ~/cell_simulation/cluster && ./status.sh"
-```
-
-## Downloading Results
-
-### Download Specific Run
-```powershell
-wsl scp -r -o "ControlPath=~/.ssh/sockets/nibi" ssilber@nibi.alliancecan.ca:/scratch/ssilber/cell_sim_results/medium_64c_n64_r49_20251208_182711 ./cluster_results/
-```
-
-### Download Latest Run
-```powershell
-# Find latest
-$latest = wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "ls -t /scratch/ssilber/cell_sim_results | head -1"
-Write-Host "Downloading: $latest"
-wsl scp -r -o "ControlPath=~/.ssh/sockets/nibi" "ssilber@nibi.alliancecan.ca:/scratch/ssilber/cell_sim_results/$latest" ./cluster_results/
-```
-
-### Download Just Checkpoints/Trajectories (Skip VTK)
-```powershell
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cd /scratch/ssilber/cell_sim_results/my_run && tar -cvf ~/results_lite.tar checkpoint.bin trajectory.txt run_info.json *.csv"
-wsl scp -o "ControlPath=~/.ssh/sockets/nibi" ssilber@nibi.alliancecan.ca:~/results_lite.tar ./
-```
-
-## Using the PowerShell Management Script
-
-The `nibi.ps1` script provides a convenient interface from Windows:
-
-```powershell
-cd C:\Users\stevensilber\source\repos\data_processing\cpp\simulation\cluster
-
-# Check status
-.\nibi.ps1 status
-
-# Submit jobs
-.\nibi.ps1 submit quick_test
-.\nibi.ps1 submit medium
-.\nibi.ps1 submit 48 -r 32 -t 200
-
-# Sync code
-.\nibi.ps1 sync
-
-# Download results
-.\nibi.ps1 download              # Latest
-.\nibi.ps1 download run_name     # Specific run
-
-# View logs
-.\nibi.ps1 logs                  # Recent logs
-.\nibi.ps1 logs 5517273          # Specific job
-```
-
-**Note**: The script uses direct `ssh` commands, not the socket. For socket-based access, use the WSL commands directly.
+---
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| "Connection refused" | Socket expired; re-establish master connection with MFA |
-| "Permission denied" | Check SSH key is loaded: `wsl ssh-add -l` |
-| Job stuck in PENDING | Check account quota: `sshare -u ssilber` |
-| Job failed immediately | Check error log: `cat ~/cell_sim_logs/<run>.err` |
-| Out of disk space | Clean old results: `rm -rf /scratch/ssilber/cell_sim_results/old_run` |
-| Module not found | Run: `module spider cuda` to find available versions |
-| Build fails | Ensure modules loaded: `module load cuda/12.2 cmake/3.27 gcc/12.3` |
-
-## Quick Reference Commands
-
-```powershell
-# === Connection ===
-# Establish (with MFA)
-wsl ssh -M -S ~/.ssh/sockets/nibi -o ControlPersist=4h ssilber@nibi.alliancecan.ca "hostname"
-
-# Test connection
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "echo ok"
-
-# === Jobs ===
-# Submit
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cd ~/cell_simulation/cluster && ./submit.sh medium"
-
-# Status
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "squeue -u ssilber"
-
-# Cancel job
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "scancel <job_id>"
-
-# === Logs ===
-# Submission log
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cat ~/cell_sim_logs/submitted_jobs.txt"
-
-# Job status history
-wsl ssh -S ~/.ssh/sockets/nibi ssilber@nibi.alliancecan.ca "cat ~/cell_sim_logs/job_status.txt"
-
-# === Files ===
-# Upload
-wsl scp -o "ControlPath=~/.ssh/sockets/nibi" file.tar ssilber@nibi.alliancecan.ca:/scratch/ssilber/
-
-# Download
-wsl scp -r -o "ControlPath=~/.ssh/sockets/nibi" ssilber@nibi.alliancecan.ca:/scratch/ssilber/results ./
-```
+| `connect` returns false | Call `connect` with `reconnect: true`; approve Duo push |
+| Job stuck in PENDING | Use `check_queues` to find less-loaded cluster |
+| Job failed immediately | Use `get_job_logs` to read stderr |
+| Out of disk space | Use `disk_usage` MCP tool (or `diskusage_report` via `run_command` for full Alliance report) |
+| Checkpoint version mismatch | Binary is stale — use `sync_and_build` |
+| Binary runs on CPU | Use `check_binary` to verify CUDA linkage; rebuild with `sync_and_build` |
+| Mid-chain failure | Use `check_progress` to find last good time; resubmit with `resume_simulation` |

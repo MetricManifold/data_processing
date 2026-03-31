@@ -194,8 +194,53 @@ static bool parse_gamma_arg(const char *arg, cellsim::SimParams &params,
       fprintf(stderr, "Error: --gamma %s has no cell IDs after 'cell'\n", arg);
       return false;
     }
+  } else if (selector.substr(0, 8) == "nearest(") {
+    // Nearest selector: "nearest(x,y)" — cell closest to (x,y)
+    ov.type = cellsim::SimParams::GammaOverride::Type::Nearest;
+    auto paren_end = selector.find(')');
+    if (paren_end == std::string::npos) {
+      fprintf(stderr, "Error: --gamma %s missing ')' in nearest(x,y)\n", arg);
+      return false;
+    }
+    std::string coords = selector.substr(8, paren_end - 8);
+    auto comma = coords.find(',');
+    if (comma == std::string::npos) {
+      fprintf(stderr, "Error: --gamma %s nearest(x,y) requires two coordinates\n", arg);
+      return false;
+    }
+    ov.pos_x = static_cast<float>(atof(coords.substr(0, comma).c_str()));
+    ov.pos_y = static_cast<float>(atof(coords.substr(comma + 1).c_str()));
+    ov.fraction = 0.0f;
+  } else if (selector.substr(0, 8) == "cluster(") {
+    // Cluster selector: "cluster(N%,x,y)" — nearest N% of cells to (x,y)
+    ov.type = cellsim::SimParams::GammaOverride::Type::Cluster;
+    auto paren_end = selector.find(')');
+    if (paren_end == std::string::npos) {
+      fprintf(stderr, "Error: --gamma %s missing ')' in cluster(N%%,x,y)\n", arg);
+      return false;
+    }
+    std::string inner = selector.substr(8, paren_end - 8);
+    // Parse "N%,x,y"
+    auto c1 = inner.find(',');
+    auto c2 = inner.find(',', c1 + 1);
+    if (c1 == std::string::npos || c2 == std::string::npos) {
+      fprintf(stderr, "Error: --gamma %s cluster(N%%,x,y) requires fraction and two coords\n", arg);
+      return false;
+    }
+    std::string frac_str = inner.substr(0, c1);
+    if (frac_str.back() == '%') {
+      ov.fraction = static_cast<float>(atof(frac_str.c_str())) / 100.0f;
+    } else {
+      ov.fraction = static_cast<float>(atof(frac_str.c_str()));
+    }
+    ov.pos_x = static_cast<float>(atof(inner.substr(c1 + 1, c2 - c1 - 1).c_str()));
+    ov.pos_y = static_cast<float>(atof(inner.substr(c2 + 1).c_str()));
+    if (ov.fraction <= 0.0f || ov.fraction > 1.0f) {
+      fprintf(stderr, "Error: --gamma %s cluster fraction must be 0-100%%\n", arg);
+      return false;
+    }
   } else {
-    fprintf(stderr, "Error: --gamma %s unknown selector '%s' (use N%% or cellN)\n",
+    fprintf(stderr, "Error: --gamma %s unknown selector '%s' (use N%%, cellN, nearest(x,y), or cluster(N%%,x,y))\n",
             arg, selector.c_str());
     return false;
   }
@@ -300,7 +345,9 @@ void print_usage(const char *program) {
   printf("                    --gamma 1.0           Base value for all cells\n");
   printf("                    --gamma 0.35:20%%      20%% of cells get gamma=0.35\n");
   printf("                    --gamma 0.35:cell0,5   Cells 0 and 5 get gamma=0.35\n");
-  printf("                  Order: base -> fractions (random assign) -> cells (override)\n");
+  printf("                    --gamma 0.35:nearest(x,y)       Cell nearest to (x,y)\n");
+  printf("                    --gamma 0.35:cluster(20%%,x,y)   20%% nearest to (x,y)\n");
+  printf("                  Order: base -> spatial -> fractions -> cells (override)\n");
   printf("  --radius <f[:selector]>  Per-cell target radius (default: same as -r).\n");
   printf("                  Enables polydisperse populations (different-sized cells).\n");
   printf("                  Each cell gets its own target_area = pi*R^2 and volume_coeff = mu/A0.\n");
@@ -343,6 +390,284 @@ void print_usage(const char *program) {
   printf("\n  -h            Show this help\n");
 }
 
+//=============================================================================
+// BATCH MODE: Run multiple independent systems in a single GPU process
+//
+// All systems are concatenated into one set of device arrays.
+// Each kernel uses d_system_id to look up per-system Nx/Ny/sum_field.
+// Requirements: all systems must share the same domain dimensions (Nx, Ny).
+// This is satisfied when all systems use the same (N_cells, R, rho).
+//=============================================================================
+
+struct BatchSystemConfig {
+  std::string checkpoint;   // Path to checkpoint file
+  std::string output;       // Output directory
+  float v_A = -1.0f;       // Override v_A (-1 = use checkpoint value)
+  std::string gamma_spec;   // Gamma override spec (e.g., "0.35:cell0")
+  int seed_offset = 0;     // RNG seed offset for independent replicas
+};
+
+struct BatchConfig {
+  std::vector<BatchSystemConfig> systems;
+  float t_end = -1.0f;          // Override t_end (-1 = use checkpoint value)
+  int trajectory_samples = 2000;
+  int checkpoint_interval = -1;  // -1 = auto
+  int print_interval = 1000000;
+};
+
+// Simple JSON batch config parser
+static bool parse_batch_config(const char *filename, BatchConfig &config) {
+  FILE *f = fopen(filename, "r");
+  if (!f) {
+    printf("Error: Could not open batch config: %s\n", filename);
+    return false;
+  }
+  fseek(f, 0, SEEK_END);
+  long file_size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  std::string json(file_size, '\0');
+  fread(&json[0], 1, file_size, f);
+  fclose(f);
+
+  // Parse t_end
+  {
+    const char *p = strstr(json.c_str(), "\"t_end\"");
+    if (p) { p = strchr(p, ':'); if (p) config.t_end = (float)atof(p + 1); }
+  }
+  // Parse trajectory_samples
+  {
+    const char *p = strstr(json.c_str(), "\"trajectory_samples\"");
+    if (p) { p = strchr(p, ':'); if (p) config.trajectory_samples = atoi(p + 1); }
+  }
+  // Parse checkpoint_interval
+  {
+    const char *p = strstr(json.c_str(), "\"checkpoint_interval\"");
+    if (p) { p = strchr(p, ':'); if (p) config.checkpoint_interval = atoi(p + 1); }
+  }
+  // Parse print_interval
+  {
+    const char *p = strstr(json.c_str(), "\"print_interval\"");
+    if (p) { p = strchr(p, ':'); if (p) config.print_interval = atoi(p + 1); }
+  }
+
+  // Parse systems array
+  const char *systems_start = strstr(json.c_str(), "\"systems\"");
+  if (!systems_start) {
+    printf("Error: batch config missing 'systems' array\n");
+    return false;
+  }
+  systems_start = strchr(systems_start, '[');
+  if (!systems_start) return false;
+
+  // Find each system object
+  const char *pos = systems_start;
+  while (true) {
+    const char *obj_start = strchr(pos, '{');
+    if (!obj_start) break;
+    const char *obj_end = strchr(obj_start, '}');
+    if (!obj_end) break;
+
+    std::string obj(obj_start, obj_end - obj_start + 1);
+    BatchSystemConfig sys;
+
+    // Parse checkpoint
+    const char *ck = strstr(obj.c_str(), "\"checkpoint\"");
+    if (ck) {
+      ck = strchr(ck + 12, '"'); if (ck) { ck++;
+      const char *ce = strchr(ck, '"');
+      if (ce) sys.checkpoint = std::string(ck, ce - ck);
+    }}
+    // Parse output
+    const char *ou = strstr(obj.c_str(), "\"output\"");
+    if (ou) {
+      ou = strchr(ou + 8, '"'); if (ou) { ou++;
+      const char *oe = strchr(ou, '"');
+      if (oe) sys.output = std::string(ou, oe - ou);
+    }}
+    // Parse v_A
+    const char *va = strstr(obj.c_str(), "\"v_A\"");
+    if (va) { va = strchr(va, ':'); if (va) sys.v_A = (float)atof(va + 1); }
+    // Parse gamma
+    const char *ga = strstr(obj.c_str(), "\"gamma\"");
+    if (ga) {
+      ga = strchr(ga + 7, '"'); if (ga) { ga++;
+      const char *ge = strchr(ga, '"');
+      if (ge) sys.gamma_spec = std::string(ga, ge - ga);
+    }}
+    // Parse seed_offset
+    const char *so = strstr(obj.c_str(), "\"seed_offset\"");
+    if (so) { so = strchr(so, ':'); if (so) sys.seed_offset = atoi(so + 1); }
+
+    if (!sys.checkpoint.empty()) {
+      config.systems.push_back(sys);
+    }
+    pos = obj_end + 1;
+  }
+
+  printf("Batch config: %zu systems, t_end=%.0f, trajectory_samples=%d\n",
+         config.systems.size(), config.t_end, config.trajectory_samples);
+  for (size_t i = 0; i < config.systems.size(); ++i) {
+    printf("  [%zu] checkpoint=%s output=%s", i, config.systems[i].checkpoint.c_str(),
+           config.systems[i].output.c_str());
+    if (config.systems[i].v_A >= 0) printf(" v_A=%.4f", config.systems[i].v_A);
+    if (!config.systems[i].gamma_spec.empty()) printf(" gamma=%s", config.systems[i].gamma_spec.c_str());
+    printf("\n");
+  }
+
+  return !config.systems.empty();
+}
+
+// Run batch mode: multiple independent systems in a single GPU process.
+// Each system is a separate Simulation instance with its own Domain+Integrator.
+// Kernels are launched sequentially per system per step — no kernel changes needed.
+// GPU memory is shared via the CUDA context; each Integrator allocates its own arrays.
+static int run_batch(const BatchConfig &config, int base_seed) {
+  int num_systems = (int)config.systems.size();
+  printf("=== BATCH MODE: %d independent systems ===\n\n", num_systems);
+
+  // Phase 1: Create N independent Simulation instances from checkpoints
+  std::vector<std::unique_ptr<Simulation>> sims;
+  SimParams base_params;
+
+  for (int s = 0; s < num_systems; ++s) {
+    printf("Loading system %d: %s\n", s, config.systems[s].checkpoint.c_str());
+
+    // Load checkpoint to get params
+    Domain temp_domain(SimParams{});
+    CheckpointHeader hdr;
+    std::vector<float> ck_v_A, ck_gamma, ck_radius;
+    if (!load_checkpoint(temp_domain, config.systems[s].checkpoint,
+                         hdr, &ck_v_A, &ck_gamma, &ck_radius)) {
+      printf("ERROR: Failed to load checkpoint for system %d\n", s);
+      return 1;
+    }
+
+    // Apply config overrides
+    SimParams params = temp_domain.params;
+    if (config.t_end > 0) params.t_end = config.t_end;
+    if (s == 0) base_params = params;
+
+    printf("  System %d: %d cells, domain %dx%d, t=%.1f\n",
+           s, temp_domain.num_cells(), params.Nx, params.Ny, hdr.current_time);
+
+    // Create simulation
+    auto sim = std::make_unique<Simulation>(params);
+    sim->output_dir = config.systems[s].output;
+    sim->save_interval = 0;
+    sim->save_vtk = false;
+    sim->checkpoint_interval = (config.checkpoint_interval > 0) ? config.checkpoint_interval : 8000000;
+    sim->trajectory_samples = config.trajectory_samples;
+    sim->print_interval = config.print_interval;
+    sim->current_time = (double)hdr.current_time;
+    sim->current_step = hdr.current_step;
+    sim->resumed_from_checkpoint = true;
+
+    // Move cells from temp domain into sim domain
+    sim->domain.cells = std::move(temp_domain.cells);
+    sim->domain.device_arrays_dirty = true;
+    sim->domain.sync_device_arrays();
+
+    // Per-system v_A override
+    if (config.systems[s].v_A >= 0) {
+      int nc = sim->domain.num_cells();
+      std::vector<float> v_A(nc, config.systems[s].v_A);
+      sim->integrator.checkpoint_v_A = std::move(v_A);
+    } else if (!ck_v_A.empty()) {
+      sim->integrator.checkpoint_v_A = std::move(ck_v_A);
+    }
+
+    // Per-system gamma override
+    if (!config.systems[s].gamma_spec.empty()) {
+      const std::string &spec = config.systems[s].gamma_spec;
+      size_t colon = spec.find(':');
+      if (colon != std::string::npos) {
+        float gamma_val = std::stof(spec.substr(0, colon));
+        std::string sel = spec.substr(colon + 1);
+        if (sel.substr(0, 4) == "cell") {
+          std::string ids = sel.substr(4);
+          size_t p = 0;
+          while (p < ids.size()) {
+            size_t c = ids.find(',', p);
+            if (c == std::string::npos) c = ids.size();
+            int local = std::stoi(ids.substr(p, c - p));
+            SimParams::GammaOverride ov;
+            ov.value = gamma_val;
+            ov.type = SimParams::GammaOverride::Type::Cells;
+            ov.cell_ids.push_back(local);
+            sim->integrator.gamma_overrides.push_back(ov);
+            p = c + 1;
+          }
+          sim->integrator.gamma_overrides_set = true;
+        }
+      }
+    }
+    if (!ck_gamma.empty()) {
+      sim->integrator.checkpoint_gamma = std::move(ck_gamma);
+    }
+    if (!ck_radius.empty()) {
+      sim->integrator.checkpoint_target_radius = std::move(ck_radius);
+    }
+
+    // RNG seed offset for independent replicas
+    srand(base_seed + config.systems[s].seed_offset);
+
+    std::filesystem::create_directories(config.systems[s].output);
+    sims.push_back(std::move(sim));
+  }
+
+  printf("\nStarting batch: %d systems, t=%.0f to t=%.0f\n",
+         num_systems, sims[0]->current_time, base_params.t_end);
+  fflush(stdout);
+
+  // Phase 2: Run in lockstep — each step advances all systems
+  auto t0 = std::chrono::high_resolution_clock::now();
+  float dt = base_params.dt;
+  float t_end = base_params.t_end;
+
+  // Compute trajectory interval for each system
+  std::vector<int> traj_intervals(num_systems);
+  for (int s = 0; s < num_systems; ++s) {
+    int total_steps = (int)((t_end - sims[s]->current_time) / dt + 0.5f);
+    traj_intervals[s] = std::max(1, total_steps / config.trajectory_samples);
+  }
+
+  int step_count = 0;
+  while (sims[0]->current_time < t_end && !g_shutdown_requested) {
+    step_count++;
+    bool is_print_step = (step_count % config.print_interval == 0);
+
+    for (int s = 0; s < num_systems; ++s) {
+      bool save_traj = (step_count % traj_intervals[s] == 0);
+      sims[s]->integrator.step(sims[s]->domain, dt, save_traj, save_traj || is_print_step);
+      sims[s]->current_time += dt;
+      sims[s]->current_step++;
+
+      if (save_traj) {
+        sims[s]->save_trajectory();
+      }
+    }
+
+    if (is_print_step) {
+      printf("Step %7d | t=%.4f\n", sims[0]->current_step, sims[0]->current_time);
+      fflush(stdout);
+    }
+  }
+
+  double elapsed = std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - t0).count();
+
+  // Phase 3: Save per-system checkpoints
+  printf("\nSaving per-system checkpoints...\n");
+  for (int s = 0; s < num_systems; ++s) {
+    sims[s]->save_current_checkpoint(config.systems[s].output + "/checkpoint.bin");
+    printf("  System %d: %s/checkpoint.bin\n", s, config.systems[s].output.c_str());
+  }
+
+  printf("\nBatch finished: %d systems, %.1f seconds\n", num_systems, elapsed);
+  printf("Total wall time: %.3f seconds\n", elapsed);
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   // Register SIGTERM handler for clean SLURM chain-job transitions
   std::signal(SIGTERM, sigterm_handler);
@@ -367,6 +692,7 @@ int main(int argc, char *argv[]) {
   std::string output_dir = "./output";
   std::string checkpoint_file = "";
   std::string init_file = "";  // JSON initial conditions file
+  std::string batch_config_file = "";  // --batch mode
   bool edge_test = false;
   bool corner_push_test = false;
   bool use_diagnostics = false;
@@ -434,6 +760,8 @@ int main(int argc, char *argv[]) {
       min_spacing = atof(argv[++i]);
     } else if ((arg == "-c" || arg == "--load") && i + 1 < argc) {
       checkpoint_file = argv[++i];
+    } else if (arg == "--batch" && i + 1 < argc) {
+      batch_config_file = argv[++i];
     } else if (arg == "-i" && i + 1 < argc) {
       init_file = argv[++i];
     } else if (arg == "--edge-test") {
@@ -601,6 +929,17 @@ int main(int argc, char *argv[]) {
   printf("  Compute capability: %d.%d\n", prop.major, prop.minor);
   printf("  Memory: %.1f GB\n", prop.totalGlobalMem / 1e9);
   printf("\n");
+
+  //=========================================================================
+  // Batch Mode Branch
+  //=========================================================================
+  if (!batch_config_file.empty()) {
+    BatchConfig batch_config;
+    if (!parse_batch_config(batch_config_file.c_str(), batch_config)) {
+      return 1;
+    }
+    return run_batch(batch_config, random_seed >= 0 ? random_seed : (int)time(nullptr));
+  }
 
   //=========================================================================
   // 3D Simulation Branch

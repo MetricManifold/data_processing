@@ -112,15 +112,22 @@ inline float tanh_profile(float r, float R, float lambda) {
 }
 
 /**
- * Compute effective radius for initialization.
+ * Compute effective radius for 2D initialization.
+ *
+ * For a circular cell with tanh profile φ = 0.5(1 - tanh((r-R_eff)/w)),
+ * the volume integral ∫φ² dA depends on the interface width.
+ *
+ * Empirical formula (fitted to numerical integration):
+ *   R_eff = R_target + 0.7088*λ - 0.5887*λ²/R_target
+ *
+ * This gives initial volume within 0.5% of target for R >= 30, λ = 5-10.
  */
 inline float effective_radius_2d(float target_radius, float lambda) {
-  float w = sqrtf(2.0f) * lambda;
-  float w2_over_3 = (w * w) / 3.0f;
-  if (target_radius * target_radius > w2_over_3) {
-    return sqrtf(target_radius * target_radius - w2_over_3);
-  }
-  return target_radius;
+  // Empirical correction for 2D circular cells with tanh interface
+  // R_eff = R + c1*λ - c2*λ²/R where c1 ≈ 0.7088, c2 ≈ 0.5887
+  float c1 = 0.7088f;
+  float c2 = 0.5887f;
+  return target_radius + c1 * lambda - c2 * lambda * lambda / target_radius;
 }
 
 //=============================================================================

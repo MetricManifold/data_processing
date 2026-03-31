@@ -9,7 +9,8 @@
 namespace cellsim {
 
 void save_checkpoint(const Domain &domain, const std::string &filename,
-                     const CheckpointHeader &header) {
+                     const CheckpointHeader &header,
+                     const float *h_v_A, int num_v_A) {
   // Write to temporary file first, then rename atomically
   std::string temp_filename = filename + ".tmp";
 
@@ -44,6 +45,16 @@ void save_checkpoint(const Domain &domain, const std::string &filename,
                cell->field_size * sizeof(float));
   }
 
+  // Write per-cell v_A values for quenched disorder preservation
+  if (h_v_A != nullptr && num_v_A > 0) {
+    uint32_t v_A_magic = 0x56415F41; // "VA_A"
+    file.write(reinterpret_cast<const char *>(&v_A_magic), sizeof(uint32_t));
+    int32_t v_A_count = num_v_A;
+    file.write(reinterpret_cast<const char *>(&v_A_count), sizeof(int32_t));
+    file.write(reinterpret_cast<const char *>(h_v_A),
+               num_v_A * sizeof(float));
+  }
+
   file.close();
 
   // Atomic rename
@@ -60,7 +71,8 @@ void save_checkpoint(const Domain &domain, const std::string &filename,
 }
 
 bool load_checkpoint(Domain &domain, const std::string &filename,
-                     CheckpointHeader &out_header) {
+                     CheckpointHeader &out_header,
+                     std::vector<float> *out_v_A) {
   std::ifstream file(filename, std::ios::binary);
   if (!file.is_open()) {
     printf("Warning: Could not open checkpoint file: %s\n", filename.c_str());
@@ -108,7 +120,9 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
     file.read(reinterpret_cast<char *>(&val_at_40), sizeof(uint32_t));
     file.seekg(0);
 
-    bool is_old_format = (val_at_36 == 0 && val_at_40 == sizeof(SimParams));
+    // NOTE: Don't compare val_at_40 against sizeof(SimParams) — that breaks
+    // when SimParams grows (e.g., adding v_A_sigma changed 76 → 80).
+    bool is_old_format = (val_at_36 == 0 && val_at_40 >= 64 && val_at_40 <= 512);
 
     if (is_old_format) {
       printf("Note: Loading old v4 checkpoint format\n");
@@ -124,11 +138,13 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
   int num_cells = header.num_cells;
 
   // Handle SimParams size mismatch
-  size_t old_sim_params_size = sizeof(SimParams) - sizeof(SimParams::MotilityModel);
+  // v3 had neither motility_model nor v_A_sigma
+  size_t v3_sim_params_size = sizeof(SimParams) - sizeof(SimParams::MotilityModel) - sizeof(float);
 
   if (header.version <= 3 || header.sim_params_size == 0) {
-    file.read(reinterpret_cast<char *>(&domain.params), old_sim_params_size);
+    file.read(reinterpret_cast<char *>(&domain.params), v3_sim_params_size);
     domain.params.motility_model = SimParams::MotilityModel::RunAndTumble;
+    domain.params.v_A_sigma = 0.0f;
   } else if (header.sim_params_size != sizeof(SimParams)) {
     printf("Warning: SimParams size mismatch (file: %u, current: %zu)\n",
            header.sim_params_size, sizeof(SimParams));
@@ -177,6 +193,22 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
 
     domain.cells.push_back(std::move(cell));
     domain.next_cell_id = std::max(domain.next_cell_id, id + 1);
+  }
+
+  // Try to read per-cell v_A values (appended after cell data)
+  if (out_v_A != nullptr) {
+    uint32_t v_A_magic = 0;
+    file.read(reinterpret_cast<char *>(&v_A_magic), sizeof(uint32_t));
+    if (file.good() && v_A_magic == 0x56415F41) { // "VA_A"
+      int32_t v_A_count = 0;
+      file.read(reinterpret_cast<char *>(&v_A_count), sizeof(int32_t));
+      if (file.good() && v_A_count > 0 && v_A_count <= num_cells) {
+        out_v_A->resize(v_A_count);
+        file.read(reinterpret_cast<char *>(out_v_A->data()),
+                  v_A_count * sizeof(float));
+        printf("  Loaded per-cell v_A: %d values from checkpoint\n", v_A_count);
+      }
+    }
   }
 
   file.close();

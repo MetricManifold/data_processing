@@ -16,7 +16,7 @@ using namespace cellsim;
 
 void print_usage(const char *program) {
   printf("Usage: %s [options]\n", program);
-  printf("MPI/CPU implementation of cell simulation\n\n");
+  printf("CPU/OpenMP implementation of cell simulation\n\n");
   printf("Options:\n");
   printf("  -n <num>      Number of cells (default: 8)\n");
   printf("  -r <radius>   Cell radius (default: 49)\n");
@@ -117,13 +117,10 @@ int main(int argc, char *argv[]) {
   std::filesystem::create_directories(output_dir);
 
   // Seed random number generator
-  if (random_seed >= 0) {
-    srand(static_cast<unsigned>(random_seed));
-    printf("Using random seed: %d\n", random_seed);
-  } else {
+  if (random_seed < 0) {
     random_seed = static_cast<int>(time(nullptr));
-    srand(static_cast<unsigned>(random_seed));
   }
+  srand(static_cast<unsigned>(random_seed));
 
   // Apply v_A and tau overrides
   if (v_A_override >= 0.0f) {
@@ -137,8 +134,8 @@ int main(int argc, char *argv[]) {
   }
 
   // Print parameters
-  printf("MPI Cell Simulation (CPU)\n");
-  printf("=========================\n");
+  printf("Cell Simulation (CPU/OpenMP)\n");
+  printf("============================\n");
   printf("Simulation Parameters:\n");
   printf("  Domain: %d x %d\n", params.Nx, params.Ny);
   printf("  Time step: dt=%.4f\n", params.dt);
@@ -151,6 +148,7 @@ int main(int argc, char *argv[]) {
          params.motility_model == SimParams::MotilityModel::ABP
              ? "ABP" : "Run-and-Tumble");
   printf("  Cells: %d\n", num_cells);
+  printf("  Random seed: %d\n", random_seed);
   printf("\n");
 
   // Create domain and integrator
@@ -161,7 +159,7 @@ int main(int argc, char *argv[]) {
   float current_time = 0.0f;
   int current_step = 0;
 
-  // Initialize
+  // Initialize cells
   bool resumed = false;
   if (!checkpoint_file.empty()) {
     CheckpointHeader header;
@@ -172,7 +170,7 @@ int main(int argc, char *argv[]) {
       current_step = header.current_step;
       current_time = header.current_time;
       
-      // Restore t_end from command line (checkpoint shouldn't override target)
+      // Restore t_end from command line
       domain.params.t_end = saved_t_end;
       
       // Apply command-line overrides
@@ -282,7 +280,6 @@ int main(int argc, char *argv[]) {
 
     // Progress output
     if (prnt_interval > 0 && current_step % prnt_interval == 0) {
-      // Compute average volume
       float total_volume = 0.0f;
       for (const auto &cell : domain.cells) {
         total_volume += cell->volume;

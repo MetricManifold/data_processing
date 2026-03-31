@@ -4,6 +4,20 @@ applyTo: "rust/vtk_viewer/**"
 
 # VTK Viewer - Copilot Instructions
 
+> **When to consult this file:** You are building, modifying, or debugging the Rust-based VTK viewer (`rust/vtk_viewer/`). This covers the rendering pipeline, colormap system, glow effects, layer compositing, preset system, and UI patterns. For the Python visualization alternative, see [postprocessing.instructions.md](postprocessing.instructions.md). For simulation parameters that affect VTK output, see [cell-simulation.instructions.md](cell-simulation.instructions.md).
+
+## ⚠️ Related Instructions - Read Before Proceeding
+
+| Task | Instruction File |
+|------|-----------------|
+| Cell simulation parameters/physics | [cell-simulation.instructions.md](cell-simulation.instructions.md) |
+| Python visualization (alternative) | [postprocessing.instructions.md](postprocessing.instructions.md) |
+| Viewing cluster-generated VTK files | [cluster-operations.instructions.md](cluster-operations.instructions.md) |
+
+**Note**: This viewer loads VTK files from the cell simulation. Ensure output format compatibility when making simulation changes.
+
+---
+
 This is a high-performance VTK frame viewer written in Rust using `eframe`/`egui` for the GUI. It visualizes 2D structured grid VTK files with multi-layer compositing, colormaps, and glow effects.
 
 **Primary Use Case**: Visualizing time-series simulation data (phase fields, stress tensors, etc.) from the cell simulation project.

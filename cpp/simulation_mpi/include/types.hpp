@@ -133,6 +133,40 @@ struct BoundingBox {
     return (dx < hw) && (dy < hh);
   }
 
+  // Compute intersection of two bounding boxes (considering periodic BC)
+  // Returns true if intersection is non-empty, and fills result
+  // The intersection is given in terms of local coordinates within THIS bbox
+  // (lx0, ly0) to (lx1, ly1) exclusive, representing which parts of THIS bbox overlap with other
+  bool intersection_local(const BoundingBox &other, int Nx, int Ny,
+                          int &lx0, int &ly0, int &lx1, int &ly1) const {
+    if (!overlaps(other, Nx, Ny)) {
+      return false;
+    }
+    
+    // For each point in this bbox, check if it's also in other bbox
+    // This is O(width*height) but we do it once during setup, not per timestep
+    lx0 = width();
+    ly0 = height();
+    lx1 = 0;
+    ly1 = 0;
+    
+    for (int ly = 0; ly < height(); ++ly) {
+      for (int lx = 0; lx < width(); ++lx) {
+        int gx, gy;
+        local_to_global(lx, ly, gx, gy, Nx, Ny);
+        
+        if (other.contains(gx, gy, Nx, Ny)) {
+          lx0 = std::min(lx0, lx);
+          ly0 = std::min(ly0, ly);
+          lx1 = std::max(lx1, lx + 1);
+          ly1 = std::max(ly1, ly + 1);
+        }
+      }
+    }
+    
+    return (lx1 > lx0) && (ly1 > ly0);
+  }
+
   // Expand box by a margin (for halo cells)
   BoundingBox expanded(int margin) const {
     return {x0 - margin, y0 - margin, x1 + margin, y1 + margin};

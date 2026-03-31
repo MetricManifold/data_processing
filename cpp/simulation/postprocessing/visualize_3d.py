@@ -95,11 +95,14 @@ def read_checkpoint_3d(filename):
             # Vec3 velocity
             velocity = struct.unpack('3f', f.read(12))
             
-            # Read field data - use bbox_with_halo dimensions!
-            width = hx1 - hx0
-            height = hy1 - hy0
-            depth = hz1 - hz0
-            size = width * height * depth
+            # Explicit field_size (always positive, handles wrapping bboxes)
+            field_size = struct.unpack('i', f.read(4))[0]
+            
+            # Compute dimensions using abs (bbox can wrap around periodic domain)
+            width = abs(hx1 - hx0)
+            height = abs(hy1 - hy0)
+            depth = abs(hz1 - hz0)
+            size = field_size  # Use the saved field_size rather than recomputing
             
             phi_data = np.frombuffer(f.read(size * 4), dtype=np.float32)
             phi = phi_data.reshape((depth, height, width))  # z, y, x order

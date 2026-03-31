@@ -473,6 +473,7 @@ cmake --build . --config Release
 | `-o <dir>` | Output directory | ./output |
 | `-c <file>` | Load checkpoint | — |
 | `--v-A <f>` | Active velocity | 0 |
+| `--v-A-sigma <f>` | Per-cell v_A disorder std dev (log-normal) | 0 |
 | `--3d` | Enable 3D mode | false |
 | `--save-interval <n>` | Steps between VTK saves | 100 |
 | `--trajectory-samples <n>` | Trajectory points to save | 100 |
@@ -558,6 +559,7 @@ Load the equilibrated checkpoint and enable active motility:
 **Notes:**
 - The `-t` parameter is the **absolute** end time, not additional time
 - You can change parameters like `--v-A` when resuming
+- **v_A regeneration:** v4 checkpoints store per-cell v_A values. When resuming from an equilibration checkpoint (v_A=0) for production runs, you **must** specify `--v-A` on the command line. This clears the checkpoint's per-cell v_A and regenerates fresh values. Without `--v-A`, cells keep their checkpoint v_A (all zeros from equilibration). Specifying `--v-A-sigma` also triggers regeneration with log-normal disorder.
 
 ### 3D Simulation Guidelines
 

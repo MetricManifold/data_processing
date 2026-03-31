@@ -1,8 +1,10 @@
 #include "integrator.hpp"
+#include "mpi_spatial.hpp"
 #include "physics.hpp"
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <numeric>
 
 namespace cellsim {
 
@@ -22,16 +24,15 @@ void Integrator::step(Domain &domain, float dt) {
 
   const SimParams &params = domain.params;
   int num_cells = domain.num_cells();
-  int halo = params.halo_width;
 
-  // Temporary buffers for each cell
+  // Temporary buffers for all cells
   std::vector<std::vector<float>> all_laplacian(num_cells);
   std::vector<std::vector<float>> all_bulk(num_cells);
   std::vector<std::vector<float>> all_grad_x(num_cells);
   std::vector<std::vector<float>> all_grad_y(num_cells);
   std::vector<std::vector<float>> all_interaction_sum(num_cells);
 
-  // Step 1: Compute local terms for all cells
+  // Step 1: Compute local terms for all cells (OpenMP parallel)
   #ifdef USE_OPENMP
   #pragma omp parallel for schedule(dynamic)
   #endif
@@ -43,7 +44,6 @@ void Integrator::step(Domain &domain, float dt) {
     all_grad_y[i].resize(cell->field_size);
     all_interaction_sum[i].resize(cell->field_size, 0.0f);
 
-    // Compute laplacian, bulk, and gradients
     compute_local_terms(*cell, params, all_laplacian[i], all_bulk[i],
                         all_grad_x[i], all_grad_y[i]);
   }
@@ -62,7 +62,7 @@ void Integrator::step(Domain &domain, float dt) {
     domain.cells[i]->volume_deviation = target_area - domain.cells[i]->volume;
   }
 
-  // Step 4: Compute interaction sums (cell-cell interactions)
+  // Step 4: Compute interaction sums for all cells
   if (num_cells > 1) {
     #ifdef USE_OPENMP
     #pragma omp parallel for schedule(dynamic)
@@ -72,7 +72,7 @@ void Integrator::step(Domain &domain, float dt) {
     }
   }
 
-  // Step 5: Compute velocities
+  // Step 5: Compute velocities for all cells
   #ifdef USE_OPENMP
   #pragma omp parallel for schedule(dynamic)
   #endif
@@ -82,12 +82,12 @@ void Integrator::step(Domain &domain, float dt) {
                                all_interaction_sum[i]);
   }
 
-  // Step 6: Update polarization directions (sequential due to RNG)
+  // Step 6: Update polarization for all cells (sequential due to RNG)
   for (int i = 0; i < num_cells; ++i) {
     update_polarization(*domain.cells[i], params, dt);
   }
 
-  // Step 7: Compute RHS and apply Euler step
+  // Step 7: Compute RHS and apply Euler step for all cells
   #ifdef USE_OPENMP
   #pragma omp parallel for schedule(dynamic)
   #endif
@@ -98,10 +98,12 @@ void Integrator::step(Domain &domain, float dt) {
                          all_interaction_sum[i]);
   }
 
-  // Step 8: Update bounding boxes periodically
+  // Step 8: Periodically update bounding boxes
   step_counter++;
   if (step_counter % bbox_update_interval == 0) {
-    domain.update_all_bounding_boxes();
+    for (int i = 0; i < num_cells; ++i) {
+      domain.cells[i]->update_bounding_box(params);
+    }
   }
 }
 
@@ -355,5 +357,137 @@ void Integrator::update_polarization(Cell &cell, const SimParams &params, float 
   cell.polarization.x = cosf(cell.theta);
   cell.polarization.y = sinf(cell.theta);
 }
+
+#ifdef USE_MPI
+//=============================================================================
+// MPI-Parallel Integration Step - EFFICIENT VERSION
+//
+// Communication pattern:
+// - Each rank computes updates for its owned cells (local computation)
+// - Exchange ghost cell data ONLY for cells whose bboxes overlap tile boundaries
+// - This is O(boundary_cells) communication, not O(all_cells)
+//
+// Key insight: Most cells don't overlap tile boundaries, so need no communication.
+//=============================================================================
+
+void Integrator::step_mpi(Domain &domain, float dt, MPISpatial &mpi) {
+  if (domain.num_cells() == 0) return;
+
+  const SimParams &params = domain.params;
+  int num_cells = domain.num_cells();
+
+  // Build communication pattern if needed
+  if (mpi.needs_comm_rebuild()) {
+    mpi.build_comm_pattern(domain);
+  }
+
+  // Get owned cells from the precomputed pattern
+  const std::vector<int>& owned_cells = mpi.owned_cells();
+  int num_owned = static_cast<int>(owned_cells.size());
+
+  // Temporary buffers for ALL cells (needed for interaction computation)
+  std::vector<std::vector<float>> all_laplacian(num_cells);
+  std::vector<std::vector<float>> all_bulk(num_cells);
+  std::vector<std::vector<float>> all_grad_x(num_cells);
+  std::vector<std::vector<float>> all_grad_y(num_cells);
+  std::vector<std::vector<float>> all_interaction_sum(num_cells);
+
+  // Step 1: Compute local terms for owned cells only (OpenMP parallel)
+  #ifdef USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+  #endif
+  for (int idx = 0; idx < num_owned; ++idx) {
+    int i = owned_cells[idx];
+    auto &cell = domain.cells[i];
+    all_laplacian[i].resize(cell->field_size);
+    all_bulk[i].resize(cell->field_size);
+    all_grad_x[i].resize(cell->field_size);
+    all_grad_y[i].resize(cell->field_size);
+    all_interaction_sum[i].resize(cell->field_size, 0.0f);
+
+    compute_local_terms(*cell, params, all_laplacian[i], all_bulk[i],
+                        all_grad_x[i], all_grad_y[i]);
+  }
+
+  // Step 2: Compute volume and centroid for owned cells
+  #ifdef USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+  #endif
+  for (int idx = 0; idx < num_owned; ++idx) {
+    int i = owned_cells[idx];
+    compute_volume_and_centroid(*domain.cells[i], params);
+  }
+
+  // Step 3: Compute volume deviations for owned cells
+  float target_area = params.target_area();
+  for (int idx = 0; idx < num_owned; ++idx) {
+    int i = owned_cells[idx];
+    domain.cells[i]->volume_deviation = target_area - domain.cells[i]->volume;
+  }
+
+  // Step 4: Exchange ghost cells BEFORE computing interactions
+  // This ensures we have up-to-date phi data from neighbors for interaction computation
+  mpi.exchange_ghost_cells(domain);
+
+  // Step 5: Compute interaction sums for owned cells
+  // Now safe to access ghost cell phi data
+  if (num_cells > 1) {
+    #ifdef USE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+    #endif
+    for (int idx = 0; idx < num_owned; ++idx) {
+      int i = owned_cells[idx];
+      all_interaction_sum[i].resize(domain.cells[i]->field_size, 0.0f);
+      compute_interaction_sum(domain, i, all_interaction_sum[i]);
+    }
+  }
+
+  // Step 6: Compute velocities for owned cells
+  #ifdef USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+  #endif
+  for (int idx = 0; idx < num_owned; ++idx) {
+    int i = owned_cells[idx];
+    compute_velocity_integrals(*domain.cells[i], params,
+                               all_grad_x[i], all_grad_y[i],
+                               all_interaction_sum[i]);
+  }
+
+  // Step 7: Update polarization for owned cells (sequential due to RNG)
+  for (int idx = 0; idx < num_owned; ++idx) {
+    int i = owned_cells[idx];
+    update_polarization(*domain.cells[i], params, dt);
+  }
+
+  // Step 8: Compute RHS and apply Euler step for owned cells
+  #ifdef USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+  #endif
+  for (int idx = 0; idx < num_owned; ++idx) {
+    int i = owned_cells[idx];
+    compute_rhs_and_step(*domain.cells[i], params, dt,
+                         all_laplacian[i], all_bulk[i],
+                         all_grad_x[i], all_grad_y[i],
+                         all_interaction_sum[i]);
+  }
+
+  // Step 9: Periodically update bounding boxes and rebuild comm pattern
+  step_counter++;
+  if (step_counter % bbox_update_interval == 0) {
+    bool any_changed = false;
+    for (int idx = 0; idx < num_owned; ++idx) {
+      int i = owned_cells[idx];
+      if (domain.cells[i]->update_bounding_box(params)) {
+        any_changed = true;
+      }
+    }
+    
+    // If any bounding box changed significantly, rebuild comm pattern
+    if (any_changed) {
+      mpi.invalidate_comm_pattern();
+    }
+  }
+}
+#endif  // USE_MPI
 
 } // namespace cellsim

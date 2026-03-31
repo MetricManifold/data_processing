@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -26,80 +26,81 @@ impl VtkData {
 
 pub fn parse_vtk<P: AsRef<Path>>(path: P) -> Result<VtkData> {
     let file = File::open(path.as_ref())?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    
+    let mut reader = BufReader::new(file);
+
     let mut dims = Dimensions::default();
     let mut n_points = 0usize;
+    let mut is_binary = false;
     let mut scalars: HashMap<String, Vec<f32>> = HashMap::new();
-    
-    // Parse header
-    while let Some(line) = lines.next() {
-        let line = line?;
-        let line = line.trim();
-        
+
+    // Parse header (always ASCII in VTK legacy format)
+    let mut header_line = String::new();
+    let mut current_field_name: Option<String> = None;
+
+    loop {
+        header_line.clear();
+        let bytes_read = reader.read_line(&mut header_line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let line = header_line.trim();
+
         if line.starts_with("DIMENSIONS") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
+            if parts.len() >= 3 {
                 dims.nx = parts[1].parse()?;
                 dims.ny = parts[2].parse()?;
             }
+        } else if line == "BINARY" {
+            is_binary = true;
         } else if line.starts_with("POINT_DATA") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 n_points = parts[1].parse()?;
             }
-            break;
+        } else if line.starts_with("SCALARS") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                current_field_name = Some(parts[1].to_string());
+            }
+        } else if line.starts_with("LOOKUP_TABLE") {
+            // Data starts right after this line
+            if is_binary {
+                // Read binary data: big-endian f32 values
+                if let Some(name) = current_field_name.take() {
+                    let mut buf = vec![0u8; n_points * 4];
+                    reader.read_exact(&mut buf)?;
+                    let data: Vec<f32> = buf
+                        .chunks_exact(4)
+                        .map(|chunk| {
+                            f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                        })
+                        .collect();
+                    scalars.insert(name, data);
+                }
+            }
+        } else if !is_binary {
+            // ASCII data lines
+            if let Some(ref name) = current_field_name {
+                if !line.is_empty() && !line.starts_with("VECTORS") {
+                    let entry = scalars.entry(name.clone()).or_insert_with(|| Vec::with_capacity(n_points));
+                    for val_str in line.split_whitespace() {
+                        if let Ok(val) = val_str.parse::<f32>() {
+                            entry.push(val);
+                        }
+                    }
+                    if entry.len() >= n_points {
+                        current_field_name = None;
+                    }
+                }
+            }
         }
     }
-    
+
     if n_points == 0 {
         return Err(anyhow!("No POINT_DATA found"));
     }
-    
-    // Parse scalar fields
-    let mut current_field: Option<String> = None;
-    let mut current_data: Vec<f32> = Vec::new();
-    
-    for line in lines {
-        let line = line?;
-        let line = line.trim();
-        
-        if line.starts_with("SCALARS") {
-            if let Some(name) = current_field.take() {
-                if current_data.len() == n_points {
-                    scalars.insert(name, std::mem::take(&mut current_data));
-                }
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                current_field = Some(parts[1].to_string());
-                current_data = Vec::with_capacity(n_points);
-            }
-        } else if line.starts_with("LOOKUP_TABLE") {
-            continue;
-        } else if line.starts_with("VECTORS") {
-            if let Some(name) = current_field.take() {
-                if current_data.len() == n_points {
-                    scalars.insert(name, std::mem::take(&mut current_data));
-                }
-            }
-            current_field = None;
-        } else if current_field.is_some() && !line.is_empty() {
-            for val_str in line.split_whitespace() {
-                if let Ok(val) = val_str.parse::<f32>() {
-                    current_data.push(val);
-                }
-            }
-        }
-    }
-    
-    if let Some(name) = current_field {
-        if current_data.len() == n_points {
-            scalars.insert(name, current_data);
-        }
-    }
-    
+
     Ok(VtkData { dims, scalars })
 }
 

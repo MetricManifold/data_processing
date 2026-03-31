@@ -91,9 +91,11 @@ struct SimParams {
   // Parsed from repeated --gamma flags: --gamma 1.0 --gamma 0.35:20% --gamma 0.5:cell0
   struct GammaOverride {
     float value;
-    enum class Type { Fraction, Cells } type;
-    float fraction;             // used when type == Fraction (0-1)
+    enum class Type { Fraction, Cells, Nearest, Cluster } type;
+    float fraction;             // used when type == Fraction or Cluster (0-1)
     std::vector<int> cell_ids;  // used when type == Cells
+    float pos_x = 0.0f;        // used when type == Nearest or Cluster
+    float pos_y = 0.0f;
   };
   // NOTE: gamma_overrides live on Simulation/Integrator, NOT here,
   // because SimParams is raw-serialized in checkpoints (no std::vector allowed).

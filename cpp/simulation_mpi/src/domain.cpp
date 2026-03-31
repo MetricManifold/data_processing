@@ -6,7 +6,8 @@
 
 namespace cellsim {
 
-Domain::Domain(const SimParams &p) : params(p), next_cell_id(0) {}
+Domain::Domain(const SimParams &p) 
+    : params(p), next_cell_id(0) {}
 
 Cell *Domain::add_cell(float cx, float cy, float radius) {
   // Compute bounding box for this cell
@@ -60,6 +61,30 @@ void Domain::update_all_bounding_boxes() {
   for (auto &cell : cells) {
     cell->update_bounding_box(params);
   }
+}
+
+void Domain::update_ghost_cell(int cell_id, const float* phi_data,
+                               float volume, float cx, float cy,
+                               float vx, float vy, float theta, float px_val, float py_val) {
+  // Find the cell by index (cell_id is the index in this CPU version)
+  if (cell_id < 0 || cell_id >= static_cast<int>(cells.size())) {
+    return;
+  }
+  
+  Cell& c = *cells[cell_id];
+  
+  // Update phi field
+  c.update_phi_from_host(phi_data);
+  
+  // Update metadata
+  c.volume = volume;
+  c.centroid.x = cx;
+  c.centroid.y = cy;
+  c.velocity.x = vx;
+  c.velocity.y = vy;
+  c.theta = theta;
+  c.polarization.x = px_val;
+  c.polarization.y = py_val;
 }
 
 void Domain::initialize_random_cells(int num_cells_to_add, float radius,
