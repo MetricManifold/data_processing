@@ -528,8 +528,6 @@ __global__ void kernel_fused_step(
     const int *__restrict__ heights,
     const int *__restrict__ offsets_x,
     const int *__restrict__ offsets_y,
-    const int *__restrict__ neighbor_counts,
-    const int *__restrict__ neighbor_lists,
     const float *__restrict__ sum_field,
     const float *__restrict__ sum_field_linear,
     float *__restrict__ next_sum_field,
@@ -542,10 +540,10 @@ __global__ void kernel_fused_step(
     const float *__restrict__ ref_x,
     const float *__restrict__ ref_y,
     const float *__restrict__ d_volume_coeff,
-    float interaction_coeff,
+    float two_interaction_coeff,
     float adhesion_J,
-    float bulk_coeff,
-    const float *__restrict__ d_gamma,
+    const float *__restrict__ d_two_gamma_bulk,
+    const float *__restrict__ d_two_gamma,
     float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
@@ -553,8 +551,6 @@ __global__ void kernel_fused_step(
 {
   int cell_idx = blockIdx.z;
   if (cell_idx >= num_cells) return;
-
-  float gamma = d_gamma[cell_idx];
 
   int width = widths[cell_idx];
   int height = heights[cell_idx];
@@ -611,8 +607,8 @@ __global__ void kernel_fused_step(
       float laplacian = (4.0f * (phi_xp + phi_xm + phi_yp + phi_ym)
                        + (phi_pp + phi_pm + phi_mp + phi_mm)
                        - 20.0f * phi_val) * inv_h2 / 6.0f;
-      // Bulk term: γ * (60/λ²) * φ(1-φ)(1-2φ)
-      float bulk = 2.0f * gamma * bulk_coeff * phi_val * (1.0f - phi_val) * (1.0f - 2.0f * phi_val);
+      // Bulk term: 2γ(60/λ²) * φ(1-φ)(1-2φ)  — d_two_gamma_bulk[cell_idx] = 2*gamma*bulk_coeff
+      float bulk = d_two_gamma_bulk[cell_idx] * phi_val * (1.0f - phi_val) * (1.0f - 2.0f * phi_val);
       float grad_x = (phi_xp - phi_xm) * inv_2dx;
       float grad_y = (phi_yp - phi_ym) * inv_2dy;
 
@@ -620,34 +616,11 @@ __global__ void kernel_fused_step(
       float volume_deviation = volume_deviations[cell_idx];
       float constraint = -4.0f * d_volume_coeff[cell_idx] * volume_deviation * phi_val;
 
-      // --- Interaction with neighbors (gx, gy already computed above) ---
+      // --- Interaction via sum field (gx, gy already computed above) ---
+      float S_xy = sum_field[gy * Nx + gx];
+      float sum_phi_j_sq = fmaxf(0.0f, S_xy - phi_val * phi_val);
 
-      float sum_phi_j_sq;
-      if (sum_field) {
-        float S_xy = sum_field[gy * Nx + gx];
-        sum_phi_j_sq = fmaxf(0.0f, S_xy - phi_val * phi_val);
-      } else {
-        sum_phi_j_sq = 0.0f;
-        int num_neighbors = neighbor_counts[cell_idx];
-        const int *my_neighbors = neighbor_lists + cell_idx * MAX_NEIGHBORS;
-        for (int n = 0; n < num_neighbors; ++n) {
-          int j = my_neighbors[n];
-          int ow = widths[j];
-          int oh = heights[j];
-          int ox = offsets_x[j];
-          int oy = offsets_y[j];
-          int ljx_raw = gx - ox;
-          int ljx = ljx_raw + ((ljx_raw < 0) - (ljx_raw >= Nx)) * Nx;
-          int ljy_raw = gy - oy;
-          int ljy = ljy_raw + ((ljy_raw < 0) - (ljy_raw >= Ny)) * Ny;
-          if (ljx < ow && ljy < oh) {
-            float phi_j = phi_ptrs[j][ljy * ow + ljx];
-            sum_phi_j_sq += phi_j * phi_j;
-          }
-        }
-      }
-
-      float repulsion = 2.0f * interaction_coeff * phi_val * sum_phi_j_sq;
+      float repulsion = two_interaction_coeff * phi_val * sum_phi_j_sq;
 
       // --- Adhesion ---
       float adhesion = 0.0f;
@@ -683,7 +656,7 @@ __global__ void kernel_fused_step(
 
       // --- Full RHS including advection (uses CURRENT velocity) ---
       // Palmieri Eq. 1: ∂φ/∂t + v·∇φ = -(1/2) δF/δφ
-      float var_deriv = -2.0f * gamma * laplacian + bulk + constraint + repulsion + adhesion;
+      float var_deriv = -d_two_gamma[cell_idx] * laplacian + bulk + constraint + repulsion + adhesion;
       float vx = velocities_x[cell_idx];
       float vy = velocities_y[cell_idx];
       float advection = vx * grad_x + vy * grad_y;

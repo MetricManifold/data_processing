@@ -73,6 +73,8 @@ public:
   float *d_v_A;               // Per-cell active motility speed
   std::vector<float> checkpoint_v_A; // v_A values loaded from checkpoint (used once, then cleared)
   float *d_gamma;             // Per-cell gradient coefficient (stiffness)
+  float *d_two_gamma;         // Per-cell 2*gamma (precomputed for fused kernel)
+  float *d_two_gamma_bulk;    // Per-cell 2*gamma*bulk_coeff (precomputed)
   std::vector<float> checkpoint_gamma; // Per-cell gamma loaded from checkpoint
   std::vector<SimParams::GammaOverride> gamma_overrides; // CLI --gamma V:selector overrides
   bool gamma_overrides_set = false;

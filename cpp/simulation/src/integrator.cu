@@ -186,6 +186,7 @@ Integrator::Integrator(Method m)
       d_polarization_x(nullptr), d_polarization_y(nullptr), d_theta(nullptr),
       d_v_A(nullptr),
       d_gamma(nullptr),
+      d_two_gamma(nullptr), d_two_gamma_bulk(nullptr),
       d_target_radius(nullptr), d_target_area(nullptr), d_volume_coeff(nullptr),
       d_centroids_x(nullptr), d_centroids_y(nullptr),
       d_perimeters(nullptr),
@@ -588,6 +589,8 @@ void Integrator::allocate_reduction_arrays(int num_cells) {
   CUDA_CHECK(cudaMalloc(&d_theta, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_v_A, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_gamma, new_capacity * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_two_gamma, new_capacity * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_two_gamma_bulk, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_target_radius, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_target_area, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_volume_coeff, new_capacity * sizeof(float)));
@@ -701,6 +704,8 @@ void Integrator::free_reduction_arrays() {
     cudaFree(d_gamma);
     d_gamma = nullptr;
   }
+  if (d_two_gamma) { cudaFree(d_two_gamma); d_two_gamma = nullptr; }
+  if (d_two_gamma_bulk) { cudaFree(d_two_gamma_bulk); d_two_gamma_bulk = nullptr; }
   if (d_target_radius) {
     cudaFree(d_target_radius);
     d_target_radius = nullptr;
@@ -969,6 +974,18 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
 
       cudaMemcpy(d_gamma, h_gamma.data(), num_cells * sizeof(float),
                  cudaMemcpyHostToDevice);
+
+      // Precompute derived arrays for fused kernel
+      float bc = params.bulk_coeff();
+      std::vector<float> h_two_gamma(num_cells), h_two_gamma_bulk(num_cells);
+      for (int i = 0; i < num_cells; ++i) {
+        h_two_gamma[i] = 2.0f * h_gamma[i];
+        h_two_gamma_bulk[i] = 2.0f * h_gamma[i] * bc;
+      }
+      cudaMemcpy(d_two_gamma, h_two_gamma.data(), num_cells * sizeof(float),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_two_gamma_bulk, h_two_gamma_bulk.data(), num_cells * sizeof(float),
+                 cudaMemcpyHostToDevice);
     }
 
     // Initialize per-cell target radius and derived arrays (target_area, volume_coeff)
@@ -1207,6 +1224,8 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
              d_neighbor_counts, d_neighbor_lists,
              d_v_A,
              d_gamma,
+             d_two_gamma,
+             d_two_gamma_bulk,
              d_target_area,
              d_volume_coeff,
              d_perimeters,
