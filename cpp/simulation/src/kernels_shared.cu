@@ -547,7 +547,8 @@ __global__ void kernel_fused_step(
     float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
-    int num_cells)
+    int num_cells,
+    bool compute_perimeter)
 {
   int cell_idx = blockIdx.z;
   if (cell_idx >= num_cells) return;
@@ -649,8 +650,8 @@ __global__ void kernel_fused_step(
         adhesion = -adhesion_J * lap_neighbors;
       }
 
-      // --- Perimeter ---
-      if (in_inner) {
+      // --- Perimeter (only when needed for trajectory output) ---
+      if (compute_perimeter && in_inner) {
         my_grad_mag = sqrtf(grad_x * grad_x + grad_y * grad_y);
       }
 

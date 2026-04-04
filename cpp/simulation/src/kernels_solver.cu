@@ -236,7 +236,8 @@ __global__ void kernel_fused_step(
     float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
-    int num_cells);
+    int num_cells,
+    bool compute_perimeter);
 
 __global__ void kernel_scatter_phi_sq(
     float **__restrict__ phi_ptrs,
@@ -315,7 +316,8 @@ void step_fused(Domain &domain, float dt,
                    int cached_max_size, int cached_max_w, int cached_max_h,
                    bool sync_centroids,
                    bool rebuild_neighbors,
-                   bool centroid_sums_precomputed) {
+                   bool centroid_sums_precomputed,
+                   bool compute_perimeter) {
   const SimParams &params = domain.params;
   int num_cells = domain.num_cells();
   if (num_cells == 0)
@@ -458,20 +460,23 @@ void step_fused(Domain &domain, float dt,
   float inv_h2 = 1.0f / (params.dx * params.dx);
   float inv_2dx = 0.5f / params.dx;
   float inv_2dy = 0.5f / params.dy;
+  // Disable inline bbox edge atomic when full-scan mode is active (N>200),
+  // since the full scan already checks bbox every step — the inline flag is redundant.
+  int *bbox_for_fused = (num_cells <= 200) ? d_bbox_scan_results : nullptr;
   kernel_fused_step<<<grid, block, smem_fused>>>(
       d_all_phi_ptrs, d_all_phi_out_ptrs, d_all_widths, d_all_heights,
       d_all_offsets_x, d_all_offsets_y,
       d_sum_field, d_sum_field_linear, d_next_sum_field,
       d_volume_deviations, d_velocities_x, d_velocities_y,
       d_centroid_sums, d_perimeters,
-      d_bbox_scan_results,
+      bbox_for_fused,
       d_ref_x, d_ref_y,
       d_volume_coeff, 2.0f * params.interaction_coeff(),
       params.adhesion_J,
       d_two_gamma_bulk, d_two_gamma,
       inv_h2, inv_2dx, inv_2dy, dt,
       params.halo_width, params.Nx, params.Ny,
-      num_cells);
+      num_cells, compute_perimeter);
 
   // Phi pointer swap is now done in kernel_pre_step of the NEXT step
   // (saves 1 kernel launch per step)

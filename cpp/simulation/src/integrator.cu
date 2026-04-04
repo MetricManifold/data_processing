@@ -1237,7 +1237,8 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
              cached_max_size, cached_max_w, cached_max_h,
              sync_centroids,
              rebuild_neighbors,
-             centroid_sums_ready);
+             centroid_sums_ready,
+             sync_polarization_to_host);  // compute_perimeter only on output steps
 
   // Fused kernel populated centroid_sums for next step
   centroid_sums_ready = true;
