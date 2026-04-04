@@ -345,8 +345,9 @@ void step_fused(Domain &domain, float dt,
   float dA = params.dx * params.dy;
 
   // Common grid config (needed for scatter, velocity integral, and fused kernel)
-  dim3 block(16, 16, 1);
-  dim3 grid((max_w + 15) / 16, (max_h + 15) / 16, num_cells);
+  // 32×8 block: better coalescing for row-major phi (warp spans 1 row, not 2)
+  dim3 block(32, 8, 1);
+  dim3 grid((max_w + 31) / 32, (max_h + 7) / 8, num_cells);
   size_t smem_fused = 4 * block.x * block.y * sizeof(float);  // 4 channels: cent_dx/dy/phi2 + grad_mag
   size_t smem_vint  = 2 * block.x * block.y * sizeof(float);  // 2 channels: int_x, int_y
 
