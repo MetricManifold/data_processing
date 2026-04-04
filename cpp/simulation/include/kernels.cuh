@@ -98,8 +98,7 @@ void step_fused(Domain &domain, float dt,
                 int cached_max_size, int cached_max_w, int cached_max_h,
                 bool sync_centroids = true,
                 bool rebuild_neighbors = true,
-                bool centroid_sums_precomputed = false,
-                bool compute_perimeter = true);
+                bool centroid_sums_precomputed = false);
 
 //=============================================================================
 // DIAGNOSTICS (optional, enabled via DIAGNOSTICS_ENABLED)
