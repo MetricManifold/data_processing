@@ -215,8 +215,8 @@ __global__ void kernel_draw_moment_boxes(
 
     int cx = (int)roundf(centroids_x[i]);
     int cy = (int)roundf(centroids_y[i]);
-    int half_w = (int)ceilf(3.0f * sigma_x);
-    int half_h = (int)ceilf(3.0f * sigma_y);
+    int half_w = (int)ceilf(2.0f * sigma_x) + 25;  // 2σ + safety (matches resize threshold)
+    int half_h = (int)ceilf(2.0f * sigma_y) + 25;
 
     uchar4 col = make_uchar4(255, 50, 50, 255);  // red
 
