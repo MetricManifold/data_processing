@@ -27,29 +27,36 @@ namespace cellsim {
 // Replaces kernel_compute_ref_points + kernel_compute_centroids_and_deviations
 __global__ void kernel_pre_step(
     float *__restrict__ ref_x, float *__restrict__ ref_y,
-    const int *__restrict__ offsets_x, const int *__restrict__ offsets_y,
-    const int *__restrict__ widths, const int *__restrict__ heights,
+    int *__restrict__ offsets_x, int *__restrict__ offsets_y,
+    int *__restrict__ widths, int *__restrict__ heights,
+    int *__restrict__ old_widths, int *__restrict__ old_heights,
     float *__restrict__ centroids_x, float *__restrict__ centroids_y,
     float *__restrict__ volume_deviations, float *__restrict__ volumes,
     float *__restrict__ centroid_sums,
+    float *__restrict__ d_second_moment_x,
+    float *__restrict__ d_second_moment_y,
     const float *__restrict__ d_target_area, float dA,
-    int *__restrict__ d_bbox_results,
+    int *__restrict__ d_shift_x, int *__restrict__ d_shift_y,
+    int *__restrict__ d_max_wh,  // [0]=max_w, [1]=max_h (atomicMax target)
+    bool compute_shifts, int max_side,
     int Nx, int Ny, int num_cells) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_cells) return;
 
-  // 0. Init bbox edge flag (global flag in d_bbox_results[0])
-  if (d_bbox_results && i == 0) {
-    d_bbox_results[0] = 0;  // Reset global "edge touched" flag
-  }
+  int old_off_x = offsets_x[i];
+  int old_off_y = offsets_y[i];
+  int w = widths[i];
+  int h = heights[i];
+
+  // Save current dims as READ dims for fused kernel + velocity_integral
+  old_widths[i] = w;
+  old_heights[i] = h;
 
   // 1. Compute ref points (bbox center, wrapped)
-  float rx = (float)offsets_x[i] + (float)widths[i] * 0.5f;
-  float ry = (float)offsets_y[i] + (float)heights[i] * 0.5f;
+  float rx = (float)old_off_x + (float)w * 0.5f;
+  float ry = (float)old_off_y + (float)h * 0.5f;
   rx = fmodf(fmodf(rx, (float)Nx) + (float)Nx, (float)Nx);
   ry = fmodf(fmodf(ry, (float)Ny) + (float)Ny, (float)Ny);
-  ref_x[i] = rx;
-  ref_y[i] = ry;
 
   // 2. Compute centroids + volume deviations from centroid sums
   float sum_dx = centroid_sums[i * 3 + 0];
@@ -61,10 +68,20 @@ __global__ void kernel_pre_step(
   volume_deviations[i] = d_target_area[i] - volume;
 
   // Zero centroid_sums for fused kernel to accumulate NEXT step's sums.
-  // Safe to write here: we've already read all three components above.
   centroid_sums[i * 3 + 0] = 0.0f;
   centroid_sums[i * 3 + 1] = 0.0f;
   centroid_sums[i * 3 + 2] = 0.0f;
+
+  // Read second moments then zero for next step
+  float moment_x = d_second_moment_x[i];
+  float moment_y = d_second_moment_y[i];
+  d_second_moment_x[i] = 0.0f;
+  d_second_moment_y[i] = 0.0f;
+
+  // 3. Compute centroid shift + dynamic resize
+  // sx/sy encode the mapping: new local (lx,ly) reads from old local (lx+sx, ly+sy)
+  int sx = 0, sy = 0;
+  int new_w = w, new_h = h;
 
   if (sum_phi2 > 1e-8f) {
     float cx = rx + sum_dx / sum_phi2;
@@ -73,7 +90,64 @@ __global__ void kernel_pre_step(
     cy = fmodf(fmodf(cy, (float)Ny) + (float)Ny, (float)Ny);
     centroids_x[i] = cx;
     centroids_y[i] = cy;
+
+    if (compute_shifts) {
+      // --- Centroid shift (recenter subdomain) ---
+      float sub_cx = (float)old_off_x + (float)w * 0.5f;
+      float sub_cy = (float)old_off_y + (float)h * 0.5f;
+      float dx = cx - sub_cx;
+      float dy = cy - sub_cy;
+      if (dx >  Nx * 0.5f) dx -= Nx;
+      if (dx < -Nx * 0.5f) dx += Nx;
+      if (dy >  Ny * 0.5f) dy -= Ny;
+      if (dy < -Ny * 0.5f) dy += Ny;
+      int candidate_sx = (int)roundf(dx);
+      int candidate_sy = (int)roundf(dy);
+      if (abs(candidate_sx) > 2) sx = candidate_sx;
+      if (abs(candidate_sy) > 2) sy = candidate_sy;
+
+      // --- Dynamic resize using second moments ---
+      if (max_side > 0 && sum_phi2 > 1.0f) {
+        float sigma_x = sqrtf(fmaxf(moment_x / sum_phi2, 1.0f));
+        float sigma_y = sqrtf(fmaxf(moment_y / sum_phi2, 1.0f));
+        int halo = 4;  // halo_width
+        int avail_half_x = w / 2 - halo - 2;
+        int avail_half_y = h / 2 - halo - 2;
+        int needed_half_x = (int)ceilf(3.0f * sigma_x);
+        int needed_half_y = (int)ceilf(3.0f * sigma_y);
+
+        if (needed_half_x > avail_half_x) {
+          int grow_x = needed_half_x - avail_half_x + 8;  // +8 buffer to avoid re-triggering
+          new_w = min(w + 2 * grow_x, max_side) & ~1;
+          int gl = (new_w - w) / 2;
+          sx -= gl;
+          if (i == 0) printf("GROW[%d] w:%d->%d gl=%d sx=%d\n", i, w, new_w, gl, sx);
+        }
+        if (needed_half_y > avail_half_y) {
+          int grow_y = needed_half_y - avail_half_y + 8;
+          new_h = min(h + 2 * grow_y, max_side) & ~1;
+          int gb = (new_h - h) / 2;
+          sy -= gb;
+          if (i == 0) printf("GROW[%d] h:%d->%d gb=%d sy=%d\n", i, h, new_h, gb, sy);
+        }
+      }
+    }
   }
+
+  // Write new dims (for fused kernel WRITE path + grid launch)
+  widths[i] = new_w;
+  heights[i] = new_h;
+
+  d_shift_x[i] = sx;
+  d_shift_y[i] = sy;
+
+  // Track max of NEW dims for grid launch
+  atomicMax(&d_max_wh[0], new_w);
+  atomicMax(&d_max_wh[1], new_h);
+
+  // Ref point is based on OLD offset (matches fused kernel's global coord computation)
+  ref_x[i] = rx;
+  ref_y[i] = ry;
 }
 
 // Fused per-cell kernel: compute_velocities + swap_phi_ptrs (post-step)
@@ -225,7 +299,12 @@ __global__ void kernel_fused_step(
     const float *__restrict__ velocities_y,
     float *__restrict__ d_centroid_sums,
     float *__restrict__ d_perimeters,
-    int *__restrict__ d_bbox_results,
+    float *__restrict__ d_second_moment_x,
+    float *__restrict__ d_second_moment_y,
+    const int *__restrict__ d_shift_x,
+    const int *__restrict__ d_shift_y,
+    const int *__restrict__ old_widths,
+    const int *__restrict__ old_heights,
     const float *__restrict__ ref_x,
     const float *__restrict__ ref_y,
     const float *__restrict__ d_volume_coeff,
@@ -257,6 +336,8 @@ __global__ void kernel_scatter_phi_linear(
     int Nx, int Ny, int num_cells);
 
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
+                                      int *offsets_x, int *offsets_y,
+                                      const int *shift_x, const int *shift_y,
                                       int num_cells);
 
 __global__ void kernel_compute_velocities(
@@ -307,15 +388,23 @@ void step_fused(Domain &domain, float dt,
                    float *d_target_area,
                    float *d_volume_coeff,
                    float *d_perimeters,
+                   float *d_second_moment_x,
+                   float *d_second_moment_y,
+                   int *d_old_widths,
+                   int *d_old_heights,
+                   int pool_max_side,
+                   int *d_max_wh,
+                   int *d_shift_x,
+                   int *d_shift_y,
                    int *d_block_arrival,
-                   int *d_bbox_scan_results,
                    float *d_sum_field,
                    float *d_sum_field_linear,
                    float *d_next_sum_field,
                    int cached_max_size, int cached_max_w, int cached_max_h,
                    bool sync_centroids,
                    bool rebuild_neighbors,
-                   bool centroid_sums_precomputed) {
+                   bool centroid_sums_precomputed,
+                   int step_counter) {
   const SimParams &params = domain.params;
   int num_cells = domain.num_cells();
   if (num_cells == 0)
@@ -348,12 +437,12 @@ void step_fused(Domain &domain, float dt,
   // 32×8 block: better coalescing for row-major phi (warp spans 1 row, not 2)
   dim3 block(32, 8, 1);
   dim3 grid((max_w + 31) / 32, (max_h + 7) / 8, num_cells);
-  size_t smem_fused = 4 * block.x * block.y * sizeof(float);  // 4 channels: cent_dx/dy/phi2 + grad_mag
+  size_t smem_fused = 6 * block.x * block.y * sizeof(float);  // 6 channels: cent_dx/dy/phi2 + grad_mag + moment_x/y
   size_t smem_vint  = 2 * block.x * block.y * sizeof(float);  // 2 channels: int_x, int_y
 
   // Zero integrals + perimeters + block arrival in one memset (contiguous in d_reduction_block)
-  // Layout: [int_x(N) | int_y(N) | perim(N) | block_arrival(N) | centroid_sums(3N)]
-  // Only zero the first 4N — centroid_sums is zeroed by kernel_pre_step after reading.
+  // Layout: [int_x(N) | int_y(N) | perim(N) | block_arrival(N) | moment_x(N) | moment_y(N) | centroid_sums(3N)]
+  // Zero only first 4N — moment_x/y and centroid_sums are zeroed by kernel_pre_step after reading.
   cudaMemsetAsync(d_integrals_x, 0, 4 * num_cells * sizeof(float));
 
 #ifdef ENABLE_KERNEL_PROFILING
@@ -383,15 +472,41 @@ void step_fused(Domain &domain, float dt,
         params.Nx, params.Ny, num_cells);
   }
 
-  // Pre-step: compute ref points + centroids + volume deviations (1 fused launch)
-  // Also zeros centroid_sums and swaps phi double-buffer pointers from previous step.
+  // Pre-step: compute ref points + centroids + volume deviations + remap shifts
+  // Also zeros centroid_sums for the fused kernel to accumulate NEXT step's sums.
+  // Zero d_max_wh before pre_step so atomicMax accumulates fresh values.
+  if (step_counter % 10 == 0) {
+    cudaMemsetAsync(d_max_wh, 0, 2 * sizeof(int));
+  }
   kernel_pre_step<<<blocks_1d, threads_1d>>>(
       d_ref_x, d_ref_y, d_all_offsets_x, d_all_offsets_y,
       d_all_widths, d_all_heights,
+      d_old_widths, d_old_heights,
       d_centroids_x, d_centroids_y, d_volume_deviations, d_volumes,
-      d_centroid_sums, d_target_area, dA,
-      d_bbox_scan_results,
+      d_centroid_sums,
+      d_second_moment_x, d_second_moment_y,
+      d_target_area, dA,
+      d_shift_x, d_shift_y,
+      d_max_wh,
+      (step_counter % 10 == 0), pool_max_side,
       params.Nx, params.Ny, num_cells);
+
+  // After resize check, read GPU-computed max dims for the FUSED kernel (write path).
+  // Velocity_integral and scatter use the OLD grid (max_w/max_h from before pre_step)
+  // since they read phi at the old stride.
+  dim3 grid_read = grid;  // Save old grid for read-path kernels
+  if (pool_max_side > 0 && step_counter % 10 == 0) {
+    int h_max_wh[2];
+    cudaMemcpy(h_max_wh, d_max_wh, 2 * sizeof(int), cudaMemcpyDeviceToHost);
+    int new_max_w = h_max_wh[0];
+    int new_max_h = h_max_wh[1];
+    if (new_max_w > 0 && new_max_h > 0) {
+      // Update grid for fused kernel (write path uses new dims)
+      grid = dim3((new_max_w + 31) / 32, (new_max_h + 7) / 8, num_cells);
+      cached_max_w = new_max_w;
+      cached_max_h = new_max_h;
+    }
+  }
 
 #ifdef ENABLE_KERNEL_PROFILING
   cudaEventRecord(ev_centroid);
@@ -419,15 +534,15 @@ void step_fused(Domain &domain, float dt,
   // Build sum field: standalone scatter when inline scatter is disabled (large N)
   // or on first step (centroid_sums not yet precomputed by fused kernel).
   if (d_sum_field && (!d_next_sum_field || !centroid_sums_precomputed)) {
-    kernel_scatter_phi_sq<<<grid, block>>>(  
-        d_all_phi_ptrs, d_sum_field, d_all_widths, d_all_heights,
+    kernel_scatter_phi_sq<<<grid_read, block>>>(  
+        d_all_phi_ptrs, d_sum_field, d_old_widths, d_old_heights,
         d_all_offsets_x, d_all_offsets_y, params.Nx, params.Ny, num_cells);
   }
 
   // Adhesion linear sum field: only scatter when J > 0
   if (d_sum_field_linear && params.adhesion_J > 0.0f) {
-    kernel_scatter_phi_linear<<<grid, block>>>(
-        d_all_phi_ptrs, d_sum_field_linear, d_all_widths, d_all_heights,
+    kernel_scatter_phi_linear<<<grid_read, block>>>(
+        d_all_phi_ptrs, d_sum_field_linear, d_old_widths, d_old_heights,
         d_all_offsets_x, d_all_offsets_y, params.Nx, params.Ny, num_cells);
   }
 
@@ -437,8 +552,8 @@ void step_fused(Domain &domain, float dt,
   // eliminating the need for a separate kernel_compute_velocities launch.
   // ===================================================================
   if (d_sum_field) {
-    kernel_velocity_integral_2d<<<grid, block, smem_vint>>>(
-        d_all_phi_ptrs, d_all_widths, d_all_heights,
+    kernel_velocity_integral_2d<<<grid_read, block, smem_vint>>>(
+        d_all_phi_ptrs, d_old_widths, d_old_heights,
         d_all_offsets_x, d_all_offsets_y,
         d_sum_field, nullptr,
         d_integrals_x, d_integrals_y,
@@ -465,7 +580,9 @@ void step_fused(Domain &domain, float dt,
       d_sum_field, d_sum_field_linear, d_next_sum_field,
       d_volume_deviations, d_velocities_x, d_velocities_y,
       d_centroid_sums, d_perimeters,
-      d_bbox_scan_results,
+      d_second_moment_x, d_second_moment_y,
+      d_shift_x, d_shift_y,
+      d_old_widths, d_old_heights,
       d_ref_x, d_ref_y,
       d_volume_coeff, 2.0f * params.interaction_coeff(),
       params.adhesion_J,

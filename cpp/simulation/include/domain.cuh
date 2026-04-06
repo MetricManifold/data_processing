@@ -92,11 +92,7 @@ inline Domain::~Domain() {
 
 inline Cell *Domain::add_cell(float cx, float cy, float radius) {
   // Compute bounding box for this cell.
-  // Use adaptive margin: radius + interface tail (3*lambda) + halo.
-  // The cell profile extends ~3*lambda beyond the nominal radius at the
-  // phi=0.01 threshold level. Adding halo gives room for the Laplacian stencil.
-  // Note: Cell constructor expands bbox by halo_width to create bbox_with_halo,
-  // so we don't double-count halo here.
+  // Use smaller margin to test dynamic resize
   int adaptive_margin =
       static_cast<int>(radius + 3.0f * params.lambda) + params.halo_width;
   BoundingBox bbox = {

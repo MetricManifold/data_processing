@@ -61,6 +61,14 @@ public:
   int *d_block_arrival;   // Block arrival counter per cell (alias into d_reduction_block)
   size_t reduction_array_capacity; // Capacity for reduction arrays
 
+  // Second moments for bbox extent estimation (accumulated by fused kernel)
+  float *d_second_moment_x;  // Σ (x-ref_x)² · φ² per cell
+  float *d_second_moment_y;  // Σ (y-ref_y)² · φ² per cell
+
+  // Per-step offset shifts for inline remap (computed by pre_step, applied after fused kernel)
+  int *d_shift_x;
+  int *d_shift_y;
+
   // Additional arrays for GPU-side computation
   float *d_volume_deviations; // Volume deviations per cell
   float *d_velocities_x;      // Velocities X per cell
@@ -106,20 +114,18 @@ public:
   int neighbor_rebuild_count;      // Stats: how many rebuilds occurred
   int neighbor_skip_count;         // Stats: how many rebuilds skipped
 
-  // GPU-accelerated bounding box update (every step, replaces interval-based CPU scan)
-  int *d_bbox_scan_results;  // [num_cells * 9] scan output buffer
-  size_t bbox_scan_capacity; // Allocated capacity in cells
   int step_counter;          // Internal step counter
   bool host_ptrs_stale;      // True when GPU pointers swapped but host not yet synced
 
-  // Deferred bbox check: async D→H of change flag avoids pipeline drain.
-  // Scan + check kernels launch async, result read on NEXT bbox-check step.
-  int *d_bbox_any_change_flag;  // Device flag for deferred change detection
-  int *h_bbox_any_change;       // Pinned host flag (async D→H, no pipeline drain)
-  cudaEvent_t bbox_check_event; // Signals async bbox check complete
-  bool bbox_async_pending;      // True when deferred bbox check is in flight
+  // Get current sum field (ping-pong aware). Returns the buffer that was last
+  // WRITTEN by the fused kernel's inline scatter (the other buffer gets cleared).
+  float *get_sum_field() const {
+    if (!d_sum_field) return nullptr;
+    // step_counter % 2 selects the READ buffer; the WRITE buffer is the other one
+    return (step_counter % 2 == 0) ? d_sum_field_b : d_sum_field;
+  }
 
-  // Cached max dimensions (updated on bbox change, avoids host loop every step)
+  // Cached max dimensions (avoids host loop every step)
   int cached_max_size;       // Max field_size across all cells
   int cached_max_w;          // Max width across all cells
   int cached_max_h;          // Max height across all cells
@@ -130,7 +136,12 @@ public:
   float *d_phi_pool;         // Single allocation: [phi slots... | phi_out slots...]
   size_t pool_slot_size;     // Floats per slot (>= max field_size across all cells)
   int pool_num_cells;        // Number of cells pool was allocated for
+  int pool_max_side;         // Max width/height any cell can grow to (sqrt(pool_slot_size))
   bool pool_active;          // True once cells have been migrated to pool
+  int *d_grow;               // Per-cell grow amounts [N*4]: left, right, top, bottom
+  int *d_old_widths;         // Previous step's widths (for resize remap in fused kernel)
+  int *d_old_heights;        // Previous step's heights
+  int *d_max_wh;             // [0]=max_w, [1]=max_h (GPU-side atomicMax from pre_step)
 
   // Global sum field: S(x,y) = Σ_all φ_i²(x,y) on N×N grid.
   // Eliminates scattered neighbor reads in fused kernel:

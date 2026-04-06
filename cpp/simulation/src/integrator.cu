@@ -6,21 +6,28 @@
 #include <cstdio>
 #include <vector>
 
-// Forward declaration for bbox change detection kernel (defined in kernels_solver.cu)
-namespace cellsim {
-__global__ void kernel_bbox_check_any_change(
-    const int *__restrict__ results, const int *__restrict__ widths,
-    const int *__restrict__ heights, const int *__restrict__ offsets_x,
-    const int *__restrict__ offsets_y, int halo, int Nx, int Ny,
-    float lambda, int min_subdomain_size, int *__restrict__ any_change_flag,
-    int num_cells);
-}
-
 namespace cellsim {
 
-// Forward declaration: GPU pointer swap (defined in kernels_shared.cu)
+// Forward declaration: GPU pointer swap + offset apply (defined in kernels_shared.cu)
+__global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
+                                      int *offsets_x, int *offsets_y,
+                                      const int *shift_x, const int *shift_y,
+                                      int num_cells);
+// Swap-only overload (no offset/dim update)
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
                                       int num_cells);
+
+// Forward declaration: remap kernel for dynamic subdomain resize
+__global__ void kernel_remap_grow(
+    float **__restrict__ phi_ptrs, float **__restrict__ phi_out_ptrs,
+    const int *__restrict__ widths, const int *__restrict__ heights,
+    const int *__restrict__ grow, int num_cells);
+// Forward declaration: apply resize (swap + update dims) after remap
+__global__ void kernel_apply_resize(
+    float **__restrict__ phi_ptrs, float **__restrict__ phi_out_ptrs,
+    int *__restrict__ widths, int *__restrict__ heights,
+    int *__restrict__ offsets_x, int *__restrict__ offsets_y,
+    const int *__restrict__ grow, int num_cells);
 
 //=============================================================================
 // GPU-side RNG Kernels for Polarization Updates
@@ -181,6 +188,8 @@ Integrator::Integrator(Method m)
       d_centroid_sums(nullptr), d_reduction_block(nullptr),
       d_block_arrival(nullptr),
       reduction_block_floats(0), reduction_array_capacity(0),
+      d_second_moment_x(nullptr), d_second_moment_y(nullptr),
+      d_shift_x(nullptr), d_shift_y(nullptr),
       d_volume_deviations(nullptr), d_velocities_x(nullptr),
       d_velocities_y(nullptr), d_ref_x(nullptr), d_ref_y(nullptr),
       d_polarization_x(nullptr), d_polarization_y(nullptr), d_theta(nullptr),
@@ -196,18 +205,16 @@ Integrator::Integrator(Method m)
       d_max_displacement(nullptr), neighbor_list_valid(false),
       neighbor_rebuild_threshold(5.0f), // Default: rebuild when any cell moves >5 grid units
       neighbor_rebuild_count(0), neighbor_skip_count(0),
-      d_bbox_scan_results(nullptr), bbox_scan_capacity(0),
       cached_max_size(0), cached_max_w(0), cached_max_h(0),
       cached_dims_valid(false),
       d_phi_pool(nullptr), pool_slot_size(0), pool_num_cells(0),
-      pool_active(false),
+      pool_max_side(0), pool_active(false), d_grow(nullptr),
+      d_old_widths(nullptr), d_old_heights(nullptr), d_max_wh(nullptr),
       d_sum_field(nullptr), d_sum_field_b(nullptr), sum_field_size(0),
       d_sum_field_linear(nullptr), d_sum_field_linear_b(nullptr),
       sum_field_clear_stream(nullptr),
       sum_field_read_done_event(nullptr), sum_field_clear_done_event(nullptr),
-      step_counter(0), host_ptrs_stale(false),
-      d_bbox_any_change_flag(nullptr), h_bbox_any_change(nullptr),
-      bbox_check_event(nullptr), bbox_async_pending(false) {
+      step_counter(0), host_ptrs_stale(false) {
   create_streams();
 }
 
@@ -330,6 +337,14 @@ void Integrator::update_interaction_arrays(const Domain &domain) {
              cudaMemcpyHostToDevice);
   cudaMemcpy(d_all_field_sizes, h_field_sizes.data(), n * sizeof(int),
              cudaMemcpyHostToDevice);
+
+  // Initialize old_widths/heights to match current (for fused kernel's first step)
+  if (d_old_widths && d_old_heights) {
+    cudaMemcpy(d_old_widths, h_widths.data(), n * sizeof(int),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_old_heights, h_heights.data(), n * sizeof(int),
+               cudaMemcpyHostToDevice);
+  }
 }
 
 size_t Integrator::compute_max_page_size(const SimParams &params) {
@@ -408,6 +423,19 @@ void Integrator::allocate_phi_pool(Domain &domain) {
   CUDA_CHECK(cudaMalloc(&d_phi_pool, alloc_bytes));
   CUDA_CHECK(cudaMemset(d_phi_pool, 0, alloc_bytes));
 
+  // Compute max side length any cell can grow to within the slot
+  pool_max_side = static_cast<int>(sqrtf(static_cast<float>(pool_slot_size)));
+
+  // Allocate grow buffer for dynamic resize
+  if (d_grow) cudaFree(d_grow);
+  CUDA_CHECK(cudaMalloc(&d_grow, num_cells * 4 * sizeof(int)));
+  if (d_old_widths) cudaFree(d_old_widths);
+  if (d_old_heights) cudaFree(d_old_heights);
+  CUDA_CHECK(cudaMalloc(&d_old_widths, num_cells * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_old_heights, num_cells * sizeof(int)));
+  if (d_max_wh) cudaFree(d_max_wh);
+  CUDA_CHECK(cudaMalloc(&d_max_wh, 2 * sizeof(int)));
+
   // Migrate existing phi data into pool
   for (int i = 0; i < num_cells; ++i) {
     auto &cell = domain.cells[i];
@@ -483,8 +511,16 @@ void Integrator::free_phi_pool() {
     cudaFree(d_phi_pool);
     d_phi_pool = nullptr;
   }
+  if (d_grow) {
+    cudaFree(d_grow);
+    d_grow = nullptr;
+  }
+  if (d_old_widths) { cudaFree(d_old_widths); d_old_widths = nullptr; }
+  if (d_old_heights) { cudaFree(d_old_heights); d_old_heights = nullptr; }
+  if (d_max_wh) { cudaFree(d_max_wh); d_max_wh = nullptr; }
   pool_slot_size = 0;
   pool_num_cells = 0;
+  pool_max_side = 0;
   pool_active = false;
 }
 
@@ -566,22 +602,31 @@ void Integrator::allocate_reduction_arrays(int num_cells) {
   CUDA_CHECK(cudaMalloc(&d_volumes, new_capacity * sizeof(float)));
 
   // Allocate reduction arrays as one contiguous block for single-memset zeroing.
-  // Layout: [integrals_x (N) | integrals_y (N) | perimeters (N) | block_arrival (N) | centroid_sums (3N)]
-  reduction_block_floats = 7 * new_capacity;
+  // Layout: [integrals_x (N) | integrals_y (N) | perimeters (N) | block_arrival (N) | moment_x (N) | moment_y (N) | centroid_sums (3N)]
+  reduction_block_floats = 9 * new_capacity;
   CUDA_CHECK(cudaMalloc(&d_reduction_block, reduction_block_floats * sizeof(float)));
-  d_integrals_x  = d_reduction_block;
-  d_integrals_y  = d_reduction_block + new_capacity;
-  d_perimeters   = d_reduction_block + 2 * new_capacity;
-  d_block_arrival = reinterpret_cast<int*>(d_reduction_block + 3 * new_capacity);
-  d_centroid_sums = d_reduction_block + 4 * new_capacity;
+  CUDA_CHECK(cudaMemset(d_reduction_block, 0, reduction_block_floats * sizeof(float)));
+  d_integrals_x      = d_reduction_block;
+  d_integrals_y      = d_reduction_block + new_capacity;
+  d_perimeters       = d_reduction_block + 2 * new_capacity;
+  d_block_arrival    = reinterpret_cast<int*>(d_reduction_block + 3 * new_capacity);
+  d_second_moment_x  = d_reduction_block + 4 * new_capacity;
+  d_second_moment_y  = d_reduction_block + 5 * new_capacity;
+  d_centroid_sums    = d_reduction_block + 6 * new_capacity;
 
   // Additional arrays for GPU-side computation
   CUDA_CHECK(cudaMalloc(&d_volume_deviations, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_velocities_x, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_velocities_y, new_capacity * sizeof(float)));
+
   // Zero-init: first step uses v=0 for advection before velocity integral runs
   cudaMemset(d_velocities_x, 0, new_capacity * sizeof(float));
   cudaMemset(d_velocities_y, 0, new_capacity * sizeof(float));
+  // Shift arrays for inline remap (zero = no shift on first step)
+  CUDA_CHECK(cudaMalloc(&d_shift_x, new_capacity * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_shift_y, new_capacity * sizeof(int)));
+  cudaMemset(d_shift_x, 0, new_capacity * sizeof(int));
+  cudaMemset(d_shift_y, 0, new_capacity * sizeof(int));
   CUDA_CHECK(cudaMalloc(&d_ref_x, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_ref_y, new_capacity * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_polarization_x, new_capacity * sizeof(float)));
@@ -612,23 +657,6 @@ void Integrator::allocate_reduction_arrays(int num_cells) {
   CUDA_CHECK(cudaMalloc(&d_max_displacement, sizeof(float))); // Single value for reduction
   neighbor_list_valid = false; // Force rebuild on first use
 
-  // GPU bbox scan results buffer (9 ints per cell)
-  CUDA_CHECK(cudaMalloc(&d_bbox_scan_results, new_capacity * 9 * sizeof(int)));
-  bbox_scan_capacity = new_capacity;
-
-  // Deferred bbox check: device flag + pinned host flag for async D→H
-  if (!d_bbox_any_change_flag) {
-    CUDA_CHECK(cudaMalloc(&d_bbox_any_change_flag, sizeof(int)));
-  }
-  if (!h_bbox_any_change) {
-    CUDA_CHECK(cudaHostAlloc(&h_bbox_any_change, sizeof(int), cudaHostAllocDefault));
-    *h_bbox_any_change = 0;
-  }
-  if (!bbox_check_event) {
-    cudaEventCreateWithFlags(&bbox_check_event, cudaEventDisableTiming);
-  }
-  bbox_async_pending = false;
-
   reduction_array_capacity = new_capacity;
 }
 
@@ -637,15 +665,17 @@ void Integrator::free_reduction_arrays() {
     cudaFree(d_volumes);
     d_volumes = nullptr;
   }
-  // d_integrals_x/y, d_perimeters, d_block_arrival, d_centroid_sums are aliases into d_reduction_block
+  // d_integrals_x/y, d_perimeters, d_block_arrival, d_second_moment_x/y, d_centroid_sums are aliases into d_reduction_block
   if (d_reduction_block) {
     cudaFree(d_reduction_block);
     d_reduction_block = nullptr;
     d_integrals_x = nullptr;
     d_integrals_y = nullptr;
-    d_centroid_sums = nullptr;
     d_perimeters = nullptr;
     d_block_arrival = nullptr;
+    d_second_moment_x = nullptr;
+    d_second_moment_y = nullptr;
+    d_centroid_sums = nullptr;
   }
   // Free persistent kernel arrays
   if (d_volume_deviations) {
@@ -660,6 +690,8 @@ void Integrator::free_reduction_arrays() {
     cudaFree(d_velocities_y);
     d_velocities_y = nullptr;
   }
+  if (d_shift_x) { cudaFree(d_shift_x); d_shift_x = nullptr; }
+  if (d_shift_y) { cudaFree(d_shift_y); d_shift_y = nullptr; }
   if (d_ref_x) {
     cudaFree(d_ref_x);
     d_ref_x = nullptr;
@@ -739,28 +771,6 @@ void Integrator::free_reduction_arrays() {
   }
   neighbor_list_valid = false;
   
-  // Free GPU bbox scan buffer
-  if (d_bbox_scan_results) {
-    cudaFree(d_bbox_scan_results);
-    d_bbox_scan_results = nullptr;
-  }
-  bbox_scan_capacity = 0;
-
-  // Free deferred bbox check resources
-  if (d_bbox_any_change_flag) {
-    cudaFree(d_bbox_any_change_flag);
-    d_bbox_any_change_flag = nullptr;
-  }
-  if (h_bbox_any_change) {
-    cudaFreeHost(h_bbox_any_change);
-    h_bbox_any_change = nullptr;
-  }
-  if (bbox_check_event) {
-    cudaEventDestroy(bbox_check_event);
-    bbox_check_event = nullptr;
-  }
-  bbox_async_pending = false;
-
   reduction_array_capacity = 0;
 }
 
@@ -1229,15 +1239,23 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
              d_target_area,
              d_volume_coeff,
              d_perimeters,
+             d_second_moment_x,
+             d_second_moment_y,
+             d_old_widths,
+             d_old_heights,
+             pool_max_side,
+             d_max_wh,
+             d_shift_x,
+             d_shift_y,
              d_block_arrival,
-             d_bbox_scan_results,
              current_sum_field,
              current_sum_field_linear,
              next_sum_field_for_scatter,
              cached_max_size, cached_max_w, cached_max_h,
              sync_centroids,
              rebuild_neighbors,
-             centroid_sums_ready);
+             centroid_sums_ready,
+             step_counter);
 
   // Fused kernel populated centroid_sums for next step
   centroid_sums_ready = true;
@@ -1267,8 +1285,32 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     int swap_threads = 256;
     int swap_blocks = (nc + swap_threads - 1) / swap_threads;
     kernel_swap_phi_ptrs<<<swap_blocks, swap_threads>>>(
-        d_all_phi_ptrs, d_all_phi_out_ptrs, nc);
+        d_all_phi_ptrs, d_all_phi_out_ptrs,
+        d_all_offsets_x, d_all_offsets_y,
+        d_shift_x, d_shift_y, nc);
     host_ptrs_stale = true;
+  }
+
+  // Sync GPU offsets + widths/heights to host bbox structs (after swap kernel applied shifts)
+  if (sync_centroids_to_host) {
+    cudaDeviceSynchronize();  // ensure swap kernel finished
+    int nc = domain.num_cells();
+    std::vector<int> h_off_x(nc), h_off_y(nc), h_w(nc), h_h(nc);
+    cudaMemcpy(h_off_x.data(), d_all_offsets_x, nc * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_off_y.data(), d_all_offsets_y, nc * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_w.data(), d_all_widths, nc * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_h.data(), d_all_heights, nc * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    for (int i = 0; i < nc; ++i) {
+      domain.cells[i]->bbox_with_halo.x0 = h_off_x[i];
+      domain.cells[i]->bbox_with_halo.y0 = h_off_y[i];
+      domain.cells[i]->bbox_with_halo.x1 = h_off_x[i] + h_w[i];
+      domain.cells[i]->bbox_with_halo.y1 = h_off_y[i] + h_h[i];
+      domain.cells[i]->field_size = h_w[i] * h_h[i];
+    }
   }
 
   // After rebuild, save current centroids as reference for next displacement check
@@ -1282,103 +1324,6 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     neighbor_rebuild_count++;
   } else if (!d_sum_field && num_cells > 1) {
     neighbor_skip_count++;
-  }
-
-  // =========================================================================
-  // Deferred GPU Bounding Box Updates
-  //
-  // The bbox scan + change-detection runs asynchronously: scan kernels launch
-  // on the default stream, then the change flag is copied D→H via
-  // cudaMemcpyAsync to pinned host memory. The flag is read on the NEXT
-  // bbox-check step (2 steps later), avoiding the synchronous cudaMemcpy
-  // that would otherwise drain the GPU pipeline every 2 steps.
-  //
-  // 95%+ of checks find no changes (flag=0) — these now cost zero host sync.
-  // The rare flag=1 case triggers a full synchronous rescan + remap.
-  // =========================================================================
-  bool do_bbox_update = (step_counter == 1) || (step_counter % 2 == 0);
-  // Full scan (includes shrink/recenter) every 100 steps
-  // For small N: inline edge flag in fused kernel is cheap (1 atomicMax)
-  // For large N: use full scan every time (inline atomicMax causes contention)
-  bool use_full_scan = (step_counter == 1) || (step_counter % 100 == 0) || (num_cells > 200);
-
-  if (do_bbox_update) {
-    // --- Phase 1: Read result of PREVIOUS async bbox check ---
-    if (bbox_async_pending) {
-      if (cudaEventQuery(bbox_check_event) == cudaSuccess) {
-        int prev_flag = *h_bbox_any_change;
-        bbox_async_pending = false;
-
-        if (prev_flag) {
-          // Previous scan detected changes — do full synchronous update
-          // (re-scans with fresh data + remaps affected cells)
-          if (host_ptrs_stale) {
-            int nc = domain.num_cells();
-            for (int i = 0; i < nc; ++i) {
-              std::swap(domain.cells[i]->d_phi, domain.cells[i]->d_dphi_dt);
-            }
-            host_ptrs_stale = false;
-          }
-
-          bool pool_needs_grow = false;
-          bool any_bbox_changed = gpu_update_all_bboxes_2d(
-              domain, d_bbox_scan_results, d_centroids_x, d_centroids_y,
-              pool_active ? d_phi_pool : nullptr,
-              pool_slot_size, pool_num_cells, &pool_needs_grow,
-              d_all_phi_ptrs, d_all_phi_out_ptrs,
-              d_all_widths, d_all_heights,
-              d_all_offsets_x, d_all_offsets_y,
-              d_all_field_sizes, cached_max_size);
-
-          if (any_bbox_changed) {
-            domain.device_arrays_dirty = true;
-            domain.device_arrays_dirty = false;
-            neighbor_list_valid = false;
-            cached_dims_valid = false;
-            centroid_sums_ready = false;
-
-            // Recompute cached dims now so the async scan below uses fresh values
-            int nc = domain.num_cells();
-            cached_max_size = 0; cached_max_w = 0; cached_max_h = 0;
-            for (int i = 0; i < nc; ++i) {
-              cached_max_size = std::max(cached_max_size, domain.cells[i]->field_size);
-              cached_max_w = std::max(cached_max_w, domain.cells[i]->width());
-              cached_max_h = std::max(cached_max_h, domain.cells[i]->height());
-            }
-            cached_dims_valid = true;
-
-            if (pool_needs_grow) {
-              grow_phi_pool(domain);
-            }
-          }
-        }
-      }
-      // If event not ready yet, leave bbox_async_pending true and retry next step
-    }
-
-    // --- Phase 2: Check bbox changes ---
-    if (!bbox_async_pending) {
-      *h_bbox_any_change = 0;
-      if (use_full_scan) {
-        // Full scan: launch separate scan kernels for shrink/recenter detection
-        gpu_launch_bbox_scan_async_2d(
-            d_all_phi_ptrs, d_all_widths, d_all_heights,
-            d_all_offsets_x, d_all_offsets_y,
-            d_centroids_x, d_centroids_y,
-            domain.params, num_cells, cached_max_size,
-            d_bbox_scan_results, d_bbox_any_change_flag,
-            h_bbox_any_change);
-        cudaEventRecord(bbox_check_event);
-        bbox_async_pending = true;
-      } else {
-        // Edge-only: the fused kernel wrote 1 to d_bbox_scan_results[0] if
-        // any cell's phi touched its subdomain edge. Just async-copy that flag.
-        cudaMemcpyAsync(h_bbox_any_change, d_bbox_scan_results, sizeof(int),
-                        cudaMemcpyDeviceToHost);
-        cudaEventRecord(bbox_check_event);
-        bbox_async_pending = true;
-      }
-    }
   }
 
   // Lazy host pointer flush: ensure host Cell structs have correct d_phi/d_dphi_dt

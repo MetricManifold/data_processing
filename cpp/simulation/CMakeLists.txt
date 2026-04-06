@@ -72,6 +72,7 @@ option(ENABLE_DIAGNOSTICS "Enable GPU-side diagnostics (CUDA only)" OFF)
 option(ENABLE_STRESS_FIELDS "Enable stress tensor field output (CUDA only)" OFF)
 option(USE_HALF_PRECISION_3D "Use FP16 for 3D phi fields (CUDA only)" OFF)
 option(ENABLE_KERNEL_PROFILING "Enable per-phase timing (CUDA only)" OFF)
+option(ENABLE_VISUALIZER "Enable real-time OpenGL visualizer (CUDA only)" OFF)
 
 #==============================================================================
 # C++ Standard
@@ -172,6 +173,29 @@ if(USE_CUDA)
     if(ENABLE_KERNEL_PROFILING)
         target_compile_definitions(cell_sim PRIVATE ENABLE_KERNEL_PROFILING=1)
         message(STATUS "ENABLE_KERNEL_PROFILING enabled")
+    endif()
+    
+    if(ENABLE_VISUALIZER)
+        # Fetch GLFW for windowing
+        include(FetchContent)
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            glfw
+            GIT_REPOSITORY https://github.com/glfw/glfw.git
+            GIT_TAG 3.4
+        )
+        FetchContent_MakeAvailable(glfw)
+
+        # Find OpenGL
+        find_package(OpenGL REQUIRED)
+
+        target_sources(cell_sim PRIVATE src/visualizer.cu)
+        target_link_libraries(cell_sim glfw OpenGL::GL)
+        target_compile_definitions(cell_sim PRIVATE ENABLE_VISUALIZER=1)
+        message(STATUS "VISUALIZER enabled (GLFW + OpenGL)")
     endif()
     
     message(STATUS "CUDA Toolkit: ${CUDAToolkit_VERSION}")

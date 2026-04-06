@@ -536,7 +536,12 @@ __global__ void kernel_fused_step(
     const float *__restrict__ velocities_y,
     float *__restrict__ d_centroid_sums,
     float *__restrict__ d_perimeters,
-    int *__restrict__ d_bbox_results,
+    float *__restrict__ d_second_moment_x,
+    float *__restrict__ d_second_moment_y,
+    const int *__restrict__ d_shift_x,
+    const int *__restrict__ d_shift_y,
+    const int *__restrict__ old_widths,
+    const int *__restrict__ old_heights,
     const float *__restrict__ ref_x,
     const float *__restrict__ ref_y,
     const float *__restrict__ d_volume_coeff,
@@ -552,8 +557,10 @@ __global__ void kernel_fused_step(
   int cell_idx = blockIdx.z;
   if (cell_idx >= num_cells) return;
 
-  int width = widths[cell_idx];
-  int height = heights[cell_idx];
+  int old_w = old_widths[cell_idx];    // OLD width (phi buffer has this stride for reading)
+  int old_h = old_heights[cell_idx];   // OLD height
+  int width = widths[cell_idx];        // NEW width (for writing + grid bounds)
+  int height = heights[cell_idx];      // NEW height
 
   int lx = blockIdx.x * blockDim.x + threadIdx.x;
   int ly = blockIdx.y * blockDim.y + threadIdx.y;
@@ -562,45 +569,62 @@ __global__ void kernel_fused_step(
   // Per-thread accumulation values for block reduction
   float my_cent_dx = 0.0f, my_cent_dy = 0.0f, my_cent_phi2 = 0.0f;
   float my_grad_mag = 0.0f;
+  float my_dx2 = 0.0f, my_dy2 = 0.0f;  // second moments for bbox extent
 
   bool active = (lx < width && ly < height);
 
   if (active) {
-    int idx = ly * width + lx;
-    const float *phi = phi_ptrs[cell_idx];
-    float phi_val = phi[idx];
-
     int offset_x_i = offsets_x[cell_idx];
     int offset_y_i = offsets_y[cell_idx];
+
+    // Inline remap shifts: read old phi at shifted local coords
+    int sx = d_shift_x[cell_idx];
+    int sy = d_shift_y[cell_idx];
+    int rx = lx + sx;  // source coord in old buffer
+    int ry = ly + sy;
+
+    const float *phi = phi_ptrs[cell_idx];
+    // If source pixel is out of old buffer bounds, phi is 0 (clean edge from remap/resize)
+    float phi_val = (rx >= 0 && rx < old_w && ry >= 0 && ry < old_h)
+                    ? phi[ry * old_w + rx] : 0.0f;
+
     bool in_inner = (lx >= halo && lx < width - halo &&
                      ly >= halo && ly < height - halo);
 
     float new_phi = phi_val;
 
-    // Global coordinates (computed once, reused for interaction + scatter)
-    int gx_raw = offset_x_i + lx;
+    // Global coordinates for sum field READ: use OLD offsets + shifted source coords
+    // (sum field was scattered by previous step using old offsets)
+    int gx_raw = offset_x_i + rx;
     int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-    int gy_raw = offset_y_i + ly;
+    int gy_raw = offset_y_i + ry;
     int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
 
-    {
+    // NEW global coordinates for scatter (offset + lx + sx = new_offset + lx)
+    int ngx_raw = offset_x_i + lx + sx;
+    int ngx = ngx_raw - ((ngx_raw >= Nx) - (ngx_raw < 0)) * Nx;
+    int ngy_raw = offset_y_i + ly + sy;
+    int ngy = ngy_raw - ((ngy_raw >= Ny) - (ngy_raw < 0)) * Ny;
+    // Guard: skip PDE if source pixel is out of buffer bounds (remap strip)
+    bool source_valid = (rx >= 0 && rx < old_w && ry >= 0 && ry < old_h);
+    if (source_valid) {
       // --- Stencil + PDE (inv_h2, inv_2dx, inv_2dy are precomputed kernel params) ---
+      // Stencil reads from OLD buffer at shifted coordinates
+      int xm = (rx > 0) ? rx - 1 : 0;
+      int xp = (rx < old_w - 1) ? rx + 1 : old_w - 1;
+      int ym = (ry > 0) ? ry - 1 : 0;
+      int yp = (ry < old_h - 1) ? ry + 1 : old_h - 1;
 
-      int xm = (lx > 0) ? lx - 1 : 0;
-      int xp = (lx < width - 1) ? lx + 1 : width - 1;
-      int ym = (ly > 0) ? ly - 1 : 0;
-      int yp = (ly < height - 1) ? ly + 1 : height - 1;
-
-      float phi_xm = phi[ly * width + xm];
-      float phi_xp = phi[ly * width + xp];
-      float phi_ym = phi[ym * width + lx];
-      float phi_yp = phi[yp * width + lx];
+      float phi_xm = phi[ry * old_w + xm];
+      float phi_xp = phi[ry * old_w + xp];
+      float phi_ym = phi[ym * old_w + rx];
+      float phi_yp = phi[yp * old_w + rx];
 
       // Diagonal neighbors (for McLellan isotropic 9-point stencil)
-      float phi_mm = phi[ym * width + xm];
-      float phi_pm = phi[ym * width + xp];
-      float phi_mp = phi[yp * width + xm];
-      float phi_pp = phi[yp * width + xp];
+      float phi_mm = phi[ym * old_w + xm];
+      float phi_pm = phi[ym * old_w + xp];
+      float phi_mp = phi[yp * old_w + xm];
+      float phi_pp = phi[yp * old_w + xp];
 
       // McLellan isotropic 9-point Laplacian (eliminates O(h²) grid anisotropy)
       // ∇²f = [4(N+S+E+W) + (NE+NW+SE+SW) - 20*C] / (6h²)
@@ -665,32 +689,23 @@ __global__ void kernel_fused_step(
       new_phi = phi_val + dt * dphi_dt_val;
     }
 
-    // --- Write Euler output to double buffer ---
-    phi_out_ptrs[cell_idx][idx] = new_phi;
+    // --- Write Euler output to double buffer at NEW local coords ---
+    phi_out_ptrs[cell_idx][ly * width + lx] = new_phi;
 
-    // --- Inline bbox edge flag: is phi dangerously close to subdomain edge? ---
-    // Single atomicMax to global flag — essentially free. Full scan periodically.
-    if (d_bbox_results && new_phi > 0.01f) {
-      if (lx <= halo + 1 || lx >= width - halo - 2 ||
-          ly <= halo + 1 || ly >= height - halo - 2) {
-        // d_bbox_results[0] is used as a global "any edge touched" flag
-        atomicMax(&d_bbox_results[0], 1);
-      }
-    }
-
-    // --- Scatter new_phi² to NEXT step's sum field (reuses gx, gy from above) ---
+    // --- Scatter new_phi² to NEXT step's sum field (uses NEW global coords) ---
     if (next_sum_field) {
       float new_phi_sq_scatter = new_phi * new_phi;
       if (new_phi_sq_scatter > 1e-8f) {
-        atomicAdd(&next_sum_field[gy * Nx + gx], new_phi_sq_scatter);
+        atomicAdd(&next_sum_field[ngy * Nx + ngx], new_phi_sq_scatter);
       }
     }
 
     // --- Centroid sums of NEW phi (for next step's volume/centroid) ---
+    // Displacement relative to ref using actual global position (offset + lx + sx)
     if (in_inner) {
       float new_phi_sq = new_phi * new_phi;
-      float dx_from_ref = (float)(offset_x_i + lx) - ref_x[cell_idx];
-      float dy_from_ref = (float)(offset_y_i + ly) - ref_y[cell_idx];
+      float dx_from_ref = (float)(offset_x_i + lx + sx) - ref_x[cell_idx];
+      float dy_from_ref = (float)(offset_y_i + ly + sy) - ref_y[cell_idx];
       if (dx_from_ref > Nx * 0.5f) dx_from_ref -= Nx;
       if (dx_from_ref < -Nx * 0.5f) dx_from_ref += Nx;
       if (dy_from_ref > Ny * 0.5f) dy_from_ref -= Ny;
@@ -698,21 +713,27 @@ __global__ void kernel_fused_step(
       my_cent_dx = dx_from_ref * new_phi_sq;
       my_cent_dy = dy_from_ref * new_phi_sq;
       my_cent_phi2 = new_phi_sq;
+      my_dx2 = dx_from_ref * dx_from_ref * new_phi_sq;
+      my_dy2 = dy_from_ref * dy_from_ref * new_phi_sq;
     }
   }
 
-  // === Block-level reduction: 4 channels (centroid + perimeter) ===
+  // === Block-level reduction: 6 channels (centroid + perimeter + second moments) ===
   extern __shared__ float smem[];
   int block_size = blockDim.x * blockDim.y;
   float *s0 = smem;                    // cent_dx
   float *s1 = smem + block_size;       // cent_dy
   float *s2 = smem + 2 * block_size;   // cent_phi2
   float *s3 = smem + 3 * block_size;   // grad_mag (perimeter)
+  float *s4 = smem + 4 * block_size;   // dx² · φ² (second moment x)
+  float *s5 = smem + 5 * block_size;   // dy² · φ² (second moment y)
 
   s0[tid] = my_cent_dx;
   s1[tid] = my_cent_dy;
   s2[tid] = my_cent_phi2;
   s3[tid] = my_grad_mag;
+  s4[tid] = my_dx2;
+  s5[tid] = my_dy2;
   __syncthreads();
 
   for (int s = block_size / 2; s > 32; s >>= 1) {
@@ -721,6 +742,8 @@ __global__ void kernel_fused_step(
       s1[tid] += s1[tid + s];
       s2[tid] += s2[tid + s];
       s3[tid] += s3[tid + s];
+      s4[tid] += s4[tid + s];
+      s5[tid] += s5[tid + s];
     }
     __syncthreads();
   }
@@ -730,11 +753,15 @@ __global__ void kernel_fused_step(
     float v1 = s1[tid] + s1[tid + 32];
     float v2 = s2[tid] + s2[tid + 32];
     float v3 = s3[tid] + s3[tid + 32];
+    float v4 = s4[tid] + s4[tid + 32];
+    float v5 = s5[tid] + s5[tid + 32];
     for (int offset = 16; offset > 0; offset >>= 1) {
       v0 += __shfl_down_sync(0xffffffff, v0, offset);
       v1 += __shfl_down_sync(0xffffffff, v1, offset);
       v2 += __shfl_down_sync(0xffffffff, v2, offset);
       v3 += __shfl_down_sync(0xffffffff, v3, offset);
+      v4 += __shfl_down_sync(0xffffffff, v4, offset);
+      v5 += __shfl_down_sync(0xffffffff, v5, offset);
     }
     if (tid == 0) {
       // Skip atomicAdds when block contributes nothing (most blocks are in
@@ -744,12 +771,29 @@ __global__ void kernel_fused_step(
         atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
         atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
         atomicAdd(&d_perimeters[cell_idx], v3);
+        atomicAdd(&d_second_moment_x[cell_idx], v4);
+        atomicAdd(&d_second_moment_y[cell_idx], v5);
       }
     }
   }
 }
 
-// GPU-side pointer swap (avoids H→D memcpy for double-buffer swap each step)
+// GPU-side pointer swap + offset apply + resize commit
+__global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
+                                      int *offsets_x, int *offsets_y,
+                                      const int *shift_x, const int *shift_y,
+                                      int num_cells) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_cells) return;
+  float *tmp = phi_ptrs[i];
+  phi_ptrs[i] = phi_out_ptrs[i];
+  phi_out_ptrs[i] = tmp;
+  // Apply deferred offset shifts from inline remap
+  offsets_x[i] += shift_x[i];
+  offsets_y[i] += shift_y[i];
+}
+
+// Backward-compatible swap-only overload (no offset update, used by 3D integrator)
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
                                       int num_cells) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -757,6 +801,71 @@ __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
   float *tmp = phi_ptrs[i];
   phi_ptrs[i] = phi_out_ptrs[i];
   phi_out_ptrs[i] = tmp;
+}
+
+//=============================================================================
+// Dynamic subdomain resize: remap phi to new (larger) layout
+// Runs between steps. Uses phi_out as scratch, then swaps back.
+// d_grow: [N*4] = {grow_left, grow_right, grow_top, grow_bottom} per cell
+// One thread block per row of the output cell.
+//=============================================================================
+__global__ void kernel_remap_grow(
+    float **__restrict__ phi_ptrs,      // source (current phi)
+    float **__restrict__ phi_out_ptrs,  // destination (scratch)
+    const int *__restrict__ widths,
+    const int *__restrict__ heights,
+    const int *__restrict__ grow,  // [N*4]: gl, gr, gt, gb per cell
+    int num_cells) {
+  int cell_idx = blockIdx.z;
+  if (cell_idx >= num_cells) return;
+
+  int gl = grow[cell_idx * 4 + 0];
+  int gr = grow[cell_idx * 4 + 1];
+  int gt = grow[cell_idx * 4 + 2];
+  int gb = grow[cell_idx * 4 + 3];
+  if (gl == 0 && gr == 0 && gt == 0 && gb == 0) return;
+
+  int old_w = widths[cell_idx];
+  int old_h = heights[cell_idx];
+  int new_w = old_w + gl + gr;
+  int new_h = old_h + gt + gb;
+
+  int lx = blockIdx.x * blockDim.x + threadIdx.x;
+  int ly = blockIdx.y * blockDim.y + threadIdx.y;
+  if (lx >= new_w || ly >= new_h) return;
+
+  const float *src = phi_ptrs[cell_idx];
+  float *dst = phi_out_ptrs[cell_idx];
+
+  // Map new local coords to old local coords
+  int ox = lx - gl;
+  int oy = ly - gb;
+  float val = (ox >= 0 && ox < old_w && oy >= 0 && oy < old_h)
+              ? src[oy * old_w + ox] : 0.0f;
+  dst[ly * new_w + lx] = val;
+}
+
+// Apply resize: swap pointers + update dims/offsets for resized cells only
+__global__ void kernel_apply_resize(
+    float **__restrict__ phi_ptrs,
+    float **__restrict__ phi_out_ptrs,
+    int *__restrict__ widths, int *__restrict__ heights,
+    int *__restrict__ offsets_x, int *__restrict__ offsets_y,
+    const int *__restrict__ grow, int num_cells) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_cells) return;
+  int gl = grow[i * 4 + 0], gr = grow[i * 4 + 1];
+  int gt = grow[i * 4 + 2], gb = grow[i * 4 + 3];
+  if (gl == 0 && gr == 0 && gt == 0 && gb == 0) return;
+  // Swap pointers so remapped data becomes current
+  float *tmp = phi_ptrs[i];
+  phi_ptrs[i] = phi_out_ptrs[i];
+  phi_out_ptrs[i] = tmp;
+  // Update dims and offsets
+  widths[i] += gl + gr;
+  heights[i] += gt + gb;
+  offsets_x[i] -= gl;
+  offsets_y[i] -= gb;
 }
 
 // Batched integral reduction

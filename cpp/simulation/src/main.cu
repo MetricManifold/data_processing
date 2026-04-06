@@ -1,4 +1,7 @@
 #include "simulation.cuh"
+#ifdef ENABLE_VISUALIZER
+#include "visualizer.cuh"
+#endif
 #include "simulation3d.cuh"
 #include <algorithm>
 #include <chrono>
@@ -369,7 +372,7 @@ void print_usage(const char *program) {
   printf("                        Production: use 0 (VTK disabled). Trajectory data is sufficient.\n");
   printf("  --print-interval <n>  Steps between progress output (default: -1 = use save_interval)\n");
   printf("  --save-final-checkpoint  Save checkpoint.bin at simulation end (for job chaining)\n");
-  printf("  --checkpoint-interval <n>  Steps between checkpoint saves (default: -1 = save_interval * 10)\n");
+  printf("  --checkpoint-interval <n>  Steps between checkpoint saves (default: -1 = auto, 0 = disabled)\n");
   printf("  --trajectory-samples <n>  Total trajectory snapshots over the run (default: %d). Production: 2000\n", def_trajectory_samples);
   printf("  --trajectory-interval <n>  Steps between trajectory saves (default: -1 = auto from samples)\n");
   printf("  --seed <n>      Random seed (default: time-based). For reproducible runs\n");
@@ -378,6 +381,8 @@ void print_usage(const char *program) {
   printf("                            (energy, stress, contacts; requires -DENABLE_DIAGNOSTICS=ON)\n");
   printf("  --stress-fields         Include stress tensor fields in VTK output\n");
   printf("                          (requires -DENABLE_STRESS_FIELDS=ON)\n");
+  printf("  --visualize [interval]  Open real-time display window (requires -DENABLE_VISUALIZER=ON)\n");
+  printf("                          interval = steps between updates (default: 100)\n");
   printf("  --save-individual-fields  Save per-cell phi fields for energy analysis\n");
   printf("  --subdomain-padding <f>  Cell window size as multiple of R (default: %.1f)\n", p.subdomain_padding);
   printf("  --safe-mode     Limit memory allocation to prevent runaway VRAM usage\n");
@@ -752,6 +757,8 @@ int main(int argc, char *argv[]) {
   bool trajectory_interval_set = false;
   int observable_interval = 0; // 0 = disabled, >0 = GPU diagnostic measurements
   bool stress_fields = false;  // Include stress tensor fields in VTK output
+  bool enable_visualizer = false;
+  int visualize_interval = 100;
   float v_A_override = -1.0f; // -1 means use default from params
   float tau_override = -1.0f;  // -1 means use default from params
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
@@ -836,6 +843,12 @@ int main(int argc, char *argv[]) {
       observable_interval = atoi(argv[++i]);
     } else if (arg == "--stress-fields") {
       stress_fields = true;
+    } else if (arg == "--visualize") {
+      enable_visualizer = true;
+      // Optional: next arg is interval if it's a number
+      if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+        visualize_interval = atoi(argv[++i]);
+      }
     } else if (arg == "--v-A" && i + 1 < argc) {
       v_A_override = atof(argv[++i]);
     } else if (arg == "--v-A-sigma" && i + 1 < argc) {
@@ -1265,6 +1278,18 @@ int main(int argc, char *argv[]) {
   sim.save_vtk = (save_interval > 0);
   sim.save_individual_fields = save_individual_fields;
 
+#ifdef ENABLE_VISUALIZER
+  static cellsim::Visualizer vis_instance;
+  if (enable_visualizer) {
+    sim.visualizer = &vis_instance;
+    sim.visualize_interval = visualize_interval;
+  }
+#else
+  if (enable_visualizer) {
+    printf("Warning: --visualize requires -DENABLE_VISUALIZER=ON at build time\n");
+  }
+#endif
+
   // Initialize
   bool resumed = false;
   if (!checkpoint_file.empty()) {
@@ -1483,6 +1508,14 @@ int main(int argc, char *argv[]) {
   }
 
   // Run simulation with timing
+#ifdef ENABLE_VISUALIZER
+  if (sim.visualizer) {
+    char title[256];
+    snprintf(title, sizeof(title), "Cell Sim: %d cells, %dx%d",
+             sim.domain.num_cells(), sim.domain.params.Nx, sim.domain.params.Ny);
+    sim.visualizer->init(sim.domain.params.Nx, sim.domain.params.Ny, title);
+  }
+#endif
   auto start_time = std::chrono::high_resolution_clock::now();
   sim.run();
   auto end_time = std::chrono::high_resolution_clock::now();

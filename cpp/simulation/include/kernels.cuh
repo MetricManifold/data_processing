@@ -90,15 +90,23 @@ void step_fused(Domain &domain, float dt,
                 float *d_target_area,
                 float *d_volume_coeff,
                 float *d_perimeters,
+                float *d_second_moment_x,
+                float *d_second_moment_y,
+                int *d_old_widths,
+                int *d_old_heights,
+                int pool_max_side,
+                int *d_max_wh,
+                int *d_shift_x,
+                int *d_shift_y,
                 int *d_block_arrival,
-                int *d_bbox_scan_results,
                 float *d_sum_field,
                 float *d_sum_field_linear,
                 float *d_next_sum_field,
                 int cached_max_size, int cached_max_w, int cached_max_h,
                 bool sync_centroids = true,
                 bool rebuild_neighbors = true,
-                bool centroid_sums_precomputed = false);
+                bool centroid_sums_precomputed = false,
+                int step_counter = 0);
 
 //=============================================================================
 // DIAGNOSTICS (optional, enabled via DIAGNOSTICS_ENABLED)
@@ -139,69 +147,6 @@ void compute_stress_fields(
     int *d_all_offsets_y,
     StressFieldBuffers &stress);
 #endif
-
-//=============================================================================
-// GPU Bounding Box Scan kernel (per-cell, finds extent + edge proximity)
-// Output: d_results[7] = {max_dist_x, max_dist_y,
-//                          min_lx, max_lx, min_ly, max_ly, found_any}
-//=============================================================================
-
-__global__ void kernel_init_bbox_scan_results(int *results, int num_cells);
-
-__global__ void kernel_bbox_scan_2d(
-    const float *__restrict__ phi,
-    int width, int height,
-    int offset_x, int offset_y,
-    const float *__restrict__ d_centroids_x,
-    const float *__restrict__ d_centroids_y,
-    int cell_idx,
-    int Nx, int Ny,
-    int halo, float threshold,
-    int *__restrict__ results);
-
-// GPU remap kernel (copies phi from old bbox to new bbox, all on device)
-__global__ void kernel_bbox_remap_2d(
-    const float *__restrict__ old_phi,
-    float *__restrict__ new_phi,
-    int old_w, int old_h,
-    int old_ox, int old_oy,
-    int new_w, int new_h,
-    int new_ox, int new_oy,
-    int Nx, int Ny);
-
-// Async bbox scan + change detection. Launches scan kernels and copies the
-// change flag to pinned host memory via cudaMemcpyAsync (no pipeline drain).
-// The caller reads h_any_change_pinned on a later step.
-void gpu_launch_bbox_scan_async_2d(
-    float **d_all_phi_ptrs,
-    int *d_all_widths, int *d_all_heights,
-    int *d_all_offsets_x, int *d_all_offsets_y,
-    float *d_centroids_x, float *d_centroids_y,
-    const SimParams &params,
-    int num_cells, int max_field_size,
-    int *d_bbox_scan_results,
-    int *d_any_change_flag,
-    int *h_any_change_pinned);
-
-// Host function: GPU-accelerated bbox update for all 2D cells (every step)
-// Returns true if any bbox changed
-// Pool params: if pool is active, remap within pool slots instead of cudaMalloc/Free
-// Device arrays: phi pointers, widths, heights, offsets for batched scan kernel
-// Also patches device arrays directly on GPU (eliminates update_interaction_arrays H→D)
-bool gpu_update_all_bboxes_2d(Domain &domain, int *d_bbox_scan_results,
-                              float *d_centroids_x, float *d_centroids_y,
-                              float *d_phi_pool = nullptr,
-                              size_t pool_slot_size = 0,
-                              int pool_num_cells = 0,
-                              bool *pool_needs_grow = nullptr,
-                              float **d_all_phi_ptrs = nullptr,
-                              float **d_all_phi_out_ptrs = nullptr,
-                              int *d_all_widths = nullptr,
-                              int *d_all_heights = nullptr,
-                              int *d_all_offsets_x = nullptr,
-                              int *d_all_offsets_y = nullptr,
-                              int *d_all_field_sizes = nullptr,
-                              int max_field_size = 0);
 
 //=============================================================================
 // Narrow-Band Inline Skip (2D)

@@ -10,6 +10,10 @@
 #include "diagnostics.cuh"
 #endif
 
+#ifdef ENABLE_VISUALIZER
+#include "visualizer.cuh"
+#endif
+
 // Stress fields also uses diagnostics.cuh for StressFieldBuffers
 #ifdef STRESS_FIELDS_ENABLED
 #ifndef DIAGNOSTICS_ENABLED
@@ -64,6 +68,11 @@ public:
   bool radius_overrides_set = false;
 
   AsyncVTKWriter vtk_writer;  // Async binary VTK output (GPU scatter + background file write)
+
+#ifdef ENABLE_VISUALIZER
+  Visualizer *visualizer = nullptr;   // Non-owning pointer; set externally
+  int visualize_interval = 100;       // Steps between display updates
+#endif
 
 #ifdef DIAGNOSTICS_ENABLED
   DiagnosticBuffers diag_buffers;
@@ -368,9 +377,14 @@ inline void Simulation::run() {
 #endif
 
   // Compute effective checkpoint interval
-  int ckpt_interval = (checkpoint_interval > 0)
-                          ? checkpoint_interval
-                          : (save_interval > 0 ? save_interval * 10 : 1000);
+  // -1 = auto (save_interval*10 or 1000), 0 = disabled, >0 = explicit
+  int ckpt_interval = 0;
+  if (checkpoint_interval > 0) {
+    ckpt_interval = checkpoint_interval;
+  } else if (checkpoint_interval < 0) {
+    ckpt_interval = (save_interval > 0) ? save_interval * 10 : 1000;
+  }
+  // checkpoint_interval == 0 → ckpt_interval stays 0 (disabled)
 
   // Compute trajectory save interval
   // trajectory_interval: -1 = auto, 0 = compute from samples, >0 = use directly
@@ -543,6 +557,24 @@ inline void Simulation::run() {
         printf("Step %6d | t=%.4f\n", current_step, current_time);
       }
     }
+
+#ifdef ENABLE_VISUALIZER
+    if (visualizer && visualizer->is_initialized() &&
+        current_step % visualize_interval == 0) {
+      visualizer->update(integrator.get_sum_field(), domain.params.Nx,
+                         domain.params.Ny,
+                         integrator.d_centroids_x, integrator.d_centroids_y,
+                         integrator.d_polarization_x, integrator.d_polarization_y,
+                         integrator.d_all_offsets_x, integrator.d_all_offsets_y,
+                         integrator.d_all_widths, integrator.d_all_heights,
+                         integrator.d_second_moment_x, integrator.d_second_moment_y,
+                         integrator.d_volumes,
+                         domain.params.dx * domain.params.dy,
+                         domain.num_cells(), (float)current_time,
+                         visualizer->show_arrows, visualizer->show_bboxes);
+      if (visualizer->should_close()) break;
+    }
+#endif
   }
 
   // Save final trajectory point
