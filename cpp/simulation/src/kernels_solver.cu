@@ -121,14 +121,14 @@ __global__ void kernel_pre_step(
         target_w = min(max(target_w, 32), max_side);
         target_h = min(max(target_h, 32), max_side);
 
-        // Grow or shrink to match target
-        if (target_w != w) {
-          int delta = target_w - w;  // positive = grow, negative = shrink
-          int gl = delta / 2;        // grow/shrink on left (negative = shrink left)
+        // Only grow, never shrink (shrinking clips phi at borders, losing mass)
+        if (target_w > w) {
+          int delta = target_w - w;
+          int gl = delta / 2;
           new_w = target_w;
           sx -= gl;
         }
-        if (target_h != h) {
+        if (target_h > h) {
           int delta = target_h - h;
           int gb = delta / 2;
           new_h = target_h;
