@@ -110,11 +110,16 @@ __global__ void kernel_pre_step(
       if (max_side > 0 && sum_phi2 > 1.0f) {
         float sigma_x = sqrtf(fmaxf(moment_x / sum_phi2, 1.0f));
         float sigma_y = sqrtf(fmaxf(moment_y / sum_phi2, 1.0f));
-        int halo = 4;  // halo_width
-        int avail_half_x = w / 2 - halo - 2;
-        int avail_half_y = h / 2 - halo - 2;
-        int needed_half_x = (int)ceilf(3.0f * sigma_x);
-        int needed_half_y = (int)ceilf(3.0f * sigma_y);
+        int halo = 4;
+        // Only resize when the cell is ACTUALLY close to the subdomain edge.
+        // Use a tight check: if 2σ + halo + lambda approaches the half-width,
+        // the cell's interface (which extends ~3λ beyond the core) is in danger.
+        int safety = halo + 21; // halo + 3*lambda
+        int avail_half_x = w / 2 - safety;
+        int avail_half_y = h / 2 - safety;
+        // 2σ captures the core of the cell (95% of phi² mass)
+        int needed_half_x = (int)ceilf(2.0f * sigma_x);
+        int needed_half_y = (int)ceilf(2.0f * sigma_y);
 
         if (needed_half_x > avail_half_x) {
           int grow_x = needed_half_x - avail_half_x + 8;  // +8 buffer to avoid re-triggering
