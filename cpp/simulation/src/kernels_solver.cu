@@ -110,30 +110,29 @@ __global__ void kernel_pre_step(
       if (max_side > 0 && sum_phi2 > 1.0f) {
         float sigma_x = sqrtf(fmaxf(moment_x / sum_phi2, 1.0f));
         float sigma_y = sqrtf(fmaxf(moment_y / sum_phi2, 1.0f));
-        int halo = 4;
-        // Only resize when the cell is ACTUALLY close to the subdomain edge.
-        // Use a tight check: if 2σ + halo + lambda approaches the half-width,
-        // the cell's interface (which extends ~3λ beyond the core) is in danger.
-        int safety = halo + 21; // halo + 3*lambda
-        int avail_half_x = w / 2 - safety;
-        int avail_half_y = h / 2 - safety;
-        // 2σ captures the core of the cell (95% of phi² mass)
-        int needed_half_x = (int)ceilf(2.0f * sigma_x);
-        int needed_half_y = (int)ceilf(2.0f * sigma_y);
+        // Target half-size: 3σ + halo + small buffer
+        // This matches the red diagnostic box + room for the stencil
+        int margin = 4 + 8;  // halo + buffer
+        int target_half_x = (int)ceilf(3.0f * sigma_x) + margin;
+        int target_half_y = (int)ceilf(3.0f * sigma_y) + margin;
+        int target_w = (2 * target_half_x) & ~1;  // even
+        int target_h = (2 * target_half_y) & ~1;
+        // Clamp to pool slot
+        target_w = min(max(target_w, 32), max_side);
+        target_h = min(max(target_h, 32), max_side);
 
-        if (needed_half_x > avail_half_x) {
-          int grow_x = needed_half_x - avail_half_x + 8;  // +8 buffer to avoid re-triggering
-          new_w = min(w + 2 * grow_x, max_side) & ~1;
-          int gl = (new_w - w) / 2;
+        // Grow or shrink to match target
+        if (target_w != w) {
+          int delta = target_w - w;  // positive = grow, negative = shrink
+          int gl = delta / 2;        // grow/shrink on left (negative = shrink left)
+          new_w = target_w;
           sx -= gl;
-          if (i == 0) printf("GROW[%d] w:%d->%d gl=%d sx=%d\n", i, w, new_w, gl, sx);
         }
-        if (needed_half_y > avail_half_y) {
-          int grow_y = needed_half_y - avail_half_y + 8;
-          new_h = min(h + 2 * grow_y, max_side) & ~1;
-          int gb = (new_h - h) / 2;
+        if (target_h != h) {
+          int delta = target_h - h;
+          int gb = delta / 2;
+          new_h = target_h;
           sy -= gb;
-          if (i == 0) printf("GROW[%d] h:%d->%d gb=%d sy=%d\n", i, h, new_h, gb, sy);
         }
       }
     }
