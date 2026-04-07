@@ -1311,10 +1311,16 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     cudaMemcpy(h_h.data(), d_all_heights, nc * sizeof(int),
                cudaMemcpyDeviceToHost);
     for (int i = 0; i < nc; ++i) {
+      int hw = params.halo_width;
       domain.cells[i]->bbox_with_halo.x0 = h_off_x[i];
       domain.cells[i]->bbox_with_halo.y0 = h_off_y[i];
       domain.cells[i]->bbox_with_halo.x1 = h_off_x[i] + h_w[i];
       domain.cells[i]->bbox_with_halo.y1 = h_off_y[i] + h_h[i];
+      // Keep inner bbox in sync (needed for checkpoint save)
+      domain.cells[i]->bbox.x0 = h_off_x[i] + hw;
+      domain.cells[i]->bbox.y0 = h_off_y[i] + hw;
+      domain.cells[i]->bbox.x1 = h_off_x[i] + h_w[i] - hw;
+      domain.cells[i]->bbox.y1 = h_off_y[i] + h_h[i] - hw;
       domain.cells[i]->field_size = h_w[i] * h_h[i];
     }
   }

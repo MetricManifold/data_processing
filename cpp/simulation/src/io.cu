@@ -506,10 +506,7 @@ void save_checkpoint(const Domain &domain, const std::string &filename,
   // Write each cell
   for (const auto &cell : domain.cells) {
     file.write(reinterpret_cast<const char *>(&cell->id), sizeof(int));
-    // Write bbox_with_halo (includes halo) — this matches field_size.
-    // After dynamic resize, bbox_with_halo tracks the actual subdomain
-    // dimensions while the inner bbox may be stale.
-    file.write(reinterpret_cast<const char *>(&cell->bbox_with_halo),
+    file.write(reinterpret_cast<const char *>(&cell->bbox),
                sizeof(BoundingBox));
     file.write(reinterpret_cast<const char *>(&cell->centroid), sizeof(Vec2));
     file.write(reinterpret_cast<const char *>(&cell->velocity), sizeof(Vec2));
@@ -598,8 +595,8 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
     return false;
   }
 
-  if (min_hdr.version < 2 || min_hdr.version > 4) {
-    printf("Error: Unsupported checkpoint version %d (expected 2, 3, or 4)\n",
+  if (min_hdr.version < 2 || min_hdr.version > 5) {
+    printf("Error: Unsupported checkpoint version %d (expected 2-5)\n",
            min_hdr.version);
     return false;
   }
@@ -745,12 +742,8 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
     file.read(reinterpret_cast<char *>(&velocity), sizeof(Vec2));
     file.read(reinterpret_cast<char *>(&volume), sizeof(float));
 
-    // bbox from checkpoint is bbox_with_halo (includes halo).
-    // Compute inner bbox by shrinking, then construct cell with that + halo.
-    int hw = domain.params.halo_width;
-    BoundingBox inner_bbox = {bbox.x0 + hw, bbox.y0 + hw,
-                              bbox.x1 - hw, bbox.y1 - hw};
-    auto cell = std::make_unique<Cell>(id, inner_bbox, hw);
+    // bbox from checkpoint is the inner bbox (without halo).
+    auto cell = std::make_unique<Cell>(id, bbox, domain.params.halo_width);
     cell->centroid = centroid;
     cell->velocity = velocity;
     cell->volume = volume;
