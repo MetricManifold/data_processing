@@ -92,10 +92,10 @@ inline Domain::~Domain() {
 
 inline Cell *Domain::add_cell(float cx, float cy, float radius) {
   // Compute bounding box for this cell.
-  // Initial margin: radius + 3.5λ + halo. Tight but sufficient for circular cells.
+  // Initial margin: radius + 3λ + halo. Tight but sufficient for circular cells.
   // Dynamic resize handles confluent polygonal shapes.
   int adaptive_margin =
-      static_cast<int>(radius + 3.5f * params.lambda) + params.halo_width;
+      static_cast<int>(radius + 3.0f * params.lambda) + params.halo_width;
   BoundingBox bbox = {
       static_cast<int>(cx) - adaptive_margin,
       static_cast<int>(cy) - adaptive_margin,

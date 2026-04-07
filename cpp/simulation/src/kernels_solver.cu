@@ -35,10 +35,15 @@ __global__ void kernel_pre_step(
     float *__restrict__ centroid_sums,
     float *__restrict__ d_second_moment_x,
     float *__restrict__ d_second_moment_y,
+    float *__restrict__ d_integrals_x,
+    float *__restrict__ d_integrals_y,
+    float *__restrict__ d_perimeters,
+    int *__restrict__ d_block_arrival,
     const float *__restrict__ d_target_area, float dA,
+    const float *__restrict__ d_target_radius,
     int *__restrict__ d_shift_x, int *__restrict__ d_shift_y,
     int *__restrict__ d_max_wh,  // [0]=max_w, [1]=max_h (atomicMax target)
-    bool compute_shifts, int max_side,
+    bool compute_shifts, bool zero_moments, int max_side,
     int Nx, int Ny, int num_cells) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_cells) return;
@@ -72,11 +77,21 @@ __global__ void kernel_pre_step(
   centroid_sums[i * 3 + 1] = 0.0f;
   centroid_sums[i * 3 + 2] = 0.0f;
 
-  // Read second moments then zero for next step
+  // Zero reduction accumulators (replaces cudaMemsetAsync of 4N floats)
+  d_integrals_x[i] = 0.0f;
+  d_integrals_y[i] = 0.0f;
+  d_perimeters[i] = 0.0f;
+  d_block_arrival[i] = 0;
+
+  // Read second moments. Zero them before accumulation (zero_moments=true
+  // on the step BEFORE fused kernel accumulates, so moments persist for
+  // the visualizer and resize reads on the following step).
   float moment_x = d_second_moment_x[i];
   float moment_y = d_second_moment_y[i];
-  d_second_moment_x[i] = 0.0f;
-  d_second_moment_y[i] = 0.0f;
+  if (zero_moments) {
+    d_second_moment_x[i] = 0.0f;
+    d_second_moment_y[i] = 0.0f;
+  }
 
   // 3. Compute centroid shift + dynamic resize
   // sx/sy encode the mapping: new local (lx,ly) reads from old local (lx+sx, ly+sy)
@@ -115,10 +130,11 @@ __global__ void kernel_pre_step(
         if (var_x > 4.0f && var_y > 4.0f) {
           float sigma_x = sqrtf(var_x);
           float sigma_y = sqrtf(var_y);
-          // Target half-size: 3σ + halo + small buffer
-          int margin = 4 + 8;  // halo + buffer
-          int target_half_x = (int)ceilf(3.0f * sigma_x) + margin;
-          int target_half_y = (int)ceilf(3.0f * sigma_y) + margin;
+          // Target half-size: 2σ + 2R/3 + halo (additive margin from cell radius)
+          float R = d_target_radius[i];
+          int additive_margin = (int)ceilf(2.0f * R / 3.0f) + 4;  // 2R/3 + halo
+          int target_half_x = (int)ceilf(2.0f * sigma_x) + additive_margin;
+          int target_half_y = (int)ceilf(2.0f * sigma_y) + additive_margin;
           int target_w = (2 * target_half_x) & ~1;  // even
           int target_h = (2 * target_half_y) & ~1;
           // Clamp to pool slot
@@ -323,7 +339,9 @@ __global__ void kernel_fused_step(
     float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
-    int num_cells);
+    int num_cells,
+    bool compute_moments,
+    bool has_remap);
 
 __global__ void kernel_scatter_phi_sq(
     float **__restrict__ phi_ptrs,
@@ -400,6 +418,7 @@ void step_fused(Domain &domain, float dt,
                    float *d_second_moment_y,
                    int *d_old_widths,
                    int *d_old_heights,
+                   float *d_target_radius,
                    int pool_max_side,
                    int *d_max_wh,
                    int *d_shift_x,
@@ -445,13 +464,12 @@ void step_fused(Domain &domain, float dt,
   // 32×8 block: better coalescing for row-major phi (warp spans 1 row, not 2)
   dim3 block(32, 8, 1);
   dim3 grid((max_w + 31) / 32, (max_h + 7) / 8, num_cells);
-  size_t smem_fused = 6 * block.x * block.y * sizeof(float);  // 6 channels: cent_dx/dy/phi2 + grad_mag + moment_x/y
+  bool compute_moments = (step_counter % 10 == 9);
+  size_t smem_fused = (compute_moments ? 6 : 4) * block.x * block.y * sizeof(float);
   size_t smem_vint  = 2 * block.x * block.y * sizeof(float);  // 2 channels: int_x, int_y
 
-  // Zero integrals + perimeters + block arrival in one memset (contiguous in d_reduction_block)
-  // Layout: [int_x(N) | int_y(N) | perim(N) | block_arrival(N) | moment_x(N) | moment_y(N) | centroid_sums(3N)]
-  // Zero only first 4N — moment_x/y and centroid_sums are zeroed by kernel_pre_step after reading.
-  cudaMemsetAsync(d_integrals_x, 0, 4 * num_cells * sizeof(float));
+  // Reduction accumulators (integrals, perimeters, block_arrival) are zeroed
+  // inside kernel_pre_step to eliminate a cudaMemsetAsync API call.
 
 #ifdef ENABLE_KERNEL_PROFILING
   cudaEventRecord(ev_memset);
@@ -493,10 +511,13 @@ void step_fused(Domain &domain, float dt,
       d_centroids_x, d_centroids_y, d_volume_deviations, d_volumes,
       d_centroid_sums,
       d_second_moment_x, d_second_moment_y,
+      d_integrals_x, d_integrals_y,
+      d_perimeters, d_block_arrival,
       d_target_area, dA,
+      d_target_radius,
       d_shift_x, d_shift_y,
       d_max_wh,
-      (step_counter % 10 == 0), pool_max_side,
+      (step_counter % 10 == 0), (step_counter % 10 == 9), pool_max_side,
       params.Nx, params.Ny, num_cells);
 
   // After resize check, read GPU-computed max dims for the FUSED kernel (write path).
@@ -597,7 +618,7 @@ void step_fused(Domain &domain, float dt,
       d_two_gamma_bulk, d_two_gamma,
       inv_h2, inv_2dx, inv_2dy, dt,
       params.halo_width, params.Nx, params.Ny,
-      num_cells);
+      num_cells, compute_moments, (step_counter % 10 == 0));
 
   // Phi pointer swap is now done in kernel_pre_step of the NEXT step
   // (saves 1 kernel launch per step)

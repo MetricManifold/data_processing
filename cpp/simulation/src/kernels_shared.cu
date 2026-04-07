@@ -552,15 +552,30 @@ __global__ void kernel_fused_step(
     float inv_h2, float inv_2dx, float inv_2dy,
     float dt,
     int halo, int Nx, int Ny,
-    int num_cells)
+    int num_cells,
+    bool compute_moments,
+    bool has_remap)
 {
   int cell_idx = blockIdx.z;
   if (cell_idx >= num_cells) return;
 
-  int old_w = old_widths[cell_idx];    // OLD width (phi buffer has this stride for reading)
-  int old_h = old_heights[cell_idx];   // OLD height
-  int width = widths[cell_idx];        // NEW width (for writing + grid bounds)
-  int height = heights[cell_idx];      // NEW height
+  int width = widths[cell_idx];
+  int height = heights[cell_idx];
+
+  // When no remap is happening (9 of 10 steps), skip loading old dims + shifts.
+  // old_w == width, old_h == height, sx == sy == 0 on those steps.
+  int old_w, old_h, sx, sy;
+  if (has_remap) {
+    old_w = old_widths[cell_idx];
+    old_h = old_heights[cell_idx];
+    sx = d_shift_x[cell_idx];
+    sy = d_shift_y[cell_idx];
+  } else {
+    old_w = width;
+    old_h = height;
+    sx = 0;
+    sy = 0;
+  }
 
   int lx = blockIdx.x * blockDim.x + threadIdx.x;
   int ly = blockIdx.y * blockDim.y + threadIdx.y;
@@ -689,6 +704,13 @@ __global__ void kernel_fused_step(
       new_phi = phi_val + dt * dphi_dt_val;
     }
 
+    // Enforce zero phi in the halo region (Dirichlet BC).
+    // Prevents phi from "sticking" to the subdomain boundary
+    // where the clamped stencil would otherwise act as Neumann BC.
+    if (!in_inner) {
+      new_phi = 0.0f;
+    }
+
     // --- Write Euler output to double buffer at NEW local coords ---
     phi_out_ptrs[cell_idx][ly * width + lx] = new_phi;
 
@@ -713,66 +735,102 @@ __global__ void kernel_fused_step(
       my_cent_dx = dx_from_ref * new_phi_sq;
       my_cent_dy = dy_from_ref * new_phi_sq;
       my_cent_phi2 = new_phi_sq;
-      my_dx2 = dx_from_ref * dx_from_ref * new_phi_sq;
-      my_dy2 = dy_from_ref * dy_from_ref * new_phi_sq;
+      if (compute_moments) {
+        my_dx2 = dx_from_ref * dx_from_ref * new_phi_sq;
+        my_dy2 = dy_from_ref * dy_from_ref * new_phi_sq;
+      }
     }
   }
 
-  // === Block-level reduction: 6 channels (centroid + perimeter + second moments) ===
+  // === Block-level reduction: 4 or 6 channels ===
   extern __shared__ float smem[];
   int block_size = blockDim.x * blockDim.y;
   float *s0 = smem;                    // cent_dx
   float *s1 = smem + block_size;       // cent_dy
   float *s2 = smem + 2 * block_size;   // cent_phi2
   float *s3 = smem + 3 * block_size;   // grad_mag (perimeter)
-  float *s4 = smem + 4 * block_size;   // dx² · φ² (second moment x)
-  float *s5 = smem + 5 * block_size;   // dy² · φ² (second moment y)
 
   s0[tid] = my_cent_dx;
   s1[tid] = my_cent_dy;
   s2[tid] = my_cent_phi2;
   s3[tid] = my_grad_mag;
-  s4[tid] = my_dx2;
-  s5[tid] = my_dy2;
-  __syncthreads();
 
-  for (int s = block_size / 2; s > 32; s >>= 1) {
-    if (tid < s) {
-      s0[tid] += s0[tid + s];
-      s1[tid] += s1[tid + s];
-      s2[tid] += s2[tid + s];
-      s3[tid] += s3[tid + s];
-      s4[tid] += s4[tid + s];
-      s5[tid] += s5[tid + s];
-    }
+  if (compute_moments) {
+    float *s4 = smem + 4 * block_size;
+    float *s5 = smem + 5 * block_size;
+    s4[tid] = my_dx2;
+    s5[tid] = my_dy2;
     __syncthreads();
-  }
 
-  if (tid < 32) {
-    float v0 = s0[tid] + s0[tid + 32];
-    float v1 = s1[tid] + s1[tid + 32];
-    float v2 = s2[tid] + s2[tid + 32];
-    float v3 = s3[tid] + s3[tid + 32];
-    float v4 = s4[tid] + s4[tid + 32];
-    float v5 = s5[tid] + s5[tid + 32];
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      v0 += __shfl_down_sync(0xffffffff, v0, offset);
-      v1 += __shfl_down_sync(0xffffffff, v1, offset);
-      v2 += __shfl_down_sync(0xffffffff, v2, offset);
-      v3 += __shfl_down_sync(0xffffffff, v3, offset);
-      v4 += __shfl_down_sync(0xffffffff, v4, offset);
-      v5 += __shfl_down_sync(0xffffffff, v5, offset);
+    for (int s = block_size / 2; s > 32; s >>= 1) {
+      if (tid < s) {
+        s0[tid] += s0[tid + s];
+        s1[tid] += s1[tid + s];
+        s2[tid] += s2[tid + s];
+        s3[tid] += s3[tid + s];
+        s4[tid] += s4[tid + s];
+        s5[tid] += s5[tid + s];
+      }
+      __syncthreads();
     }
-    if (tid == 0) {
-      // Skip atomicAdds when block contributes nothing (most blocks are in
-      // the zero-phi region of the subdomain — saves ~80% of atomicAdds)
-      if (v2 > 0.0f || v3 > 0.0f) {
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
-        atomicAdd(&d_perimeters[cell_idx], v3);
-        atomicAdd(&d_second_moment_x[cell_idx], v4);
-        atomicAdd(&d_second_moment_y[cell_idx], v5);
+
+    if (tid < 32) {
+      float v0 = s0[tid] + s0[tid + 32];
+      float v1 = s1[tid] + s1[tid + 32];
+      float v2 = s2[tid] + s2[tid + 32];
+      float v3 = s3[tid] + s3[tid + 32];
+      float v4 = s4[tid] + s4[tid + 32];
+      float v5 = s5[tid] + s5[tid + 32];
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        v0 += __shfl_down_sync(0xffffffff, v0, offset);
+        v1 += __shfl_down_sync(0xffffffff, v1, offset);
+        v2 += __shfl_down_sync(0xffffffff, v2, offset);
+        v3 += __shfl_down_sync(0xffffffff, v3, offset);
+        v4 += __shfl_down_sync(0xffffffff, v4, offset);
+        v5 += __shfl_down_sync(0xffffffff, v5, offset);
+      }
+      if (tid == 0) {
+        if (v2 > 0.0f || v3 > 0.0f) {
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
+          atomicAdd(&d_perimeters[cell_idx], v3);
+          atomicAdd(&d_second_moment_x[cell_idx], v4);
+          atomicAdd(&d_second_moment_y[cell_idx], v5);
+        }
+      }
+    }
+  } else {
+    __syncthreads();
+
+    for (int s = block_size / 2; s > 32; s >>= 1) {
+      if (tid < s) {
+        s0[tid] += s0[tid + s];
+        s1[tid] += s1[tid + s];
+        s2[tid] += s2[tid + s];
+        s3[tid] += s3[tid + s];
+      }
+      __syncthreads();
+    }
+
+    if (tid < 32) {
+      float v0 = s0[tid] + s0[tid + 32];
+      float v1 = s1[tid] + s1[tid + 32];
+      float v2 = s2[tid] + s2[tid + 32];
+      float v3 = s3[tid] + s3[tid + 32];
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        v0 += __shfl_down_sync(0xffffffff, v0, offset);
+        v1 += __shfl_down_sync(0xffffffff, v1, offset);
+        v2 += __shfl_down_sync(0xffffffff, v2, offset);
+        v3 += __shfl_down_sync(0xffffffff, v3, offset);
+      }
+      if (tid == 0) {
+        if (v2 > 0.0f || v3 > 0.0f) {
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
+          atomicAdd(&d_perimeters[cell_idx], v3);
+        }
       }
     }
   }

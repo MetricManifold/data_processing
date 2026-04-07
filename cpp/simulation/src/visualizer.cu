@@ -196,6 +196,67 @@ __global__ void kernel_draw_bboxes(
         draw_pixel(pixels, ox, oy + y, Nx, Ny, col);
         draw_pixel(pixels, ox + w - 1, oy + y, Nx, Ny, col);
     }
+
+    // Draw "WxH" label at top-left corner of bbox
+    {
+        char buf[12]; int len = 0;
+        // Write width digits
+        char digs[5]; int nd = 0;
+        int tmp = w;
+        if (tmp == 0) { digs[nd++] = '0'; }
+        else { while (tmp > 0) { digs[nd++] = '0' + (tmp % 10); tmp /= 10; } }
+        for (int ci = nd - 1; ci >= 0; --ci) buf[len++] = digs[ci];
+        buf[len++] = 'x';  // separator
+        // Write height digits
+        nd = 0; tmp = h;
+        if (tmp == 0) { digs[nd++] = '0'; }
+        else { while (tmp > 0) { digs[nd++] = '0' + (tmp % 10); tmp /= 10; } }
+        for (int ci = nd - 1; ci >= 0; --ci) buf[len++] = digs[ci];
+
+        uchar4 fg = make_uchar4(100, 200, 255, 255);
+        uchar4 bg = make_uchar4(0, 0, 0, 160);
+        // Wrap label position to screen
+        int lx0 = ox + 2;
+        int ly0 = oy + 2;
+        // Background
+        for (int dy = -1; dy < 8; ++dy)
+            for (int dx = -1; dx < len * 6 + 1; ++dx) {
+                int px = lx0 + dx, py = ly0 + dy;
+                if (px >= 0 && px < Nx && py >= 0 && py < Ny)
+                    draw_pixel(pixels, px, py, Nx, Ny, bg);
+            }
+        // Glyphs
+        for (int ci = 0; ci < len; ++ci) {
+            int glyph;
+            char c = buf[ci];
+            if (c >= '0' && c <= '9') glyph = c - '0';
+            else glyph = 14; // 'x' uses '+' slot, close enough — use custom
+            // For 'x', draw a simple X pattern instead of font lookup
+            if (c == 'x') {
+                for (int row = 0; row < 7; ++row) {
+                    int px1 = lx0 + ci * 6 + row * 5 / 6;
+                    int px2 = lx0 + ci * 6 + 4 - row * 5 / 6;
+                    int py = ly0 + row;
+                    if (px1 >= 0 && px1 < Nx && py >= 0 && py < Ny)
+                        draw_pixel(pixels, px1, py, Nx, Ny, fg);
+                    if (px2 >= 0 && px2 < Nx && py >= 0 && py < Ny && px2 != px1)
+                        draw_pixel(pixels, px2, py, Nx, Ny, fg);
+                }
+            } else {
+                for (int row = 0; row < 7; ++row) {
+                    unsigned char bits = d_font[glyph][row];
+                    for (int cc = 0; cc < 5; ++cc) {
+                        if (bits & (0x10 >> cc)) {
+                            int px = lx0 + ci * 6 + cc;
+                            int py = ly0 + row;
+                            if (px >= 0 && px < Nx && py >= 0 && py < Ny)
+                                draw_pixel(pixels, px, py, Nx, Ny, fg);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Draw red box showing raw 3σ extent from second moments (diagnostic)
@@ -444,7 +505,7 @@ void Visualizer::update(const float *d_sum_field, int Nx, int Ny,
 
     // 2. Overlay: bounding boxes for selected cells (cycle with up/down keys)
     if (draw_bboxes && d_offsets_x && d_widths && num_cells > 0) {
-        int watch[] = {1, 4, 47, 32, 62};
+        int watch[] = {1, 4, 67, 32, 5};
         for (int k = 0; k < 5; ++k) {
             int bid = watch[k];
             if (bid < num_cells) {
@@ -458,7 +519,7 @@ void Visualizer::update(const float *d_sum_field, int Nx, int Ny,
 
     // 2b. Red dashed boxes: raw 3σ extent from second moments (same cells as blue boxes)
     if (draw_bboxes && d_second_moment_x && d_volumes && num_cells > 0) {
-        int watch[] = {1, 4, 47, 32, 62};
+        int watch[] = {1, 4, 67, 32, 5};
         for (int k = 0; k < 5; ++k) {
             int bid = watch[k];
             if (bid < num_cells) {
