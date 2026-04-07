@@ -477,11 +477,16 @@ void Integrator::allocate_phi_pool(Domain &domain) {
     for (int i = 0; i < num_cells && !any_nonzero; ++i) {
       auto &cell = domain.cells[i];
       if (cell->field_size > 0) {
-        // Sample the center pixel of each cell's phi field
-        size_t center = static_cast<size_t>(cell->field_size) / 2;
-        CUDA_CHECK(cudaMemcpy(probe.data(), cell->d_phi + center,
-                   sizeof(float), cudaMemcpyDeviceToHost));
-        if (probe[0] != 0.0f) any_nonzero = true;
+        // Sample the center of the inner region (avoid halo which is zeroed)
+        int w = cell->width();
+        int h = cell->height();
+        int hw = domain.params.halo_width;
+        size_t center = static_cast<size_t>((h / 2)) * w + (w / 2);
+        if (center < static_cast<size_t>(cell->field_size)) {
+          CUDA_CHECK(cudaMemcpy(probe.data(), cell->d_phi + center,
+                     sizeof(float), cudaMemcpyDeviceToHost));
+          if (probe[0] != 0.0f) any_nonzero = true;
+        }
       }
     }
     if (!any_nonzero && num_cells > 0) {
