@@ -458,6 +458,7 @@ inline void Simulation::run() {
                << " v_A_sigma=" << domain.params.v_A_sigma
                << " N=" << domain.num_cells()
                << " Lx=" << domain.params.Nx << " Ly=" << domain.params.Ny
+               << " dt=" << domain.params.dt
                << "\n";
       traj_out.close();
       printf("Trajectory output: every %d steps\n", traj_interval);
