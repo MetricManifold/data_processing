@@ -108,31 +108,35 @@ __global__ void kernel_pre_step(
 
       // --- Dynamic resize using second moments ---
       if (max_side > 0 && sum_phi2 > 1.0f) {
-        float sigma_x = sqrtf(fmaxf(moment_x / sum_phi2, 1.0f));
-        float sigma_y = sqrtf(fmaxf(moment_y / sum_phi2, 1.0f));
-        // Target half-size: 3σ + halo + small buffer
-        // This matches the red diagnostic box + room for the stencil
-        int margin = 4 + 8;  // halo + buffer
-        int target_half_x = (int)ceilf(3.0f * sigma_x) + margin;
-        int target_half_y = (int)ceilf(3.0f * sigma_y) + margin;
-        int target_w = (2 * target_half_x) & ~1;  // even
-        int target_h = (2 * target_half_y) & ~1;
-        // Clamp to pool slot
-        target_w = min(max(target_w, 32), max_side);
-        target_h = min(max(target_h, 32), max_side);
+        float var_x = moment_x / sum_phi2;
+        float var_y = moment_y / sum_phi2;
+        // Guard: only resize when moments are meaningful (σ > 2 pixels).
+        // On step 0 moments are zero → var ~ 0, skip to avoid catastrophic shrink.
+        if (var_x > 4.0f && var_y > 4.0f) {
+          float sigma_x = sqrtf(var_x);
+          float sigma_y = sqrtf(var_y);
+          // Target half-size: 3σ + halo + small buffer
+          int margin = 4 + 8;  // halo + buffer
+          int target_half_x = (int)ceilf(3.0f * sigma_x) + margin;
+          int target_half_y = (int)ceilf(3.0f * sigma_y) + margin;
+          int target_w = (2 * target_half_x) & ~1;  // even
+          int target_h = (2 * target_half_y) & ~1;
+          // Clamp to pool slot
+          target_w = min(max(target_w, 32), max_side);
+          target_h = min(max(target_h, 32), max_side);
 
-        // Only grow, never shrink (shrinking clips phi at borders, losing mass)
-        if (target_w > w) {
-          int delta = target_w - w;
-          int gl = delta / 2;
-          new_w = target_w;
-          sx -= gl;
-        }
-        if (target_h > h) {
-          int delta = target_h - h;
-          int gb = delta / 2;
-          new_h = target_h;
-          sy -= gb;
+          // Grow or shrink symmetrically around centroid.
+          // delta > 0 → grow: sx shifts read LEFT to expose new zero-filled border.
+          // delta < 0 → shrink: sx shifts read RIGHT, dropping border pixels (safe
+          //             because 3σ + 12 margin ensures phi ≈ 0 at the cut edge).
+          if (target_w != w) {
+            new_w = target_w;
+            sx -= (target_w - w) / 2;
+          }
+          if (target_h != h) {
+            new_h = target_h;
+            sy -= (target_h - h) / 2;
+          }
         }
       }
     }
