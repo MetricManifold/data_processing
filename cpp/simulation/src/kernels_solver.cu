@@ -130,9 +130,9 @@ __global__ void kernel_pre_step(
         if (var_x > 4.0f && var_y > 4.0f) {
           float sigma_x = sqrtf(var_x);
           float sigma_y = sqrtf(var_y);
-          // Target half-size: 2σ + 2R/3 + halo (additive margin from cell radius)
+          // Target half-size: 2σ + R/2 + halo (additive margin from cell radius)
           float R = d_target_radius[i];
-          int additive_margin = (int)ceilf(2.0f * R / 3.0f) + 4;  // 2R/3 + halo
+          int additive_margin = (int)ceilf(R * 0.5f) + 4;  // R/2 + halo
           int target_half_x = (int)ceilf(2.0f * sigma_x) + additive_margin;
           int target_half_y = (int)ceilf(2.0f * sigma_y) + additive_margin;
           int target_w = (2 * target_half_x) & ~1;  // even
