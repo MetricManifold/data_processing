@@ -341,7 +341,16 @@ __global__ void kernel_fused_step(
     int halo, int Nx, int Ny,
     int num_cells,
     bool compute_moments,
-    bool has_remap);
+    bool has_remap,
+    float *__restrict__ d_integrals_x,
+    float *__restrict__ d_integrals_y,
+    int *__restrict__ d_block_arrival,
+    float *__restrict__ out_velocities_x,
+    float *__restrict__ out_velocities_y,
+    const float *__restrict__ d_polarization_x,
+    const float *__restrict__ d_polarization_y,
+    const float *__restrict__ d_v_A,
+    float motility_coeff, float dA);
 
 __global__ void kernel_scatter_phi_sq(
     float **__restrict__ phi_ptrs,
@@ -465,7 +474,7 @@ void step_fused(Domain &domain, float dt,
   dim3 block(32, 8, 1);
   dim3 grid((max_w + 31) / 32, (max_h + 7) / 8, num_cells);
   bool compute_moments = (step_counter % 10 == 9);
-  size_t smem_fused = (compute_moments ? 6 : 4) * block.x * block.y * sizeof(float);
+  size_t smem_fused = (compute_moments ? 8 : 6) * block.x * block.y * sizeof(float);
   size_t smem_vint  = 2 * block.x * block.y * sizeof(float);  // 2 channels: int_x, int_y
 
   // Reduction accumulators (integrals, perimeters, block_arrival) are zeroed
@@ -575,31 +584,16 @@ void step_fused(Domain &domain, float dt,
         d_all_offsets_x, d_all_offsets_y, params.Nx, params.Ny, num_cells);
   }
 
-  // ===================================================================
-  // VELOCITY PRE-PASS: Compute v = v_I + v_A * p from CURRENT phi + sum field.
-  // The last-arriving block per cell converts integrals → velocity inline,
-  // eliminating the need for a separate kernel_compute_velocities launch.
-  // ===================================================================
-  if (d_sum_field) {
-    kernel_velocity_integral_2d<<<grid_read, block, smem_vint>>>(
-        d_all_phi_ptrs, d_old_widths, d_old_heights,
-        d_all_offsets_x, d_all_offsets_y,
-        d_sum_field, nullptr,
-        d_integrals_x, d_integrals_y,
-        d_block_arrival,
-        d_velocities_x, d_velocities_y,
-        d_polarization_x, d_polarization_y,
-        d_v_A, params.motility_coeff(), dA,
-        params.dx, params.dy,
-        params.halo_width, params.Nx, params.Ny, num_cells);
-  }
+  // Velocity integral is folded into the fused kernel (1-step lag).
+  // Advection uses previous-step velocity; fused kernel accumulates
+  // new integrals and last-arriving block computes velocity for step N+1.
 
 #ifdef ENABLE_KERNEL_PROFILING
   cudaEventRecord(ev_neighbor);
 #endif
 
-  // Launch fused kernel (uses CURRENT velocity for advection)
-  // Precompute stencil constants (avoids per-thread FP division)
+  // Launch fused kernel (uses PREVIOUS velocity for advection — 1-step lag)
+  // Velocity integral is accumulated inside and converted to velocity for step N+1.
   float inv_h2 = 1.0f / (params.dx * params.dx);
   float inv_2dx = 0.5f / params.dx;
   float inv_2dy = 0.5f / params.dy;
@@ -618,7 +612,12 @@ void step_fused(Domain &domain, float dt,
       d_two_gamma_bulk, d_two_gamma,
       inv_h2, inv_2dx, inv_2dy, dt,
       params.halo_width, params.Nx, params.Ny,
-      num_cells, compute_moments, (step_counter % 10 == 0));
+      num_cells, compute_moments, (step_counter % 10 == 0),
+      d_integrals_x, d_integrals_y,
+      d_block_arrival,
+      d_velocities_x, d_velocities_y,
+      d_polarization_x, d_polarization_y,
+      d_v_A, params.motility_coeff(), dA);
 
   // Phi pointer swap is now done in kernel_pre_step of the NEXT step
   // (saves 1 kernel launch per step)
