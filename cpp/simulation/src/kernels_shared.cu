@@ -554,16 +554,7 @@ __global__ void kernel_fused_step(
     int halo, int Nx, int Ny,
     int num_cells,
     bool compute_moments,
-    bool has_remap,
-    float *__restrict__ d_integrals_x,
-    float *__restrict__ d_integrals_y,
-    int *__restrict__ d_block_arrival,
-    float *__restrict__ out_velocities_x,
-    float *__restrict__ out_velocities_y,
-    const float *__restrict__ d_polarization_x,
-    const float *__restrict__ d_polarization_y,
-    const float *__restrict__ d_v_A,
-    float motility_coeff, float dA)
+    bool has_remap)
 {
   int cell_idx = blockIdx.z;
   if (cell_idx >= num_cells) return;
@@ -594,7 +585,6 @@ __global__ void kernel_fused_step(
   float my_cent_dx = 0.0f, my_cent_dy = 0.0f, my_cent_phi2 = 0.0f;
   float my_grad_mag = 0.0f;
   float my_dx2 = 0.0f, my_dy2 = 0.0f;  // second moments for bbox extent
-  float my_int_x = 0.0f, my_int_y = 0.0f;  // velocity integral
 
   bool active = (lx < width && ly < height);
 
@@ -699,13 +689,6 @@ __global__ void kernel_fused_step(
       // --- Perimeter ---
       if (in_inner) {
         my_grad_mag = sqrtf(grad_x * grad_x + grad_y * grad_y);
-
-        // --- Velocity integral (folded in to eliminate separate kernel) ---
-        // v_I = motility_coeff * ∫ φ ∇φ Σ_{j≠i}φ_j² dA
-        if (phi_val > 1e-4f) {
-          my_int_x = phi_val * grad_x * sum_phi_j_sq;
-          my_int_y = phi_val * grad_y * sum_phi_j_sq;
-        }
       }
 
       // --- Full RHS including advection (uses CURRENT velocity) ---
@@ -757,45 +740,45 @@ __global__ void kernel_fused_step(
     }
   }
 
-  // === Block-level reduction: 6 channels + optional 2 moments ===
+  // === Block-level reduction: 4 or 6 channels ===
   extern __shared__ float smem[];
   int block_size = blockDim.x * blockDim.y;
   float *s0 = smem;                    // cent_dx
   float *s1 = smem + block_size;       // cent_dy
   float *s2 = smem + 2 * block_size;   // cent_phi2
   float *s3 = smem + 3 * block_size;   // grad_mag (perimeter)
-  float *s4 = smem + 4 * block_size;   // int_x (velocity integral)
-  float *s5 = smem + 5 * block_size;   // int_y (velocity integral)
 
   s0[tid] = my_cent_dx;
   s1[tid] = my_cent_dy;
   s2[tid] = my_cent_phi2;
   s3[tid] = my_grad_mag;
-  s4[tid] = my_int_x;
-  s5[tid] = my_int_y;
 
   if (compute_moments) {
-    float *s6 = smem + 6 * block_size;
-    float *s7 = smem + 7 * block_size;
-    s6[tid] = my_dx2;
-    s7[tid] = my_dy2;
+    float *s4 = smem + 4 * block_size;
+    float *s5 = smem + 5 * block_size;
+    s4[tid] = my_dx2;
+    s5[tid] = my_dy2;
     __syncthreads();
 
     for (int s = block_size / 2; s > 32; s >>= 1) {
       if (tid < s) {
-        s0[tid] += s0[tid + s]; s1[tid] += s1[tid + s];
-        s2[tid] += s2[tid + s]; s3[tid] += s3[tid + s];
-        s4[tid] += s4[tid + s]; s5[tid] += s5[tid + s];
-        s6[tid] += s6[tid + s]; s7[tid] += s7[tid + s];
+        s0[tid] += s0[tid + s];
+        s1[tid] += s1[tid + s];
+        s2[tid] += s2[tid + s];
+        s3[tid] += s3[tid + s];
+        s4[tid] += s4[tid + s];
+        s5[tid] += s5[tid + s];
       }
       __syncthreads();
     }
 
     if (tid < 32) {
-      float v0 = s0[tid]+s0[tid+32]; float v1 = s1[tid]+s1[tid+32];
-      float v2 = s2[tid]+s2[tid+32]; float v3 = s3[tid]+s3[tid+32];
-      float v4 = s4[tid]+s4[tid+32]; float v5 = s5[tid]+s5[tid+32];
-      float v6 = s6[tid]+s6[tid+32]; float v7 = s7[tid]+s7[tid+32];
+      float v0 = s0[tid] + s0[tid + 32];
+      float v1 = s1[tid] + s1[tid + 32];
+      float v2 = s2[tid] + s2[tid + 32];
+      float v3 = s3[tid] + s3[tid + 32];
+      float v4 = s4[tid] + s4[tid + 32];
+      float v5 = s5[tid] + s5[tid + 32];
       for (int offset = 16; offset > 0; offset >>= 1) {
         v0 += __shfl_down_sync(0xffffffff, v0, offset);
         v1 += __shfl_down_sync(0xffffffff, v1, offset);
@@ -803,18 +786,16 @@ __global__ void kernel_fused_step(
         v3 += __shfl_down_sync(0xffffffff, v3, offset);
         v4 += __shfl_down_sync(0xffffffff, v4, offset);
         v5 += __shfl_down_sync(0xffffffff, v5, offset);
-        v6 += __shfl_down_sync(0xffffffff, v6, offset);
-        v7 += __shfl_down_sync(0xffffffff, v7, offset);
       }
-      if (tid == 0 && (v2 > 0.0f || v3 > 0.0f)) {
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
-        atomicAdd(&d_perimeters[cell_idx], v3);
-        atomicAdd(&d_integrals_x[cell_idx], v4);
-        atomicAdd(&d_integrals_y[cell_idx], v5);
-        atomicAdd(&d_second_moment_x[cell_idx], v6);
-        atomicAdd(&d_second_moment_y[cell_idx], v7);
+      if (tid == 0) {
+        if (v2 > 0.0f || v3 > 0.0f) {
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
+          atomicAdd(&d_perimeters[cell_idx], v3);
+          atomicAdd(&d_second_moment_x[cell_idx], v4);
+          atomicAdd(&d_second_moment_y[cell_idx], v5);
+        }
       }
     }
   } else {
@@ -822,47 +803,33 @@ __global__ void kernel_fused_step(
 
     for (int s = block_size / 2; s > 32; s >>= 1) {
       if (tid < s) {
-        s0[tid] += s0[tid + s]; s1[tid] += s1[tid + s];
-        s2[tid] += s2[tid + s]; s3[tid] += s3[tid + s];
-        s4[tid] += s4[tid + s]; s5[tid] += s5[tid + s];
+        s0[tid] += s0[tid + s];
+        s1[tid] += s1[tid + s];
+        s2[tid] += s2[tid + s];
+        s3[tid] += s3[tid + s];
       }
       __syncthreads();
     }
 
     if (tid < 32) {
-      float v0 = s0[tid]+s0[tid+32]; float v1 = s1[tid]+s1[tid+32];
-      float v2 = s2[tid]+s2[tid+32]; float v3 = s3[tid]+s3[tid+32];
-      float v4 = s4[tid]+s4[tid+32]; float v5 = s5[tid]+s5[tid+32];
+      float v0 = s0[tid] + s0[tid + 32];
+      float v1 = s1[tid] + s1[tid + 32];
+      float v2 = s2[tid] + s2[tid + 32];
+      float v3 = s3[tid] + s3[tid + 32];
       for (int offset = 16; offset > 0; offset >>= 1) {
         v0 += __shfl_down_sync(0xffffffff, v0, offset);
         v1 += __shfl_down_sync(0xffffffff, v1, offset);
         v2 += __shfl_down_sync(0xffffffff, v2, offset);
         v3 += __shfl_down_sync(0xffffffff, v3, offset);
-        v4 += __shfl_down_sync(0xffffffff, v4, offset);
-        v5 += __shfl_down_sync(0xffffffff, v5, offset);
       }
-      if (tid == 0 && (v2 > 0.0f || v3 > 0.0f)) {
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
-        atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
-        atomicAdd(&d_perimeters[cell_idx], v3);
-        atomicAdd(&d_integrals_x[cell_idx], v4);
-        atomicAdd(&d_integrals_y[cell_idx], v5);
+      if (tid == 0) {
+        if (v2 > 0.0f || v3 > 0.0f) {
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 0], v0);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 1], v1);
+          atomicAdd(&d_centroid_sums[cell_idx * 3 + 2], v2);
+          atomicAdd(&d_perimeters[cell_idx], v3);
+        }
       }
-    }
-  }
-
-  // Last-arriving block per cell: convert integrals → velocity for NEXT step
-  if (tid == 0) {
-    __threadfence();
-    int total_blocks = gridDim.x * gridDim.y;
-    int arrived = atomicAdd(&d_block_arrival[cell_idx], 1);
-    if (arrived == total_blocks - 1) {
-      float vA = d_v_A[cell_idx];
-      out_velocities_x[cell_idx] = motility_coeff * d_integrals_x[cell_idx] * dA
-                                   + vA * d_polarization_x[cell_idx];
-      out_velocities_y[cell_idx] = motility_coeff * d_integrals_y[cell_idx] * dA
-                                   + vA * d_polarization_y[cell_idx];
     }
   }
 }
