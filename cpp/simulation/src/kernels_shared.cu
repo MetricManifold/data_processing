@@ -602,9 +602,7 @@ __global__ void kernel_fused_step(
     int offset_x_i = offsets_x[cell_idx];
     int offset_y_i = offsets_y[cell_idx];
 
-    // Inline remap shifts: read old phi at shifted local coords
-    int sx = d_shift_x[cell_idx];
-    int sy = d_shift_y[cell_idx];
+    // Inline remap shifts: use pre-loaded sx/sy (skips global read when has_remap=false)
     int rx = lx + sx;  // source coord in old buffer
     int ry = ly + sy;
 
