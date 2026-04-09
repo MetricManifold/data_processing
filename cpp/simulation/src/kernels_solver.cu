@@ -108,8 +108,10 @@ __global__ void kernel_pre_step(
 
     if (compute_shifts) {
       // --- Centroid shift (recenter subdomain) ---
-      float sub_cx = (float)old_off_x + (float)w * 0.5f;
-      float sub_cy = (float)old_off_y + (float)h * 0.5f;
+      // Use wrapped offset for bbox center (offsets are now always in [0,N))
+      float sub_cx = fmodf((float)old_off_x + (float)w * 0.5f, (float)Nx);
+      float sub_cy = fmodf((float)old_off_y + (float)h * 0.5f, (float)Ny);
+      // Periodic delta: shortest distance between centroid and bbox center
       float dx = cx - sub_cx;
       float dy = cy - sub_cy;
       if (dx >  Nx * 0.5f) dx -= Nx;
@@ -364,7 +366,7 @@ __global__ void kernel_scatter_phi_linear(
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
                                       int *offsets_x, int *offsets_y,
                                       const int *shift_x, const int *shift_y,
-                                      int num_cells);
+                                      int num_cells, int Nx, int Ny);
 
 __global__ void kernel_compute_velocities(
     float *__restrict__ velocities_x, float *__restrict__ velocities_y,

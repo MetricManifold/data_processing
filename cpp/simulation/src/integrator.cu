@@ -12,7 +12,7 @@ namespace cellsim {
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
                                       int *offsets_x, int *offsets_y,
                                       const int *shift_x, const int *shift_y,
-                                      int num_cells);
+                                      int num_cells, int Nx, int Ny);
 // Swap-only overload (no offset/dim update)
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
                                       int num_cells);
@@ -1293,7 +1293,7 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
     kernel_swap_phi_ptrs<<<swap_blocks, swap_threads>>>(
         d_all_phi_ptrs, d_all_phi_out_ptrs,
         d_all_offsets_x, d_all_offsets_y,
-        d_shift_x, d_shift_y, nc);
+        d_shift_x, d_shift_y, nc, params.Nx, params.Ny);
     host_ptrs_stale = true;
   }
 
@@ -1418,5 +1418,40 @@ void Integrator::compute_stress_fields(Domain &domain, StressFieldBuffers &stres
       stress);
 }
 #endif
+
+void Integrator::sync_bbox_to_host(Domain &domain) {
+  int nc = domain.num_cells();
+  if (nc == 0 || d_all_widths == nullptr) return;
+
+  cudaDeviceSynchronize();
+
+  // Swap host phi pointers if stale (double-buffer)
+  if (host_ptrs_stale) {
+    for (int i = 0; i < nc; ++i) {
+      std::swap(domain.cells[i]->d_phi, domain.cells[i]->d_dphi_dt);
+    }
+    host_ptrs_stale = false;
+  }
+
+  // Copy GPU bbox arrays to host Cell structs
+  std::vector<int> h_off_x(nc), h_off_y(nc), h_w(nc), h_h(nc);
+  cudaMemcpy(h_off_x.data(), d_all_offsets_x, nc * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_off_y.data(), d_all_offsets_y, nc * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_w.data(), d_all_widths, nc * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_h.data(), d_all_heights, nc * sizeof(int), cudaMemcpyDeviceToHost);
+
+  int hw = domain.params.halo_width;
+  for (int i = 0; i < nc; ++i) {
+    domain.cells[i]->bbox_with_halo.x0 = h_off_x[i];
+    domain.cells[i]->bbox_with_halo.y0 = h_off_y[i];
+    domain.cells[i]->bbox_with_halo.x1 = h_off_x[i] + h_w[i];
+    domain.cells[i]->bbox_with_halo.y1 = h_off_y[i] + h_h[i];
+    domain.cells[i]->bbox.x0 = h_off_x[i] + hw;
+    domain.cells[i]->bbox.y0 = h_off_y[i] + hw;
+    domain.cells[i]->bbox.x1 = h_off_x[i] + h_w[i] - hw;
+    domain.cells[i]->bbox.y1 = h_off_y[i] + h_h[i] - hw;
+    domain.cells[i]->field_size = h_w[i] * h_h[i];
+  }
+}
 
 } // namespace cellsim

@@ -4,6 +4,12 @@
 #endif
 #include <cstdio>
 
+// Periodic coordinate wrap: maps any integer to [0, N).
+// Handles arbitrarily large positive or negative values (full modulo).
+__device__ __forceinline__ int wrap_coord(int x, int N) {
+  return ((x % N) + N) % N;
+}
+
 // Work buffer layout: 2 sub-buffers per cell
 // [0] integrand_x  (written by fused kernel, read by integral reduction)
 // [1] integrand_y  (written by fused kernel, read by integral reduction)
@@ -307,10 +313,8 @@ __global__ void kernel_scatter_phi_sq(
 
   int ox = offsets_x[cell_idx];
   int oy = offsets_y[cell_idx];
-  int gx_raw = ox + lx;
-  int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-  int gy_raw = oy + ly;
-  int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+  int gx = wrap_coord(ox + lx, Nx);
+  int gy = wrap_coord(oy + ly, Ny);
 
   atomicAdd(&sum_field[gy * Nx + gx], phi_sq);
 }
@@ -356,10 +360,8 @@ __global__ void kernel_scatter_phi_linear(
 
   int ox = offsets_x[cell_idx];
   int oy = offsets_y[cell_idx];
-  int gx_raw = ox + lx;
-  int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-  int gy_raw = oy + ly;
-  int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+  int gx = wrap_coord(ox + lx, Nx);
+  int gy = wrap_coord(oy + ly, Ny);
 
   atomicAdd(&sum_field_linear[gy * Nx + gx], phi_val);
 }
@@ -422,10 +424,8 @@ __global__ void kernel_velocity_integral_2d(
       if (phi_sq > 1e-8f) {
         int ox = offsets_x[cell_idx];
         int oy = offsets_y[cell_idx];
-        int gx_raw = ox + lx;
-        int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-        int gy_raw = oy + ly;
-        int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+        int gx = wrap_coord(ox + lx, Nx);
+        int gy = wrap_coord(oy + ly, Ny);
         atomicAdd(&scatter_sum_field[gy * Nx + gx], phi_sq);
       }
     }
@@ -449,10 +449,8 @@ __global__ void kernel_velocity_integral_2d(
         // Σ_{j≠i} φ_j² = S(x,y) - φ_i²
         int offset_x_i = offsets_x[cell_idx];
         int offset_y_i = offsets_y[cell_idx];
-        int gx_raw = offset_x_i + lx;
-        int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-        int gy_raw = offset_y_i + ly;
-        int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+        int gx = wrap_coord(offset_x_i + lx, Nx);
+        int gy = wrap_coord(offset_y_i + ly, Ny);
 
         float S_xy = sum_field[gy * Nx + gx];
         float sum_phi_j_sq = fmaxf(0.0f, S_xy - phi_val * phi_val);
@@ -608,16 +606,12 @@ __global__ void kernel_fused_step(
 
     // Global coordinates for sum field READ: use OLD offsets + shifted source coords
     // (sum field was scattered by previous step using old offsets)
-    int gx_raw = offset_x_i + rx;
-    int gx = gx_raw - ((gx_raw >= Nx) - (gx_raw < 0)) * Nx;
-    int gy_raw = offset_y_i + ry;
-    int gy = gy_raw - ((gy_raw >= Ny) - (gy_raw < 0)) * Ny;
+    int gx = wrap_coord(offset_x_i + rx, Nx);
+    int gy = wrap_coord(offset_y_i + ry, Ny);
 
     // NEW global coordinates for scatter (offset + lx + sx = new_offset + lx)
-    int ngx_raw = offset_x_i + lx + sx;
-    int ngx = ngx_raw - ((ngx_raw >= Nx) - (ngx_raw < 0)) * Nx;
-    int ngy_raw = offset_y_i + ly + sy;
-    int ngy = ngy_raw - ((ngy_raw >= Ny) - (ngy_raw < 0)) * Ny;
+    int ngx = wrap_coord(offset_x_i + lx + sx, Nx);
+    int ngy = wrap_coord(offset_y_i + ly + sy, Ny);
     // Guard: skip PDE if source pixel is out of buffer bounds (remap strip)
     bool source_valid = (rx >= 0 && rx < old_w && ry >= 0 && ry < old_h);
     if (source_valid) {
@@ -838,15 +832,15 @@ __global__ void kernel_fused_step(
 __global__ void kernel_swap_phi_ptrs(float **phi_ptrs, float **phi_out_ptrs,
                                       int *offsets_x, int *offsets_y,
                                       const int *shift_x, const int *shift_y,
-                                      int num_cells) {
+                                      int num_cells, int Nx, int Ny) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_cells) return;
   float *tmp = phi_ptrs[i];
   phi_ptrs[i] = phi_out_ptrs[i];
   phi_out_ptrs[i] = tmp;
-  // Apply deferred offset shifts from inline remap
-  offsets_x[i] += shift_x[i];
-  offsets_y[i] += shift_y[i];
+  // Apply deferred offset shifts and normalize to [0, N)
+  offsets_x[i] = wrap_coord(offsets_x[i] + shift_x[i], Nx);
+  offsets_y[i] = wrap_coord(offsets_y[i] + shift_y[i], Ny);
 }
 
 // Backward-compatible swap-only overload (no offset update, used by 3D integrator)

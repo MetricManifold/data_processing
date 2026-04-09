@@ -197,6 +197,10 @@ public:
   void step(Domain &domain, float dt, bool sync_polarization_to_host = false,
             bool sync_centroids_to_host = false);
 
+  // Force-sync bbox/field_size from GPU arrays to host Cell structs.
+  // Call before checkpoint save to guarantee consistent phi field data.
+  void sync_bbox_to_host(Domain &domain);
+
 #ifdef DIAGNOSTICS_ENABLED
   // Run GPU-side diagnostic measurements
   // Must call step() first to ensure arrays are populated

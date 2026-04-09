@@ -453,12 +453,13 @@ inline void Simulation::run() {
       // with header
       std::ofstream traj_out(trajectory_file, std::ios::trunc);
       traj_out << "# Trajectory data for MSD computation\n";
-      traj_out << "# Format: time cell_id x y vx vy px py theta v_A_i L_n\n";
+      traj_out << "# Format: time cell_id x y vx vy px py theta v_A_i L_n volume\n";
       traj_out << "# v_A=" << domain.params.v_A
                << " v_A_sigma=" << domain.params.v_A_sigma
                << " N=" << domain.num_cells()
                << " Lx=" << domain.params.Nx << " Ly=" << domain.params.Ny
                << " dt=" << domain.params.dt
+               << " tau=" << domain.params.tau
                << "\n";
       traj_out.close();
       printf("Trajectory output: every %d steps\n", traj_interval);
@@ -481,8 +482,10 @@ inline void Simulation::run() {
   int effective_print_interval = (print_interval > 0) ? print_interval : save_interval;
 
   while (current_time < domain.params.t_end) {
-    // Check for SIGTERM (SLURM walltime limit) — clean shutdown
+    // Check for SIGTERM (SLURM walltime limit) — clean shutdown.
+    // Force centroids sync so the final checkpoint has correct host state.
     if (g_shutdown_requested) {
+      step(false, true);
       printf("\nSIGTERM received — shutting down cleanly at step %d, t=%.4f\n",
              current_step, current_time);
       fflush(stdout);
@@ -508,6 +511,9 @@ inline void Simulation::run() {
     if (observable_interval > 0 && next_step % observable_interval == 0)
       need_centroids = true;
 #endif
+    // Force sync on last step so final checkpoint has correct host state
+    if (current_time + domain.params.dt >= domain.params.t_end)
+      need_centroids = true;
     step(need_polarization_sync, need_centroids);
 
     // Periodic checkpointing (independent of VTK saves)
@@ -724,13 +730,16 @@ inline void Simulation::save_trajectory() {
          << cell->centroid.y << " " << cell->velocity.x << " "
          << cell->velocity.y << " " << cell->polarization.x << " "
          << cell->polarization.y << " " << cell->theta << " "
-         << h_v_A[i] << " " << L_n << "\n";
+         << h_v_A[i] << " " << L_n << " " << cell->volume << "\n";
   }
   file.flush();  // Explicit flush before close — survives SIGTERM between flush and destructor
   file.close();
 }
 
 inline void Simulation::save_current_checkpoint(const std::string &filename) {
+  // Force sync of bbox/field_size from GPU to ensure checkpoint has valid phi fields
+  integrator.sync_bbox_to_host(domain);
+
   CheckpointHeader header;
   header.current_step = current_step;
   header.current_time = static_cast<float>(current_time);  // checkpoint stores float
