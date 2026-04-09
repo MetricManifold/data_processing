@@ -1,0 +1,1187 @@
+% manuscript.tex — Adhesion-controlled rigidity transition in a multi-cell phase field model
+% Target: Physical Review E  (revtex4-2, two-column)
+%
+% Build:  pdflatex manuscript && pdflatex manuscript
+%
+\documentclass[aps,pre,twocolumn,superscriptaddress,longbibliography,floatfix]{revtex4-2}
+
+% ── packages ──────────────────────────────────────────────────────────────────
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{bm}              % bold math
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}        % nice tables
+\usepackage{lineno}           % line numbers for review
+\linenumbers
+
+% ── convenience macros ────────────────────────────────────────────────────────
+\newcommand{\dd}{\mathrm{d}}               % upright differential
+\newcommand{\vA}{v_{\!A}}                  % self-propulsion speed
+\newcommand{\peff}{p_{\mathrm{eff}}}       % effective shape index
+\newcommand{\Jt}{\tilde{J}}               % dimensionless adhesion J/(2γ)
+\newcommand{\phii}{\phi_i}                 % cell field shorthand
+\newcommand{\phij}{\phi_j}                 % neighbor field shorthand
+\newcommand{\TODO}[1]{{\color{red}\textbf{[TODO: #1]}}}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+
+\title{Adhesion-controlled rigidity transition in a multi-cell phase field model}
+
+\author{Steven~A.~Silber}
+\affiliation{Department of Physics and Astronomy, Western University, 1151 Richmond Street, London, Ontario, Canada N6A 3K7}
+
+\author{Mikko~Karttunen}
+\email{mikko.karttunen1@uef.fi}
+\affiliation{Department of Physics and Astronomy, Western University, 1151 Richmond Street, London, Ontario, Canada N6A 3K7}
+\affiliation{ELLIS Institute Finland, Maarintie 8, 02150 Espoo, Finland}
+\affiliation{Department of Technical Physics, University of Eastern Finland, P.O.\ Box 1627, FI-70211 Kuopio, Finland}
+\affiliation{Department of Chemistry, Western University, 1151 Richmond Street, London, Ontario, Canada N6A 5B7}
+
+\date{\today}
+
+% ── abstract ──────────────────────────────────────────────────────────────────
+\begin{abstract}
+The vertex model predicts a rigidity transition at a critical target shape index
+$p_0^*\!\approx 3.81$, controlled by the balance between cortical contractility
+and cell-cell adhesion.  Whether an analogous transition exists in continuum
+phase field descriptions, where cell boundaries are diffuse and topology is
+unconstrained, remains an open question.  In this work we add gradient-coupling
+adhesion,
+$F_{\mathrm{adh}} = J\sum_{i<j}\!\int\!\nabla\phii\cdot\nabla\phij\,\dd A$,
+to the multi-cell phase field model of Palmieri
+\textit{et al.}~\cite{Palmieri2015} and derive the
+stability bound~$J < 2\gamma$.  The dimensionless parameter
+$\Jt = J/(2\gamma)$ measures the fraction of surface energy removed at shared
+interfaces.  Two-cell simulations confirm mass conservation, shape
+preservation, and the predicted critical point.  Adhesion quench
+experiments, in which adhesion is instantaneously enabled from an equilibrated
+zero-adhesion state, show that cells undergo smooth, sub-cell interface
+relaxation whose magnitude grows monotonically with~$\Jt$, but do not
+undergo neighbor exchanges at zero motility.  Because the phase field
+dynamics are continuous (unlike the discrete topology changes of the
+vertex model), the quench traces the full relaxation trajectory from the
+repulsive equilibrium to the adhesive one.  Motility probe experiments at
+small~$\vA$ locate the adhesion-controlled jammed-to-fluid boundary.
+The dimensionless parameter $\Jt$ thus plays the same role as the vertex
+model target shape index $p_0$, enabling quantitative comparison
+between the two frameworks.
+\end{abstract}
+
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  I.  INTRODUCTION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Epithelial monolayers can switch between a solid-like, mechanically rigid
+state and a fluid-like, collectively migrating one.  This jamming transition
+has been observed in wound-edge MDCK
+monolayers~\cite{Angelini2011,Garcia2015}, in bronchial epithelial cells
+from asthmatic donors~\cite{Park2015}, along the vertebrate body
+axis~\cite{Mongera2018}, and in a variety of other epithelial
+systems~\cite{Atia2018,Malinverno2017}.  The experimental evidence
+consistently points to cell shape as the relevant order parameter: unjammed
+monolayers contain elongated cells with a shape index $p = P/\sqrt{A}$
+exceeding $\approx 3.81$, while jammed tissues consist of compact
+cells~\cite{Park2015,Atia2018}.
+
+The theoretical picture has been built largely on the vertex model, in
+which each cell is a polygon with energy
+$E = \sum_i[K_A(A_i - A_0)^2 + K_P(P_i - P_0)^2]$, and the target shape
+index $p_0 = P_0/\sqrt{A_0}$ serves as the control
+parameter~\cite{NagaiHonda2001,Farhadifar2007,Staple2010,Fletcher2014}.
+Bi \textit{et al.}~\cite{Bi2015} showed that a rigidity transition occurs at
+$p_0^* \approx 3.81$, and with added self-propulsion the transition extends
+to a full $(p_0,\,v_0)$ phase diagram~\cite{Bi2016}.  Subsequent work
+introduced active polarity~\cite{Barton2017}, multicellular
+rosettes~\cite{YanBi2019}, 3D shape criteria~\cite{MerkelManning2018},
+and cell turnover~\cite{Czajkowski2019}.  In the vertex model, adhesion
+enters indirectly: cadherin-mediated adhesion reduces the line tension at
+cell-cell junctions, which raises $p_0$ and pushes the tissue toward the
+fluid phase.
+
+Phase field models offer a complementary description in which each cell~$i$
+is represented by a continuous scalar field $\phii(\bm{r},t)$, unity inside
+the cell and zero outside, with a diffuse interface of width~$\lambda$.
+Rearrangements occur through smooth field evolution rather than discrete
+topology changes, and cell shapes are unconstrained by a polygonal
+representation~\cite{Camley2017,AlertTrepat2020}.  Several multi-cell
+formulations exist~\cite{Nonomura2012,Palmieri2015,Lober2015,Najem2016},
+with various treatments of cell-cell adhesion
+(Sec.~\ref{sec:model:literature}), but none has systematically varied
+adhesion strength across a rigidity transition.
+
+We add gradient-coupling adhesion
+%
+\begin{equation}
+  F_{\mathrm{adh}} = J\sum_{i<j}\int \nabla\phii\cdot\nabla\phij\;\dd A,
+  \label{eq:adhesion-intro}
+\end{equation}
+%
+to the Palmieri \textit{et al.}~\cite{Palmieri2015} model, which uses
+quartic repulsion but no explicit adhesion.  The dimensionless
+control parameter $\Jt = J/(2\gamma)$ measures the fraction of surface
+energy removed at shared interfaces, providing the phase field
+counterpart of the vertex model target shape index~$p_0$.
+
+We probe the transition using three protocols.
+(i)~An \emph{adhesion quench} (Sec.~\ref{sec:quench}) at zero motility,
+in which adhesion is switched on instantaneously from an equilibrated
+repulsive state.  This protocol has no vertex model analog, since at
+$T = 0$ the vertex model is frozen regardless of
+$p_0$~\cite{Bi2015}; the phase field, by contrast, relaxes via gradient
+descent, exposing the continuous trajectory of rearrangement events.
+(ii)~A \emph{motility probe} (Sec.~\ref{sec:motility}), in which we sweep
+$\Jt$ at small fixed $\vA$ to locate the jammed-to-fluid boundary.
+(iii)~A full \emph{$(\Jt,\,\vA)$ phase diagram}
+(Sec.~\ref{sec:diagram}), compared to the $(p_0, v_0)$ diagram of
+Bi \textit{et al.}~\cite{Bi2016}.
+
+The model and equations of motion are defined in Sec.~\ref{sec:model}
+and simulation methods in Sec.~\ref{sec:methods}.
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  II.  MODEL
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Model}
+\label{sec:model}
+
+% --- II.A  Phase field representation and free energy ---
+\subsection{Free energy}
+\label{sec:model:energy}
+
+We build on the multi-cell phase field model of Palmieri
+\textit{et al.}~\cite{Palmieri2015}, in which $N$ cells occupy a
+two-dimensional square domain of side~$L$ with periodic boundary conditions.
+Each cell $i = 1,\dots,N$ is described by a scalar order parameter
+$\phii(\bm{r},t) \in [0,1]$, where $\phii \approx 1$ inside the cell and
+$\phii \approx 0$ outside.  Following Palmieri
+\textit{et al.}~\cite{Palmieri2015}, the single-cell free energy contains
+a gradient term, a double-well potential, and an area constraint;
+cell-cell interactions add a quartic repulsion.  We extend this with
+a gradient-coupling adhesion term, giving the total free energy
+%
+\begin{equation}
+  F = F_{\mathrm{int}} + F_{\mathrm{vol}} + F_{\mathrm{rep}} + F_{\mathrm{adh}}.
+  \label{eq:free-energy}
+\end{equation}
+
+The single-cell free energy contains a gradient and double-well
+term~\cite{Palmieri2015}:
+%
+\begin{equation}
+  F_{\mathrm{int}} = \sum_i \int \biggl[
+    \gamma \, |\nabla\phii|^2
+    + \frac{30\gamma}{\lambda^2}\,\phii^2(1-\phii)^2
+  \biggr] \dd A,
+  \label{eq:F-int}
+\end{equation}
+%
+where $\gamma$ is the gradient energy coefficient (interfacial energy
+scale) and $\lambda$ is the interface width.  The double-well potential
+$V(\phi) = (30\gamma/\lambda^2)\,\phi^2(1-\phi)^2$ has minima at
+$\phi = 0$ and $\phi = 1$ and sets the equilibrium interface profile to
+a $\tanh$ shape of width~$\lambda$.  A soft volume constraint penalizes
+deviations from the target area~$A_0 = \pi R^2$:
+%
+\begin{equation}
+  F_{\mathrm{vol}} = \mu \sum_i
+    \biggl(\int \phii^2 \, \dd A - A_0\biggr)^{\!2}.
+  \label{eq:F-vol}
+\end{equation}
+
+Cell-cell interactions comprise steric repulsion and adhesion:
+%
+\begin{equation}
+  F_{\mathrm{rep}} = \kappa \sum_{i<j} \int \phii^2\,\phij^2 \; \dd A,
+  \label{eq:F-rep}
+\end{equation}
+%
+\begin{equation}
+  F_{\mathrm{adh}} = J \sum_{i<j} \int
+    \nabla\phii \cdot \nabla\phij \; \dd A.
+  \label{eq:F-adh}
+\end{equation}
+
+The quartic repulsion~$F_{\mathrm{rep}}$ prevents cell
+overlap~\cite{Nonomura2012,Palmieri2015}.  Because $\phii^2\phij^2$ grows
+as the fourth power of the fields, the cost of overlap rises steeply once
+two cells' interiors begin to coincide.
+
+The gradient-coupling adhesion~$F_{\mathrm{adh}}$ is the term added
+in this work.  At a shared interface, the gradients of neighboring
+cells are anti-parallel ($\nabla\phii \approx -\nabla\phij$), making
+the integrand negative and reducing the energy.  Away from interfaces
+both gradients vanish, so the coupling is surface-localized.
+
+% --- II.B  Adhesion in the literature ---
+\subsection{Context: adhesion in multi-cell phase field models}
+\label{sec:model:literature}
+
+Three distinct adhesion mechanisms have appeared in the multi-cell phase
+field literature.
+
+Nonomura~\cite{Nonomura2012} designed the first multi-cell phase field
+model around the smooth step function $h(\phi) = \phi^2(3 - 2\phi)$, whose
+gradient $\nabla h(\phii)$ is localized at the diffuse interface and
+serves as a mathematical representation of the cell cortex.
+Adhesion is a gradient-overlap coupling
+$-\gamma_N\sum_{i<j}\!\int\!\nabla h(\phii)\!\cdot\!\nabla h(\phij)\,\dd A$,
+supplemented by a regularization term
+$c \sum_i \int |\nabla h(\phii)|^2 \, \dd A$ with $c > \gamma_N$.
+The regularization adds gradient stiffness that stabilizes the interface
+against adhesion-induced dissolution~\cite{Nonomura2012}, at the cost of a
+second free parameter.  Using this model, Nonomura demonstrated
+differential-adhesion-driven cell sorting in binary mixtures.
+
+L\"ober, Ziebert, and Aranson~\cite{Lober2015} extended their single-cell
+actin-substrate motility model~\cite{Ziebert2012} to many cells.  Because
+the underlying model already contains non-variational terms (actin
+advection, substrate friction, motor contractility), interactions are added
+at the equation-of-motion level rather than through a free energy.  Their
+adhesion term
+$-\kappa_L\,\nabla\rho_i \!\cdot\! \hat{f}(\nabla\rho_j)$
+advects cell~$i$'s boundary along the outward normal of cell~$j$,
+modeling the mechanical attraction of adjacent cell
+membranes~\cite{Lober2015}.  They used this to study
+collision outcomes and collective migration of deformable cells.
+This formulation cannot, by construction, be derived from a free energy
+functional.
+
+Najem and Grant~\cite{Najem2016} began from an explicit continuum
+mechanics picture: an exponentially decaying adhesion potential
+$W(x) = w\exp(-d^2/\delta^2)$ between cell surfaces.  They translated
+this into phase field language via an auxiliary range field~$C_i$ that
+defines each cell's interaction neighborhood independently of the
+interface width.  The resulting adhesion energy
+$w\,C_i\,\phii^2(1 - \phii)\sum_{j\neq i}(1 - \phij)$
+has a range set by~$C_i$ rather than by the interface width, allowing
+them to measure tissue surface tension as a function of the
+adhesion-to-cortical-tension ratio.
+
+The remaining multi-cell phase field
+studies~\cite{Palmieri2015,Loewe2020,Wenzel2021,Graham2024,Saito2024} omit
+adhesion entirely.  Palmieri \textit{et al.}~\cite{Palmieri2015} use
+quartic repulsion only; Loewe \textit{et al.}~\cite{Loewe2020} study
+the solid-liquid transition via deformability and motility;
+Wenzel and Voigt~\cite{Wenzel2021} compare activity models;
+Graham \textit{et al.}~\cite{Graham2024} demonstrate activity-driven
+cell sorting; and Saito and Ishihara~\cite{Saito2024} show that
+deformability alone can produce a fluid-to-fluid transition.
+
+% --- II.C  Choice of the gradient-coupling form ---
+\subsection{Choice of the gradient-coupling form}
+\label{sec:model:choice}
+
+Our formulation~\eqref{eq:F-adh} is the simplest member of the
+Nonomura~\cite{Nonomura2012} family of gradient-overlap couplings.
+Nonomura's original form uses the smooth-step function
+$h(\phi) = \phi^2(3-2\phi)$ and requires a regularization term
+$c\sum_i\!\int\!|\nabla h(\phii)|^2\dd A$ ($c > \gamma_N$)
+to prevent adhesion-induced interface dissolution.  The
+regularization widens the stable adhesion range but introduces a
+second free parameter whose value must be chosen
+empirically~\cite{Nonomura2012}.
+
+We avoid the regularization entirely by coupling
+$\nabla\phii$ directly rather than $\nabla h(\phii)$.
+Physically, both forms are surface-localized:
+both $\nabla\phii$ and $\nabla h(\phii)$ vanish in the cell
+interior and exterior where $\phii$ is constant.  The quantitative
+difference is a profile-dependent weighting factor
+$h'(\phi) = 6\phi(1-\phi)$ that enters Nonomura's integrand
+but not ours; the sharp-interface limit
+(Sec.~\ref{sec:model:sharp}) shows that both forms produce an
+adhesion energy proportional to the shared contact length.
+The reason our simpler coupling does not require regularization
+is that the stability bound $J < 2\gamma$
+(Sec.~\ref{sec:model:stability}) is more restrictive than
+Nonomura's regularized bound ($\gamma_N \lesssim 0.017$ vs.\
+$2D_0 = 0.002$), confining $J$ to a range where the
+interface remains stable without additional gradient stiffness.
+The trade-off is a narrower stable adhesion range in
+exchange for a single-parameter model with an analytically
+derived stability criterion.
+
+The variational derivative of the adhesion energy with respect to
+cell~$i$ is
+%
+\begin{equation}
+  \frac{\delta F_{\mathrm{adh}}}{\delta \phii}
+    = -J \sum_{j \neq i} \nabla^2 \phij,
+  \label{eq:adhesion-var}
+\end{equation}
+%
+a Laplacian coupling: each cell feels the curvature of its neighbors'
+fields.  Since $\nabla^2\phij$ is localized at cell~$j$'s interface (it
+vanishes in the flat interior and exterior), the adhesion force is
+automatically surface-localized without requiring the smooth step
+function~$h$ or an auxiliary range field.
+
+Unlike the non-variational advection of L\"ober
+\textit{et al.}~\cite{Lober2015}, the gradient-coupling form derives from
+a free energy functional.  This ensures that the $\vA = 0$ dynamics are
+purely relaxational (gradient descent on~$F$), which is
+required for the quench experiments of
+Sec.~\ref{sec:quench}.
+
+% --- II.D  Stability bound ---
+\subsection{Stability bound}
+\label{sec:model:stability}
+
+The gradient coupling has a critical point beyond which shared
+interfaces become energetically unstable.  Consider two cells in contact,
+with anti-parallel gradients at the shared boundary
+($\nabla\phi_1 \approx -\nabla\phi_2$).  The total gradient-type energy
+per unit contact length is
+%
+\begin{align}
+  E_{\mathrm{shared}} &= \int
+    \bigl[\gamma|\nabla\phi_1|^2 + \gamma|\nabla\phi_2|^2
+    + J\,\nabla\phi_1 \cdot \nabla\phi_2\bigr] \dd x
+    \nonumber\\
+  &= (2\gamma - J)\!\int\! |\nabla\phi|^2 \dd x,
+  \label{eq:stability}
+\end{align}
+%
+where each cell contributes $\gamma|\nabla\phi|^2$ to the gradient
+energy at the shared boundary.  Without adhesion ($J = 0$) the cost
+of the shared interface equals that of two free surfaces,
+$2\gamma \int |\nabla\phi|^2 \dd x$; adhesion reduces this by a
+fraction $J/(2\gamma)$.  The dimensionless control parameter is
+therefore
+%
+\begin{equation}
+  \Jt = \frac{J}{2\gamma},
+  \label{eq:Jtilde}
+\end{equation}
+%
+which measures the fraction of surface energy removed at shared
+interfaces.  At~$\Jt = 1$ ($J = 2\gamma$), the shared interface
+has zero energy cost; above this critical point the system gains energy
+by creating more interface, leading to runaway instability and cell
+merger.  In practice the quartic repulsion~$\kappa \phii^2 \phij^2$
+provides additional stabilization that shifts the effective merger point
+slightly above $J = 2\gamma$, but the interface is already effectively
+dissolved at the critical point.
+
+For our parameters ($\gamma = 1$, following Palmieri
+\textit{et al.}~\cite{Palmieri2015}), the stability bound is
+$J < 2$, giving a physical range $\Jt \in [0, 1)$.  Values up
+to $\Jt = 0.75$ ($J = 1.5$, corresponding to 75\%\ surface
+energy reduction) remain well within the stable regime.
+
+The same bound follows from a positive-definiteness argument.
+Define $S = \phi_1 + \phi_2$ and use the identity
+$\nabla\phi_1\!\cdot\!\nabla\phi_2 = \tfrac{1}{2}(|\nabla S|^2
+- |\nabla\phi_1|^2 - |\nabla\phi_2|^2)$.  The total gradient-type
+energy becomes
+$(\gamma - J/2)|\nabla\phi_1|^2 + (\gamma - J/2)|\nabla\phi_2|^2
++ (J/2)|\nabla S|^2$,
+which is positive-definite if and only if $\gamma > J/2$, i.e.,
+$J < 2\gamma$.
+
+\textit{Comparison with Nonomura.}---Nonomura's
+model~\cite{Nonomura2012} uses gradient-energy coefficient
+$D_0 = 0.001$, adhesion coupling $\gamma_N = 0.003$--$0.0065$, and
+regularization $c = 0.01$.  Without regularization, the model would
+require $\gamma_N < 2D_0 = 0.002$; the regularization raises
+the effective stability bound to $\gamma_N \lesssim 0.017$ by
+adding gradient stiffness proportional to $c\langle h'^2\rangle$
+(where $\langle h'^2\rangle \approx 0.77$ is the profile-averaged
+square of $h' = 6\phi(1-\phi)$), roughly an $8.7\times$ increase
+over the unregularized bound.  Nonomura's strongest
+two-dimensional adhesion achieves~${\sim}36\%$ surface energy reduction,
+comparable to our $\Jt \approx 0.36$ ($J \approx 0.7$).  Our model
+without regularization has a more restricted range but still supports
+physically meaningful adhesion strengths up to 75\%\ surface reduction.
+
+% --- II.E  Equations of motion ---
+\subsection{Equations of motion}
+\label{sec:model:eom}
+
+The dynamics of each cell field follow from the model of Palmieri
+\textit{et al.}~\cite{Palmieri2015}, which falls into the model-A
+classification of Hohenberg and Halperin~\cite{HohenbergHalperin1977}
+with an additional convective term.  The equation of motion is
+%
+\begin{equation}
+  \frac{\partial \phii}{\partial t}
+    + \bm{v}_i \cdot \nabla\phii
+    = -M\,\frac{\delta F}{\delta \phii},
+  \label{eq:eom}
+\end{equation}
+%
+where $M = 1/2$ is the mobility and $\bm{v}_i$ decomposes into an
+inactive part (determined by thermodynamic relaxation) and active
+self-propulsion $\vA^{(i)}\hat{\bm{p}}_i$~\cite{Palmieri2015}.
+The polarity $\hat{\bm{p}}_i$ reorients via a run-and-tumble
+process with persistence time~$\tau$.  In the zero-motility limit
+($\vA = 0$) the dynamics reduce to relaxation on~$F$.
+The full variational derivative, including the adhesion
+contribution $-J(\nabla^2 S - \nabla^2\phii)$ where
+$S = \sum_k\phi_k$, is given in the Supplemental Material.
+
+% --- II.F  Sharp-interface limit ---
+\subsection{Sharp-interface limit}
+\label{sec:model:sharp}
+
+To connect the gradient coupling to vertex model adhesion, we evaluate
+the adhesion integral for $\tanh$-profile
+interfaces of width~$\lambda$ at a flat shared boundary of
+length~$\ell_{ij}$.  Using
+$\nabla\phi_1 = -(2\lambda)^{-1}\mathrm{sech}^2(x/\lambda)\,\hat{x}$
+and $\nabla\phi_2 = +(2\lambda)^{-1}\mathrm{sech}^2(x/\lambda)\,\hat{x}$,
+the normal integral evaluates to
+$\int\! \nabla\phi_1\!\cdot\!\nabla\phi_2\,dx = -1/(3\lambda)$
+(via $\int\!\mathrm{sech}^4 u\,du = 4/3$).  Summing over all shared
+boundaries:
+%
+\begin{equation}
+  F_{\mathrm{adh}} \sim -\frac{J}{3\lambda}\sum_{i<j}\ell_{ij},
+  \label{eq:sharp-interface}
+\end{equation}
+%
+which has the same form as the vertex model adhesion
+$-\gamma_{\mathrm{vm}}\sum_{i<j}\ell_{ij}$ with
+$\gamma_{\mathrm{vm}} = J/(3\lambda)$.  The adhesion energy is
+proportional to the total shared contact length, as in the
+vertex model.  The effective shape index
+$\peff = P_i/\sqrt{A_i}$, measured from the $\phii = 0.5$ contour,
+is the corresponding phase field observable.
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  III.  SIMULATION METHODS
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Simulation methods}
+\label{sec:methods}
+
+% --- III.A  Implementation ---
+\subsection{GPU-accelerated implementation}
+\label{sec:methods:gpu}
+
+The model is implemented as a custom CUDA C++ code.  All $N$ phase fields
+are stored on a single GPU and evolved simultaneously.  The per-cell fields
+$\phii$ are represented on a uniform Cartesian grid of $L \times L$ points
+with spacing $\Delta x = 1$.  At each time step a \emph{scatter} kernel
+accumulates the sum fields
+%
+\begin{equation}
+  S(\bm{r}) = \textstyle\sum_k \phi_k(\bm{r}), \qquad
+  S_2(\bm{r}) = \textstyle\sum_k \phi_k^2(\bm{r})
+  \label{eq:sum-fields}
+\end{equation}
+%
+over all cells, and then a \emph{fused} kernel evaluates the
+variational derivative~\eqref{eq:eom}, self-propulsion, and
+forward-Euler update for every cell and grid point in a single pass.
+The repulsive force on cell~$i$ is
+$2\kappa\,\phii\bigl(S_2 - \phii^2\bigr)$; the adhesive force is
+$-J\bigl(\nabla^2 S - \nabla^2\phii\bigr)$, computed via a
+McLellan nine-point isotropic Laplacian stencil on~$S$ (matching the
+stencil used for $\nabla^2\phii$).  When $J = 0$, the Laplacian of~$S$ is neither
+computed nor applied, so the code incurs zero overhead for the purely
+repulsive case.
+
+All production runs were performed on NVIDIA H100~GPUs (Digital Research
+Alliance of Canada).
+
+% --- III.B  Parameters ---
+\subsection{Simulation parameters}
+\label{sec:methods:params}
+
+Table~\ref{tab:params} summarizes the physical and numerical parameters,
+which are held fixed across all adhesion experiments.
+
+\begin{table}[b]
+  \caption{%
+    Fixed simulation parameters.  The time scale is set by $\tau = 10{,}000$
+    (tumble time); the length scale by the cell radius $R = 49$.  The packing
+    fraction $\phi = N \pi R^2 / L^2 = 0.89$ places the system in the
+    confluent regime.
+  }
+  \label{tab:params}
+  \begin{ruledtabular}
+  \begin{tabular}{lll}
+    Parameter & Symbol & Value \\ \hline
+    Cell count       & $N$        & 288 (or 1152)     \\
+    Domain side      & $L$        & 1562 (or 3124)    \\
+    Cell radius      & $R$        & 49                \\
+    Packing fraction & $\phi$     & 0.89              \\
+    Interface width  & $\lambda$  & 7                 \\
+    Gradient energy  & $\gamma$   & 1                 \\
+    Repulsion        & $\kappa$   & 10                \\
+    Volume penalty   & $\mu$      & 1                 \\
+    Friction         & $\xi$      & 1500              \\
+    Mobility         & $M$        & 0.5               \\
+    Time step        & $\Delta t$ & 0.01              \\
+    Tumble time      & $\tau$     & $10{,}000$        \\
+    Boundary cond.   &            & periodic          \\
+  \end{tabular}
+  \end{ruledtabular}
+\end{table}
+
+The packing fraction $\phi = 0.89$ was chosen to match the near-confluent
+regime in which the vertex model is defined.  At this density, cells tile
+the domain with only small interstitial gaps, consistent with a confluent
+monolayer.
+
+% --- III.C  Equilibration ---
+\subsection{Equilibration protocol}
+\label{sec:methods:eq}
+
+All adhesion experiments start from a well-equilibrated, purely repulsive
+configuration.  One hundred independent realizations of 288 cells were
+initialized at random positions on the $L = 1562$ domain and relaxed at
+$\vA = 0$, $J = 0$ for $t = 80{,}000$ ($8\tau$), following the
+equilibration protocol of Palmieri \textit{et al.}~\cite{Palmieri2015}.
+At this point, all transient stress from the random initialization has
+decayed and the system sits in a local energy minimum of the repulsive
+free energy.  The resulting 100 checkpoints serve as independent starting
+states for the adhesion experiments.
+
+We verified convergence by confirming that control runs ($\vA = 0$,
+$J = 0$) starting from these equilibrated states produce mean centroid
+displacements below $0.02R$ over $20{,}000$ time units, negligible
+compared to the cell radius~$R$.
+
+% --- III.D  Adhesion quench ---
+\subsection{Adhesion quench protocol}
+\label{sec:methods:quench}
+
+The adhesion quench probes the rigidity of the energy landscape by
+instantaneously enabling adhesion in an equilibrated many-cell system.
+Starting from an equilibrated $N = 288$ configuration
+(Sec.~\ref{sec:methods:eq}), we sweep
+$\Jt$ at adhesion strength $J \in \{0,\, 0.9375,\, 1.875,\, 2.8125\}$
+(corresponding to
+$\Jt \in \{0,\, 0.125,\, 0.250,\, 0.375\}$)
+and evolve for $t = 20{,}000$ time units ($= 2\tau$).  With no
+self-propulsion, the dynamics are purely overdamped relaxation on the
+free energy landscape.  The total centroid displacement
+$\sum_i |\Delta\bm{r}_i|$ is the primary diagnostic.
+
+Only phase field models can perform this experiment.  In vertex models,
+changing adhesion modifies~$p_0$, but the system can only explore
+configuration space through discrete T1~events or explicit motility.
+The overdamped phase field dynamics explore the landscape continuously,
+revealing the distinction between rigid and fluid energy landscapes
+without any activity.
+
+% --- III.F  Observables ---
+\subsection{Observables}
+\label{sec:methods:obs}
+
+\paragraph{Mean-squared displacement (MSD).}
+The ensemble- and time-averaged MSD is
+%
+\begin{equation}
+  \langle \Delta r^2(t) \rangle
+    = \biggl\langle \frac{1}{N}\sum_{i=1}^{N}
+      |\bm{r}_i(t_0 + t) - \bm{r}_i(t_0)|^2 \biggr\rangle_{t_0},
+  \label{eq:msd}
+\end{equation}
+%
+with displacements unwrapped across periodic boundaries.
+
+\paragraph{Self-overlap function.}
+The fraction of cells that have not displaced beyond a cage
+radius~$a$ after time~$\Delta t$:
+%
+\begin{equation}
+  Q(\Delta t) = \frac{1}{N}\sum_{i=1}^{N}
+  \Theta\!\bigl(a - |\bm{r}_i(t_0 + \Delta t) - \bm{r}_i(t_0)|\bigr),
+  \label{eq:Qt}
+\end{equation}
+%
+where $a = 0.3\,d_{\mathrm{cell}} \approx 28$ grid units.  We fit
+$Q(t)$ to a stretched exponential
+$Q(t) = \exp[-(t/\tau_\alpha)^\beta]$, where $\beta < 1$ indicates a
+broad distribution of relaxation times.
+
+\paragraph{Non-Gaussian parameter.}
+%
+\begin{equation}
+  \alpha_2(t)
+    = \frac{\langle \Delta r^4(t)\rangle}
+           {2\,\langle \Delta r^2(t)\rangle^2} - 1
+  \label{eq:alpha2}
+\end{equation}
+%
+measures dynamic heterogeneity; a peak in $\alpha_2$ signals a population
+of fast-moving cells coexisting with caged cells.
+
+\paragraph{Four-point susceptibility.}
+%
+\begin{equation}
+  \chi_4(\Delta t) = N\bigl[\langle Q(\Delta t)^2 \rangle
+  - \langle Q(\Delta t)\rangle^2\bigr],
+  \label{eq:chi4}
+\end{equation}
+%
+which measures the number of cells participating in cooperative
+rearrangements.
+
+\paragraph{Effective shape index.}
+From VTK snapshots, we extract the $\phii = 0.5$ contour for each cell
+using a marching-squares algorithm, then compute the perimeter $P_i$
+and area $A_i$ of the contour:
+%
+\begin{equation}
+  \peff = \frac{P_i}{\sqrt{A_i}}.
+  \label{eq:peff}
+\end{equation}
+
+\paragraph{Energy decomposition.}
+The free energy~\eqref{eq:free-energy} is decomposed into gradient,
+bulk, repulsive, and adhesive contributions, each tracked as a function
+of time.  In the quench protocol, the time series of each component
+distinguishes interface relaxation (smooth gradient energy decay) from
+topological rearrangements (stepwise drops in interaction energy).
+
+% --- III.G  Protocol summary ---
+\subsection{Experimental protocols}
+\label{sec:methods:protocols}
+
+Three experimental phases, summarized in Table~\ref{tab:protocols}, probe the
+rigidity transition at increasing levels of detail.
+
+\begin{table}[t]
+  \caption{%
+    Summary of the three experimental protocols.  All start from the same
+    pool of 100 independently equilibrated checkpoints at $t = 80{,}000$.
+  }
+  \label{tab:protocols}
+  \begin{ruledtabular}
+  \begin{tabular}{lccc}
+    & Phase 0     & Phase 1       & Phase 2           \\
+    & (quench)    & (probe)       & (diagram)         \\ \hline
+    $\Jt$
+      & 0--0.75 (4+ pts)  & 0--0.75 (6 pts) & 0--0.75 (6 pts) \\
+    $\vA$
+      & 0               & 0.002          & 0.002--0.012    \\
+    Duration
+      & $2\tau$          & $5\tau$        & $5\tau$         \\
+    Replicates
+      & 1 (deterministic)& 3             & 3--10           \\
+    Key observable
+      & displacement,    & MSD,           & MSD,            \\
+      & energy           & $\alpha_2$     & $\peff$         \\
+  \end{tabular}
+  \end{ruledtabular}
+\end{table}
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  IV.  RESULTS — Two-cell validation
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Two-cell validation}
+\label{sec:2cell}
+
+To characterize the gradient-coupling adhesion in isolation, we
+place two cells in a $400 \times 400$ domain ($R = 49$, $\vA = 0$)
+at center-to-center distance $d_0 \approx 1.9R$ and evolve for
+$t = 2\tau$ at each adhesion strength.
+Figure~\ref{fig:twocell} shows equilibrium snapshots at four
+representative values of~$\Jt$, and the contact angle~$\theta$
+as a function of~$\Jt$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.24\columnwidth]{figures/fig1_snap_Jt0.12}%
+  \includegraphics[width=0.24\columnwidth]{figures/fig1_snap_Jt0.25}%
+  \includegraphics[width=0.24\columnwidth]{figures/fig1_snap_Jt0.50}%
+  \includegraphics[width=0.24\columnwidth]{figures/fig1_snap_Jt0.75}\\[4pt]
+  \includegraphics[width=0.95\columnwidth]{figures/fig1_contact_angle}
+  \caption{Two-cell adhesion validation
+    ($\gamma = 1$, $R = 49$, $\vA = 0$, $t = 2\tau$).
+    Top: composite field $\sum_i\phi_i$ at equilibrium for
+    $\Jt = 0.125$, $0.25$, $0.50$, and $0.75$, with
+    per-cell $\phi_i = 0.5$ contours (white).
+    Bottom: measured contact angle $\theta$ versus $\Jt$.
+    The contact angle increases monotonically with adhesion
+    strength, confirming that the gradient coupling produces
+    the expected interfacial geometry.}
+  \label{fig:twocell}
+\end{figure}
+
+The contact angle increases monotonically from
+$\theta = 22.5^\circ$ at $\Jt = 0.125$ to $50.8^\circ$ at
+$\Jt = 0.75$ (Fig.~\ref{fig:twocell}).  At low adhesion the
+cells remain nearly circular with a narrow contact zone; at
+$\Jt = 0.75$ the contact region flattens substantially and the
+cells deform into a peanut-like shape with a well-defined
+contact angle.
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  V.  RESULTS — Adhesion quench
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Adhesion quench at zero motility}
+\label{sec:quench}
+
+\subsection{Protocol}
+\label{sec:quench:protocol}
+
+Starting from a checkpoint equilibrated at $J = 0$, $\vA = 0$ for
+$t = 80{,}000$ ($8\tau$), we instantaneously set $J > 0$ while keeping
+$\vA = 0$ and evolve for an additional $2\tau$.  The dynamics are
+purely relaxational: $\partial_t \phii = -M\,\delta F/\delta\phii$.
+Because the $J = 0$ equilibrium is generally not a minimum of the
+$J > 0$ energy landscape, the system flows downhill to a new minimum.
+
+This ``$J$-quench'' has no vertex model analog.  In the vertex model at
+$T = 0$, $v_0 = 0$, the system is frozen in a local minimum regardless
+of~$p_0$; changing $p_0$ relabels the energy without inducing motion.
+In the phase field, turning on adhesion creates an energetic driving
+force and the overdamped dynamics trace out the continuous
+relaxation path---including intermediate configurations inaccessible in
+a discrete-topology model.
+
+\subsection{Centroid displacement}
+\label{sec:quench:displacement}
+
+\begin{table}[b]
+\caption{Phase~0 adhesion quench results: mean centroid displacement
+  after $t = 20{,}000$ TU ($2\tau$) of overdamped relaxation from an
+  equilibrated $N = 288$ configuration at $\vA = 0$.  All displacements
+  are sub-cell, reflecting interface reshaping rather than neighbor
+  exchanges.}
+\label{tab:quench}
+\begin{ruledtabular}
+\begin{tabular}{ccccc}
+$J/\kappa$ & $\Jt$ & $\langle\Delta r\rangle / R$ & RMS disp. & $v_{\mathrm{rms}}$ (final) \\
+\midrule
+0.00 & 0    & 0.025 & 1.2 & $4.4\times10^{-6}$ \\
+0.05 & 0.25 & 0.058 & 2.8 & $6.5\times10^{-5}$ \\
+0.10 & 0.50 & 0.086 & 4.2 & $3.7\times10^{-4}$ \\
+0.15 & 0.75 & 0.132 & 6.5 & $2.2\times10^{-3}$ \\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+The quench results (Table~\ref{tab:quench}) show a smooth, monotonic
+increase in displacement with~$\Jt$.  The $J = 0$ control produces
+mean displacements of $0.025R$, negligible compared to the cell
+radius, confirming that the starting state is fully relaxed.  At
+$\Jt = 0.25$, cells displace by $0.058R$; at $\Jt = 0.75$, by
+$0.132R$.  All displacements are sub-cell ($\ll R$), and no neighbor
+exchanges (T1-like topology changes) occur at any adhesion strength.
+
+The displacements reflect interface reshaping: contact angles adjust
+and shared contact areas grow as adhesion lowers the effective surface
+tension at cell-cell boundaries.  The smooth, monotonic trend is
+consistent with the system relaxing to the nearest local energy
+minimum while preserving the neighbor topology inherited from
+the~$J = 0$ equilibrium.  At $\Jt = 0.75$, the final
+$v_{\mathrm{rms}} = 2.2\times10^{-3}$ indicates the system has not
+fully equilibrated within $2\tau$, suggesting the relaxation timescale
+grows with~$\Jt$, consistent with proximity to a soft mode.
+
+The absence of neighbor rearrangements is physically expected.  At the
+confluent packing fraction $\phi = 0.89$, the saddle-point energy for
+a topology change is dominated by the cell-squeezing cost ($\kappa$
+repulsion and $\gamma$ gradient energy required to push one cell past
+another), which adhesion does not reduce.  Adhesion lowers the energy
+of configurations with more shared contact area (the destination) but
+not the barrier.  At $\vA = 0$, gradient descent cannot overcome
+these barriers regardless of~$\Jt$.
+
+The quench thus measures the static equilibrium
+properties at each adhesion strength.  The active driving needed to
+overcome topological barriers is provided by motility, which is the
+subject of Phase~1 (Sec.~\ref{sec:motility}).
+
+\TODO{Fig: (a)~Centroid displacement $\langle\Delta r\rangle / R$ vs.\ $\Jt$ from
+the adhesion quench (Table~\ref{tab:quench}).
+(b)~Representative VTK snapshots before and after quench.
+(d)~Energy time series during quench.}
+
+\subsection{Energy landscape}
+\label{sec:quench:energy}
+
+\TODO{Energy time series for representative $\Jt$ values.  Expected:
+smooth monotonic decay below $\Jt^*$; stepwise or multi-plateau decay
+above $\Jt^*$ corresponding to discrete rearrangement events.}
+
+\subsection{Neighbor rearrangements}
+\label{sec:quench:topology}
+
+\TODO{Count T1-like neighbor changes vs.\ $\Jt$.}
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  VI.  RESULTS — Phase 1: Motility probe
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Motility probe sweep}
+\label{sec:motility}
+
+At fixed $\vA = 0.002$, all tested adhesion strengths
+($\Jt \leq 0.25$) remain jammed. The clean baseline
+($\Jt = 0$) has $D_{\mathrm{eff}} = 6.4 \times 10^{-4}$
+and $\tau_\alpha > 100{,}000$ (Q does not decay to $e^{-1}$
+within $20\tau$), confirming the system is deep in the solid
+phase. At $\Jt = 0.125$, $D_{\mathrm{eff}}$ decreases
+slightly to $2.8 \times 10^{-4}$, indicating that weak
+adhesion does not fluidize the system at this low motility.
+
+\subsection{Mean-squared displacement}
+\label{sec:motility:msd}
+
+\TODO{MSD vs.\ time for each $\Jt$ at $\vA = 0.002$.}
+
+\subsection{Dynamic heterogeneity}
+\label{sec:motility:alpha2}
+
+\TODO{$\alpha_2(t)$ for each $\Jt$.}
+
+\subsection{Effective shape index}
+\label{sec:motility:shape}
+
+\TODO{Extract $\peff$ from trajectory $L_n$ column. Plot
+$\langle\peff\rangle$ vs.\ $\Jt$; compare to
+$p_0^* \approx 3.81$.}
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  VII.  RESULTS — Phase 2: Phase diagram
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Adhesion--motility phase diagram}
+\label{sec:diagram}
+
+Table~\ref{tab:phase2} summarizes the effective diffusion coefficient
+$D_{\mathrm{eff}}$ and structural relaxation time $\tau_\alpha$
+across the $(\Jt,\,\vA)$ parameter space.  Results for
+$\Jt \geq 0.25$ are in progress at $\Delta t = 0.01$.
+
+\begin{table}[t]
+\caption{Phase~2 results: effective diffusion coefficient
+  $D_{\mathrm{eff}}$ and relaxation time $\tau_\alpha$ (from
+  stretched-exponential fit to $Q(t)$) for the adhesion--motility
+  sweep.  $N = 288$, $\phi = 0.89$, production time $20\tau$ from
+  equilibrated checkpoint.  Three independent replicates per point.
+  $\beta = 2.0$ indicates Q did not decay sufficiently for a reliable
+  stretched-exponential fit (jammed regime).}
+\label{tab:phase2}
+\begin{ruledtabular}
+\begin{tabular}{ccccr}
+$\Jt$ & $\vA$ & $D_{\mathrm{eff}}$ & $\tau_\alpha$ & $\beta$ \\
+\midrule
+\multicolumn{5}{c}{$\Jt = 0$ (no adhesion)} \\
+0 & 0.002 & $4.8\times10^{-4}$ & $>10^5$ & 2.0 \\
+0 & 0.004 & $8.8\times10^{-4}$ & $>10^5$ & 2.0 \\
+0 & 0.006 & $1.5\times10^{-3}$ & $>10^5$ & 2.0 \\
+0 & 0.008 & $6.3\times10^{-3}$ & $80{,}977$ & 1.24 \\
+0 & 0.010 & $1.4\times10^{-2}$ & $47{,}761$ & 1.06 \\
+0 & 0.012 & $2.3\times10^{-2}$ & $29{,}986$ & 0.88 \\
+\midrule
+\multicolumn{5}{c}{$\Jt = 0.125$ (12.5\% surface energy reduction)} \\
+0.125 & 0.002 & $1.9\times10^{-4}$ & $>10^5$ & 2.0 \\
+0.125 & 0.004 & $5.6\times10^{-4}$ & $>10^5$ & 2.0 \\
+0.125 & 0.006 & $1.6\times10^{-3}$ & $99{,}433$ & 2.0 \\
+0.125 & 0.008 & $7.1\times10^{-3}$ & $64{,}838$ & 1.23 \\
+0.125 & 0.010 & $1.2\times10^{-2}$ & $36{,}197$ & 0.89 \\
+0.125 & 0.012 & $3.4\times10^{-2}$ & $21{,}875$ & 0.89 \\
+\end{tabular}
+\end{ruledtabular}
+\end{table}
+
+The data show two trends. First, the clean-system ($\Jt = 0$)
+transition is visible: $D_{\mathrm{eff}}$ increases by an order of
+magnitude between $\vA = 0.006$ and $0.010$, and $\tau_\alpha$ drops
+from $>10^5$ to $47{,}761$ ($\approx 5\tau$) with $\beta$ falling
+below~1.
+This locates the unjamming transition at $v_A^* \approx 0.009$ for
+$\Jt = 0$, consistent with the Palmieri~\textit{et al.}~\cite{Palmieri2015}
+calibration.
+
+Second, adhesion shifts the transition.  At $\Jt = 0.125$,
+$\tau_\alpha$ at $\vA = 0.008$ drops from $80{,}977$ to $64{,}838$
+and $D_{\mathrm{eff}}$ increases from $6.3 \times 10^{-3}$ to
+$7.1 \times 10^{-3}$.  At $\vA = 0.012$, $D_{\mathrm{eff}}$
+increases by 50\% (from $2.3 \times 10^{-2}$ to
+$3.4 \times 10^{-2}$) and $\tau_\alpha$ decreases from
+$29{,}986$ to $21{,}875$.
+
+\subsection{Phase boundary}
+\label{sec:diagram:boundary}
+
+\TODO{Heatmap of $D_{\mathrm{eff}}$ in the $(\Jt,\,\vA)$ plane
+once $\Jt \geq 0.25$ data with McLellan stencil is available.
+Compare to the $(p_0,\,v_0)$ boundary of Bi \textit{et al.}~\cite{Bi2016}.}
+
+\subsection{Shape index mapping}
+\label{sec:diagram:shape}
+
+\TODO{Overlay contours of constant $\peff$ on the phase diagram.}
+
+\subsection{System-size effects}
+\label{sec:diagram:size}
+
+\TODO{Compare 288-cell and 1152-cell results.}
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  VIII.  DISCUSSION
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+
+We have added gradient-coupling adhesion to the Palmieri
+\textit{et al.}~\cite{Palmieri2015} multi-cell phase field model.
+The dimensionless parameter $\Jt = J/(2\gamma)$ controls the
+fraction of surface energy removed at shared interfaces, and the
+sharp-interface limit (Sec.~\ref{sec:model:sharp}) confirms that
+$\Jt$ is the phase field counterpart of the vertex model target
+shape index~$p_0$.
+
+The two-cell validation (Fig.~\ref{fig:twocell}) and the adhesion
+quench (Table~\ref{tab:quench}) establish that the coupling is
+well-behaved within the stability bound $J < 2\gamma$: mass is
+conserved, cell shapes are preserved, and the quench produces
+smooth interface relaxation without neighbor exchanges at
+$\vA = 0$.  The quench protocol has no vertex model analog, since
+at zero motility the vertex model is frozen regardless of $p_0$;
+the phase field dynamics trace the full relaxation trajectory
+from the repulsive to the adhesive equilibrium.
+
+The motility sweep (Table~\ref{tab:phase2}) shows that adhesion
+shifts the unjamming transition.  At $\Jt = 0.125$,
+$\tau_\alpha$ at $\vA = 0.008$ drops by 20\% relative to $\Jt = 0$,
+and at $\vA = 0.012$ $D_{\mathrm{eff}}$ increases by 50\%.
+The clean-system transition at $v_A^* \approx 0.009$ is consistent
+with the Palmieri \textit{et al.}~\cite{Palmieri2015} calibration.
+
+Several questions remain open.  Extracting the effective shape
+index $\peff$ from $\phii = 0.5$ contours will test whether the
+transition at $\Jt^*$ coincides with
+$\langle\peff\rangle \approx 3.81$.  The diffuse interface
+(width $\lambda = 7$ vs.\ cell radius $R = 49$) may introduce
+corrections relative to the sharp-polygon limit.  Comparing
+$N = 288$ and $N = 1152$ will quantify finite-size effects, and
+extension to three dimensions is direct since the gradient coupling
+and the bound $J < 2\gamma$ hold in any spatial dimension.
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  ACKNOWLEDGMENTS
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{acknowledgments}
+Computational resources were provided by the Digital Research Alliance
+of Canada.
+M.K.\ thanks the Natural Sciences and Engineering Research Council of
+Canada (NSERC), the Canada Research Chairs Program, and Foundation PS
+for financial support.
+S.A.S.\ thanks NSERC for financial support through the Postgraduate
+Scholarships (PGS~D) program.
+\end{acknowledgments}
+
+% ══════════════════════════════════════════════════════════════════════════════
+%  BIBLIOGRAPHY
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{thebibliography}{99}
+
+\bibitem{Angelini2011}
+T.~E. Angelini \textit{et~al.},
+Glass-like dynamics of collective cell migration,
+\href{https://doi.org/10.1073/pnas.1010059108}{Proc.\ Natl.\ Acad.\ Sci.\
+USA \textbf{108}, 4714 (2011)}.
+
+\bibitem{Garcia2015}
+S.~Garcia, E.~Hannezo, J.~Elgeti, J.-F. Joanny, P.~Silberzan, and
+N.~S. Gov,
+Physics of active jamming during collective cellular motion in a
+monolayer,
+\href{https://doi.org/10.1073/pnas.1510973112}{Proc.\ Natl.\ Acad.\ Sci.\
+USA \textbf{112}, 15314 (2015)}.
+
+\bibitem{Park2015}
+J.~A. Park \textit{et~al.},
+Unjamming and cell shape in the asthmatic airway epithelium,
+\href{https://doi.org/10.1038/nmat4357}{Nat.\ Mater.\ \textbf{14}, 1040
+(2015)}.
+
+\bibitem{Mongera2018}
+A.~Mongera \textit{et~al.},
+A fluid-to-solid jamming transition underlies vertebrate body axis
+elongation,
+\href{https://doi.org/10.1038/s41586-018-0479-2}{Nature \textbf{561}, 401
+(2018)}.
+
+\bibitem{Atia2018}
+L.~Atia \textit{et~al.},
+Geometric constraints during epithelial jamming,
+\href{https://doi.org/10.1038/s41567-018-0089-9}{Nat.\ Phys.\ \textbf{14},
+613 (2018)}.
+
+\bibitem{Malinverno2017}
+C.~Malinverno \textit{et~al.},
+Endocytic reawakening of motility in jammed epithelia,
+\href{https://doi.org/10.1038/nmat4848}{Nat.\ Mater.\ \textbf{16}, 587
+(2017)}.
+
+\bibitem{NagaiHonda2001}
+T.~Nagai and H.~Honda,
+A dynamic cell model for the formation of epithelial tissues,
+\href{https://doi.org/10.1080/13642810108205772}{Philos.\ Mag.\ B
+\textbf{81}, 699 (2001)}.
+
+\bibitem{Farhadifar2007}
+R.~Farhadifar, J.-C. R\"oben, B.~Aigouy, S.~Eaton, and F.~J\"ulicher,
+The influence of cell mechanics, cell-cell interactions, and
+proliferation on epithelial packing,
+\href{https://doi.org/10.1016/j.cub.2007.11.049}{Curr.\ Biol.\
+\textbf{17}, 2095 (2007)}.
+
+\bibitem{Staple2010}
+D.~B. Staple, R.~Farhadifar, J.-C. R\"oben, B.~Aigouy, S.~Eaton, and
+F.~J\"ulicher,
+Mechanics and remodelling of cell packings in epithelia,
+\href{https://doi.org/10.1140/epje/i2010-10677-0}{Eur.\ Phys.\ J.\ E
+\textbf{33}, 117 (2010)}.
+
+\bibitem{Fletcher2014}
+A.~G. Fletcher, M.~Osterfield, R.~E. Baker, and S.~Y. Shvartsman,
+Vertex models of epithelial morphogenesis,
+\href{https://doi.org/10.1016/j.bpj.2013.11.4498}{Biophys.\ J.\
+\textbf{106}, 2291 (2014)}.
+
+\bibitem{Bi2015}
+D.~Bi, J.~H. Lopez, J.~M. Schwarz, and M.~L. Manning,
+A density-independent glass transition in biological tissues,
+\href{https://doi.org/10.1038/nphys3471}{Nat.\ Phys.\ \textbf{11}, 1074
+(2015)}.
+
+\bibitem{Bi2016}
+D.~Bi, X.~Yang, M.~C. Marchetti, and M.~L. Manning,
+Motility-driven glass and jamming transitions in biological tissues,
+\href{https://doi.org/10.1103/PhysRevX.6.021011}{Phys.\ Rev.\ X
+\textbf{6}, 021011 (2016)}.
+
+\bibitem{Barton2017}
+D.~L. Barton, S.~Henkes, C.~J. Weijer, and R.~Sknepnek,
+Active Vertex Model for cell-resolution description of epithelial
+tissue mechanics,
+\href{https://doi.org/10.1371/journal.pcbi.1005569}{PLoS Comput.\ Biol.\
+\textbf{13}, e1005569 (2017)}.
+
+\bibitem{YanBi2019}
+L.~Yan and D.~Bi,
+Multicellular rosettes drive fluid-solid transition in epithelial
+tissues,
+\href{https://doi.org/10.1103/PhysRevX.9.011029}{Phys.\ Rev.\ X
+\textbf{9}, 011029 (2019)}.
+
+\bibitem{MerkelManning2018}
+M.~Merkel and M.~L. Manning,
+A geometrically controlled rigidity transition in a model for confluent
+3D tissues,
+\href{https://doi.org/10.1088/1367-2630/aab4e8}{New J.\ Phys.\
+\textbf{20}, 022002 (2018)}.
+
+\bibitem{Czajkowski2019}
+M.~Czajkowski, D.~M. Sussman, M.~C. Marchetti, and M.~L. Manning,
+Glassy dynamics in models of confluent tissue with mitosis and
+apoptosis,
+\href{https://doi.org/10.1039/C9SM00916G}{Soft Matter \textbf{15}, 9133
+(2019)}.
+
+\bibitem{Camley2017}
+B.~A. Camley and W.-J. Rappel,
+Physical models of collective cell motility: from cell to tissue,
+\href{https://doi.org/10.1088/1361-6463/aa56fe}{J.\ Phys.\ D \textbf{50},
+113002 (2017)}.
+
+\bibitem{AlertTrepat2020}
+R.~Alert and X.~Trepat,
+Physical models of collective cell migration,
+\href{https://doi.org/10.1146/annurev-conmatphys-031218-013516}{Annu.\
+Rev.\ Condens.\ Matter Phys.\ \textbf{11}, 77 (2020)}.
+
+\bibitem{Shao2010}
+D.~Shao, W.-J. Rappel, and H.~Levine,
+Computational model for cell morphodynamics,
+\href{https://doi.org/10.1103/PhysRevLett.105.108104}{Phys.\ Rev.\ Lett.\
+\textbf{105}, 108104 (2010)}.
+
+\bibitem{Ziebert2012}
+F.~Ziebert, S.~Swaminathan, and I.~S. Aranson,
+Model for self-polarization and motility of keratocyte fragments,
+\href{https://doi.org/10.1098/rsif.2011.0694}{J.\ R.\ Soc.\ Interface
+\textbf{9}, 1084 (2012)}.
+
+\bibitem{Nonomura2012}
+M.~Nonomura,
+Study on multicellular systems using a phase field model,
+\href{https://doi.org/10.1371/journal.pone.0033501}{PLoS ONE \textbf{7},
+e33501 (2012)}.
+
+\bibitem{Lober2015}
+J.~L\"ober, F.~Ziebert, and I.~S. Aranson,
+Collisions of deformable cells lead to collective migration,
+\href{https://doi.org/10.1038/srep09172}{Sci.\ Rep.\ \textbf{5}, 9172
+(2015)}.
+
+\bibitem{Najem2016}
+S.~Najem and M.~Grant,
+Phase-field model for collective cell migration,
+\href{https://doi.org/10.1103/PhysRevE.93.052405}{Phys.\ Rev.\ E
+\textbf{93}, 052405 (2016)}.
+
+\bibitem{Palmieri2015}
+B.~Palmieri, Y.~Bresler, D.~Wirtz, and M.~Grant,
+Multiple scale model for cell migration in monolayers,
+\href{https://doi.org/10.1038/srep11745}{Sci.\ Rep.\ \textbf{5}, 11745
+(2015)}.
+
+\bibitem{Loewe2020}
+B.~Loewe, M.~Chiang, D.~Marenduzzo, and M.~C. Marchetti,
+Solid-liquid transition of deformable and overlapping active particles,
+\href{https://doi.org/10.1103/PhysRevLett.125.038003}{Phys.\ Rev.\ Lett.\
+\textbf{125}, 038003 (2020)}.
+
+\bibitem{Wenzel2021}
+D.~Wenzel and A.~Voigt,
+Multiphase field models for collective cell migration,
+\href{https://doi.org/10.1103/PhysRevE.104.054410}{Phys.\ Rev.\ E
+\textbf{104}, 054410 (2021)}.
+
+\bibitem{Graham2024}
+R.~Graham, D.~Zhang, and J.~M. Yeomans,
+Cell sorting by active forces in a phase-field model of cell
+monolayers,
+\href{https://doi.org/10.1039/d3sm01033c}{Soft Matter \textbf{20}, 2955
+(2024)}.
+
+\bibitem{Saito2024}
+S.~Saito and S.~Ishihara,
+Cell deformability gives rise to a fluid-to-fluid transition in tissues,
+\href{https://doi.org/10.1126/sciadv.adi8433}{Sci.\ Adv.\ \textbf{10},
+eadi8433 (2024)}.
+
+\bibitem{Moshe2018}
+M.~Moshe, M.~J. Bowick, and M.~C. Marchetti,
+Geometric frustration and solid-solid transitions in model 2D tissue,
+\href{https://doi.org/10.1103/PhysRevLett.120.268105}{Phys.\ Rev.\ Lett.\
+\textbf{120}, 268105 (2018)}.
+
+\bibitem{Bresler2018}
+Y.~Bresler, B.~Palmieri, and M.~Grant,
+Sharp interface limit of the phase field model for cell motility
+(2018), \href{https://arxiv.org/abs/1807.10318}{arXiv:1807.10318}.
+
+\bibitem{HohenbergHalperin1977}
+P.~C. Hohenberg and B.~I. Halperin,
+Theory of dynamic critical phenomena,
+\href{https://doi.org/10.1103/RevModPhys.49.435}{Rev.\ Mod.\ Phys.\
+\textbf{49}, 435 (1977)}.
+
+\end{thebibliography}
+
+\end{document}

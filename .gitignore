@@ -8,6 +8,17 @@ build
 rust/cell_data/target/**/*
 cpp/simulation/**/*
 **/agent_test_runs
+
+# Directories kept local only
+papers/
+cluster_results/
+results/
+output/
+canvas*/
+tmp_*
+*.tar.gz
+
+# Simulation source whitelist
 !**/*/README.md
 !cpp/simulation/CMakeLists.txt
 !cpp/simulation/include
@@ -22,4 +33,9 @@ cpp/simulation/**/*
 !cpp/simulation/cluster
 !cpp/simulation/cluster/*.sh
 !cpp/simulation/cluster/*.c
+!cpp/simulation/study
+!cpp/simulation/study/**
+
+# MPI is dead
+cpp/simulation_mpi/
 

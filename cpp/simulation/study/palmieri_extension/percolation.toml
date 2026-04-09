@@ -1,0 +1,39 @@
+# Palmieri Percolation — Multiple Cancer Cell Fractions
+#
+# Phase 3B: fraction scan at N=4000, rho=0.90.
+# Measures population D_eff and tagged-cell metrics vs cancer fraction.
+#
+# Usage:
+#   cell_analyze study studies/palmieri_percolation.toml -d /path/to/phase3 -o results/percolation.json
+
+[study]
+name = "Palmieri Percolation"
+description = "System-wide D_eff vs cancer cell fraction f_c at N=4000, rho=0.90"
+
+[discovery]
+pattern = "fc_{frac}/run_{seed}"
+
+[observables]
+compute = ["per_cell_diffusion", "shape_index"]
+tau = 10000.0
+cell_radius = 49.0
+fit_frac = 0.3
+
+[analysis]
+tagged_cell = 0
+group_by = ["frac"]
+
+[analysis.metrics]
+d_eff_pop = "population_d_eff"
+d_eff_tagged = "tagged_cell_d_eff"
+ln_pop = "population_ln"
+d_eff_cv = "d_eff_cv"
+
+[[plots]]
+title = "Population D_eff vs cancer fraction"
+x = "frac"
+y = "d_eff_pop"
+output = "percolation_deff.svg"
+x_label = "Cancer cell fraction f_c"
+y_label = "Population D_eff"
+error_bars = true

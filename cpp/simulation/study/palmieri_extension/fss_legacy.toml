@@ -1,0 +1,52 @@
+# Palmieri FSS — Legacy single-file layout
+#
+# For analyzing the old v3 data in cluster_results/fss_*.txt
+# Each (N, rho, cond) has one trajectory file, no replicate seeds.
+#
+# Usage:
+#   cell_analyze study studies/palmieri_fss_legacy.toml -d cluster_results -o results/fss_legacy.json
+
+[study]
+name = "Palmieri FSS (legacy)"
+description = "Single-replicate FSS data from v3 runs"
+
+[discovery]
+pattern = "fss_{N}c_{rho}{cond}.txt"
+
+[observables]
+compute = ["per_cell_diffusion", "shape_index", "velocity_distribution"]
+tau = 10000.0
+cell_radius = 49.0
+fit_frac = 0.3
+
+[analysis]
+tagged_cell = 0
+group_by = ["N", "rho", "cond"]
+pair_by = "cond"
+pair_numerator = "s"
+pair_denominator = "c"
+
+[analysis.metrics]
+d_eff = "tagged_cell_d_eff"
+d_eff_pop = "population_d_eff"
+ln = "tagged_cell_ln"
+ln_pop = "population_ln"
+kurtosis = "tagged_cell_kurtosis"
+
+[[plots]]
+title = "D_eff ratio vs N — legacy"
+x = "N"
+y = "d_eff_ratio"
+output = "fss_legacy_deff_ratio.svg"
+x_label = "N (system size)"
+y_label = "D_eff(soft cell 0) / D_eff(ctrl cell 0)"
+error_bars = true
+
+[[plots]]
+title = "L_n gap vs N — legacy"
+x = "N"
+y = "ln_diff"
+output = "fss_legacy_ln_gap.svg"
+x_label = "N"
+y_label = "L_n(soft) - L_n(ctrl)"
+error_bars = true

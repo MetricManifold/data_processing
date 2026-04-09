@@ -1,31 +1,18 @@
 ---
-applyTo: "cpp/simulation/**,cpp/simulation_mpi/**"
+applyTo: "cpp/simulation/**"
 ---
 
 # Cell Simulation Project Instructions
 
-> **When to consult this file:** You are building, running, testing, or modifying the cell simulation code (CUDA or MPI). This covers local builds, CLI reference, physics parameters, validation tests, visualization, and performance benchmarks. For cluster job submission, see [cluster-operations.instructions.md](cluster-operations.instructions.md). For post-processing analysis, see [postprocessing.instructions.md](postprocessing.instructions.md).
-
-This project has **two implementations** of the same phase field cell simulation:
-
-1. **CUDA version** (`cpp/simulation/`) - GPU-accelerated, primary development version
-2. **MPI/CPU version** (`cpp/simulation_mpi/`) - For CPU clusters without GPUs
-
-Both versions implement identical physics and produce compatible checkpoint files.
+> **When to consult this file:** You are building, running, testing, or modifying the cell simulation code (CUDA). This covers local builds, CLI reference, physics parameters, validation tests, visualization, and performance benchmarks. For cluster job submission, see [cluster-operations.instructions.md](cluster-operations.instructions.md). For post-processing analysis, see [postprocessing.instructions.md](postprocessing.instructions.md).
 
 ## Key Project Locations
 
 ### CUDA Version (Primary)
 - **Source code**: `cpp/simulation/src/` and `cpp/simulation/include/`
 - **Build directory**: `cpp/simulation/build/`
-- **Executable**: `cpp/simulation/build/bin/Release/cell_sim.exe`
+- **Executable**: `cpp/simulation/build/bin/cell_sim.exe` (Windows) or `~/cell_simulation/build/bin/cell_sim` (cluster)
 - **Test output**: `cpp/simulation/agent_test_runs/`
-
-### MPI/CPU Version
-- **Source code**: `cpp/simulation_mpi/src/` and `cpp/simulation_mpi/include/`
-- **Build directory**: `cpp/simulation_mpi/build/`
-- **Executable**: `cpp/simulation_mpi/build/cell_sim_mpi.exe`
-- **Test output**: `cpp/simulation_mpi/agent_test_runs/`
 
 ### Shared Resources
 - **Visualization scripts**: `cpp/simulation/*.py` (work with both versions)
@@ -111,108 +98,6 @@ cmake --build . --config Debug
 | `-DSAFE_MODE=ON` | Enable GPU memory tracking with 1GB limit |
 | `-DENABLE_DIAGNOSTICS=ON` | Enable GPU-side diagnostics (energy, stress, contacts) |
 | `-DENABLE_STRESS_FIELDS=ON` | Enable stress tensor field output in VTK files |
-
----
-
-## MPI/CPU Version
-
-The MPI version provides the same physics as the CUDA version but runs on CPU clusters. It's useful when:
-- GPU queues are bottlenecked
-- Running on CPU-only nodes
-- Need to distribute across multiple nodes via MPI
-
-### MPI Build Commands
-
-#### On Windows (Serial with OpenMP)
-```powershell
-# Using Visual Studio Developer Command Prompt
-cd c:\Users\stevensilber\source\repos\data_processing\cpp\simulation_mpi
-mkdir build; cd build
-cmake ..
-nmake
-```
-
-Or using vcvarsall:
-```powershell
-cmd /c "call `"C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat`" x64 && cd C:\Users\stevensilber\source\repos\data_processing\cpp\simulation_mpi\build && cmake .. && nmake"
-```
-
-#### On Linux/Cluster (with MPI)
-```bash
-cd ~/cell_simulation_mpi
-mkdir build && cd build
-cmake .. -DCMAKE_CXX_COMPILER=mpicxx
-make -j8
-```
-
-#### On Linux (Serial)
-```bash
-cmake ..
-make -j8
-```
-
-### MPI CLI (Same as CUDA)
-
-The MPI version uses the same command-line interface:
-```powershell
-# Single cell test
-.\build\cell_sim_mpi.exe -n 1 -N 256 -r 49 -t 10 --dt 0.01 -o agent_test_runs/test_mpi_single
-
-# Multi-cell test
-.\build\cell_sim_mpi.exe -n 4 -N 256 -r 30 -t 10 --dt 0.01 --seed 42 -o agent_test_runs/test_mpi_multi
-
-# With motility
-.\build\cell_sim_mpi.exe -n 8 -N 512 -r 49 -t 100 --dt 0.01 --v-A 0.01 --tau 100 -o agent_test_runs/test_mpi_motile
-```
-
-### Checkpoint Compatibility
-
-**CRITICAL**: The MPI and CUDA versions use identical checkpoint formats (v4).
-
-You can:
-- Load a CUDA checkpoint in the MPI version
-- Load an MPI checkpoint in the CUDA version
-- Continue a simulation started on GPU using CPU nodes (or vice versa)
-
-```powershell
-# Resume a CUDA checkpoint with MPI version
-.\build\cell_sim_mpi.exe -c ..\simulation\agent_test_runs\cuda_run\checkpoint.bin -t 100 -o agent_test_runs\resumed_mpi
-```
-
-### Validation Results (CUDA vs MPI)
-
-The MPI version has been validated against the CUDA version:
-
-| Test | Max Difference | RMS Difference | Status |
-|------|----------------|----------------|--------|
-| Single cell (R=49, t=10) | 4.3×10⁻⁵ | 6.6×10⁻⁶ | ✅ PASSED |
-| 4 cells (R=30, t=10) | 2.2×10⁻⁵ | 4.3×10⁻⁶ | ✅ PASSED |
-| Checkpoint cross-load | — | — | ✅ PASSED |
-
-**Note**: With motility (v_A > 0), the random tumbling events occur at slightly different times due to different RNG consumption order. This is expected - the physics is identical.
-
-### MPI Source Files
-
-| File | Purpose |
-|------|---------|
-| `src/main.cpp` | Entry point, CLI parsing |
-| `src/cell.cpp` | Cell initialization |
-| `src/domain.cpp` | Domain management |
-| `src/integrator.cpp` | Time integration (OpenMP parallelized) |
-| `src/io.cpp` | Checkpoint/VTK I/O |
-| `include/types.hpp` | SimParams, BoundingBox, Vec2 (matches CUDA) |
-| `include/physics.hpp` | CPU physics functions |
-| `include/cell.hpp` | Cell class |
-| `include/domain.hpp` | Domain class |
-| `include/integrator.hpp` | Integrator class |
-| `include/io.hpp` | CheckpointHeader, I/O declarations |
-
-### MPI Performance Notes
-
-- The MPI version is ~4x slower than CUDA for small simulations
-- OpenMP provides multi-core parallelization within a node
-- MPI (when built with MPI support) enables multi-node distribution
-- Best for CPU cluster queues with shorter wait times than GPU queues
 
 ---
 

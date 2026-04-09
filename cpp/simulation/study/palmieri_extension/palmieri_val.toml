@@ -1,0 +1,33 @@
+[study]
+name = "palmieri_validation_72c"
+description = "Palmieri validation: 72-cell ctrl vs soft, rho=0.90"
+
+[discovery]
+pattern = "prod_72c_rho90_{cond}_v{seed}"
+trajectory_name = "trajectory.txt"
+
+[observables]
+compute = ["msd", "diffusion", "per_cell_diffusion", "velocity_distribution", "velocity_autocorrelation"]
+tau = 10000.0
+cell_radius = 49.0
+fit_frac = 0.3
+
+[analysis]
+pair_by = "cond"
+pair_numerator = "soft"
+pair_denominator = "ctrl"
+group_by = []
+
+[diagnostic]
+output = "palmieri_val_v{seed}.svg"
+
+[[diagnostic.panels]]
+type = "msd_t"
+log_x = true
+log_y = true
+
+[[diagnostic.panels]]
+type = "deff_bar"
+
+[[diagnostic.panels]]
+type = "gvi"
