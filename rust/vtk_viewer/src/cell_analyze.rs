@@ -1,0 +1,1587 @@
+//! Unified analysis CLI for cell simulation trajectory data.
+//!
+//! Usage:
+//!   cell_analyze run    <dir> [-o output.json] [--observables msd,overlap,...]
+//!   cell_analyze study  <config.toml> -d <data_dir> [-o output.json]
+//!   cell_analyze snapshot <file_or_dir> [-o output.png] [--movie] [--skip N] [--fps N]
+//!   cell_analyze list
+#![allow(dead_code)]
+
+mod analysis;
+mod colormap;
+mod vtk;
+
+use analysis::batch::{discover_runs, group_by_key};
+use analysis::io::{load_trajectory, load_trajectory_subsample, unwrap_trajectory};
+use analysis::observables::*;
+use analysis::output::*;
+use analysis::study;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use rayon::prelude::*;
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Instant;
+
+#[derive(Parser)]
+#[command(name = "cell_analyze")]
+#[command(about = "High-performance analysis for cell simulation trajectories")]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Analyze a single simulation run
+    Run {
+        /// Simulation output directory (must contain trajectory.txt)
+        dir: PathBuf,
+        /// Output JSON file (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Comma-separated list of observables (default: all)
+        #[arg(long, value_delimiter = ',')]
+        observables: Option<Vec<String>>,
+        /// Persistence time τ (default: 10000)
+        #[arg(long, default_value_t = 10000.0)]
+        tau: f64,
+        /// Cell radius R for displacement normalization (default: 49)
+        #[arg(long, default_value_t = 49.0)]
+        cell_radius: f64,
+        /// Fraction of MSD used for D_eff fit (default: 0.3)
+        #[arg(long, default_value_t = 0.3)]
+        fit_frac: f64,
+        /// Number of S(q) bins (default: 200)
+        #[arg(long, default_value_t = 200)]
+        sq_bins: usize,
+        /// Number of S(q) frames to average (default: 20)
+        #[arg(long, default_value_t = 20)]
+        sq_frames: usize,
+        /// Keep every Nth frame (default: 1 = all frames)
+        #[arg(long, default_value_t = 1)]
+        subsample: usize,
+    },
+    /// Run a TOML-defined study: discover, analyze, pair, aggregate, plot
+    Study {
+        /// Path to the study TOML config file
+        config: PathBuf,
+        /// Base directory containing simulation data
+        #[arg(long, short = 'd')]
+        data_dir: PathBuf,
+        /// Output JSON file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Directory for plots (default: same as output JSON)
+        #[arg(long)]
+        plot_dir: Option<PathBuf>,
+        /// Dry run: show discovery results without analyzing
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of parallel threads (default: all available)
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Keep every Nth frame (default: 1 = all frames)
+        #[arg(long, default_value_t = 1)]
+        subsample: usize,
+    },
+    /// Render phase field snapshot(s) from checkpoint, VTK file, or directory of VTK frames
+    Snapshot {
+        /// Path to checkpoint.bin, frame_NNNNNN.vtk, or directory containing VTK frames
+        input: PathBuf,
+        /// Output PNG file (single) or directory for frames (directory mode)
+        #[arg(short, long, default_value = "snapshot.png")]
+        output: PathBuf,
+        /// Image width in pixels (default: 800)
+        #[arg(long, default_value_t = 800)]
+        width: u32,
+        /// Label each cell with its ID at the centroid position
+        #[arg(long)]
+        label_cells: bool,
+        /// Movie mode: render all VTK frames in directory, then assemble with ffmpeg
+        #[arg(long)]
+        movie: bool,
+        /// Skip every Nth frame in movie mode (default: 1 = all frames)
+        #[arg(long, default_value_t = 1)]
+        skip: usize,
+        /// Frames per second for movie output (default: 15)
+        #[arg(long, default_value_t = 15)]
+        fps: u32,
+        /// Color cell contours by property: auto, v_a, gamma, cell_id, none (default: auto)
+        /// auto = detects from checkpoint: uses v_a if it varies, gamma if it varies, else cell_id
+        #[arg(long, default_value = "auto")]
+        color_by: String,
+        /// Shade cell interiors by displacement speed (grayscale). Requires trajectory.txt
+        #[arg(long)]
+        shade_speed: bool,
+        /// Speed averaging window in trajectory frames (for --shade-speed, default: 5)
+        #[arg(long, default_value_t = 5)]
+        speed_window: usize,
+    },
+    /// List available observables
+    List,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run {
+            dir,
+            output,
+            observables,
+            tau,
+            cell_radius,
+            fit_frac,
+            sq_bins,
+            sq_frames,
+            subsample,
+        } => {
+            let obs = parse_observables(observables)?;
+            let result = analyze_single_run(
+                &dir,
+                &obs,
+                tau,
+                cell_radius,
+                fit_frac,
+                sq_bins,
+                sq_frames,
+                subsample,
+            )?;
+            write_json(&result, &output)?;
+        }
+        Commands::Study {
+            config,
+            data_dir,
+            output,
+            plot_dir,
+            dry_run,
+            threads,
+            subsample,
+        } => {
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .ok();
+            }
+
+            let toml_str = std::fs::read_to_string(&config)
+                .with_context(|| format!("Reading study config: {}", config.display()))?;
+            let study_config: study::StudyConfig = toml::from_str(&toml_str)
+                .with_context(|| format!("Parsing study config: {}", config.display()))?;
+
+            eprintln!("Study: {}", study_config.study.name);
+            if !study_config.study.description.is_empty() {
+                eprintln!("  {}", study_config.study.description);
+            }
+
+            if dry_run {
+                let discovered = study::discover_study_runs(&data_dir, &study_config.discovery)?;
+                eprintln!("\nDry run: found {} runs", discovered.len());
+                for run in &discovered {
+                    let vars: Vec<String> = run.variables.iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect();
+                    eprintln!("  {} [{}]", run.trajectory.display(), vars.join(", "));
+                }
+                return Ok(());
+            }
+
+            let plot_out = plot_dir
+                .or_else(|| output.as_ref().and_then(|p| p.parent().map(|pp| pp.to_path_buf())))
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            let result = study::run_study(&data_dir, &study_config, &plot_out, subsample)?;
+
+            // Print summary to stderr
+            eprintln!("\n{}", "=".repeat(70));
+            eprintln!("STUDY RESULTS: {}", result.study_name);
+            eprintln!("{}", "=".repeat(70));
+            eprintln!("Runs analyzed: {}", result.n_runs_total);
+            eprintln!("Groups: {}", result.n_groups);
+
+            if !result.paired.is_empty() {
+                eprintln!("\nPaired comparisons:");
+                for pg in &result.paired {
+                    eprintln!("  {} ({}n/{}d):", pg.group_key, pg.numerator.n_seeds, pg.denominator.n_seeds);
+                    for (name, val) in &pg.paired_metrics {
+                        eprintln!("    {}: {:.4} ± {:.4}", name, val.mean, val.stderr);
+                    }
+                }
+            }
+
+            if !result.groups.is_empty() {
+                eprintln!("\nGroups:");
+                for g in &result.groups {
+                    eprintln!("  {} ({} seeds):", g.group_key, g.n_seeds);
+                    for (name, val) in &g.metrics {
+                        eprintln!("    {}: {:.4} ± {:.4}", name, val.mean, val.stderr);
+                    }
+                }
+            }
+
+            write_json(&result, &output)?;
+        }
+        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window } => {
+            let is_dir = input.is_dir();
+            let is_vtk = input.extension().map_or(false, |e| e == "vtk");
+            // Activate per-cell rendering when user wants colored contours or speed shading
+            let use_cell_render = color_by != "none" || shade_speed;
+
+            if is_dir || movie {
+                // Directory mode: render all VTK frames
+                let vtk_dir = if is_dir { input.clone() } else { input.parent().unwrap().to_path_buf() };
+                let mut vtk_files = vtk::find_vtk_frames(&vtk_dir)?;
+                if vtk_files.is_empty() {
+                    anyhow::bail!("No VTK frames found in {}", vtk_dir.display());
+                }
+                vtk_files.sort_by_key(|p| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.strip_prefix("frame_"))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                });
+
+                // Apply skip
+                let selected: Vec<_> = vtk_files.iter().step_by(skip.max(1)).collect();
+                eprintln!("Rendering {} of {} VTK frames (skip={})...", selected.len(), vtk_files.len(), skip);
+
+                // Determine output paths
+                let frames_dir = if is_dir {
+                    output.clone()
+                } else {
+                    output.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+                };
+                std::fs::create_dir_all(&frames_dir)?;
+
+                // Get domain size from first frame for consistent rendering
+                let first_vtk = vtk::parse_vtk(&selected[0])?;
+                let nx = first_vtk.dims.nx;
+                let ny = first_vtk.dims.ny;
+                // Ensure even dimensions for h264
+                let w = (nx / 2) * 2;
+                let h = (ny / 2) * 2;
+
+                // ── Per-cell rendering: preload checkpoint + trajectory ──
+                let movie_ctx = if use_cell_render {
+                    Some(MovieContext::load(&vtk_dir, nx, ny, &selected, speed_window, &color_by, shade_speed)?)
+                } else {
+                    None
+                };
+
+                if movie {
+                    // Direct ffmpeg piping: stream raw RGB frames, no intermediate PNGs
+                    let movie_path = frames_dir.join("movie.mp4");
+                    eprintln!("Piping {} frames directly to ffmpeg at {} fps...", selected.len(), fps);
+                    let ffmpeg_result = std::process::Command::new("ffmpeg")
+                        .args([
+                            "-y",
+                            "-f", "rawvideo",
+                            "-pixel_format", "rgb24",
+                            "-video_size", &format!("{}x{}", w, h),
+                            "-framerate", &fps.to_string(),
+                            "-i", "pipe:0",
+                            "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p",
+                            "-crf", "18",
+                            &movie_path.to_string_lossy(),
+                        ])
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn();
+
+                    match ffmpeg_result {
+                        Ok(mut proc) => {
+                            {
+                                let stdin = proc.stdin.as_mut().unwrap();
+                                let start = std::time::Instant::now();
+                                for (frame_idx, vtk_path) in selected.iter().enumerate() {
+                                    let rgb = if let Some(ref ctx) = movie_ctx {
+                                        ctx.render_frame(vtk_path, frame_idx, label_cells)?
+                                    } else {
+                                        match render_single_vtk(vtk_path, label_cells, None) {
+                                            Ok((data, _nx, _ny, _)) => data,
+                                            Err(e) => { eprintln!("Error rendering {}: {}", vtk_path.display(), e); continue; }
+                                        }
+                                    };
+                                    // Crop to even dimensions if needed
+                                    let frame_data = if w == nx && h == ny {
+                                        rgb
+                                    } else {
+                                        let mut cropped = vec![0u8; w * h * 3];
+                                        for y in 0..h {
+                                            let src_off = y * nx * 3;
+                                            let dst_off = y * w * 3;
+                                            cropped[dst_off..dst_off + w * 3].copy_from_slice(&rgb[src_off..src_off + w * 3]);
+                                        }
+                                        cropped
+                                    };
+                                    if let Err(e) = stdin.write_all(&frame_data) {
+                                        eprintln!("ffmpeg pipe broken at frame {}: {}", frame_idx, e);
+                                        break;
+                                    }
+                                    if (frame_idx + 1) % 50 == 0 || frame_idx + 1 == selected.len() {
+                                        let elapsed = start.elapsed().as_secs_f64();
+                                        let fps_actual = (frame_idx + 1) as f64 / elapsed;
+                                        eprintln!("  {}/{} frames ({:.1} fps)", frame_idx + 1, selected.len(), fps_actual);
+                                    }
+                                }
+                            } // stdin drops here, closing the pipe
+                            let status = proc.wait()?;
+                            if status.success() && movie_path.exists() {
+                                let size = std::fs::metadata(&movie_path).map(|m| m.len()).unwrap_or(0);
+                                eprintln!("Movie saved: {} ({:.1} MB)", movie_path.display(), size as f64 / 1_048_576.0);
+                            } else {
+                                eprintln!("ERROR: ffmpeg failed (exit={})", status);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("ffmpeg not found ({}), falling back to PNG output...", e);
+                            // Fallback: write PNGs then assemble
+                            render_frames_to_png(&selected, &frames_dir, label_cells, movie_ctx.as_ref())?;
+                            assemble_movie_from_png(&frames_dir, fps)?;
+                        }
+                    }
+                } else {
+                    // Non-movie directory mode: just render PNGs
+                    render_frames_to_png(&selected, &frames_dir, label_cells, movie_ctx.as_ref())?;
+                }
+                eprintln!("Done.");
+            } else {
+                // Single file mode (existing behavior)
+                let is_vtk = input.extension().map_or(false, |e| e == "vtk");
+
+                // Centroids for cell labeling: (cell_id, x, y, is_soft)
+                let mut centroids: Vec<(u32, f64, f64, bool)> = Vec::new();
+
+                let (phi, nx, ny, title) = if is_vtk {
+                    // VTK file: parse structured points, extract "phi" field
+                    let vtk_data = vtk::parse_vtk(&input)?;
+                    let phi_field = vtk_data.scalars.get("phi")
+                        .ok_or_else(|| anyhow::anyhow!("No 'phi' field in VTK file. Fields: {:?}", vtk_data.field_names()))?;
+                    let nx = vtk_data.dims.nx;
+                    let ny = vtk_data.dims.ny;
+                    let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let step: i64 = stem.strip_prefix("frame_").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let dt = 0.01;
+                    let time = step as f64 * dt;
+                    let title = format!("VTK frame: step={}, t={:.0} ({:.1}tau), {}x{}",
+                                        step, time, time / 10000.0, nx, ny);
+                    eprintln!("{}", title);
+
+                    if label_cells {
+                        if let Some(parent) = input.parent() {
+                            let traj_path = parent.join("trajectory.txt");
+                            if traj_path.exists() {
+                                centroids = read_centroids_at_time(&traj_path, time);
+                                eprintln!("  Loaded {} cell centroids at t={:.0}", centroids.len(), time);
+                            }
+                        }
+                    }
+
+                    (phi_field.clone(), nx, ny, title)
+                } else {
+                    // Checkpoint file
+                    use analysis::checkpoint::load_checkpoint;
+                    let ckpt = load_checkpoint(&input)?;
+                    let phi = ckpt.composite_phi();
+                    let nx = ckpt.params.nx as usize;
+                    let ny = ckpt.params.ny as usize;
+                    let title = format!("phi field: N={}, t={:.0} ({:.1}tau), {}x{}",
+                                        ckpt.header.num_cells, ckpt.header.time,
+                                        ckpt.header.time / 10000.0, nx, ny);
+
+                    if label_cells {
+                        // Determine which cells are "soft" by comparing per-cell gamma
+                        // to the majority (mode) gamma. Cells with lower gamma are soft.
+                        let gammas = &ckpt.per_cell_gamma;
+                        let mode_gamma = if gammas.len() > 1 {
+                            // Find mode: most common gamma value (1% relative tolerance)
+                            let mut sorted = gammas.clone();
+                            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            let tol = (sorted.last().unwrap_or(&1.0) * 0.01).max(1e-6);
+                            let mut best_val = sorted[0];
+                            let mut best_count = 1usize;
+                            let mut cur_val = sorted[0];
+                            let mut cur_count = 1usize;
+                            for &g in &sorted[1..] {
+                                if (g - cur_val).abs() < tol {
+                                    cur_count += 1;
+                                } else {
+                                    if cur_count > best_count { best_count = cur_count; best_val = cur_val; }
+                                    cur_val = g; cur_count = 1;
+                                }
+                            }
+                            if cur_count > best_count { best_val = cur_val; }
+                            best_val
+                        } else { 1.0 };
+
+                        for (i, cell) in ckpt.cells.iter().enumerate() {
+                            let tol_check = (mode_gamma * 0.01).max(1e-6);
+                            let is_soft = if i < gammas.len() {
+                                (gammas[i] - mode_gamma).abs() > tol_check && gammas[i] < mode_gamma
+                            } else { false };
+                            centroids.push((cell.id as u32, cell.centroid.0 as f64, cell.centroid.1 as f64, is_soft));
+                        }
+                        let n_soft = centroids.iter().filter(|c| c.3).count();
+                        eprintln!("  Loaded {} cell centroids from checkpoint ({} soft)", centroids.len(), n_soft);
+                    }
+
+                    (phi, nx, ny, title)
+                };
+
+                let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells, &centroids);
+
+                let out_path = if output.extension().map_or(true, |e| e != "png") {
+                    output.with_extension("png")
+                } else {
+                    output.clone()
+                };
+                write_png(&out_path, &img_data, nx, ny)?;
+                eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), nx, ny);
+            }
+        }
+        Commands::List => {
+            println!("Available observables:");
+            println!();
+            for name in ALL_OBSERVABLES {
+                let desc = match *name {
+                    "msd" => "Mean squared displacement MSD(Δt)",
+                    "diffusion" => "Effective diffusion coefficient D_eff from MSD slope",
+                    "log_slope" => "MSD log-slope Δ(t) — diffusion exponent",
+                    "cage" => "Cage length l_c from MSD plateau",
+                    "alpha2" => "Non-Gaussian parameter α₂(t)",
+                    "overlap" => "Self-overlap Q(t), four-point susceptibility χ₄(t), τ_α, β",
+                    "structure" => "Static structure factor S(q) + peak q*",
+                    "scattering" => "Self-intermediate scattering function F_s(q*, t)",
+                    "van_hove" => "van Hove self-correlation G_s(Δx, t)",
+                    "per_cell_diffusion" => "Per-cell diffusion coefficient D_i",
+                    "displacement" => "Displacement statistics (Phase 0 quench analysis)",
+                    "va_mobility_correlation" => "Pearson r between inherent v_A and time-averaged speed (σ>0 runs)",
+                    "spatial_correlation" => "Spatial autocorrelation C(r) of mobility + correlation length ξ",
+                    "shape_index" => "Shape index p_eff = L_n × 2√π from trajectory perimeter (vertex model)",
+                    "velocity_autocorrelation" => "Velocity autocorrelation C_v(τ) and correlation time τ_c",
+                    "burst_detection" => "Speed burst events (|v| > μ+3σ), frequency, duration, amplitude",
+                    "velocity_distribution" => "Velocity distribution P(v_x), kurtosis for cell 0 and population",
+                    "polarity_tau" => "Persistence time τ from polarity autocorrelation ⟨p̂(t+Δt)·p̂(t)⟩ = exp(-Δt/τ)",
+                    _ => "",
+                };
+                println!("  {:<22} {}", name, desc);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_observables(input: Option<Vec<String>>) -> Result<Vec<String>> {
+    match input {
+        None => Ok(ALL_OBSERVABLES.iter().map(|s| s.to_string()).collect()),
+        Some(names) => {
+            for name in &names {
+                if !is_valid_observable(name) {
+                    anyhow::bail!(
+                        "Unknown observable '{}'. Run 'cell_analyze list' to see options.",
+                        name
+                    );
+                }
+            }
+            Ok(names)
+        }
+    }
+}
+
+fn analyze_single_run(
+    dir: &PathBuf,
+    observables: &[String],
+    tau: f64,
+    cell_radius: f64,
+    fit_frac: f64,
+    sq_bins: usize,
+    sq_frames: usize,
+    subsample: usize,
+) -> Result<RunResult> {
+    let t0 = Instant::now();
+    let traj_path = dir.join("trajectory.txt");
+    if !traj_path.exists() {
+        anyhow::bail!("No trajectory.txt found in {}", dir.display());
+    }
+
+    let traj = load_trajectory_subsample(&traj_path, subsample)?;
+    let pos = unwrap_trajectory(&traj);
+
+    let has = |name: &str| observables.iter().any(|s| s == name);
+
+    let cell_spacing = (pos.lx * pos.ly / pos.n_cells as f64).sqrt();
+    let cage_radius = cell_spacing * 0.3;
+
+    // Compute requested observables
+    let msd = if has("msd") || has("diffusion") || has("log_slope") || has("cage") {
+        eprintln!("  Computing MSD...");
+        Some(compute_msd(&pos))
+    } else {
+        None
+    };
+
+    let diffusion = if has("diffusion") {
+        msd.as_ref().map(|m| compute_diffusion(m, fit_frac))
+    } else {
+        None
+    };
+
+    let log_slope = if has("log_slope") {
+        msd.as_ref().map(|m| msd_log_slope(m))
+    } else {
+        None
+    };
+
+    let cage = if has("cage") {
+        msd.as_ref().map(|m| cage_length(m, tau))
+    } else {
+        None
+    };
+
+    let alpha2 = if has("alpha2") {
+        eprintln!("  Computing α₂...");
+        Some(non_gaussian_parameter(&pos))
+    } else {
+        None
+    };
+
+    let overlap = if has("overlap") {
+        eprintln!("  Computing Q(t), χ₄...");
+        Some(overlap_and_chi4(&pos, cage_radius))
+    } else {
+        None
+    };
+
+    let structure = if has("structure") || has("scattering") {
+        eprintln!("  Computing S(q)...");
+        Some(structure_factor(&pos, sq_bins, sq_frames))
+    } else {
+        None
+    };
+
+    let scattering = if has("scattering") {
+        let q_star = structure
+            .as_ref()
+            .map_or(0.1, |s| s.q_star);
+        eprintln!("  Computing F_s(q*={:.4}, t)...", q_star);
+        Some(self_intermediate_scattering(&pos, q_star))
+    } else {
+        None
+    };
+
+    let van_hove_result = if has("van_hove") {
+        eprintln!("  Computing van Hove G_s...");
+        Some(van_hove(&pos, tau, 200))
+    } else {
+        None
+    };
+
+    let pcd = if has("per_cell_diffusion") {
+        eprintln!("  Computing per-cell D...");
+        Some(per_cell_diffusion(&pos, fit_frac, tau))
+    } else {
+        None
+    };
+
+    let displacement = if has("displacement") {
+        Some(compute_displacement(&pos, cell_radius))
+    } else {
+        None
+    };
+
+    let va_corr = if has("va_mobility_correlation") {
+        eprintln!("  Computing v_A-mobility correlation...");
+        Some(va_mobility_correlation(&pos))
+    } else {
+        None
+    };
+
+    let spatial_corr = if has("spatial_correlation") {
+        eprintln!("  Computing spatial correlation C(r)...");
+        Some(spatial_correlation(&pos, 40))
+    } else {
+        None
+    };
+
+    let shape_idx = if has("shape_index") {
+        eprintln!("  Computing shape index p_eff from L_n...");
+        Some(shape_index(&traj))
+    } else {
+        None
+    };
+    let vel_autocorr = if has("velocity_autocorrelation") {
+        eprintln!("  Computing velocity autocorrelation C_v(τ)...");
+        Some(velocity_autocorrelation(&pos))
+    } else {
+        None
+    };
+
+    let bursts = if has("burst_detection") {
+        eprintln!("  Detecting speed bursts (3σ threshold)...");
+        Some(detect_bursts(&pos, &traj, 3.0, 1))
+    } else {
+        None
+    };
+
+    let vel_dist = if has("velocity_distribution") {
+        eprintln!("  Computing velocity distribution P(v_x)...");
+        Some(velocity_distribution(&pos, 100))
+    } else {
+        None
+    };
+
+    let pol_tau = if has("polarity_tau") {
+        eprintln!("  Estimating τ from polarity autocorrelation...");
+        Some(polarity_tau(&traj))
+    } else {
+        None
+    };
+    let se = match (&diffusion, &overlap) {
+        (Some(d), Some(o)) => {
+            let val = stokes_einstein(d.d_eff, o.tau_alpha);
+            if val.is_finite() {
+                Some(val)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let extra: BTreeMap<String, String> = traj
+        .params
+        .extra
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "  Done: {} frames, {} cells, {:.1}s",
+        pos.n_times,
+        pos.n_cells,
+        elapsed.as_secs_f64()
+    );
+
+    Ok(RunResult {
+        path: dir.display().to_string(),
+        params: RunParams {
+            v_a: traj.params.v_a,
+            n_cells: traj.params.n_cells,
+            lx: traj.params.lx,
+            ly: traj.params.ly,
+            confluence: traj.params.n_cells as f64 * std::f64::consts::PI * cell_radius * cell_radius / (traj.params.lx * traj.params.ly),
+            extra,
+        },
+        msd: if has("msd") { msd } else { None },
+        diffusion,
+        log_slope,
+        cage,
+        alpha2,
+        overlap,
+        structure: if has("structure") { structure } else { None },
+        scattering,
+        van_hove: van_hove_result,
+        per_cell_diffusion: pcd,
+        displacement,
+        stokes_einstein: se,
+        va_mobility_correlation: va_corr,
+        spatial_correlation: spatial_corr,
+        shape_index: shape_idx,
+        velocity_autocorrelation: vel_autocorr,
+        burst_detection: bursts,
+        velocity_distribution: vel_dist,
+        polarity_tau: pol_tau,
+    })
+}
+
+/// RdYlBu_r colormap approximation: 0=blue, 0.5=yellow, 1=dark red.
+// ============================================================================
+// Cell label rendering for snapshot --label-cells
+// ============================================================================
+
+/// Simple 4x6 bitmap patterns for digits 0-9 (each is 6 rows of 4-bit wide)
+fn digit_bitmap(d: u8) -> [u8; 6] {
+    match d {
+        0 => [0b0110, 0b1001, 0b1001, 0b1001, 0b1001, 0b0110],
+        1 => [0b0010, 0b0110, 0b0010, 0b0010, 0b0010, 0b0111],
+        2 => [0b0110, 0b1001, 0b0010, 0b0100, 0b1000, 0b1111],
+        3 => [0b0110, 0b1001, 0b0010, 0b0001, 0b1001, 0b0110],
+        4 => [0b1001, 0b1001, 0b1111, 0b0001, 0b0001, 0b0001],
+        5 => [0b1111, 0b1000, 0b1110, 0b0001, 0b0001, 0b1110],
+        6 => [0b0110, 0b1000, 0b1110, 0b1001, 0b1001, 0b0110],
+        7 => [0b1111, 0b0001, 0b0010, 0b0100, 0b0100, 0b0100],
+        8 => [0b0110, 0b1001, 0b0110, 0b1001, 0b1001, 0b0110],
+        9 => [0b0110, 0b1001, 0b0111, 0b0001, 0b0001, 0b0110],
+        _ => [0b0000, 0b0000, 0b0000, 0b0000, 0b0000, 0b0000],
+    }
+}
+
+/// Draw a cell ID label at pixel position (cx, cy) on an RGB image buffer.
+/// `highlight` = true for cell 0 (green label), false = white label.
+fn draw_label(img: &mut [u8], w: usize, h: usize, cx: i32, cy: i32, text: &str, highlight: bool) {
+    draw_label_with_spatial(img, w, h, cx, cy, text, "", highlight);
+}
+
+/// Draw cell ID + spatial index label. Spatial index drawn smaller below the ID.
+fn draw_label_with_spatial(img: &mut [u8], w: usize, h: usize, cx: i32, cy: i32,
+                            id_text: &str, spatial_text: &str, highlight: bool) {
+    let scale = 2i32;
+    let small_scale = 1i32;
+    let char_w = 4 * scale + scale;
+    let char_h = 6 * scale;
+    let n_chars = id_text.len() as i32;
+    let total_w = n_chars * char_w - scale;
+
+    let has_spatial = !spatial_text.is_empty();
+    let small_char_w = 4 * small_scale + small_scale;
+    let small_char_h = 6 * small_scale;
+    let small_n = spatial_text.len() as i32;
+    let small_total_w = if has_spatial { small_n * small_char_w - small_scale } else { 0 };
+    let gap = if has_spatial { 2 } else { 0 };
+
+    let pad = scale;
+    let label_w = total_w.max(small_total_w);
+    let label_h = char_h + if has_spatial { gap + small_char_h } else { 0 };
+
+    // Clamp label position so it stays fully inside the image
+    let half_w = label_w / 2 + pad;
+    let half_h = label_h / 2 + pad;
+    let cx = cx.max(half_w).min(w as i32 - 1 - half_w);
+    let cy = cy.max(half_h).min(h as i32 - 1 - half_h);
+
+    // Background rectangle
+    let bg_x0 = cx - label_w / 2 - pad;
+    let bg_y0 = cy - label_h / 2 - pad;
+    let bg_x1 = cx + label_w / 2 + pad;
+    let bg_y1 = cy + label_h / 2 + pad;
+
+    let (bg_r, bg_g, bg_b) = if highlight { (0u8, 80, 0) } else { (0, 0, 0) };
+    let bg_a = 180u8; // slightly transparent effect via blending
+
+    for py in bg_y0..=bg_y1 {
+        for px in bg_x0..=bg_x1 {
+            if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                let idx = (py as usize * w + px as usize) * 3;
+                // Alpha blend
+                let a = bg_a as u16;
+                img[idx]     = ((img[idx] as u16 * (255 - a) + bg_r as u16 * a) / 255) as u8;
+                img[idx + 1] = ((img[idx + 1] as u16 * (255 - a) + bg_g as u16 * a) / 255) as u8;
+                img[idx + 2] = ((img[idx + 2] as u16 * (255 - a) + bg_b as u16 * a) / 255) as u8;
+            }
+        }
+    }
+
+    // Draw cell ID (main text, scale 2)
+    let (fg_r, fg_g, fg_b) = if highlight { (100, 255, 100) } else { (255, 255, 255) };
+    let start_x = cx - total_w / 2;
+    let start_y = cy - label_h / 2;
+
+    draw_text_bitmap(img, w, h, start_x, start_y, id_text, scale, fg_r, fg_g, fg_b);
+
+    // Draw spatial index below (scale 1, dimmer)
+    if has_spatial {
+        let (sr, sg, sb) = if highlight { (80, 200, 80) } else { (180, 180, 180) };
+        let small_start_x = cx - small_total_w / 2;
+        let small_start_y = start_y + char_h + gap;
+        draw_text_bitmap(img, w, h, small_start_x, small_start_y, spatial_text, small_scale, sr, sg, sb);
+    }
+}
+
+/// Render bitmap text at (x, y) with given scale and color.
+fn draw_text_bitmap(img: &mut [u8], w: usize, h: usize, x: i32, y: i32,
+                    text: &str, scale: i32, r: u8, g: u8, b: u8) {
+    let char_w = 4 * scale + scale;
+    for (ci, ch) in text.chars().enumerate() {
+        if let Some(d) = ch.to_digit(10) {
+            let bitmap = digit_bitmap(d as u8);
+            let ox = x + ci as i32 * char_w;
+            for row in 0..6 {
+                for col in 0..4 {
+                    if bitmap[row] & (0b1000 >> col) != 0 {
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                let px = ox + col as i32 * scale + sx;
+                                let py = y + row as i32 * scale + sy;
+                                if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                                    let idx = (py as usize * w + px as usize) * 3;
+                                    img[idx] = r;
+                                    img[idx + 1] = g;
+                                    img[idx + 2] = b;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read cell centroids from trajectory.txt at the closest time to `target_time`.
+fn read_centroids_at_time(traj_path: &std::path::Path, target_time: f64) -> Vec<(u32, f64, f64, bool)> {
+    use std::io::BufRead;
+    let file = match std::fs::File::open(traj_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = std::io::BufReader::new(file);
+
+    let mut best_time = -1.0f64;
+    let mut best_cells: Vec<(u32, f64, f64, bool)> = Vec::new();
+    let mut current_cells: Vec<(u32, f64, f64, bool)> = Vec::new();
+    let mut current_time = -1.0f64;
+
+    for line in reader.lines() {
+        let line = match line { Ok(l) => l, Err(_) => continue };
+        if line.starts_with('#') || line.is_empty() { continue; }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 { continue; }
+        let t: f64 = match parts[0].parse() { Ok(v) => v, Err(_) => continue };
+        let cid: u32 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
+        let x: f64 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
+        let y: f64 = match parts[3].parse() { Ok(v) => v, Err(_) => continue };
+
+        if (t - current_time).abs() > 0.01 {
+            // New time point — check if previous was better
+            if !current_cells.is_empty() {
+                if best_time < 0.0 || (current_time - target_time).abs() < (best_time - target_time).abs() {
+                    best_time = current_time;
+                    best_cells = current_cells.clone();
+                }
+                // If we've passed the target, stop
+                if current_time > target_time + 1000.0 { break; }
+            }
+            current_cells.clear();
+            current_time = t;
+        }
+        if x.is_finite() && y.is_finite() {
+            current_cells.push((cid, x, y, false));  // no gamma info from trajectory
+        }
+    }
+    // Check last batch
+    if !current_cells.is_empty() {
+        if best_time < 0.0 || (current_time - target_time).abs() < (best_time - target_time).abs() {
+            best_cells = current_cells;
+        }
+    }
+    best_cells
+}
+
+/// Load centroids for a VTK frame, enriching with soft-cell info from checkpoint if available.
+fn load_centroids_for_vtk(vtk_path: &std::path::Path, time: f64) -> Vec<(u32, f64, f64, bool)> {
+    let parent = match vtk_path.parent() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let traj_path = parent.join("trajectory.txt");
+    if !traj_path.exists() { return Vec::new(); }
+
+    let mut centroids = read_centroids_at_time(&traj_path, time);
+    if centroids.is_empty() { return centroids; }
+
+    // Try to load checkpoint.bin in the same directory for gamma-based soft detection
+    let ckpt_path = parent.join("checkpoint.bin");
+    if ckpt_path.exists() {
+        if let Ok(ckpt) = analysis::checkpoint::load_checkpoint(&ckpt_path) {
+            let gammas = &ckpt.per_cell_gamma;
+            if gammas.len() > 1 {
+                // Find mode gamma (most common value, 1% relative tolerance)
+                let mut sorted = gammas.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mut best_val = sorted[0];
+                let mut best_count = 1usize;
+                let mut cur_val = sorted[0];
+                let mut cur_count = 1usize;
+                let tol = (sorted.last().unwrap_or(&1.0) * 0.01).max(1e-6);
+                for &g in &sorted[1..] {
+                    if (g - cur_val).abs() < tol {
+                        cur_count += 1;
+                    } else {
+                        if cur_count > best_count { best_count = cur_count; best_val = cur_val; }
+                        cur_val = g; cur_count = 1;
+                    }
+                }
+                if cur_count > best_count { best_val = cur_val; }
+                // Mark soft cells
+                for c in &mut centroids {
+                    let cid = c.0 as usize;
+                    if cid < gammas.len() {
+                        c.3 = (gammas[cid] - best_val).abs() > tol && gammas[cid] < best_val;
+                    }
+                }
+            }
+        }
+    }
+    centroids
+}
+
+// ── Rendering helpers ───────────────────────────────────────────────────
+
+/// Render a single VTK file to RGB pixel data.
+fn render_single_vtk(
+    vtk_path: &std::path::Path,
+    label_cells: bool,
+    centroids: Option<&[(u32, f64, f64, bool)]>,
+) -> Result<(Vec<u8>, usize, usize, String)> {
+    let vtk_data = vtk::parse_vtk(vtk_path)?;
+    let phi_field = vtk_data.scalars.get("phi")
+        .ok_or_else(|| anyhow::anyhow!("No 'phi' field in VTK file"))?;
+    let nx = vtk_data.dims.nx;
+    let ny = vtk_data.dims.ny;
+    let stem = vtk_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let step: i64 = stem.strip_prefix("frame_").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let time = step as f64 * 0.01;
+    let title = format!("step={}, t={:.0} ({:.1}τ)", step, time, time / 10000.0);
+
+    if label_cells {
+        // Use provided centroids, or try to load from trajectory/checkpoint
+        let owned_centroids;
+        let cents = if let Some(c) = centroids {
+            c
+        } else {
+            owned_centroids = load_centroids_for_vtk(vtk_path, time);
+            &owned_centroids
+        };
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents);
+        Ok((img_data, nx, ny, title))
+    } else {
+        let empty_centroids = Vec::new();
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids);
+        Ok((img_data, nx, ny, title))
+    }
+}
+
+/// Convert phi field to RGB image data.
+fn render_phi_to_rgb(
+    phi: &[f32], nx: usize, ny: usize,
+    label_cells: bool, centroids: &[(u32, f64, f64, bool)],
+) -> (Vec<u8>, usize, usize) {
+    let mut img_data = vec![0u8; nx * ny * 3];
+    for y in 0..ny {
+        for x in 0..nx {
+            let val = phi[y * nx + x] as f64;
+            let (r, g, b) = phi_colormap(val.clamp(0.0, 1.0));
+            let iy = ny - 1 - y;
+            let idx = (iy * nx + x) * 3;
+            img_data[idx] = r;
+            img_data[idx + 1] = g;
+            img_data[idx + 2] = b;
+        }
+    }
+
+    if label_cells && !centroids.is_empty() {
+        // Build is_soft lookup from centroids
+        let soft_map: std::collections::HashMap<u32, bool> = centroids.iter()
+            .map(|&(cid, _, _, is_soft)| (cid, is_soft))
+            .collect();
+        let mut wrapped: Vec<(u32, f64, f64)> = centroids.iter()
+            .map(|&(cid, cx, cy, _)| {
+                let wx = ((cx % nx as f64) + nx as f64) % nx as f64;
+                let wy = ((cy % ny as f64) + ny as f64) % ny as f64;
+                (cid, wx, wy)
+            }).collect();
+        let r_band = 80.0;
+        wrapped.sort_by(|a, b| {
+            let row_a = (a.2 / r_band) as i32;
+            let row_b = (b.2 / r_band) as i32;
+            row_b.cmp(&row_a).then(a.1.partial_cmp(&b.1).unwrap())
+        });
+        let spatial_map: std::collections::HashMap<u32, usize> = wrapped.iter()
+            .enumerate()
+            .map(|(i, &(cid, _, _))| (cid, i + 1))
+            .collect();
+        for &(cid, wx, wy) in &wrapped {
+            let ix = wx as i32;
+            let iy = (ny as i32 - 1) - wy as i32;
+            let spatial_idx = spatial_map[&cid];
+            let highlight = soft_map.get(&cid).copied().unwrap_or(false);
+            draw_label_with_spatial(&mut img_data, nx, ny, ix, iy,
+                &format!("{}", cid), &format!("{}", spatial_idx), highlight);
+        }
+    }
+
+    (img_data, nx, ny)
+}
+
+/// Write RGB image data to a PNG file.
+fn write_png(path: &std::path::Path, img_data: &[u8], nx: usize, ny: usize) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    let w = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, nx as u32, ny as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(img_data)?;
+    Ok(())
+}
+
+fn phi_colormap(val: f64) -> (u8, u8, u8) {
+    if val < 0.01 {
+        return (49, 54, 149); // deep blue for background
+    }
+    // Simplified 5-stop RdYlBu_r
+    let stops: [(f64, f64, f64); 5] = [
+        (0.192, 0.212, 0.584),  // 0.0: blue
+        (0.557, 0.769, 0.867),  // 0.25: light blue
+        (1.000, 1.000, 0.749),  // 0.5: yellow
+        (0.957, 0.427, 0.263),  // 0.75: orange
+        (0.647, 0.059, 0.082),  // 1.0: dark red
+    ];
+    let t = val.clamp(0.0, 1.0) * 4.0;
+    let i = (t as usize).min(3);
+    let frac = t - i as f64;
+    let (r0, g0, b0) = stops[i];
+    let (r1, g1, b1) = stops[i + 1];
+    let r = r0 + (r1 - r0) * frac;
+    let g = g0 + (g1 - g0) * frac;
+    let b = b0 + (b1 - b0) * frac;
+    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+fn write_json<T: serde::Serialize>(data: &T, output: &Option<PathBuf>) -> Result<()> {
+    let json = serde_json::to_string_pretty(data)?;
+    match output {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, &json).context("Writing output file")?;
+            eprintln!("Output written to {}", path.display());
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            handle.write_all(json.as_bytes())?;
+            handle.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Per-cell movie rendering: contour coloring + speed shading
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Which property colors cell contours.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColorBy { VA, Gamma, CellId, None }
+
+/// Pre-loaded context for per-cell movie rendering.
+struct MovieContext {
+    color_by: ColorBy,
+    /// Per-cell property values for contour coloring (v_A or gamma, indexed by cell_id)
+    per_cell_color: Vec<f32>,
+    color_min: f32,
+    color_range: f32,
+    shade_speed: bool,
+    traj: Vec<(f32, std::collections::HashMap<u32, [f32; 2]>)>, // (time, cell_id -> [x, y])
+    intervals: Vec<DisplacementInterval>,
+    speed_max: f32,
+    speed_window: usize,
+    nx: usize,
+    ny: usize,
+    boundary_dilations: usize,
+}
+
+struct DisplacementInterval {
+    time: f32,
+    displacements: std::collections::HashMap<u32, f32>,
+}
+
+impl MovieContext {
+    fn load(vtk_dir: &std::path::Path, nx: usize, ny: usize, _selected: &[&PathBuf],
+            speed_window: usize, color_by_str: &str, shade_speed: bool) -> Result<Self> {
+        // Load checkpoint for per-cell properties
+        let ckpt_path = vtk_dir.join("checkpoint.bin");
+        let ckpt = if ckpt_path.exists() {
+            Some(analysis::checkpoint::load_checkpoint(&ckpt_path)?)
+        } else {
+            None
+        };
+
+        // Determine what to color by
+        let (color_by, per_cell_color) = match color_by_str {
+            "v_a" | "va" => {
+                let vals = ckpt.as_ref().map(|c| c.per_cell_v_a.clone()).unwrap_or_default();
+                if vals.is_empty() { anyhow::bail!("--color-by v_a requires checkpoint with per-cell v_A"); }
+                (ColorBy::VA, vals)
+            }
+            "gamma" => {
+                let vals = ckpt.as_ref().map(|c| c.per_cell_gamma.clone()).unwrap_or_default();
+                if vals.is_empty() { anyhow::bail!("--color-by gamma requires checkpoint with per-cell gamma"); }
+                (ColorBy::Gamma, vals)
+            }
+            "cell_id" => {
+                let n = ckpt.as_ref().map(|c| c.header.num_cells as usize).unwrap_or(0);
+                let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
+                (ColorBy::CellId, vals)
+            }
+            "none" => (ColorBy::None, Vec::new()),
+            "auto" | _ => {
+                // Auto-detect: check if per-cell v_A varies, then gamma, else cell_id
+                if let Some(ref c) = ckpt {
+                    let va = &c.per_cell_v_a;
+                    let gamma = &c.per_cell_gamma;
+                    if va.len() > 1 {
+                        let va_min = va.iter().copied().fold(f32::MAX, f32::min);
+                        let va_max = va.iter().copied().fold(f32::MIN, f32::max);
+                        if (va_max - va_min) > va_min * 0.01 {
+                            eprintln!("  Auto-detected: coloring contours by v_A (range [{:.4}, {:.4}])", va_min, va_max);
+                            (ColorBy::VA, va.clone())
+                        } else if gamma.len() > 1 {
+                            let g_min = gamma.iter().copied().fold(f32::MAX, f32::min);
+                            let g_max = gamma.iter().copied().fold(f32::MIN, f32::max);
+                            if (g_max - g_min) > g_min * 0.01 {
+                                eprintln!("  Auto-detected: coloring contours by gamma (range [{:.4}, {:.4}])", g_min, g_max);
+                                (ColorBy::Gamma, gamma.clone())
+                            } else {
+                                eprintln!("  Uniform v_A and gamma: coloring contours by cell_id");
+                                let n = c.header.num_cells as usize;
+                                (ColorBy::CellId, (0..n).map(|i| i as f32).collect())
+                            }
+                        } else {
+                            eprintln!("  No per-cell gamma: coloring contours by cell_id");
+                            let n = c.header.num_cells as usize;
+                            (ColorBy::CellId, (0..n).map(|i| i as f32).collect())
+                        }
+                    } else if gamma.len() > 1 {
+                        let g_min = gamma.iter().copied().fold(f32::MAX, f32::min);
+                        let g_max = gamma.iter().copied().fold(f32::MIN, f32::max);
+                        if (g_max - g_min) > g_min * 0.01 {
+                            eprintln!("  Auto-detected: coloring contours by gamma (range [{:.4}, {:.4}])", g_min, g_max);
+                            (ColorBy::Gamma, gamma.clone())
+                        } else {
+                            let n = c.header.num_cells as usize;
+                            (ColorBy::CellId, (0..n).map(|i| i as f32).collect())
+                        }
+                    } else {
+                        let n = c.header.num_cells as usize;
+                        (ColorBy::CellId, (0..n).map(|i| i as f32).collect())
+                    }
+                } else {
+                    eprintln!("  No checkpoint: coloring disabled");
+                    (ColorBy::None, Vec::new())
+                }
+            }
+        };
+
+        let color_min = per_cell_color.iter().copied().fold(f32::MAX, f32::min);
+        let color_max = per_cell_color.iter().copied().fold(f32::MIN, f32::max);
+        let color_range = color_max - color_min;
+        if color_by != ColorBy::None {
+            eprintln!("  Contour color: {:?}, range [{:.4}, {:.4}]", color_by, color_min, color_max);
+        }
+
+        // Load trajectory for centroids and speed computation
+        let traj_path = vtk_dir.join("trajectory.txt");
+        let traj = if traj_path.exists() {
+            Self::load_traj_positions(&traj_path)?
+        } else if shade_speed {
+            anyhow::bail!("--shade-speed requires trajectory.txt for displacement computation");
+        } else {
+            Vec::new()
+        };
+        if !traj.is_empty() {
+            eprintln!("  Trajectory: {} time samples", traj.len());
+        }
+
+        // Compute displacement intervals (only if shade_speed is on)
+        let mut intervals = Vec::new();
+        let mut speed_max_val = 1e-6f32;
+        if shade_speed && traj.len() > 1 {
+            let hlx = nx as f32 / 2.0;
+        let hly = ny as f32 / 2.0;
+        let lx = nx as f32;
+        let ly = ny as f32;
+        let mut intervals = Vec::with_capacity(traj.len());
+        for i in 1..traj.len() {
+            let (t_now, cells_now) = &traj[i];
+            let (t_prev, cells_prev) = &traj[i - 1];
+            let dt = t_now - t_prev;
+            if dt <= 0.0 { continue; }
+            let mut dr_map = std::collections::HashMap::new();
+            for (&cid, pos) in cells_now {
+                if let Some(prev) = cells_prev.get(&cid) {
+                    let mut dx = pos[0] - prev[0];
+                    let mut dy = pos[1] - prev[1];
+                    if dx > hlx { dx -= lx; } if dx < -hlx { dx += lx; }
+                    if dy > hly { dy -= ly; } if dy < -hly { dy += ly; }
+                    dr_map.insert(cid, (dx * dx + dy * dy).sqrt());
+                }
+            }
+            intervals.push(DisplacementInterval { time: *t_now, displacements: dr_map });
+        }
+
+        // Fixed global speed normalization: scan trajectory for P95
+            speed_max_val = {
+                let mut all_speeds: Vec<f32> = Vec::new();
+                let n_samples = 50.min(intervals.len());
+                let sample_step = intervals.len().max(1) / n_samples.max(1);
+                for si in (0..intervals.len()).step_by(sample_step.max(1)) {
+                    let t = intervals[si].time;
+                    let speeds = Self::path_avg_speed_static(&intervals, t, speed_window);
+                    all_speeds.extend(speeds.values());
+                }
+                if all_speeds.is_empty() {
+                    1e-6
+                } else {
+                    all_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let p95 = all_speeds[(all_speeds.len() as f32 * 0.95) as usize];
+                    p95.max(1e-6)
+                }
+            };
+            eprintln!("  Speed scale (P95): {:.6}", speed_max_val);
+        }
+
+        let cell_radius = ckpt.as_ref().map(|c| c.params.target_radius as f32).unwrap_or(49.0);
+        let boundary_dilations = ((cell_radius / 25.0).round() as usize).max(1);
+
+        Ok(Self { color_by, per_cell_color, color_min, color_range, shade_speed,
+                  traj, intervals, speed_max: speed_max_val, speed_window, nx, ny, boundary_dilations })
+    }
+
+    fn load_traj_positions(path: &std::path::Path) -> Result<Vec<(f32, std::collections::HashMap<u32, [f32; 2]>)>> {
+        let file = std::fs::File::open(path).context("Opening trajectory.txt")?;
+        let reader = std::io::BufReader::new(file);
+        let mut by_time: std::collections::HashMap<i64, std::collections::HashMap<u32, [f32; 2]>> = std::collections::HashMap::new();
+        let mut time_order: Vec<(i64, f32)> = Vec::new();
+        for line in std::io::BufRead::lines(reader) {
+            let line = line?;
+            if line.starts_with('#') || line.is_empty() { continue; }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 { continue; }
+            let t: f32 = parts[0].parse().unwrap_or(0.0);
+            let cid: u32 = parts[1].parse().unwrap_or(0);
+            let x: f32 = parts[2].parse().unwrap_or(0.0);
+            let y: f32 = parts[3].parse().unwrap_or(0.0);
+            let key = (t * 100.0) as i64;
+            let frame = by_time.entry(key).or_insert_with(|| { time_order.push((key, t)); std::collections::HashMap::new() });
+            frame.insert(cid, [x, y]);
+        }
+        time_order.sort_by_key(|&(k, _)| k);
+        Ok(time_order.into_iter().map(|(k, t)| (t, by_time.remove(&k).unwrap())).collect())
+    }
+
+    fn path_avg_speed_static(intervals: &[DisplacementInterval], frame_time: f32, window: usize) -> std::collections::HashMap<u32, f32> {
+        if intervals.is_empty() { return std::collections::HashMap::new(); }
+        let center = intervals.iter().enumerate()
+            .min_by(|(_, a), (_, b)| (a.time - frame_time).abs().partial_cmp(&(b.time - frame_time).abs()).unwrap())
+            .map(|(i, _)| i).unwrap_or(0);
+        let half = window / 2;
+        let lo = center.saturating_sub(half);
+        let hi = (lo + window).min(intervals.len());
+        let lo = hi.saturating_sub(window);
+        let mut path_len: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+        let mut total_dt: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+        for idx in lo..hi {
+            let iv = &intervals[idx];
+            for (&cid, &dr) in &iv.displacements {
+                *path_len.entry(cid).or_insert(0.0) += dr;
+                *total_dt.entry(cid).or_insert(0.0) += 1.0; // count frames
+            }
+        }
+        path_len.into_iter().map(|(cid, pl)| {
+            let dt = total_dt.get(&cid).copied().unwrap_or(1.0);
+            (cid, if dt > 0.0 { pl / dt } else { 0.0 })
+        }).collect()
+    }
+
+    fn render_frame(&self, vtk_path: &std::path::Path, _frame_idx: usize, label_cells: bool) -> Result<Vec<u8>> {
+        let vtk_data = vtk::parse_vtk(vtk_path)?;
+        let phi = vtk_data.scalars.get("phi")
+            .ok_or_else(|| anyhow::anyhow!("No phi field in {:?}", vtk_path))?;
+        let nx = self.nx;
+        let ny = self.ny;
+
+        // Get frame time from filename
+        let stem = vtk_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let step: u64 = stem.strip_prefix("frame_").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let frame_time = step as f32 * 0.01; // dt=0.01
+
+        // Find closest trajectory frame
+        let traj_times: Vec<f32> = self.traj.iter().map(|t| t.0).collect();
+        let closest_idx = traj_times.iter().enumerate()
+            .min_by(|(_, a), (_, b)| ((**a) - frame_time).abs().partial_cmp(&((**b) - frame_time).abs()).unwrap())
+            .map(|(i, _)| i).unwrap_or(0);
+        let centroids = &self.traj[closest_idx].1;
+        let cell_speeds = if self.shade_speed {
+            Self::path_avg_speed_static(&self.intervals, frame_time, self.speed_window)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Compute gradient magnitude
+        let grad_mag: Vec<f32> = (0..ny).flat_map(|y| {
+            (0..nx).map(move |x| {
+                let idx = y * nx + x;
+                let xp = if x + 1 < nx { phi[idx + 1] } else { phi[y * nx] };
+                let xm = if x > 0 { phi[idx - 1] } else { phi[y * nx + nx - 1] };
+                let yp = if y + 1 < ny { phi[(y + 1) * nx + x] } else { phi[x] };
+                let ym = if y > 0 { phi[(y - 1) * nx + x] } else { phi[(ny - 1) * nx + x] };
+                let gx = (xp - xm) * 0.5;
+                let gy = (yp - ym) * 0.5;
+                (gx * gx + gy * gy).sqrt()
+            })
+        }).collect();
+
+        // Watershed segmentation
+        let labels = watershed(phi, &grad_mag, nx, ny, centroids);
+
+        // Cell mask and erosion for boundary ring
+        let cell_mask: Vec<bool> = phi.iter().map(|&p| p > 0.5).collect();
+        let mut interior = cell_mask.clone();
+        for _ in 0..self.boundary_dilations {
+            interior = erode_mask(&interior, nx, ny);
+        }
+
+        // Render pixels
+        let mut rgb = vec![0u8; nx * ny * 3];
+        for y in 0..ny {
+            let iy = ny - 1 - y; // flip Y
+            for x in 0..nx {
+                let idx = y * nx + x;
+                let dst = (iy * nx + x) * 3;
+
+                if !cell_mask[idx] {
+                    if self.color_by == ColorBy::None {
+                        // When color_by=none, show phi heatmap for background too
+                        let val = phi[idx].clamp(0.0, 1.0) as f64;
+                        let (r, g, b) = phi_colormap(val);
+                        rgb[dst] = r; rgb[dst + 1] = g; rgb[dst + 2] = b;
+                    } else {
+                        rgb[dst] = 31; rgb[dst + 1] = 31; rgb[dst + 2] = 38;
+                    }
+                    continue;
+                }
+
+                let label = labels[idx];
+                if interior[idx] && label >= 0 {
+                    // Interior
+                    let cid = label as u32;
+                    if self.shade_speed {
+                        let speed = cell_speeds.get(&cid).copied().unwrap_or(0.0);
+                        let intensity = (speed / self.speed_max).clamp(0.08, 1.0);
+                        let brightness = (intensity * phi[idx].clamp(0.0, 1.0) * 255.0) as u8;
+                        rgb[dst] = brightness; rgb[dst + 1] = brightness; rgb[dst + 2] = brightness;
+                    } else {
+                        // Default interior: muted phi heatmap
+                        let val = phi[idx].clamp(0.0, 1.0) as f64;
+                        let (r, g, b) = phi_colormap(val);
+                        rgb[dst] = (r as f32 * 0.7) as u8;
+                        rgb[dst + 1] = (g as f32 * 0.7) as u8;
+                        rgb[dst + 2] = (b as f32 * 0.7) as u8;
+                    }
+                } else if label >= 0 {
+                    // Boundary ring: color by selected property
+                    let cid = label as u32;
+                    let (r, g, b) = match self.color_by {
+                        ColorBy::VA | ColorBy::Gamma => {
+                            let val = if (cid as usize) < self.per_cell_color.len() { self.per_cell_color[cid as usize] } else { 0.0 };
+                            let t = if self.color_range > 0.0 { ((val - self.color_min) / self.color_range).clamp(0.0, 1.0) } else { 0.5 };
+                            coolwarm(t as f64)
+                        }
+                        ColorBy::CellId => {
+                            // Distinct colors via golden-ratio hue rotation
+                            let hue = (cid as f64 * 0.618033988749895) % 1.0;
+                            hsv_to_rgb(hue, 0.7, 0.9)
+                        }
+                        ColorBy::None => {
+                            let val = phi[idx].clamp(0.0, 1.0) as f64;
+                            phi_colormap(val)
+                        }
+                    };
+                    rgb[dst] = r; rgb[dst + 1] = g; rgb[dst + 2] = b;
+                } else {
+                    rgb[dst] = 31; rgb[dst + 1] = 31; rgb[dst + 2] = 38;
+                }
+            }
+        }
+
+        // Overlay cell labels if requested
+        if label_cells && !centroids.is_empty() {
+            // Build centroids vec with is_soft from per_cell_color (gamma mode)
+            let mut cent_vec: Vec<(u32, f64, f64, bool)> = Vec::new();
+            for (&cid, pos) in centroids {
+                let is_soft = if self.color_by == ColorBy::Gamma && (cid as usize) < self.per_cell_color.len() {
+                    // Same logic as checkpoint soft detection: compare to mode
+                    let val = self.per_cell_color[cid as usize];
+                    val < self.color_min + self.color_range * 0.5 && self.color_range > 0.0
+                } else {
+                    false
+                };
+                cent_vec.push((cid, pos[0] as f64, pos[1] as f64, is_soft));
+            }
+            // Wrap coordinates and draw labels using existing infrastructure
+            let mut wrapped: Vec<(u32, i32, i32, bool)> = cent_vec.iter().map(|&(cid, cx, cy, soft)| {
+                let wx = ((cx as i32 % nx as i32) + nx as i32) % nx as i32;
+                let wy = ny as i32 - 1 - ((cy as i32 % ny as i32) + ny as i32) % ny as i32; // flip Y
+                (cid, wx, wy, soft)
+            }).collect();
+            // Sort spatially for spatial index
+            wrapped.sort_by(|a, b| {
+                let row_a = a.2 / 80; let row_b = b.2 / 80;
+                row_a.cmp(&row_b).then(a.1.cmp(&b.1))
+            });
+            let spatial_map: std::collections::HashMap<u32, usize> = wrapped.iter().enumerate()
+                .map(|(i, &(cid, _, _, _))| (cid, i + 1)).collect();
+            for &(cid, wx, wy, soft) in &wrapped {
+                let sp = spatial_map.get(&cid).copied().unwrap_or(0);
+                draw_label_with_spatial(&mut rgb, nx, ny, wx, wy,
+                    &cid.to_string(), &sp.to_string(), soft);
+            }
+        }
+
+        Ok(rgb)
+    }
+}
+
+/// Coolwarm colormap: blue (low) → white (mid) → red (high)
+fn coolwarm(t: f64) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let (r, g, b) = if t < 0.5 {
+        let s = t * 2.0;
+        (59.0 + s * 196.0, 76.0 + s * 179.0, 192.0 + s * 63.0)
+    } else {
+        let s = (t - 0.5) * 2.0;
+        (255.0, 255.0 - s * 190.0, 255.0 - s * 205.0)
+    };
+    (r as u8, g as u8, b as u8)
+}
+
+/// HSV to RGB conversion for per-cell_id coloring.
+fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
+    let h = (h % 1.0) * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x),
+        3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
+    };
+    (((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8)
+}
+
+/// Watershed segmentation: flood-fill from centroids through low-gradient regions.
+fn watershed(phi: &[f32], grad_mag: &[f32], nx: usize, ny: usize,
+             centroids: &std::collections::HashMap<u32, [f32; 2]>) -> Vec<i32> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    #[derive(Copy, Clone)]
+    struct Pixel { cost: f32, idx: usize, cell_id: i32 }
+    impl PartialEq for Pixel { fn eq(&self, o: &Self) -> bool { self.idx == o.idx } }
+    impl Eq for Pixel {}
+    impl PartialOrd for Pixel { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+    impl Ord for Pixel { fn cmp(&self, o: &Self) -> Ordering { o.cost.partial_cmp(&self.cost).unwrap_or(Ordering::Equal) } }
+
+    let mut labels = vec![-1i32; nx * ny];
+    let mut heap = BinaryHeap::new();
+
+    for (&cid, pos) in centroids {
+        let cx = ((pos[0] as isize % nx as isize) + nx as isize) as usize % nx;
+        let cy = ((pos[1] as isize % ny as isize) + ny as isize) as usize % ny;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let sx = ((cx as i32 + dx) as usize) % nx;
+                let sy = ((cy as i32 + dy) as usize) % ny;
+                let idx = sy * nx + sx;
+                if labels[idx] < 0 {
+                    labels[idx] = cid as i32;
+                    heap.push(Pixel { cost: grad_mag[idx], idx, cell_id: cid as i32 });
+                }
+            }
+        }
+    }
+
+    while let Some(px) = heap.pop() {
+        if labels[px.idx] != px.cell_id { continue; }
+        let x = px.idx % nx;
+        let y = px.idx / nx;
+        let neighbors = [
+            (if x + 1 < nx { x + 1 } else { 0 }, y),
+            (if x > 0 { x - 1 } else { nx - 1 }, y),
+            (x, if y + 1 < ny { y + 1 } else { 0 }),
+            (x, if y > 0 { y - 1 } else { ny - 1 }),
+        ];
+        for (nx2, ny2) in neighbors {
+            let nidx = ny2 * nx + nx2;
+            if labels[nidx] >= 0 { continue; }
+            if phi[nidx] < 0.1 { continue; }
+            labels[nidx] = px.cell_id;
+            heap.push(Pixel { cost: grad_mag[nidx], idx: nidx, cell_id: px.cell_id });
+        }
+    }
+    labels
+}
+
+/// Erode a boolean mask by 1 pixel (4-connected, periodic).
+fn erode_mask(src: &[bool], nx: usize, ny: usize) -> Vec<bool> {
+    (0..ny).flat_map(|y| {
+        (0..nx).map(move |x| {
+            let idx = y * nx + x;
+            if !src[idx] { return false; }
+            let r = if x + 1 < nx { src[idx + 1] } else { src[y * nx] };
+            let l = if x > 0 { src[idx - 1] } else { src[y * nx + nx - 1] };
+            let u = if y + 1 < ny { src[(y + 1) * nx + x] } else { src[x] };
+            let d = if y > 0 { src[(y - 1) * nx + x] } else { src[(ny - 1) * nx + x] };
+            r && l && u && d
+        })
+    }).collect()
+}
+
+/// Render frames to PNGs (fallback when ffmpeg piping fails).
+fn render_frames_to_png(selected: &[&PathBuf], frames_dir: &std::path::Path,
+                        label_cells: bool, movie_ctx: Option<&MovieContext>) -> Result<()> {
+    selected.par_iter().enumerate().for_each(|(idx, vtk_path)| {
+        let result = if let Some(ctx) = movie_ctx {
+            ctx.render_frame(vtk_path, idx, label_cells).map(|rgb| (rgb, ctx.nx, ctx.ny))
+        } else {
+            render_single_vtk(vtk_path, label_cells, None).map(|(data, nx, ny, _)| (data, nx, ny))
+        };
+        match result {
+            Ok((img_data, nx, ny)) => {
+                let frame_path = frames_dir.join(format!("frame_{:06}.png", idx));
+                if let Err(e) = write_png(&frame_path, &img_data, nx, ny) {
+                    eprintln!("Error writing {}: {}", frame_path.display(), e);
+                }
+            }
+            Err(e) => eprintln!("Error rendering {}: {}", vtk_path.display(), e),
+        }
+    });
+    eprintln!("Rendered {} frames to {}", selected.len(), frames_dir.display());
+    Ok(())
+}
+
+/// Assemble movie from PNG frames using ffmpeg.
+fn assemble_movie_from_png(frames_dir: &std::path::Path, fps: u32) -> Result<()> {
+    let movie_path = frames_dir.join("movie.mp4");
+    let ffmpeg_input = frames_dir.join("frame_%06d.png");
+    eprintln!("Assembling movie from PNGs at {} fps...", fps);
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-framerate", &fps.to_string(),
+            "-i", &ffmpeg_input.to_string_lossy(),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+            &movie_path.to_string_lossy().to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()?;
+    if status.success() && movie_path.exists() {
+        let size = std::fs::metadata(&movie_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("Movie saved: {} ({:.1} MB)", movie_path.display(), size as f64 / 1_048_576.0);
+    } else {
+        eprintln!("ERROR: ffmpeg failed (exit={})", status);
+    }
+    Ok(())
+}
