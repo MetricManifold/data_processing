@@ -1,5 +1,5 @@
 ---
-applyTo: "rust/vtk_viewer/src/analysis/**,rust/vtk_viewer/src/cell_analyze.rs,fss_quick.py,fss_aggregate.py"
+applyTo: "rust/vtk_viewer/src/analysis/**,rust/vtk_viewer/src/cell_analyze.rs"
 ---
 
 # Rust cell_analyze CLI Tool — Copilot Instructions
@@ -47,17 +47,21 @@ cargo build --release --bin cell_analyze
 Binary appears at: `rust/vtk_viewer/target/release/cell_analyze.exe` (Windows) or `cell_analyze` (Linux).
 
 ### Cross-compiling for Linux (cluster deployment)
-Build from WSL (not from Windows — GUI dependencies block cross-compilation):
+Use the `sync_analysis` MCP tool — it builds in WSL and uploads via the existing SSH connection:
+```
+sync_analysis(cluster="nibi", confirm=true)
+```
+This builds `cell_analyze` for `x86_64-unknown-linux-musl` (static binary, no glibc dependency) and deploys to `~/cell_simulation/bin/cell_analyze` on the cluster.
+
+**Manual build (if MCP unavailable):**
 ```bash
 # In WSL:
 cd /mnt/c/Users/stevensilber/source/repos/data_processing/rust/vtk_viewer
-cargo build --release --bin cell_analyze
+CARGO_TARGET_DIR=target_mcp cargo build --release --target x86_64-unknown-linux-musl --bin cell_analyze
+# Upload manually via scp
 ```
-Upload the binary:
-```bash
-scp target/release/cell_analyze ssilber@nibi.alliancecan.ca:~/bin/cell_analyze
-```
-The binary is deployed at `~/bin/cell_analyze` on the cluster.
+
+**Note:** The `vtk_viewer` GUI binary requires `eframe` (system graphics) and cannot cross-compile for musl. Only `cell_analyze` is deployed to the cluster. The Cargo.toml has `required-features = ["gui"]` on vtk_viewer to prevent build failures.
 
 ### Dependencies (Cargo.toml)
 - **rayon** — parallel batch processing
@@ -104,7 +108,7 @@ cell_analyze study fss.toml -d /path/to/data --subsample 100    # keep every 100
 - `--dry-run` — show discovered runs without analyzing
 - Study configs live in `cpp/simulation/study/palmieri_extension/*.toml`
 
-#### `cell_analyze snapshot <input> [-o output.png]` — Phase-field rendering
+#### `cell_analyze snapshot <input> [-o output.png]` — Phase-field rendering & movies
 ```bash
 # Single file (checkpoint or VTK frame):
 cell_analyze snapshot checkpoint.bin -o snap.png --label-cells
@@ -113,16 +117,31 @@ cell_analyze snapshot frame_100000.vtk -o snap.png
 # Directory mode (all VTK frames → PNG sequence):
 cell_analyze snapshot /path/to/sim_output/ -o frames/ --skip 5
 
-# Movie mode (render all frames + assemble with ffmpeg):
+# Movie mode (render + pipe directly to ffmpeg — no intermediate PNGs):
 cell_analyze snapshot /path/to/sim_output/ -o frames/ --movie --fps 15 --skip 5
+
+# Per-cell rendering (watershed segmentation + colored contours):
+cell_analyze snapshot /path/to/sim_output/ --movie --color-by gamma --shade-speed --fps 15
+cell_analyze snapshot /path/to/sim_output/ --movie --color-by v_a --shade-speed   # Griffiths disorder
+cell_analyze snapshot /path/to/sim_output/ --movie --color-by cell_id             # Track individual cells
 ```
 - Accepts: checkpoint.bin, frame_NNNNNN.vtk, or directory containing VTK frames
-- `--label-cells` — draw cell IDs at centroids (single file mode)
-- `--movie` — after rendering all frames, assemble into movie.mp4 via ffmpeg
+- `--label-cells` — draw cell IDs at centroids. Green = soft cells (auto-detected from gamma). Works with all modes
+- `--movie` — pipe raw RGB frames directly to ffmpeg (fast, no disk I/O). Falls back to PNG if ffmpeg unavailable
 - `--skip N` — render every Nth frame in directory/movie mode (default: 1)
 - `--fps N` — movie framerate (default: 15)
+- `--color-by MODE` — color cell contours by property (requires checkpoint.bin in same directory):
+  - `auto` (default) — detects from checkpoint: uses `v_a` if per-cell v_A varies, `gamma` if gamma varies, else `cell_id`
+  - `v_a` — coolwarm colormap by per-cell v_A (blue=low, red=high). Best for Griffiths disorder
+  - `gamma` — coolwarm by per-cell gamma (blue=soft, red=stiff). Best for Palmieri soft-cell
+  - `cell_id` — unique HSV hue per cell (golden-ratio rotation). Best for tracking
+  - `none` — plain phi heatmap (no watershed)
+- `--shade-speed` — shade cell interiors by displacement speed (grayscale: brighter=faster). Requires trajectory.txt
+- `--speed-window N` — frames to average for speed computation (default: 5)
 
-**Output:** PNG at native domain resolution with RdYlBu_r colormap.
+**Per-cell rendering pipeline:** When `--color-by` is not `none`, the tool performs watershed segmentation from cell centroids, erodes the mask to create boundary rings, and colors contours/interiors independently. The speed normalization is fixed globally (P95 across the trajectory) to prevent frame-to-frame flashing.
+
+**Output:** PNG at native domain resolution. Movies use libx264 CRF 18.
 
 #### `cell_analyze list` — Show all available observables with descriptions
 
@@ -295,27 +314,6 @@ The trajectory file stores two different velocity quantities:
 The reason these differ: The EoM velocity drives the advection ∂φ/∂t + v·∇φ = -Γ δF/δφ, but the centroid displacement is the NET result of advection minus shape relaxation. The centroid (∫x·φ²dA / ∫φ²dA) moves less than v because the restoring force partially counteracts advection. During bursts, the elastic relaxation ADDS to the displacement, producing velocities exceeding v_A.
 
 `fss_quick.py` correctly computes displacement velocity from trajectory positions (columns 2-3). The Rust `velocity_distribution` observable also uses displacement-based velocity (Δx/Δt from unwrapped positions).
-
----
-
-## 9. Python Wrapper Scripts
-
-### `fss_quick.py` — Quick single-file analysis + 4-panel plot
-```bash
-python fss_quick.py cluster_results/fss_400c_90s.txt --plot-dir results/fss_plots
-```
-- Invokes `cell_analyze run` with standard Palmieri observables
-- Generates 4-panel plot: L_n histogram, L_n(t) time series, MSD/t plateau, G(v_i) velocity distribution
-- Prints text summary with anomaly flags (D_eff ratio, ΔL_n, kurtosis)
-
-**Expected filename pattern:** `fss_{N}c_{rho}{s|c}.txt`
-- `s` = soft-in-normal, `c` = ctrl (all-normal)
-- Example: `fss_200c_85s.txt` → N=200 cells, ρ=0.85, soft condition
-
-### `fss_aggregate.py` — Batch aggregation over all FSS files
-Runs Rust on all trajectory files and produces a single aggregated JSON.
-
-**Paired ratio computation:** The aggregation script pairs soft/ctrl runs by (N, ρ) and computes `Deff_ratio_paired = D_cell0(soft) / D_cell0(ctrl)` — which is the correct Palmieri comparison. The old `Deff_ratio_within = D_cell0 / D_pop_mean` was wrong because per-cell D_eff has CV≈30–40% (dynamic heterogeneity), making single-cell vs population-mean comparisons meaningless. Always use `Deff_ratio_paired` for FSS scaling plots.
 
 ---
 
@@ -557,3 +555,273 @@ Nx, Ny, dx, dy, dt, t_end, save_interval, lambda, gamma, kappa, target_radius, m
 | `velocity_autocorrelation` | `lag_times[]`, `cv[]`, `beta` (stub=1.0), `tau_c` |
 | `va_mobility_correlation` | `pearson_r`, `n_cells`, `cell_speeds[]`, `cell_va[]` |
 | `spatial_correlation` | `r_bins[]`, `c_r[]`, `xi` |
+
+---
+
+## 13. Diagnostic Panel Configuration
+
+The `[diagnostic]` section in study TOMLs generates per-seed SVG comparison figures (soft vs ctrl). Panels are fully configurable:
+
+### Adding panels
+```toml
+[diagnostic]
+output = "diag_rho{rho}_{seed}.svg"   # All {var} placeholders are substituted
+ln_range = [0.98, 1.5]                # Default y-range for L_n panels
+speed_max = 0.02                      # Default y-max for speed panel
+msd_lag_max = 8.0                     # Default x-max for MSD panel (in τ)
+
+[[diagnostic.panels]]
+type = "trajectory"          # Cell 0 wrapped path (x,y)
+
+[[diagnostic.panels]]
+type = "msd_t"               # MSD/Δt curves (→ 4D_eff plateau)
+log_x = true                 # Log-transform axes
+log_y = true
+x_range = [0.01, 10.0]       # Override axis range [min, max]
+
+[[diagnostic.panels]]
+type = "ln_timeseries"       # L_n(t) time series
+y_range = [0.95, 1.4]        # Override y-axis (takes priority over ln_range)
+
+[[diagnostic.panels]]
+type = "ln_histogram"        # L_n distribution (overlaid bars)
+bins = 60                    # Number of histogram bins
+x_range = [0.98, 1.3]        # Override x-axis (takes priority over ln_range)
+
+[[diagnostic.panels]]
+type = "speed_bursts"        # Cell 0 speed |v|(t) with burst threshold
+
+[[diagnostic.panels]]
+type = "gvi"                 # Palmieri G(v_i) with Eq.5 fit
+x_range = [0.0, 0.025]       # Override velocity range
+
+[[diagnostic.panels]]
+type = "deff_bar"            # 4-bar D_eff comparison
+
+[[diagnostic.panels]]
+type = "summary"             # Text summary of parameters + observables
+```
+
+### Available panel types
+| Type | Renders | Key options |
+|------|---------|-------------|
+| `trajectory` | Cell 0 wrapped path with start/end markers | — |
+| `msd_t` | MSD/Δt vs lag (→ D_eff plateau) | `log_x`, `log_y`, `x_range`, `y_range` |
+| `ln_timeseries` | Cell 0 L_n(t) with mean overlay | `y_range` (or `ln_range` from diagnostic) |
+| `ln_histogram` | L_n distribution as density bars | `bins`, `x_range` (or `ln_range`) |
+| `speed_bursts` | Cell 0 displacement speed with μ+3σ threshold | `x_range`, `y_range` (or `speed_max`) |
+| `gvi` | Palmieri G(v_i) + Gaussian ref + Eq.5 ζ fit | `x_range`, `y_range` |
+| `deff_bar` | 4-bar chart: soft_pop, soft_c0, ctrl_pop, ctrl_c0 | — |
+| `summary` | Text: N, Lx, v_A, dt, γ, time ranges, D_eff ratios | — |
+
+### Panel layout
+- Panels render left-to-right, top-to-bottom in a dynamic grid
+- ≤2 panels → 1 row; ≤4 → 1 or 2 rows; >4 → 4 columns, as many rows as needed
+- Panel order follows the TOML `[[diagnostic.panels]]` array order
+- If no panels are specified, defaults to all 8 panel types
+
+### Template variables in output filename
+The `output` field substitutes ALL discovered variables:
+```toml
+output = "diag_{N}c_rho{rho}_{seed}.svg"
+# Produces: diag_100c_rho90_2.svg, diag_100c_rho85_3.svg, etc.
+```
+
+---
+
+## 14. Case Study: Palmieri Validation (100-cell)
+
+**Goal:** Reproduce Palmieri et al. (2015) Fig 2–5 for 100 cells at ρ=0.85 and ρ=0.90.
+
+### Data layout on cluster
+```
+/scratch/ssilber/palmieri_ext/
+├── prod_100c_rho85_soft_v3/   # --gamma 0.35:cell0
+│   ├── trajectory.txt
+│   └── checkpoint.bin
+├── prod_100c_rho85_ctrl_v3/   # uniform gamma=1.0
+│   ├── trajectory.txt
+│   └── checkpoint.bin
+├── prod_100c_rho90_soft_v3/
+└── prod_100c_rho90_ctrl_v3/
+```
+
+### Study TOML
+```toml
+[study]
+name = "palmieri_ext_100c"
+description = "Palmieri extension: soft cell 0 vs control"
+
+[discovery]
+pattern = "prod_100c_rho{rho}_{cond}_v{seed}"
+
+[observables]
+compute = ["msd", "diffusion"]
+tau = 10000.0
+cell_radius = 49.0
+
+[analysis]
+pair_by = "cond"
+pair_numerator = "soft"
+pair_denominator = "ctrl"
+group_by = ["rho"]
+
+[diagnostic]
+output = "diag_100c_rho{rho}_{seed}.svg"
+
+[[diagnostic.panels]]
+type = "trajectory"
+
+[[diagnostic.panels]]
+type = "msd_t"
+log_x = true
+log_y = true
+
+[[diagnostic.panels]]
+type = "deff_bar"
+
+[[diagnostic.panels]]
+type = "summary"
+```
+
+### Run
+```bash
+cell_analyze study ~/study/palmieri_val.toml \
+  -d /scratch/ssilber/palmieri_ext \
+  --plot-dir /scratch/ssilber/palmieri_ext/plots \
+  -o /scratch/ssilber/palmieri_ext/results.json
+```
+
+### What it produces
+- `results.json` — grouped metrics per (rho) with paired soft/ctrl comparisons
+- `diag_100c_rho85_2.svg`, `diag_100c_rho90_3.svg`, etc. — per-seed diagnostic panels
+- Console output: run counts, warnings (low seed count), D_eff ratios
+
+---
+
+## 15. Case Study: Finite-Size Scaling (FSS)
+
+**Goal:** Test whether D_eff(soft)/D_eff(ctrl) converges as N→∞.
+
+### Data layout
+```
+/scratch/ssilber/palmieri_ext/
+├── 100c_rho90_soft/run_01/trajectory.txt
+├── 100c_rho90_soft/run_02/trajectory.txt
+├── 100c_rho90_ctrl/run_01/trajectory.txt
+├── 200c_rho90_soft/run_01/trajectory.txt
+├── ...
+└── 6400c_rho90_ctrl/run_03/trajectory.txt
+```
+
+### Study TOML (fss.toml)
+```toml
+[study]
+name = "Palmieri FSS"
+description = "D_eff ratio vs system size N"
+
+[discovery]
+pattern = "{N}c_rho{rho}_{cond}/run_{seed}"
+
+[observables]
+compute = ["per_cell_diffusion", "shape_index", "velocity_distribution"]
+tau = 10000.0
+cell_radius = 49.0
+
+[analysis]
+tagged_cell = 0
+group_by = ["N", "rho", "cond"]
+pair_by = "cond"
+pair_numerator = "soft"
+pair_denominator = "ctrl"
+
+[analysis.metrics]
+d_eff = "tagged_cell_d_eff"
+ln = "tagged_cell_ln"
+kurtosis = "tagged_cell_kurtosis"
+
+[[plots]]
+title = "D_eff ratio vs 1/sqrt(N)"
+x = "N"
+y = "d_eff_ratio"
+output = "fss_deff_ratio.svg"
+x_transform = "inverse_sqrt"
+h_line = 1.0
+
+[[figures]]
+title = "FSS Overview"
+output = "fss_overview.svg"
+layout = [2, 2]
+
+[[figures.panels]]
+x = "N"
+y = "d_eff"
+title = "D_eff (cell 0)"
+x_transform = "inverse_sqrt"
+
+[[figures.panels]]
+x = "N"
+y = "d_eff_pop"
+title = "D_eff (population)"
+x_transform = "inverse_sqrt"
+
+[[figures.panels]]
+x = "N"
+y = "ln"
+title = "Mean L_n"
+x_transform = "inverse_sqrt"
+h_line = 1.0
+
+[[figures.panels]]
+x = "N"
+y = "d_eff_ratio"
+title = "D_eff ratio"
+x_transform = "inverse_sqrt"
+h_line = 1.0
+```
+
+### Run
+```bash
+cell_analyze study ~/study/fss.toml \
+  -d /scratch/ssilber/palmieri_ext \
+  --plot-dir /scratch/ssilber/palmieri_ext/fss_plots \
+  -o /scratch/ssilber/palmieri_ext/fss_results.json \
+  --threads 4
+```
+
+### Expected output
+- `fss_deff_ratio.svg` — single plot: D_eff ratio vs 1/√N with error bars
+- `fss_overview.svg` — 4-panel figure: D_eff(cell0), D_eff(pop), L_n, ratio
+- `fss_results.json` — full numerical results for all groups
+- If N→∞ extrapolation shows ratio→1, the Palmieri result is a finite-size artifact
+
+---
+
+## 16. Snapshot Rendering for Publications
+
+### Generating a labeled snapshot from a checkpoint
+```bash
+# Basic phi heatmap with cell IDs (green = soft cells)
+cell_analyze snapshot checkpoint.bin -o figure_1a.png --label-cells
+
+# Per-cell rendering with gamma-colored contours (for Palmieri soft-cell papers)
+cell_analyze snapshot /path/to/vtk_dir/ --color-by gamma --label-cells --skip 1000 -o fig1/
+```
+
+### Generating a movie from VTK frames
+```bash
+# Standard phi movie
+cell_analyze snapshot /path/to/vtk_dir/ --movie --skip 5 --fps 15 -o movie_dir/
+
+# Griffiths disorder visualization (v_A contours + speed-shaded interiors)
+cell_analyze snapshot /path/to/vtk_dir/ --movie --color-by v_a --shade-speed --fps 15 -o movie_dir/
+
+# Track individual cells
+cell_analyze snapshot /path/to/vtk_dir/ --movie --color-by cell_id --shade-speed --fps 10 -o movie_dir/
+```
+
+### What `--color-by auto` does
+1. Loads `checkpoint.bin` from the VTK directory
+2. Reads per-cell v_A array — if values vary (range > 1% of max), uses coolwarm by v_A
+3. Otherwise reads per-cell gamma — if values vary, uses coolwarm by gamma
+4. Otherwise falls back to HSV by cell_id
