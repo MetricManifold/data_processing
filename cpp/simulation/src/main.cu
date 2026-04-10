@@ -376,6 +376,7 @@ void print_usage(const char *program) {
   printf("  --trajectory-samples <n>  Total trajectory snapshots over the run (default: %d). Production: 2000\n", def_trajectory_samples);
   printf("  --trajectory-interval <n>  Steps between trajectory saves (default: -1 = auto from samples)\n");
   printf("  --seed <n>      Random seed (default: time-based). For reproducible runs\n");
+  printf("  --polarity-seed <n>  Separate seed for velocity/polarity RNG (default: derived from --seed)\n");
   printf("  --use-diagnostics       Enable volume/shape computation (slower)\n");
   printf("  --observable-interval <n>  Steps between GPU diagnostic measurements\n");
   printf("                            (energy, stress, contacts; requires -DENABLE_DIAGNOSTICS=ON)\n");
@@ -384,7 +385,7 @@ void print_usage(const char *program) {
   printf("  --visualize [interval]  Open real-time display window (requires -DENABLE_VISUALIZER=ON)\n");
   printf("                          interval = steps between updates (default: 100)\n");
   printf("  --save-individual-fields  Save per-cell phi fields for energy analysis\n");
-  printf("  --subdomain-padding <f>  Cell window size as multiple of R (default: %.1f)\n", p.subdomain_padding);
+  printf("  --subdomain-padding <f>  Bbox buffer as fraction of R (default: %.2f, e.g. 0.5=R/2, 1.0=R, 1.5=3R/2)\n", p.subdomain_padding);
   printf("  --safe-mode     Limit memory allocation to prevent runaway VRAM usage\n");
   printf("  --batch <file>  Run multiple independent systems from a JSON config file.\n");
   printf("                  Each system resumes from its own checkpoint with independent\n");
@@ -750,6 +751,7 @@ int main(int argc, char *argv[]) {
   int checkpoint_interval = -1; // -1 means use save_interval * 10
   bool checkpoint_interval_set = false;
   int random_seed = -1;         // -1 means use time-based seed
+  int polarity_seed = -1;       // -1 means derive from --seed
   int trajectory_samples = 100; // Number of trajectory data points to save
   bool trajectory_samples_set = false;
   int trajectory_interval =
@@ -833,6 +835,8 @@ int main(int argc, char *argv[]) {
       checkpoint_interval_set = true;
     } else if (arg == "--seed" && i + 1 < argc) {
       random_seed = atoi(argv[++i]);
+    } else if (arg == "--polarity-seed" && i + 1 < argc) {
+      polarity_seed = atoi(argv[++i]);
     } else if (arg == "--trajectory-samples" && i + 1 < argc) {
       trajectory_samples = atoi(argv[++i]);
       trajectory_samples_set = true;
@@ -1260,6 +1264,8 @@ int main(int argc, char *argv[]) {
   sim.print_interval = print_interval;
   sim.checkpoint_interval = checkpoint_interval;
   sim.trajectory_samples = trajectory_samples;
+  // Set polarity seed on integrator (before first step initializes RNG)
+  sim.integrator.polarity_seed = polarity_seed;
   // Use save_interval as default for trajectory (same as 3D)
   sim.trajectory_interval =
       (trajectory_interval > 0) ? trajectory_interval

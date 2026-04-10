@@ -200,7 +200,7 @@ Integrator::Integrator(Method m)
       d_centroids_x(nullptr), d_centroids_y(nullptr),
       d_perimeters(nullptr),
       d_neighbor_counts(nullptr), d_neighbor_lists(nullptr),
-      d_rng_states(nullptr), rng_initialized(false),
+      d_rng_states(nullptr), rng_initialized(false), polarity_seed(-1),
       d_prev_centroids_x(nullptr), d_prev_centroids_y(nullptr),
       d_max_displacement(nullptr), neighbor_list_valid(false),
       neighbor_rebuild_threshold(5.0f), // Default: rebuild when any cell moves >5 grid units
@@ -367,7 +367,15 @@ size_t Integrator::compute_max_page_size(const SimParams &params) {
     lambda_eff = params.lambda * sqrtf(params.gamma / (params.gamma - params.adhesion_J / 2.0f));
   }
   int halo = params.halo_width;
-  int adaptive_margin = static_cast<int>(3.0f * lambda_eff) + halo;
+  // adaptive_margin must match kernels_solver.cu:
+  //   base_margin = subdomain_padding * target_radius
+  //   adhesion_extra = 3 * (lambda_eff - lambda)  [only when J > 0]
+  //   adaptive_margin = base_margin + adhesion_extra + halo
+  int base_margin = static_cast<int>(params.subdomain_padding * params.target_radius);
+  int adhesion_extra = (params.adhesion_J > 0.0f)
+      ? static_cast<int>(3.0f * (lambda_eff - params.lambda))
+      : 0;
+  int adaptive_margin = base_margin + adhesion_extra + halo;
   int overshoot = static_cast<int>(0.25f * adaptive_margin);
   int max_dist = static_cast<int>(params.target_radius + 3.0f * lambda_eff) + 1;
   int max_half = max_dist + adaptive_margin + overshoot + 10; // safety
@@ -1142,8 +1150,12 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
                  cudaMemcpyHostToDevice);
     }
 
-    // Initialize RNG states with time-based seed
-    unsigned long seed = static_cast<unsigned long>(time(nullptr));
+    // Initialize RNG states with deterministic seed.
+    // If polarity_seed was set explicitly (>= 0), use it directly.
+    // Otherwise derive from host rand() (which is seeded by --seed via srand).
+    unsigned long seed = (polarity_seed >= 0)
+        ? static_cast<unsigned long>(polarity_seed)
+        : static_cast<unsigned long>(rand());
     int threads = 256;
     int blocks = (num_cells + threads - 1) / threads;
     kernel_init_rng_states<<<blocks, threads>>>(d_rng_states, seed, num_cells);

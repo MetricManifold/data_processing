@@ -104,6 +104,7 @@ public:
   // GPU-side RNG for polarization updates (eliminates host->device transfer)
   curandState *d_rng_states;  // One RNG state per cell
   bool rng_initialized;       // Track if RNG states have been initialized
+  long polarity_seed;         // Seed for GPU polarity RNG (-1 = derive from host rand())
 
   // Adaptive neighbor list caching (rebuilds only when cells move significantly)
   float *d_prev_centroids_x;       // Centroids at last neighbor rebuild
