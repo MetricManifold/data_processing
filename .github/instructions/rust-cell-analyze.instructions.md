@@ -619,6 +619,7 @@ type = "summary"             # Text summary of parameters + observables
 | `gvi` | Palmieri G(v_i) + Gaussian ref + Eq.5 ζ fit | `x_range`, `y_range` |
 | `deff_bar` | 4-bar chart: soft_pop, soft_c0, ctrl_pop, ctrl_c0 | — |
 | `summary` | Text: N, Lx, v_A, dt, γ, time ranges, D_eff ratios | — |
+| `ln_speed_correlation` | Palmieri Fig 3E: ⟨ΔL_n⟩ vs \|v\| binned correlation | `bins`, `x_range`, `y_range` |
 
 ### Panel layout
 - Panels render left-to-right, top-to-bottom in a dynamic grid
