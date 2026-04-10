@@ -966,7 +966,48 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
                  ov.fraction * 100.0f, n, ov.value);
         }
 
-        // Pass 2: cell-specific overrides (highest priority)
+        // Pass 2: spatial overrides (Nearest, Cluster) — need cell positions
+        for (const auto &ov : gamma_overrides) {
+          if (ov.type != SimParams::GammaOverride::Type::Nearest &&
+              ov.type != SimParams::GammaOverride::Type::Cluster) continue;
+          // Compute distances from (pos_x, pos_y) to each cell centroid
+          std::vector<std::pair<float, int>> dists;
+          for (int i = 0; i < num_cells; ++i) {
+            float cx = domain.cells[i]->centroid.x;
+            float cy = domain.cells[i]->centroid.y;
+            float dx = cx - ov.pos_x;
+            float dy = cy - ov.pos_y;
+            // Periodic distance
+            if (dx > params.Nx * 0.5f) dx -= params.Nx;
+            if (dx < -params.Nx * 0.5f) dx += params.Nx;
+            if (dy > params.Ny * 0.5f) dy -= params.Ny;
+            if (dy < -params.Ny * 0.5f) dy += params.Ny;
+            dists.push_back({dx * dx + dy * dy, i});
+          }
+          std::sort(dists.begin(), dists.end());
+
+          if (ov.type == SimParams::GammaOverride::Type::Nearest) {
+            // Assign to the single nearest cell
+            int id = dists[0].second;
+            h_gamma[id] = ov.value;
+            assigned[id] = true;
+            printf("Per-cell gamma: nearest cell to (%.0f,%.0f) is cell %d, set to %.4f\n",
+                   ov.pos_x, ov.pos_y, id, ov.value);
+          } else {
+            // Cluster: assign to nearest fraction of cells
+            int count = static_cast<int>(ov.fraction * num_cells + 0.5f);
+            count = std::min(count, num_cells);
+            for (int i = 0; i < count; ++i) {
+              int id = dists[i].second;
+              h_gamma[id] = ov.value;
+              assigned[id] = true;
+            }
+            printf("Per-cell gamma: cluster %.1f%% (%d cells) nearest to (%.0f,%.0f) set to %.4f\n",
+                   ov.fraction * 100.0f, count, ov.pos_x, ov.pos_y, ov.value);
+          }
+        }
+
+        // Pass 3: cell-specific overrides (highest priority)
         for (const auto &ov : gamma_overrides) {
           if (ov.type != SimParams::GammaOverride::Type::Cells) continue;
           for (int id : ov.cell_ids) {
