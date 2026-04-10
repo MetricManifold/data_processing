@@ -2271,6 +2271,118 @@ fn generate_comparison_with_config(
         }
     }
 
+    // ===== ln_speed_correlation: Palmieri Fig 3E — ⟨ΔL_n⟩ vs |v| =====
+    "ln_speed_correlation" => {
+        // Compute ΔL_n paired with speed for each frame transition
+        // speeds[i] = displacement speed from frame i to i+1
+        // ΔL_n[i] = ln_series[i+1] - ln_series[i]
+        let n_bins = panel_cfg.bins.unwrap_or(20);
+
+        struct BinnedCorr {
+            bins: Vec<(f64, f64, usize)>, // (v_center, mean_delta_ln, count)
+        }
+
+        fn compute_binned(ln: &[f64], speeds: &[f64], n_bins: usize) -> BinnedCorr {
+            let n = speeds.len().min(ln.len().saturating_sub(1));
+            if n == 0 { return BinnedCorr { bins: vec![] }; }
+
+            // Collect (speed, delta_ln) pairs, filtering out L_n artifacts
+            let mut pairs: Vec<(f64, f64)> = Vec::new();
+            for i in 0..n {
+                let dl = ln[i + 1] - ln[i];
+                let v = speeds[i];
+                if ln[i] > 0.5 && ln[i + 1] > 0.5 && v.is_finite() && dl.is_finite() {
+                    pairs.push((v, dl));
+                }
+            }
+            if pairs.is_empty() { return BinnedCorr { bins: vec![] }; }
+
+            let v_max = pairs.iter().map(|p| p.0).fold(0.0f64, f64::max);
+            let bw = v_max / n_bins as f64;
+            if bw <= 0.0 { return BinnedCorr { bins: vec![] }; }
+
+            let mut bin_sum = vec![0.0f64; n_bins];
+            let mut bin_count = vec![0usize; n_bins];
+            for &(v, dl) in &pairs {
+                let b = ((v / bw) as usize).min(n_bins - 1);
+                bin_sum[b] += dl;
+                bin_count[b] += 1;
+            }
+
+            let bins: Vec<(f64, f64, usize)> = (0..n_bins)
+                .filter(|&b| bin_count[b] > 5) // require minimum samples per bin
+                .map(|b| {
+                    let center = (b as f64 + 0.5) * bw;
+                    let mean = bin_sum[b] / bin_count[b] as f64;
+                    (center, mean, bin_count[b])
+                })
+                .collect();
+            BinnedCorr { bins }
+        }
+
+        let sb = compute_binned(&sd.ln_series, &sd.speeds, n_bins);
+        let cb = compute_binned(&cd.ln_series, &cd.speeds, n_bins);
+
+        // Determine axis ranges
+        let all_v: Vec<f64> = sb.bins.iter().chain(cb.bins.iter()).map(|b| b.0).collect();
+        let all_dl: Vec<f64> = sb.bins.iter().chain(cb.bins.iter()).map(|b| b.1).collect();
+        let x_max = panel_cfg.x_range.map(|r| r[1]).unwrap_or_else(||
+            all_v.iter().copied().fold(0.0f64, f64::max) * 1.1);
+        let y_min = panel_cfg.y_range.map(|r| r[0]).unwrap_or_else(||
+            all_dl.iter().copied().fold(0.0f64, f64::min) * 1.3);
+        let y_max = panel_cfg.y_range.map(|r| r[1]).unwrap_or_else(||
+            all_dl.iter().copied().fold(0.0f64, f64::max) * 1.3);
+        // Ensure range spans zero
+        let y_lo = y_min.min(-0.001);
+        let y_hi = y_max.max(0.001);
+
+        let mut chart = ChartBuilder::on(area)
+            .caption(&format!("({}) {}", panel_label,
+                panel_cfg.title.as_deref().unwrap_or("⟨ΔL_n⟩ vs |v| (Fig 3E)")),
+                ("sans-serif", 16))
+            .margin(8).x_label_area_size(30).y_label_area_size(50)
+            .build_cartesian_2d(0.0..x_max, y_lo..y_hi)?;
+        chart.configure_mesh().x_desc("|v|").y_desc("⟨ΔL_n⟩")
+            .x_label_style(("sans-serif", 14)).y_label_style(("sans-serif", 14))
+            .light_line_style(TRANSPARENT).bold_line_style(RGBAColor(200, 200, 200, 0.3)).draw()?;
+
+        // Zero reference line
+        chart.draw_series(LineSeries::new(
+            vec![(0.0, 0.0), (x_max, 0.0)],
+            BLACK.mix(0.3).stroke_width(1),
+        ))?;
+
+        // Soft cell 0
+        if !sb.bins.is_empty() {
+            chart.draw_series(sb.bins.iter().map(|&(v, dl, _)| {
+                Circle::new((v, dl), 5, soft_color.filled())
+            }))?.label(soft_label)
+                .legend(move |(x, y)| Circle::new((x + 6, y), 4, soft_color.filled()));
+            chart.draw_series(LineSeries::new(
+                sb.bins.iter().map(|&(v, dl, _)| (v, dl)),
+                soft_alpha.stroke_width(1),
+            ))?;
+        }
+
+        // Ctrl cell 0
+        if !cb.bins.is_empty() {
+            chart.draw_series(cb.bins.iter().map(|&(v, dl, _)| {
+                Circle::new((v, dl), 4, ctrl_color.filled())
+            }))?.label(ctrl_label)
+                .legend(move |(x, y)| Circle::new((x + 6, y), 4, ctrl_color.filled()));
+            chart.draw_series(LineSeries::new(
+                cb.bins.iter().map(|&(v, dl, _)| (v, dl)),
+                ctrl_alpha.stroke_width(1),
+            ))?;
+        }
+
+        chart.configure_series_labels().position(SeriesLabelPosition::LowerLeft)
+            .background_style(WHITE.mix(0.8)).border_style(BLACK.mix(0.3))
+            .label_font(("sans-serif", 10)).draw()?;
+        chart.plotting_area().draw(&PathElement::new(
+            vec![(0.0, y_hi), (x_max, y_hi), (x_max, y_lo)], BLACK.mix(0.5).stroke_width(1)))?;
+    }
+
     // Unknown panel type
     other => {
         eprintln!("  Warning: unknown panel type '{}', skipping", other);
