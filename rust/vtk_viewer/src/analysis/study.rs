@@ -1539,6 +1539,7 @@ fn generate_comparison_with_config(
         t_tau: Vec<f64>,
         speeds: Vec<f64>,
         t_speed: Vec<f64>,
+        inst_speeds: Vec<f64>,      // instantaneous |v| from trajectory vx,vy (per frame)
         raw_x: Vec<f64>,
         raw_y: Vec<f64>,
         uw_x: Vec<f64>,   // unwrapped
@@ -1561,10 +1562,25 @@ fn generate_comparison_with_config(
         let dt = if n_times > 1 { pos.times[1] - pos.times[0] } else { 1.0 };
         let cell0_idx = pos.cell_ids.iter().position(|&id| id == tc as u32).unwrap_or(0);
 
-        let mut ln_series = Vec::new();
-        for (_, cells) in &traj.frames {
-            if let Some(snap) = cells.get(&(tc as u32)) {
-                ln_series.push(snap.l_n);
+        // Build ln_series aligned to unwrapped positions (pos.times),
+        // NOT all traj.frames — unwrap_trajectory may skip incomplete frames.
+        let traj_map: std::collections::HashMap<i64, &std::collections::HashMap<u32, super::io::CellSnapshot>> =
+            traj.frames.iter().map(|(t, cells)| ((*t * 1e6) as i64, cells)).collect();
+        let mut ln_series = Vec::with_capacity(n_times);
+        let mut inst_speeds = Vec::with_capacity(n_times);
+        for &t in &pos.times {
+            let key = (t * 1e6) as i64;
+            if let Some(cells) = traj_map.get(&key) {
+                if let Some(snap) = cells.get(&(tc as u32)) {
+                    ln_series.push(snap.l_n);
+                    inst_speeds.push((snap.vx * snap.vx + snap.vy * snap.vy).sqrt());
+                } else {
+                    ln_series.push(f64::NAN);
+                    inst_speeds.push(f64::NAN);
+                }
+            } else {
+                ln_series.push(f64::NAN);
+                inst_speeds.push(f64::NAN);
             }
         }
         let t_tau: Vec<f64> = (0..ln_series.len()).map(|i| i as f64 * dt / tau).collect();
@@ -1636,7 +1652,7 @@ fn generate_comparison_with_config(
         let mean_ln = if ln_series.is_empty() { 0.0 } else { ln_series.iter().sum::<f64>() / ln_series.len() as f64 };
         let mean_speed = if speeds.is_empty() { 0.0 } else { speeds.iter().sum::<f64>() / speeds.len() as f64 };
 
-        RunData { ln_series, t_tau, speeds, t_speed, raw_x, raw_y, uw_x, uw_y,
+        RunData { ln_series, t_tau, speeds, t_speed, inst_speeds, raw_x, raw_y, uw_x, uw_y,
                   msd_t, msd_pop, vx: vx_all, vy: vy_all, d_cell0, d_pop, mean_ln, mean_speed,
                   lx: pos.lx, ly: pos.ly }
     }
@@ -2273,8 +2289,8 @@ fn generate_comparison_with_config(
 
     // ===== ln_speed_correlation: Palmieri Fig 3E — ⟨ΔL_n⟩ vs |v| =====
     "ln_speed_correlation" => {
-        // Compute ΔL_n paired with speed for each frame transition
-        // speeds[i] = displacement speed from frame i to i+1
+        // Compute ΔL_n paired with displacement speed for each frame transition
+        // speeds[i] = displacement speed from frame i to i+1 (total velocity)
         // ΔL_n[i] = ln_series[i+1] - ln_series[i]
         let n_bins = panel_cfg.bins.unwrap_or(20);
 
@@ -2286,7 +2302,7 @@ fn generate_comparison_with_config(
             let n = speeds.len().min(ln.len().saturating_sub(1));
             if n == 0 { return BinnedCorr { bins: vec![] }; }
 
-            // Collect (speed, delta_ln) pairs, filtering out L_n artifacts
+            // Collect (speed, delta_ln) pairs
             let mut pairs: Vec<(f64, f64)> = Vec::new();
             for i in 0..n {
                 let dl = ln[i + 1] - ln[i];
