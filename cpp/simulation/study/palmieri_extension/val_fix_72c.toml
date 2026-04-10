@@ -1,13 +1,9 @@
 [study]
-name = "palmieri_val_72c"
-description = "Palmieri 72-cell validation: all completed runs (pre-fix, lag, fix)"
+name = "palmieri_fix_72c"
+description = "Palmieri 72-cell validation: offset-fixed, no lag"
 
 [discovery]
-pattern = [
-    "prod_72c_rho90_{cond}_v{seed}",
-    "prod_lag_{cond}/run_{seed}",
-    "prod_fix_{cond}/run_{seed}",
-]
+pattern = "prod_fix_{cond}/run_{seed}"
 trajectory_name = "trajectory.txt"
 
 [observables]
@@ -30,7 +26,7 @@ kurtosis = "tagged_cell_kurtosis"
 mean_speed = "tagged_cell_mean_speed"
 
 [diagnostic]
-output = "diag_v{seed}.svg"
+output = "diag_fix_run{seed}.svg"
 
 [[diagnostic.panels]]
 type = "trajectory"

@@ -379,6 +379,12 @@ description = "Description"    # Optional description
 
 [discovery]
 pattern = "{N}c_rho{rho}_{cond}/run_{seed}"   # Path pattern with {var} captures
+# pattern also accepts a list for matching multiple directory structures:
+# pattern = [
+#     "prod_72c_rho90_{cond}_v{seed}",
+#     "prod_lag_{cond}/run_{seed}",
+#     "prod_fix_{cond}/run_{seed}",
+# ]
 trajectory_name = "trajectory.txt"             # Default: "trajectory.txt"
 
 [observables]

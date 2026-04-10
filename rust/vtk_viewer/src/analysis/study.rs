@@ -101,15 +101,45 @@ pub struct StudyMeta {
 
 #[derive(Debug, Deserialize)]
 pub struct DiscoveryConfig {
-    /// Path pattern with named captures in braces: {N}, {rho}, {cond}, {seed}
+    /// Path pattern(s) with named captures in braces: {N}, {rho}, {cond}, {seed}
+    /// Accepts a single string or a list of strings. Multiple patterns are tried
+    /// in order and all matches are merged (duplicates by path are removed).
     /// Supports two layouts:
     ///   - Directory: "{N}c_rho{rho}_{cond}/run_{seed}" (multi-dir)  
     ///   - File: "fss_{N}c_{rho}{cond}.txt" (single-file per condition)
-    pub pattern: String,
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    pub pattern: Vec<String>,
     /// Optional: if set, look for trajectory files matching this name pattern
     /// instead of trajectory.txt
     #[serde(default = "default_traj_name")]
     pub trajectory_name: String,
+}
+
+/// Deserialize a field that can be either a single string or a list of strings.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrVec;
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or list of strings")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Vec<String>, E> {
+            Ok(vec![v.to_string()])
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<String>, A::Error> {
+            let mut v = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                v.push(s);
+            }
+            Ok(v)
+        }
+    }
+    deserializer.deserialize_any(StringOrVec)
 }
 
 fn default_traj_name() -> String {
@@ -319,19 +349,26 @@ fn pattern_to_regex(pattern: &str) -> Result<(regex::Regex, Vec<String>)> {
     Ok((re, var_names))
 }
 
-/// Discover runs under `base_dir` matching the config pattern.
+/// Discover runs under `base_dir` matching the config pattern(s).
 pub fn discover_study_runs(
     base_dir: &Path,
     config: &DiscoveryConfig,
 ) -> Result<Vec<DiscoveredRun>> {
-    let (re, var_names) = pattern_to_regex(&config.pattern)?;
     let mut runs = Vec::new();
     let traj_name = &config.trajectory_name;
+    let mut seen_paths = std::collections::HashSet::new();
 
-    // Determine pattern depth to know how deep to walk
-    let depth = config.pattern.matches('/').count() + 1;
-
-    walk_and_match(base_dir, base_dir, &re, &var_names, traj_name, depth, 0, &mut runs)?;
+    for pattern in &config.pattern {
+        let (re, var_names) = pattern_to_regex(pattern)?;
+        let depth = pattern.matches('/').count() + 1;
+        let mut pattern_runs = Vec::new();
+        walk_and_match(base_dir, base_dir, &re, &var_names, traj_name, depth, 0, &mut pattern_runs)?;
+        for r in pattern_runs {
+            if seen_paths.insert(r.path.clone()) {
+                runs.push(r);
+            }
+        }
+    }
 
     runs.sort_by(|a, b| {
         let ak = format!("{:?}", a.variables);
@@ -495,7 +532,7 @@ pub fn run_study(
 
     if discovered.is_empty() {
         anyhow::bail!(
-            "No runs found matching pattern '{}' under {}",
+            "No runs found matching pattern(s) {:?} under {}",
             config.discovery.pattern,
             base_dir.display()
         );
@@ -1975,15 +2012,15 @@ fn generate_comparison_with_config(
             // Palmieri G(v_i): empirical CCDF-based, no bins.
             // G(v) = -sqrt(|ln(P(|v|)/P(0))|) where P is the complementary CDF.
             // For a Gaussian, G(v) = -v/(σ√2), a straight line.
-            let mut v_abs: Vec<f64> = vx.iter().chain(vy.iter()).map(|v| v.abs()).collect();
+            let mut v_abs: Vec<f64> = vx.iter().chain(vy.iter()).map(|v| v.abs()).filter(|v| v.is_finite()).collect();
             if v_abs.is_empty() { return (vec![], vec![], 0.0); }
             let sigma = {
-                let all: Vec<f64> = vx.iter().chain(vy.iter()).copied().collect();
+                let all: Vec<f64> = vx.iter().chain(vy.iter()).copied().filter(|v| v.is_finite()).collect();
                 let n = all.len() as f64;
                 let mean = all.iter().sum::<f64>() / n;
                 (all.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt()
             };
-            v_abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = v_abs.len();
 
             // Empirical CCDF: P(|v| > v_i) = (n - rank) / n
@@ -2279,7 +2316,7 @@ pub fn generate_fss_plot(
 
     // 1. Discover runs
     let disc_cfg = DiscoveryConfig {
-        pattern: pattern.to_string(),
+        pattern: vec![pattern.to_string()],
         trajectory_name: "trajectory.txt".to_string(),
     };
     let runs = discover_study_runs(base_dir, &disc_cfg)?;
@@ -2538,7 +2575,7 @@ pub fn generate_fss_plot(
                     ((p.n as f64).ln(), m.mean, m.stderr)
                 })
                 .collect();
-            cond_points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            cond_points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
             // Error bars
             let x_span = x_max.ln() - x_min.ln();

@@ -15,8 +15,14 @@ cluster_results/
 results/
 output/
 canvas*/
+tools/
 tmp_*
 *.tar.gz
+*.aux
+*.log
+*.out
+*.pdf
+*Notes.bib
 
 # Simulation source whitelist
 !**/*/README.md
@@ -35,6 +41,24 @@ tmp_*
 !cpp/simulation/cluster/*.c
 !cpp/simulation/study
 !cpp/simulation/study/**
+
+# Re-ignore build artifacts inside whitelisted study dirs
+cpp/simulation/study/**/*.aux
+cpp/simulation/study/**/*.log
+cpp/simulation/study/**/*.out
+cpp/simulation/study/**/*.pdf
+cpp/simulation/study/**/*.bbl
+cpp/simulation/study/**/*.blg
+cpp/simulation/study/**/*.toc
+cpp/simulation/study/**/*Notes.bib
+cpp/simulation/study/**/output/
+cpp/simulation/study/**/output_*/
+cpp/simulation/study/**/subsampled_data*/
+cpp/simulation/study/**/artifacts/
+cpp/simulation/study/**/figures/
+cpp/simulation/study/**/validation/*.png
+cpp/simulation/study/**/validation/*.json
+cpp/simulation/study/test_*.toml
 
 # MPI is dead
 cpp/simulation_mpi/
