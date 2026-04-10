@@ -39,26 +39,9 @@ tmp_*
 !cpp/simulation/cluster
 !cpp/simulation/cluster/*.sh
 !cpp/simulation/cluster/*.c
-!cpp/simulation/study
-!cpp/simulation/study/**
 
-# Re-ignore build artifacts inside whitelisted study dirs
-cpp/simulation/study/**/*.aux
-cpp/simulation/study/**/*.log
-cpp/simulation/study/**/*.out
-cpp/simulation/study/**/*.pdf
-cpp/simulation/study/**/*.bbl
-cpp/simulation/study/**/*.blg
-cpp/simulation/study/**/*.toc
-cpp/simulation/study/**/*Notes.bib
-cpp/simulation/study/**/output/
-cpp/simulation/study/**/output_*/
-cpp/simulation/study/**/subsampled_data*/
-cpp/simulation/study/**/artifacts/
-cpp/simulation/study/**/figures/
-cpp/simulation/study/**/validation/*.png
-cpp/simulation/study/**/validation/*.json
-cpp/simulation/study/test_*.toml
+# Study files kept local + synced to Nibi (not in git)
+cpp/simulation/study/
 
 # MPI is dead
 cpp/simulation_mpi/

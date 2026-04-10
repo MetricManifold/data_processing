@@ -106,8 +106,8 @@ cell_analyze study fss.toml -d /path/to/data --subsample 100    # keep every 100
 - `--subsample N` — keep every Nth frame (default: 1 = all). **Prefer no subsampling.**
 - `--threads N` — limit parallelism (use `--threads 1` on login nodes)
 - `--dry-run` — show discovered runs without analyzing
-- Study configs live in `cpp/simulation/study/palmieri_extension/*.toml`
-
+- Study configs live in `cpp/simulation/study/palmieri_extension/*.toml` (local only — NOT in git)
+- **Sync study files to Nibi periodically:** `rsync -avz cpp/simulation/study/ ssilber@nibi:~/cell_simulation/study/`
 #### `cell_analyze snapshot <input> [-o output.png]` — Phase-field rendering & movies
 ```bash
 # Single file (checkpoint or VTK frame):
@@ -368,7 +368,7 @@ average |r(t₀+Δt) - r(t₀)|² over all starting times t₀.
 
 ## 12. TOML Study Config Schema
 
-Study configs live in `cpp/simulation/study/palmieri_extension/*.toml`.
+Study configs live in `cpp/simulation/study/palmieri_extension/*.toml` (local — synced to Nibi `~/cell_simulation/study/`, NOT tracked in git).
 
 ### Complete TOML structure
 
