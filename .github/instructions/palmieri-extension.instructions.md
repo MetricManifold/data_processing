@@ -10,6 +10,8 @@ applyTo: "cpp/simulation/study/palmieri_extension/**"
 
 ## Related Files
 
+> **NOTE:** Study files (`cpp/simulation/study/`) are NOT tracked in git. They are gitignored and backed up to Nibi at `~/cell_simulation/study/`. After editing TOMLs or manuscripts, sync with `sync_study_config` MCP tool or rsync.
+
 | File | Purpose |
 |------|---------|
 | `cpp/simulation/study/palmieri_extension/LOG_BOOK.md` | Primary logbook — all results, decisions, progress |
