@@ -59,6 +59,12 @@ pub struct RunParams {
     pub ly: f64,
     /// Packing fraction ρ = N·π·R² / (Lx·Ly)
     pub confluence: f64,
+    /// Subdomain padding parameter (fraction of R)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subdomain_padding: Option<f64>,
+    /// Mean bounding box width across all cells (pixels)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox_mean: Option<f64>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, String>,
 }

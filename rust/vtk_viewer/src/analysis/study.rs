@@ -809,7 +809,7 @@ fn analyze_run_for_study(
         _ => None,
     };
 
-    let extra: BTreeMap<String, String> = traj
+    let mut extra: BTreeMap<String, String> = traj
         .params
         .extra
         .iter()
@@ -824,6 +824,16 @@ fn analyze_run_for_study(
             lx: traj.params.lx,
             ly: traj.params.ly,
             confluence: traj.params.n_cells as f64 * std::f64::consts::PI * _cell_radius * _cell_radius / (traj.params.lx * traj.params.ly),
+            subdomain_padding: extra.remove("subdomain_padding").and_then(|v| v.parse().ok()),
+            bbox_mean: {
+                // Compute mean bbox width from checkpoint if available
+                let ckpt_path = dir.join("checkpoint.bin");
+                if ckpt_path.exists() {
+                    super::checkpoint::read_bbox_mean(&ckpt_path).ok()
+                } else {
+                    None
+                }
+            },
             extra,
         },
         msd: None, // Skip bulky MSD arrays in study output

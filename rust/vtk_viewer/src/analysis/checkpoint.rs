@@ -350,3 +350,58 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         per_cell_v_a, per_cell_gamma, per_cell_radius,
     })
 }
+
+/// Read just the mean bounding box width from a checkpoint (fast, skips phi data).
+pub fn read_bbox_mean(path: &Path) -> Result<f64> {
+    let mut f = std::fs::File::open(path)?;
+    let mut buf4 = [0u8; 4];
+
+    // Magic + version
+    f.read_exact(&mut buf4)?;
+    let magic = u32::from_le_bytes(buf4);
+    if magic != 0x43454C4C { anyhow::bail!("bad magic"); }
+    f.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+
+    // step, time, num_cells
+    f.read_exact(&mut buf4)?;
+    f.read_exact(&mut buf4)?;
+    f.read_exact(&mut buf4)?;
+    let num_cells = i32::from_le_bytes(buf4) as usize;
+
+    // runtime opts (12 bytes) + 4 bools
+    f.seek(SeekFrom::Current(16))?;
+
+    // sim_params_size
+    let sp_size = if version >= 4 {
+        f.read_exact(&mut buf4)?;
+        u32::from_le_bytes(buf4) as usize
+    } else { 76 };
+
+    // Read SimParams to get halo
+    let mut sp_buf = vec![0u8; sp_size];
+    f.read_exact(&mut sp_buf)?;
+    let halo = if sp_buf.len() > 64 {
+        i32::from_le_bytes(sp_buf[60..64].try_into().unwrap_or([0;4]))
+    } else { 4 };
+
+    // Read cell bboxes, skip phi
+    let mut total_w = 0i64;
+    for _ in 0..num_cells {
+        f.read_exact(&mut buf4)?; // id
+        let mut bb = [0u8; 16];
+        f.read_exact(&mut bb)?;
+        let x0 = i32::from_le_bytes(bb[0..4].try_into().unwrap());
+        let x1 = i32::from_le_bytes(bb[8..12].try_into().unwrap());
+        let y0 = i32::from_le_bytes(bb[4..8].try_into().unwrap());
+        let y1 = i32::from_le_bytes(bb[12..16].try_into().unwrap());
+        let w = (x1 - x0) + 2 * halo;
+        let h = (y1 - y0) + 2 * halo;
+        total_w += w as i64;
+        // Skip centroid(8) + velocity(8) + volume(4) + phi(w*h*4)
+        let skip = 20 + (w as i64) * (h as i64) * 4;
+        f.seek(SeekFrom::Current(skip))?;
+    }
+
+    Ok(total_w as f64 / num_cells as f64)
+}
