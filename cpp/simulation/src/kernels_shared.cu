@@ -309,8 +309,6 @@ __global__ void kernel_scatter_phi_sq(
   float phi_val = phi[ly * width + lx];
   float phi_sq = phi_val * phi_val;
 
-  if (phi_sq < 1e-8f) return;  // Skip negligible contributions
-
   int ox = offsets_x[cell_idx];
   int oy = offsets_y[cell_idx];
   int gx = wrap_coord(ox + lx, Nx);
@@ -355,8 +353,6 @@ __global__ void kernel_scatter_phi_linear(
 
   const float *phi = phi_ptrs[cell_idx];
   float phi_val = phi[ly * width + lx];
-
-  if (phi_val < 1e-4f) return;  // Skip negligible contributions
 
   int ox = offsets_x[cell_idx];
   int oy = offsets_y[cell_idx];
@@ -421,20 +417,17 @@ __global__ void kernel_velocity_integral_2d(
     // redundant phi load). Only runs when scatter_sum_field is non-null (N>288).
     if (scatter_sum_field) {
       float phi_sq = phi_val * phi_val;
-      if (phi_sq > 1e-8f) {
-        int ox = offsets_x[cell_idx];
-        int oy = offsets_y[cell_idx];
-        int gx = wrap_coord(ox + lx, Nx);
-        int gy = wrap_coord(oy + ly, Ny);
-        atomicAdd(&scatter_sum_field[gy * Nx + gx], phi_sq);
-      }
+      int ox = offsets_x[cell_idx];
+      int oy = offsets_y[cell_idx];
+      int gx = wrap_coord(ox + lx, Nx);
+      int gy = wrap_coord(oy + ly, Ny);
+      atomicAdd(&scatter_sum_field[gy * Nx + gx], phi_sq);
     }
 
     bool in_inner = (lx >= halo && lx < width - halo &&
                      ly >= halo && ly < height - halo);
     if (in_inner) {
-      // Only compute where phi is appreciable
-      if (phi_val > 1e-4f) {
+      {
         float inv_2dx = 0.5f / dx_grid;
         float inv_2dy = 0.5f / dy_grid;
 
@@ -709,9 +702,7 @@ __global__ void kernel_fused_step(
     // --- Scatter new_phi² to NEXT step's sum field (uses NEW global coords) ---
     if (next_sum_field) {
       float new_phi_sq_scatter = new_phi * new_phi;
-      if (new_phi_sq_scatter > 1e-8f) {
-        atomicAdd(&next_sum_field[ngy * Nx + ngx], new_phi_sq_scatter);
-      }
+      atomicAdd(&next_sum_field[ngy * Nx + ngx], new_phi_sq_scatter);
     }
 
     // --- Centroid sums of NEW phi (for next step's volume/centroid) ---
