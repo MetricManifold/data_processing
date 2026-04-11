@@ -460,7 +460,6 @@ inline void Simulation::run() {
                << " Lx=" << domain.params.Nx << " Ly=" << domain.params.Ny
                << " dt=" << domain.params.dt
                << " tau=" << domain.params.tau
-               << " subdomain_padding=" << domain.params.subdomain_padding
                << "\n";
       traj_out.close();
       printf("Trajectory output: every %d steps\n", traj_interval);

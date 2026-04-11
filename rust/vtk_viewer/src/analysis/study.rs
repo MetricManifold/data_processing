@@ -809,12 +809,20 @@ fn analyze_run_for_study(
         _ => None,
     };
 
-    let mut extra: BTreeMap<String, String> = traj
+    let extra: BTreeMap<String, String> = traj
         .params
         .extra
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+
+    // Read bbox stats from checkpoint (one read for both fields)
+    let ckpt_path = dir.join("checkpoint.bin");
+    let bbox_stats = if ckpt_path.exists() {
+        super::checkpoint::read_bbox_stats(&ckpt_path).ok()
+    } else {
+        None
+    };
 
     Ok(RunResult {
         path: dir.display().to_string(),
@@ -824,16 +832,8 @@ fn analyze_run_for_study(
             lx: traj.params.lx,
             ly: traj.params.ly,
             confluence: traj.params.n_cells as f64 * std::f64::consts::PI * _cell_radius * _cell_radius / (traj.params.lx * traj.params.ly),
-            subdomain_padding: extra.remove("subdomain_padding").and_then(|v| v.parse().ok()),
-            bbox_mean: {
-                // Compute mean bbox width from checkpoint if available
-                let ckpt_path = dir.join("checkpoint.bin");
-                if ckpt_path.exists() {
-                    super::checkpoint::read_bbox_mean(&ckpt_path).ok()
-                } else {
-                    None
-                }
-            },
+            subdomain_padding: bbox_stats.as_ref().and_then(|s| s.1),
+            bbox_mean: bbox_stats.as_ref().map(|s| s.0),
             extra,
         },
         msd: None, // Skip bulky MSD arrays in study output

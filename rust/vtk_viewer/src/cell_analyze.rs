@@ -657,7 +657,7 @@ fn analyze_single_run(
         _ => None,
     };
 
-    let mut extra: BTreeMap<String, String> = traj
+    let extra: BTreeMap<String, String> = traj
         .params
         .extra
         .iter()
@@ -680,7 +680,7 @@ fn analyze_single_run(
             lx: traj.params.lx,
             ly: traj.params.ly,
             confluence: traj.params.n_cells as f64 * std::f64::consts::PI * cell_radius * cell_radius / (traj.params.lx * traj.params.ly),
-            subdomain_padding: extra.remove("subdomain_padding").and_then(|v| v.parse().ok()),
+            subdomain_padding: None,
             bbox_mean: None,
             extra,
         },

@@ -351,8 +351,8 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     })
 }
 
-/// Read just the mean bounding box width from a checkpoint (fast, skips phi data).
-pub fn read_bbox_mean(path: &Path) -> Result<f64> {
+/// Read mean bounding box width and subdomain_padding from a checkpoint.
+pub fn read_bbox_stats(path: &Path) -> Result<(f64, Option<f64>)> {
     let mut f = std::fs::File::open(path)?;
     let mut buf4 = [0u8; 4];
 
@@ -378,12 +378,15 @@ pub fn read_bbox_mean(path: &Path) -> Result<f64> {
         u32::from_le_bytes(buf4) as usize
     } else { 76 };
 
-    // Read SimParams to get halo
+    // Read SimParams to get halo and subdomain_padding
     let mut sp_buf = vec![0u8; sp_size];
     f.read_exact(&mut sp_buf)?;
     let halo = if sp_buf.len() > 64 {
         i32::from_le_bytes(sp_buf[60..64].try_into().unwrap_or([0;4]))
     } else { 4 };
+    let subdomain_padding = if sp_buf.len() > 72 {
+        Some(f32::from_le_bytes(sp_buf[68..72].try_into().unwrap_or([0;4])) as f64)
+    } else { None };
 
     // Read cell bboxes, skip phi
     let mut total_w = 0i64;
@@ -403,5 +406,6 @@ pub fn read_bbox_mean(path: &Path) -> Result<f64> {
         f.seek(SeekFrom::Current(skip))?;
     }
 
-    Ok(total_w as f64 / num_cells as f64)
+    let bbox_mean = total_w as f64 / num_cells as f64;
+    Ok((bbox_mean, subdomain_padding))
 }
