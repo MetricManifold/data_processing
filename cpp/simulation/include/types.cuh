@@ -74,7 +74,7 @@ struct SimParams {
   int halo_width = 4;          // Ghost cell width for periodic BC
   int min_subdomain_size = 16; // Minimum subdomain dimension
   float subdomain_padding =
-      1.0f; // Bbox buffer beyond cell extent, in units of R (total ~4R for circular cell)
+      0.6f; // Bbox buffer beyond cell extent, in units of R
 
   // Motility model: Run-and-Tumble (discrete Poisson reorientations) or
   // Active Brownian Particle (continuous rotational diffusion)
