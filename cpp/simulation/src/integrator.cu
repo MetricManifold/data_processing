@@ -367,18 +367,12 @@ size_t Integrator::compute_max_page_size(const SimParams &params) {
     lambda_eff = params.lambda * sqrtf(params.gamma / (params.gamma - params.adhesion_J / 2.0f));
   }
   int halo = params.halo_width;
-  // adaptive_margin must match kernels_solver.cu:
-  //   base_margin = subdomain_padding * target_radius
-  //   adhesion_extra = 3 * (lambda_eff - lambda)  [only when J > 0]
-  //   adaptive_margin = base_margin + adhesion_extra + halo
-  int base_margin = static_cast<int>(params.subdomain_padding * params.target_radius);
-  int adhesion_extra = (params.adhesion_J > 0.0f)
-      ? static_cast<int>(3.0f * (lambda_eff - params.lambda))
-      : 0;
-  int adaptive_margin = base_margin + adhesion_extra + halo;
-  int overshoot = static_cast<int>(0.25f * adaptive_margin);
-  int max_dist = static_cast<int>(params.target_radius + 3.0f * lambda_eff) + 1;
-  int max_half = max_dist + adaptive_margin + overshoot + 10; // safety
+  // Pool slot must fit the largest possible bbox from the moment-based resize:
+  //   half = 2σ_max + padding*R
+  // σ_max for a confluent cell ≈ R + 3λ (full extent of phi > threshold)
+  int padding = static_cast<int>(params.subdomain_padding * params.target_radius);
+  int sigma_max = static_cast<int>(params.target_radius + 3.0f * lambda_eff) + 1;
+  int max_half = 2 * sigma_max + padding + 10; // +10 safety
   int max_side = 2 * max_half + 2 * halo; // +halo each side from bbox.expanded(halo)
   return static_cast<size_t>(max_side) * max_side;
 }
@@ -1150,12 +1144,12 @@ void Integrator::step(Domain &domain, float dt, bool sync_polarization_to_host, 
                  cudaMemcpyHostToDevice);
     }
 
-    // Initialize RNG states with deterministic seed.
-    // If polarity_seed was set explicitly (>= 0), use it directly.
-    // Otherwise derive from host rand() (which is seeded by --seed via srand).
+    // Initialize RNG states for polarity dynamics.
+    // If --polarity-seed was explicitly set, use it for reproducibility.
+    // Otherwise use time-based seed (always random, independent of --seed).
     unsigned long seed = (polarity_seed >= 0)
         ? static_cast<unsigned long>(polarity_seed)
-        : static_cast<unsigned long>(rand());
+        : static_cast<unsigned long>(time(nullptr));
     int threads = 256;
     int blocks = (num_cells + threads - 1) / threads;
     kernel_init_rng_states<<<blocks, threads>>>(d_rng_states, seed, num_cells);

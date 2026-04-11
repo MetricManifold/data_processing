@@ -133,9 +133,9 @@ __global__ void kernel_pre_step(
         if (var_x > 4.0f && var_y > 4.0f) {
           float sigma_x = sqrtf(var_x);
           float sigma_y = sqrtf(var_y);
-          // Target half-size: 2σ + subdomain_padding*R + halo
+          // Target half-size: 2σ + padding*R
           float R = d_target_radius[i];
-          int additive_margin = (int)ceilf(subdomain_padding * R) + 4;  // padding*R + halo
+          int additive_margin = (int)ceilf(subdomain_padding * R);
           int target_half_x = (int)ceilf(2.0f * sigma_x) + additive_margin;
           int target_half_y = (int)ceilf(2.0f * sigma_y) + additive_margin;
           int target_w = (2 * target_half_x) & ~1;  // even

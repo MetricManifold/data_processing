@@ -91,13 +91,10 @@ inline Domain::~Domain() {
 }
 
 inline Cell *Domain::add_cell(float cx, float cy, float radius) {
-  // Compute bounding box for this cell.
-  // Margin: max_dist (≈R+2λ) + subdomain_padding*R + halo
-  // subdomain_padding controls the buffer beyond the cell extent.
+  // Initial bbox: cell extent + padding*R
   int cell_extent = static_cast<int>(radius + 3.0f * params.lambda);
-  int padding_margin = static_cast<int>(params.subdomain_padding * params.target_radius)
-                       + params.halo_width;
-  int adaptive_margin = cell_extent + padding_margin;
+  int padding = static_cast<int>(params.subdomain_padding * params.target_radius);
+  int adaptive_margin = cell_extent + padding;
   BoundingBox bbox = {
       static_cast<int>(cx) - adaptive_margin,
       static_cast<int>(cy) - adaptive_margin,

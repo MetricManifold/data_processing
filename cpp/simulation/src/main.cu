@@ -385,7 +385,7 @@ void print_usage(const char *program) {
   printf("  --visualize [interval]  Open real-time display window (requires -DENABLE_VISUALIZER=ON)\n");
   printf("                          interval = steps between updates (default: 100)\n");
   printf("  --save-individual-fields  Save per-cell phi fields for energy analysis\n");
-  printf("  --subdomain-padding <f>  Bbox buffer as fraction of R (default: %.2f, e.g. 0.5=R/2, 1.0=R, 1.5=3R/2)\n", p.subdomain_padding);
+  printf("  --subdomain-padding <f>  Bbox buffer beyond cell extent, in units of R (default: %.2f)\n", p.subdomain_padding);
   printf("  --safe-mode     Limit memory allocation to prevent runaway VRAM usage\n");
   printf("  --batch <file>  Run multiple independent systems from a JSON config file.\n");
   printf("                  Each system resumes from its own checkpoint with independent\n");
