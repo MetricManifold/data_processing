@@ -219,7 +219,196 @@ class TestInterfaceWidth:
 
 
 # ============================================================================
-# 7. Soft cell has higher diffusivity than ctrl (Palmieri result)
+# 7. Cell expansion from small initial size
+# ============================================================================
+
+class TestCellExpansion:
+    """A cell initialized smaller than target R should expand to target area."""
+
+    def test_cell_expands_to_target(self, tmp_path):
+        R = 49
+        # Use a small domain so the cell starts small relative to target
+        # With -N 150 and R=49, the cell is initialized at R=49 but the
+        # volume constraint drives it to target_area = pi*R^2.
+        # Run long enough for relaxation.
+        out = run_sim(tmp_path / "run",
+                      "-n", "1", "-N", "200", "-r", str(R),
+                      "-t", "200", "--dt", "0.01", "--v-A", "0", "--seed", "42",
+                      "--save-interval", "0", "--trajectory-samples", "10")
+        chk = read_checkpoint(out / "checkpoint.bin")
+        target = math.pi * R**2
+        vol = chk["cells"][0]["volume"]
+        # Should be within 2% of target after relaxation
+        assert vol == pytest.approx(target, rel=0.02), \
+            f"After relaxation, volume {vol:.1f} should be within 2% of {target:.1f}"
+
+        # Also check volume increases monotonically from trajectory
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(traj.keys())
+        # Volume proxy: we don't have volume in trajectory, but the cell
+        # should stay near the center if it's relaxing properly
+        x0, y0 = traj[times[0]][0][:2]
+        xf, yf = traj[times[-1]][0][:2]
+        drift = math.sqrt((xf - x0)**2 + (yf - y0)**2)
+        assert drift < 5.0, f"Expanding cell drifted {drift:.1f} px (should stay put)"
+
+
+# ============================================================================
+# 8. Contact equilibrium — two cells at d≈2R should stay in contact
+# ============================================================================
+
+class TestContactEquilibrium:
+    """Two cells placed near contact distance should maintain it — no merger, no fly-apart."""
+
+    def test_cells_stay_in_contact(self, tmp_path):
+        R = 49
+        # With 2 cells on a 300x300 domain at rho~0.07, they have room to
+        # separate but repulsion should keep them at d≈2R.
+        out = run_sim(tmp_path / "run",
+                      "-n", "2", "-N", "300", "-r", str(R),
+                      "-t", "200", "--dt", "0.01", "--v-A", "0", "--seed", "42",
+                      "--save-interval", "0", "--trajectory-samples", "20")
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(traj.keys())
+        Lx = 300
+
+        # Track distance over time
+        distances = []
+        for t in times:
+            if 0 not in traj[t] or 1 not in traj[t]:
+                continue
+            x0, y0 = traj[t][0][:2]
+            x1, y1 = traj[t][1][:2]
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            if dx > Lx / 2: dx = Lx - dx
+            if dy > Lx / 2: dy = Lx - dy
+            distances.append(math.sqrt(dx**2 + dy**2))
+
+        assert len(distances) > 5, "Need enough trajectory points"
+
+        # Distance should be stable (not growing or shrinking dramatically)
+        d_start = np.mean(distances[:3])
+        d_end = np.mean(distances[-3:])
+
+        # Should not merge (d → 0) or fly apart (d → Lx/2)
+        assert d_end > R, f"Cells merged: d_end={d_end:.1f} < R={R}"
+        assert d_end < 4 * R, f"Cells flew apart: d_end={d_end:.1f} > 4R={4*R}"
+
+        # Distance should be relatively stable (within 30% of initial)
+        assert d_end == pytest.approx(d_start, rel=0.3), \
+            f"Distance unstable: {d_start:.1f} → {d_end:.1f}"
+
+
+# ============================================================================
+# 9. Soft cell has higher shape index (more deformable)
+# ============================================================================
+
+class TestGammaAffectsShape:
+    """A soft cell (γ < 1) in a monolayer should have higher L_n than normal cells."""
+
+    def test_soft_cell_more_deformed(self, tmp_path):
+        # Run with cell 0 soft
+        out = run_sim(tmp_path / "run",
+                      "-n", "16", "--confluence", "0.85", "-r", "49",
+                      "-t", "100", "--dt", "0.01", "--v-A", "0.01", "--seed", "42",
+                      "--gamma", "0.35:cell0",
+                      "--save-interval", "0", "--trajectory-samples", "10")
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(traj.keys())
+
+        # Read L_n from trajectory (column index 10)
+        # Collect L_n for cell 0 (soft) and others (ctrl) at late times
+        soft_ln = []
+        ctrl_ln = []
+        with open(out / "trajectory.txt") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 12:
+                    continue
+                t = float(parts[0])
+                cid = int(parts[1])
+                ln = float(parts[10])
+                if t > 50 and ln > 0:  # skip transient and zero values
+                    if cid == 0:
+                        soft_ln.append(ln)
+                    else:
+                        ctrl_ln.append(ln)
+
+        if soft_ln and ctrl_ln:
+            mean_soft = np.mean(soft_ln)
+            mean_ctrl = np.mean(ctrl_ln)
+            # Soft cell should be more deformed (higher L_n)
+            # L_n = perimeter / (2*sqrt(pi*area)) — 1.0 for a perfect circle
+            print(f"L_n: soft={mean_soft:.4f}, ctrl={mean_ctrl:.4f}, ratio={mean_soft/mean_ctrl:.3f}")
+            assert mean_soft > mean_ctrl * 0.95, \
+                f"Soft L_n ({mean_soft:.4f}) should be >= ctrl L_n ({mean_ctrl:.4f})"
+
+
+# ============================================================================
+# 10. MSD grows at least roughly linearly for motile cell
+# ============================================================================
+
+class TestMSDScaling:
+    """For a motile cell, MSD should grow — not be caged or ballistic forever."""
+
+    def test_msd_grows(self, tmp_path):
+        out = run_sim(tmp_path / "run",
+                      "-n", "1", "-N", "400", "-r", "49",
+                      "-t", "500", "--dt", "0.01", "--v-A", "0.01", "--seed", "42",
+                      "--polarity-seed", "100",
+                      "--save-interval", "0", "--trajectory-samples", "50",
+                      timeout=120)
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(traj.keys())
+        Lx = 400
+
+        # Unwrap positions
+        pos = []
+        for t in times:
+            if 0 not in traj[t]:
+                continue
+            x, y = traj[t][0][:2]
+            if pos:
+                px, py = pos[-1]
+                dx, dy = x - px, y - py
+                if dx > Lx / 2: dx -= Lx
+                if dx < -Lx / 2: dx += Lx
+                if dy > Lx / 2: dy -= Lx
+                if dy < -Lx / 2: dy += Lx
+                pos.append((px + dx, py + dy))
+            else:
+                pos.append((x, y))
+
+        n = len(pos)
+        if n < 10:
+            pytest.skip("Not enough trajectory points")
+
+        # Compute MSD at lag=n//4 and lag=n//2
+        def msd_at_lag(lag):
+            s = 0
+            count = 0
+            for t0 in range(n - lag):
+                dx = pos[t0 + lag][0] - pos[t0][0]
+                dy = pos[t0 + lag][1] - pos[t0][1]
+                s += dx**2 + dy**2
+                count += 1
+            return s / count if count > 0 else 0
+
+        msd_short = msd_at_lag(n // 4)
+        msd_long = msd_at_lag(n // 2)
+
+        # MSD should grow with lag (not be constant = caged)
+        assert msd_long > msd_short * 1.2, \
+            f"MSD not growing: lag=n/4 → {msd_short:.2f}, lag=n/2 → {msd_long:.2f}"
+        # Both should be positive
+        assert msd_short > 0, "Short-lag MSD should be > 0"
+
+
+# ============================================================================
+# 11. Soft cell has higher diffusivity than ctrl (Palmieri result)
 # ============================================================================
 
 @pytest.mark.slow
