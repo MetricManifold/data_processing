@@ -155,12 +155,12 @@ th { background: #f0f0f0; font-weight: 600; }
 .fail { color: #c22; font-weight: bold; }
 .info { color: #888; }
 .metric-val { font-family: monospace; font-size: 12px; }
-img.snap { width: 220px; border: 1px solid #ccc; border-radius: 3px; }
-img.chart { width: 380px; border: 1px solid #ccc; border-radius: 3px; }
+img.snap { width: 190px; border: 1px solid #ccc; border-radius: 3px; }
+img.chart { width: 320px; border: 1px solid #ccc; border-radius: 3px; }
 .test-card { display: flex; gap: 12px; align-items: flex-start; background: white;
              border: 1px solid #ddd; border-radius: 6px; padding: 10px; margin: 8px 0; }
-.test-card .visuals { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
-.test-card .data { flex: 1; min-width: 300px; }
+.test-card .visuals { display: flex; flex-direction: row; gap: 8px; flex-shrink: 0; }
+.test-card .data { flex: 1; min-width: 280px; }
 .test-card h3 { margin: 0 0 6px 0; font-size: 14px; color: #333; }
 .summary-bar { display: flex; gap: 20px; background: white; border: 1px solid #ddd;
                border-radius: 6px; padding: 10px 15px; margin: 10px 0; align-items: center; }
