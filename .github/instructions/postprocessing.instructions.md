@@ -4,7 +4,9 @@ applyTo: "cpp/simulation/postprocessing/**"
 
 # Cell Simulation Post-Processing - Copilot Instructions
 
-> **When to consult this file:** You are visualizing, analyzing, or plotting simulation output (VTK frames, trajectories, observables). This covers all Python scripts in `postprocessing/`, the compiled C analysis tools in `cluster/`, and the jamming transition analysis workflow. For running simulations, see [cell-simulation.instructions.md](cell-simulation.instructions.md). For submitting analysis jobs on the cluster, see [cluster-postprocessing.instructions.md](cluster-postprocessing.instructions.md).
+> **When to consult this file:** You are visualizing, analyzing, or plotting simulation output (VTK frames, trajectories, observables). This covers Python scripts in `postprocessing/` for visualization and one-off plotting. For production analysis (MSD, diffusion, structure factor, etc.), use the Rust `cell_analyze` tool — see [rust-cell-analyze.instructions.md](rust-cell-analyze.instructions.md). For running simulations, see [cell-simulation.instructions.md](cell-simulation.instructions.md).
+
+> **⚠️ Primary analysis tool:** `cell_analyze` (Rust) handles all standard observables. The Python and C scripts in this directory are legacy — use them only for custom visualization or plotting. `read_checkpoint.py` has been removed; use `cell_analyze run <dir>` or `cell_analyze study` for checkpoint/trajectory analysis.
 
 ## ⚠️ Related Instructions - Read Before Proceeding
 

@@ -201,6 +201,9 @@ Position unwrapping (removing periodic boundary jumps) is also handled automatic
   "params": {
     "v_a": 0.01, "n_cells": 72,
     "lx": 776.0, "ly": 776.0,
+    "confluence": 0.902,
+    "subdomain_padding": 0.6,
+    "bbox_mean": 284.5,
     "extra": { "gamma_n": "1.0", ... }
   },
   "msd": { "lag_times": [...], "values": [...] },
@@ -465,6 +468,15 @@ msd_lag_max = 100000
 {
   "study_name": "...", "description": "...",
   "n_runs_total": 20, "n_groups": 4,
+  "run_params": [
+    {
+      "path": "/scratch/.../prod_soft/run_01",
+      "params": {
+        "v_a": 0.01, "n_cells": 72, "lx": 776.0, "ly": 776.0,
+        "confluence": 0.902, "subdomain_padding": 0.6, "bbox_mean": 284.5
+      }
+    }
+  ],
   "warnings": ["..."],
   "groups": [
     {

@@ -237,8 +237,12 @@ Key options (see `-h` for the complete list and defaults):
 - Geometry: `-n`, `-r`/`--radius`, `-N` OR `--confluence` (mutually exclusive)
 - Time: `-t`, `-dt`
 - Physics: `--v-A`, `--v-A-sigma`, `--gamma`, `--kappa`, `--mu`, `--xi`, `--adhesion`, `--tau`, `--abp`
+- Bbox: `--subdomain-padding` (buffer beyond cell extent, in units of R; default 0.6)
+- RNG: `--seed` (cell placement), `--polarity-seed` (velocity/polarity GPU RNG; default: random)
 - I/O: `--save-interval`, `--trajectory-samples` OR `--trajectory-interval` (mutually exclusive), `--checkpoint-interval`, `--save-final-checkpoint`
 - Resume: `-c` (checkpoint file)
+
+**⚠️ Checkpoint resume behavior:** On resume from checkpoint (`-c`), physics parameters (dt, gamma, kappa, mu, xi, lambda, tau, etc.) are **preserved from the checkpoint** unless explicitly overridden on the CLI. Only parameters with corresponding `--flag` actually specified on the command line will override the checkpoint values. This prevents accidental physics changes from binary default drift.
 
 **⚠️ Production I/O guidance:** For long cluster runs (t~880,000), use `--save-interval 0` (no VTK) and `--trajectory-interval 18000` (~2000 data points over 720k production time, ~47 MB/run). The default interval of 100 steps produces ~8.9 GB/run and will exceed scratch quota. See [cluster-operations.instructions.md](cluster-operations.instructions.md) for the full data budget calculation.
 
