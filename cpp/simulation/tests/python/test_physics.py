@@ -8,6 +8,7 @@ import math
 import pytest
 import numpy as np
 from conftest import run_sim, read_checkpoint, read_trajectory
+from report import record_metric, record_phi_from_checkpoint
 
 
 # ============================================================================
@@ -25,6 +26,10 @@ class TestSingleCellSteadyState:
         chk = read_checkpoint(out / "checkpoint.bin")
         target_area = math.pi * 49**2
         vol = chk["cells"][0]["volume"]
+        record_metric("single_cell_volume", "target_area", target_area)
+        record_metric("single_cell_volume", "actual_volume", vol)
+        record_metric("single_cell_volume", "rel_error", abs(vol - target_area) / target_area)
+        record_phi_from_checkpoint("single_cell_steady", chk, "Single cell steady state (t=100)")
         assert vol == pytest.approx(target_area, rel=0.01), \
             f"Volume {vol:.1f} should be within 1% of target {target_area:.1f}"
 
@@ -76,6 +81,9 @@ class TestTwoCellRepulsion:
 
         # Should be near 2R = 98
         R = 49
+        record_metric("two_cell_repulsion", "final_distance", dist)
+        record_metric("two_cell_repulsion", "d/R", dist / R)
+        record_phi_from_checkpoint("two_cell_repulsion", chk, f"Two-cell repulsion (d={dist:.0f}px, d/R={dist/R:.2f})")
         assert dist > 1.5 * R, f"Cells too close: d={dist:.1f}, expected > {1.5*R}"
         assert dist < 4 * R, f"Cells too far: d={dist:.1f}, expected < {4*R}"
 
@@ -108,6 +116,10 @@ class TestVolumeConservation:
         chk = read_checkpoint(out / "checkpoint.bin")
         total_vol = sum(c["volume"] for c in chk["cells"])
         target = N * math.pi * R**2
+        record_metric("volume_conservation_16c", "total_volume", total_vol)
+        record_metric("volume_conservation_16c", "target", target)
+        record_metric("volume_conservation_16c", "rel_error", abs(total_vol - target) / target)
+        record_phi_from_checkpoint("volume_conservation_16c", chk, f"16-cell volume conservation (err={abs(total_vol-target)/target:.4f})")
         assert total_vol == pytest.approx(target, rel=0.03), \
             f"Total volume {total_vol:.1f} should be within 3% of {target:.1f}"
 
@@ -340,6 +352,9 @@ class TestGammaAffectsShape:
         if soft_ln and ctrl_ln:
             mean_soft = np.mean(soft_ln)
             mean_ctrl = np.mean(ctrl_ln)
+            record_metric("gamma_shape", "soft_Ln", mean_soft)
+            record_metric("gamma_shape", "ctrl_Ln", mean_ctrl)
+            record_metric("gamma_shape", "ratio", mean_soft / mean_ctrl)
             # Soft cell should be more deformed (higher L_n)
             # L_n = perimeter / (2*sqrt(pi*area)) — 1.0 for a perfect circle
             print(f"L_n: soft={mean_soft:.4f}, ctrl={mean_ctrl:.4f}, ratio={mean_soft/mean_ctrl:.3f}")
