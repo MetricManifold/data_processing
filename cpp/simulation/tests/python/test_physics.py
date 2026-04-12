@@ -98,9 +98,9 @@ class TestTwoCellRepulsion:
         # Should be near 2R = 98
         R = 49
         record_metric("two_cell_repulsion", "separation d", dist,
-                      expected=2*R, tolerance="50%", unit="px")
+                      expected=2*R, tolerance="25%", unit="px")
         record_metric("two_cell_repulsion", "d/R", dist / R,
-                      expected=2.0, tolerance=1.0)
+                      expected=2.0, tolerance=0.6)
 
         # Time series: centroid distance over trajectory
         traj, _ = read_trajectory(out / "trajectory.txt")

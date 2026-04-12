@@ -145,83 +145,108 @@ def generate_report():
     html.append("<title>Cell Sim Test Report</title>")
     html.append("<style>")
     html.append("""
-body { font-family: -apple-system, sans-serif; max-width: 1400px; margin: 0 auto; padding: 20px; background: #fafafa; }
-h1 { color: #222; border-bottom: 2px solid #333; padding-bottom: 8px; }
-h2 { color: #444; margin-top: 35px; }
-h3 { color: #555; margin-top: 20px; }
-table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; }
-th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; font-size: 13px; }
+body { font-family: -apple-system, sans-serif; max-width: 1400px; margin: 0 auto; padding: 15px; background: #fafafa; font-size: 13px; }
+h1 { color: #222; border-bottom: 2px solid #333; padding-bottom: 6px; font-size: 20px; margin-bottom: 10px; }
+h2 { color: #444; margin-top: 20px; font-size: 16px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+table { border-collapse: collapse; background: white; font-size: 12px; }
+th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
 th { background: #f0f0f0; font-weight: 600; }
 .pass { color: #1a7; font-weight: bold; }
 .fail { color: #c22; font-weight: bold; }
-.info { color: #666; }
-.metric-val { font-family: monospace; }
-.snapshot { max-width: 320px; margin: 8px; border: 1px solid #ccc; border-radius: 4px; }
-.ts-plot { max-width: 600px; margin: 8px; border: 1px solid #ccc; border-radius: 4px; }
-.gallery { display: flex; flex-wrap: wrap; gap: 15px; }
-.card { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 10px; }
-.card small { display: block; margin-top: 4px; color: #666; }
-.summary { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 15px; margin: 15px 0; }
+.info { color: #888; }
+.metric-val { font-family: monospace; font-size: 12px; }
+img.snap { width: 220px; border: 1px solid #ccc; border-radius: 3px; }
+img.chart { width: 380px; border: 1px solid #ccc; border-radius: 3px; }
+.test-card { display: flex; gap: 12px; align-items: flex-start; background: white;
+             border: 1px solid #ddd; border-radius: 6px; padding: 10px; margin: 8px 0; }
+.test-card .visuals { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+.test-card .data { flex: 1; min-width: 300px; }
+.test-card h3 { margin: 0 0 6px 0; font-size: 14px; color: #333; }
+.summary-bar { display: flex; gap: 20px; background: white; border: 1px solid #ddd;
+               border-radius: 6px; padding: 10px 15px; margin: 10px 0; align-items: center; }
+.summary-bar .stat { font-size: 18px; font-weight: 700; }
+.summary-bar .label { font-size: 11px; color: #666; }
+.summary-table { width: 100%; font-size: 12px; margin-top: 8px; }
+.summary-table td { padding: 3px 6px; }
+.summary-table .test-name { font-weight: 600; }
     """)
     html.append("</style></head><body>")
     html.append(f"<h1>Cell Simulation Test Report</h1>")
-    html.append(f"<p>Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>")
+    html.append(f"<p style='color:#666;margin:0;'>Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>")
 
-    # Summary
+    # Summary bar
     n_pass = sum(1 for m_list in _metrics.values() for m in m_list if m.get("status") == "PASS")
     n_fail = sum(1 for m_list in _metrics.values() for m in m_list if m.get("status") == "FAIL")
     n_info = sum(1 for m_list in _metrics.values() for m in m_list if m.get("status") == "INFO")
-    html.append(f'<div class="summary">')
-    html.append(f'<b>Metrics:</b> <span class="pass">{n_pass} PASS</span>')
+    n_tests = len(_metrics)
+    html.append(f'<div class="summary-bar">')
+    html.append(f'<div><div class="stat pass">{n_pass}</div><div class="label">PASS</div></div>')
     if n_fail:
-        html.append(f' | <span class="fail">{n_fail} FAIL</span>')
-    html.append(f' | <span class="info">{n_info} info</span>')
-    html.append(f' &nbsp;|&nbsp; <b>Snapshots:</b> {len(_snapshots)} &nbsp;|&nbsp; <b>Time series:</b> {len(_timeseries)}')
+        html.append(f'<div><div class="stat fail">{n_fail}</div><div class="label">FAIL</div></div>')
+    html.append(f'<div><div class="stat info">{n_info}</div><div class="label">INFO</div></div>')
+    html.append(f'<div><div class="stat">{len(_snapshots)}</div><div class="label">Snapshots</div></div>')
+    html.append(f'<div><div class="stat">{len(_timeseries)}</div><div class="label">Charts</div></div>')
+    html.append(f'<div><div class="stat">{n_tests}</div><div class="label">Tests</div></div>')
     html.append(f'</div>')
 
-    # Metrics table — grouped by test
-    if _metrics:
-        html.append("<h2>Quantitative Results</h2>")
-        for test_name, entries in sorted(_metrics.items()):
-            html.append(f"<h3>{test_name}</h3>")
+    # Summary table — one row per test, key metric only
+    html.append('<h2>Summary</h2>')
+    html.append('<table class="summary-table"><tr><th>Test</th><th>Key Metric</th>'
+                '<th>Measured</th><th>Expected</th><th>Status</th></tr>')
+    for test_name, entries in sorted(_metrics.items()):
+        # Pick the most interesting metric (first one with expected value, or first)
+        key_entry = next((e for e in entries if "expected" in e and e.get("status") != "INFO"), entries[0])
+        val = f"{key_entry['value']:.4g}" if isinstance(key_entry["value"], float) else str(key_entry["value"])
+        exp = f"{key_entry['expected']:.4g}" if "expected" in key_entry and isinstance(key_entry["expected"], float) else "—"
+        status = key_entry.get("status", "")
+        scls = status.lower()
+        html.append(f'<tr><td class="test-name">{test_name}</td><td>{key_entry["key"]}</td>'
+                    f'<td class="metric-val">{val}</td><td class="metric-val">{exp}</td>'
+                    f'<td class="{scls}">{status}</td></tr>')
+    html.append('</table>')
 
-            # Show time series if available
-            if test_name in _timeseries:
-                html.append(f'<img src="{_timeseries[test_name]}" class="ts-plot">')
+    # Test cards — compact layout
+    html.append("<h2>Detailed Results</h2>")
+    for test_name, entries in sorted(_metrics.items()):
+        html.append(f'<div class="test-card">')
 
-            # Show snapshot if available
+        # Visuals column (snapshot + chart stacked)
+        has_visuals = test_name in _snapshots or test_name in _timeseries
+        if has_visuals:
+            html.append(f'<div class="visuals">')
             if test_name in _snapshots:
-                html.append(f'<img src="{_snapshots[test_name]}" class="snapshot" style="float:right; margin-left:15px;">')
+                html.append(f'<img src="{_snapshots[test_name]}" class="snap">')
+            if test_name in _timeseries:
+                html.append(f'<img src="{_timeseries[test_name]}" class="chart">')
+            html.append(f'</div>')
 
-            html.append("<table><tr><th>Metric</th><th>Measured</th><th>Expected</th><th>Tolerance</th><th>Status</th></tr>")
-            for e in entries:
-                val = f"{e['value']:.6g}" if isinstance(e["value"], float) else str(e["value"])
-                exp = f"{e['expected']:.6g}" if "expected" in e and isinstance(e["expected"], float) else str(e.get("expected", "—"))
-                tol = str(e.get("tolerance", "—"))
-                unit = f" {e['unit']}" if e.get("unit") else ""
-                status = e.get("status", "")
-                scls = status.lower()
-                html.append(f'<tr><td>{e["key"]}{unit}</td><td class="metric-val">{val}</td>'
-                           f'<td class="metric-val">{exp}</td><td>{tol}</td>'
-                           f'<td class="{scls}">{status}</td></tr>')
-            html.append("</table>")
-            html.append('<div style="clear:both;"></div>')
+        # Data column
+        html.append(f'<div class="data">')
+        html.append(f'<h3>{test_name}</h3>')
+        html.append("<table><tr><th>Metric</th><th>Measured</th><th>Expected</th><th>Tol</th><th></th></tr>")
+        for e in entries:
+            val = f"{e['value']:.6g}" if isinstance(e["value"], float) else str(e["value"])
+            exp = f"{e['expected']:.6g}" if "expected" in e and isinstance(e["expected"], float) else "—"
+            tol = str(e.get("tolerance", "—"))
+            unit = f" {e['unit']}" if e.get("unit") else ""
+            status = e.get("status", "")
+            scls = status.lower()
+            html.append(f'<tr><td>{e["key"]}{unit}</td><td class="metric-val">{val}</td>'
+                       f'<td class="metric-val">{exp}</td><td>{tol}</td>'
+                       f'<td class="{scls}">{status}</td></tr>')
+        html.append("</table>")
+        html.append(f'</div></div>')
 
     # Remaining snapshots (tests without metrics)
     remaining_snaps = {k: v for k, v in _snapshots.items() if k not in _metrics}
-    if remaining_snaps:
-        html.append("<h2>Additional Snapshots</h2>")
-        html.append('<div class="gallery">')
-        for test_name, fname in sorted(remaining_snaps.items()):
-            html.append(f'<div class="card"><img src="{fname}" class="snapshot"><small>{test_name}</small></div>')
-        html.append("</div>")
-
-    # Remaining time series
     remaining_ts = {k: v for k, v in _timeseries.items() if k not in _metrics}
-    if remaining_ts:
-        html.append("<h2>Additional Time Series</h2>")
-        for test_name, fname in sorted(remaining_ts.items()):
-            html.append(f'<div class="card"><img src="{fname}" class="ts-plot"><small>{test_name}</small></div>')
+    if remaining_snaps or remaining_ts:
+        html.append("<h2>Additional</h2>")
+        html.append('<div style="display:flex;flex-wrap:wrap;gap:10px;">')
+        for test_name, fname in sorted({**remaining_snaps, **remaining_ts}.items()):
+            html.append(f'<div style="background:white;border:1px solid #ddd;border-radius:4px;padding:8px;">')
+            html.append(f'<img src="{fname}" class="snap"><br><small>{test_name}</small></div>')
+        html.append("</div>")
 
     html.append("</body></html>")
 
