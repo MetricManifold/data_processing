@@ -64,25 +64,10 @@ __global__ void kernel_pre_step(
   rx = fmodf(fmodf(rx, (float)Nx) + (float)Nx, (float)Nx);
   ry = fmodf(fmodf(ry, (float)Ny) + (float)Ny, (float)Ny);
 
-  // 2. Compute centroids + volume deviations from centroid sums
-  float sum_dx = centroid_sums[i * 3 + 0];
-  float sum_dy = centroid_sums[i * 3 + 1];
-  float sum_phi2 = centroid_sums[i * 3 + 2];
-
-  float volume = sum_phi2 * dA;
-  volumes[i] = volume;
-  volume_deviations[i] = d_target_area[i] - volume;
-
-  // Zero centroid_sums for fused kernel to accumulate NEXT step's sums.
-  centroid_sums[i * 3 + 0] = 0.0f;
-  centroid_sums[i * 3 + 1] = 0.0f;
-  centroid_sums[i * 3 + 2] = 0.0f;
-
-  // Zero reduction accumulators (replaces cudaMemsetAsync of 4N floats)
-  d_integrals_x[i] = 0.0f;
-  d_integrals_y[i] = 0.0f;
-  d_perimeters[i] = 0.0f;
-  d_block_arrival[i] = 0;
+  // 2. Volume/centroid computation is done in kernel_fused_step's last-arriving block.
+  //    Read centroids from d_centroids_x/y (already updated by fused kernel).
+  float cx = centroids_x[i];
+  float cy = centroids_y[i];
 
   // Read second moments. Zero them before accumulation (zero_moments=true
   // on the step BEFORE fused kernel accumulates, so moments persist for
@@ -94,25 +79,22 @@ __global__ void kernel_pre_step(
     d_second_moment_y[i] = 0.0f;
   }
 
+  // Zero perimeter accumulator (read by host sync, then cleared for next step's fused kernel)
+  d_perimeters[i] = 0.0f;
+
   // 3. Compute centroid shift + dynamic resize
   // sx/sy encode the mapping: new local (lx,ly) reads from old local (lx+sx, ly+sy)
   int sx = 0, sy = 0;
   int new_w = w, new_h = h;
 
-  if (sum_phi2 > 1e-8f) {
-    float cx = rx + sum_dx / sum_phi2;
-    float cy = ry + sum_dy / sum_phi2;
-    cx = fmodf(fmodf(cx, (float)Nx) + (float)Nx, (float)Nx);
-    cy = fmodf(fmodf(cy, (float)Ny) + (float)Ny, (float)Ny);
-    centroids_x[i] = cx;
-    centroids_y[i] = cy;
+  // Volume already computed by fused kernel's last block
+  float volume = volumes[i];
 
+  if (volume > 1e-8f) {
     if (compute_shifts) {
       // --- Centroid shift (recenter subdomain) ---
-      // Use wrapped offset for bbox center (offsets are now always in [0,N))
       float sub_cx = fmodf((float)old_off_x + (float)w * 0.5f, (float)Nx);
       float sub_cy = fmodf((float)old_off_y + (float)h * 0.5f, (float)Ny);
-      // Periodic delta: shortest distance between centroid and bbox center
       float dx = cx - sub_cx;
       float dy = cy - sub_cy;
       if (dx >  Nx * 0.5f) dx -= Nx;
@@ -125,9 +107,19 @@ __global__ void kernel_pre_step(
       if (abs(candidate_sy) > 2) sy = candidate_sy;
 
       // --- Dynamic resize using second moments ---
+      float sum_phi2 = volume / dA;
       if (max_side > 0 && sum_phi2 > 1.0f) {
-        float var_x = moment_x / sum_phi2;
-        float var_y = moment_y / sum_phi2;
+        // Correct variance using parallel axis theorem:
+        // Var(x) = E[(x-ref)²] - (centroid-ref)²
+        // moment_x = Σ (x-ref)² φ², centroid = ref + Σ(x-ref)φ² / Σφ²
+        float dx_cent = cx - rx;  // centroid - ref (rx is ref_x for this cell)
+        float dy_cent = cy - ry;
+        if (dx_cent > Nx * 0.5f) dx_cent -= Nx;
+        if (dx_cent < -Nx * 0.5f) dx_cent += Nx;
+        if (dy_cent > Ny * 0.5f) dy_cent -= Ny;
+        if (dy_cent < -Ny * 0.5f) dy_cent += Ny;
+        float var_x = moment_x / sum_phi2 - dx_cent * dx_cent;
+        float var_y = moment_y / sum_phi2 - dy_cent * dy_cent;
         // Guard: only resize when moments are meaningful (σ > 2 pixels).
         // On step 0 moments are zero → var ~ 0, skip to avoid catastrophic shrink.
         if (var_x > 4.0f && var_y > 4.0f) {
@@ -344,7 +336,17 @@ __global__ void kernel_fused_step(
     int halo, int Nx, int Ny,
     int num_cells,
     bool compute_moments,
-    bool has_remap);
+    bool has_remap,
+    int *__restrict__ d_block_arrival_fused,
+    float *__restrict__ d_volumes,
+    float *__restrict__ d_volume_deviations_out,
+    float *__restrict__ d_centroids_x,
+    float *__restrict__ d_centroids_y,
+    const float *__restrict__ d_target_area,
+    float *__restrict__ d_integrals_x_zero,
+    float *__restrict__ d_integrals_y_zero,
+    int *__restrict__ d_block_arrival_zero,
+    float dA);
 
 __global__ void kernel_scatter_phi_sq(
     float **__restrict__ phi_ptrs,
@@ -384,7 +386,6 @@ __global__ void kernel_velocity_integral_2d(
     const int *__restrict__ offsets_x,
     const int *__restrict__ offsets_y,
     const float *__restrict__ sum_field,
-    float *__restrict__ scatter_sum_field,
     float *__restrict__ d_integrals_x,
     float *__restrict__ d_integrals_y,
     int *__restrict__ d_block_arrival,
@@ -427,6 +428,7 @@ void step_fused(Domain &domain, float dt,
                    int *d_shift_x,
                    int *d_shift_y,
                    int *d_block_arrival,
+                   int *d_block_arrival_fused,
                    float *d_sum_field,
                    float *d_sum_field_linear,
                    float *d_next_sum_field,
@@ -529,12 +531,13 @@ void step_fused(Domain &domain, float dt,
   // since they read phi at the old stride.
   dim3 grid_read = grid;  // Save old grid for read-path kernels
   if (pool_max_side > 0 && step_counter % 10 == 0) {
+    // Read new max dims from GPU (synchronizing D→H copy, every 10 steps).
+    // This stalls the pipeline but is needed for correct grid sizing after resize.
     int h_max_wh[2];
     cudaMemcpy(h_max_wh, d_max_wh, 2 * sizeof(int), cudaMemcpyDeviceToHost);
     int new_max_w = h_max_wh[0];
     int new_max_h = h_max_wh[1];
     if (new_max_w > 0 && new_max_h > 0) {
-      // Update grid for fused kernel (write path uses new dims)
       grid = dim3((new_max_w + 31) / 32, (new_max_h + 7) / 8, num_cells);
       cached_max_w = new_max_w;
       cached_max_h = new_max_h;
@@ -588,7 +591,7 @@ void step_fused(Domain &domain, float dt,
     kernel_velocity_integral_2d<<<grid_read, block, smem_vint>>>(
         d_all_phi_ptrs, d_old_widths, d_old_heights,
         d_all_offsets_x, d_all_offsets_y,
-        d_sum_field, nullptr,
+        d_sum_field,
         d_integrals_x, d_integrals_y,
         d_block_arrival,
         d_velocities_x, d_velocities_y,
@@ -622,7 +625,12 @@ void step_fused(Domain &domain, float dt,
       d_two_gamma_bulk, d_two_gamma,
       inv_h2, inv_2dx, inv_2dy, dt,
       params.halo_width, params.Nx, params.Ny,
-      num_cells, compute_moments, (step_counter % 10 == 0));
+      num_cells, compute_moments, (step_counter % 10 == 0),
+      d_block_arrival_fused,
+      d_volumes, d_volume_deviations, d_centroids_x, d_centroids_y,
+      d_target_area,
+      d_integrals_x, d_integrals_y, d_block_arrival,
+      dA);
 
   // Phi pointer swap is now done in kernel_pre_step of the NEXT step
   // (saves 1 kernel launch per step)

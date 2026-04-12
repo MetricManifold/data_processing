@@ -765,6 +765,7 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
   // Try to read per-cell v_A values (appended after cell data)
   if (out_v_A != nullptr) {
     uint32_t v_A_magic = 0;
+    auto pos_before = file.tellg();
     file.read(reinterpret_cast<char *>(&v_A_magic), sizeof(uint32_t));
     if (file.good() && v_A_magic == 0x56415F41) { // "VA_A"
       int32_t v_A_count = 0;
@@ -775,14 +776,17 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
                   v_A_count * sizeof(float));
         printf("  Loaded per-cell v_A: %d values from checkpoint\n", v_A_count);
       }
+    } else {
+      // Magic didn't match — seek back so next section can try
+      file.clear();
+      file.seekg(pos_before);
     }
-    // If magic doesn't match or read fails, out_v_A stays empty
-    // (old checkpoint without v_A data — will be re-generated)
   }
 
   // Try to read per-cell gamma values (appended after v_A data)
   if (out_gamma != nullptr && file.good()) {
     uint32_t gamma_magic = 0;
+    auto pos_before = file.tellg();
     file.read(reinterpret_cast<char *>(&gamma_magic), sizeof(uint32_t));
     if (file.good() && gamma_magic == 0x47414D41) { // "GAMA"
       int32_t gamma_count = 0;
@@ -793,12 +797,16 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
                   gamma_count * sizeof(float));
         printf("  Loaded per-cell gamma: %d values from checkpoint\n", gamma_count);
       }
+    } else {
+      file.clear();
+      file.seekg(pos_before);
     }
   }
 
   // Try to read per-cell target radius values (appended after gamma data)
   if (out_target_radius != nullptr && file.good()) {
     uint32_t radius_magic = 0;
+    auto pos_before = file.tellg();
     file.read(reinterpret_cast<char *>(&radius_magic), sizeof(uint32_t));
     if (file.good() && radius_magic == 0x52414449) { // "RADI"
       int32_t radius_count = 0;
@@ -809,6 +817,9 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
                   radius_count * sizeof(float));
         printf("  Loaded per-cell radius: %d values from checkpoint\n", radius_count);
       }
+    } else {
+      file.clear();
+      file.seekg(pos_before);
     }
   }
 

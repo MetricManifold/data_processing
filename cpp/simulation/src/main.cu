@@ -1447,16 +1447,18 @@ int main(int argc, char *argv[]) {
         printf("  Per-cell v_A will be regenerated (--v-A or --v-A-sigma specified)\n");
       }
 
-      // If user specified gamma overrides, regenerate per-cell gamma
-      if (gamma_overrides_set) {
+      // If user specified gamma overrides or bare gamma, regenerate per-cell gamma
+      if (gamma_overrides_set || gamma_base_set) {
         sim.loaded_gamma.clear();
-        sim.gamma_overrides = gamma_overrides;
-        sim.gamma_overrides_set = true;
-        printf("  Per-cell gamma will be regenerated (--gamma overrides specified)\n");
+        if (gamma_overrides_set) {
+          sim.gamma_overrides = gamma_overrides;
+          sim.gamma_overrides_set = true;
+        }
+        printf("  Per-cell gamma will be regenerated (--gamma specified)\n");
       }
 
-      // If user specified radius overrides, regenerate per-cell radius
-      if (radius_overrides_set) {
+      // If user specified radius overrides or bare radius, regenerate per-cell radius
+      if (radius_overrides_set || target_radius_set) {
         sim.loaded_target_radius.clear();
         sim.radius_overrides = radius_overrides;
         sim.radius_overrides_set = true;

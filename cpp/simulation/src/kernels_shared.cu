@@ -381,7 +381,6 @@ __global__ void kernel_velocity_integral_2d(
     const int *__restrict__ offsets_x,
     const int *__restrict__ offsets_y,
     const float *__restrict__ sum_field,
-    float *__restrict__ scatter_sum_field,
     float *__restrict__ d_integrals_x,
     float *__restrict__ d_integrals_y,
     int *__restrict__ d_block_arrival,
@@ -412,17 +411,6 @@ __global__ void kernel_velocity_integral_2d(
   if (active) {
     const float *phi = phi_ptrs[cell_idx];
     float phi_val = phi[ly * width + lx];
-
-    // Scatter φ² to next-step sum field (fused with velocity integral to avoid
-    // redundant phi load). Only runs when scatter_sum_field is non-null (N>288).
-    if (scatter_sum_field) {
-      float phi_sq = phi_val * phi_val;
-      int ox = offsets_x[cell_idx];
-      int oy = offsets_y[cell_idx];
-      int gx = wrap_coord(ox + lx, Nx);
-      int gy = wrap_coord(oy + ly, Ny);
-      atomicAdd(&scatter_sum_field[gy * Nx + gx], phi_sq);
-    }
 
     bool in_inner = (lx >= halo && lx < width - halo &&
                      ly >= halo && ly < height - halo);
@@ -545,7 +533,18 @@ __global__ void kernel_fused_step(
     int halo, int Nx, int Ny,
     int num_cells,
     bool compute_moments,
-    bool has_remap)
+    bool has_remap,
+    // --- Post-reduction: last-arriving block computes volume/centroid for next step ---
+    int *__restrict__ d_block_arrival_fused,
+    float *__restrict__ d_volumes,
+    float *__restrict__ d_volume_deviations_out,
+    float *__restrict__ d_centroids_x,
+    float *__restrict__ d_centroids_y,
+    const float *__restrict__ d_target_area,
+    float *__restrict__ d_integrals_x_zero,   // zero for next step
+    float *__restrict__ d_integrals_y_zero,
+    int *__restrict__ d_block_arrival_zero,    // zero velocity arrival counter
+    float dA)
 {
   int cell_idx = blockIdx.z;
   if (cell_idx >= num_cells) return;
@@ -815,6 +814,50 @@ __global__ void kernel_fused_step(
           atomicAdd(&d_perimeters[cell_idx], v3);
         }
       }
+    }
+  }
+
+  // === Last-arriving block: compute volume/centroid for next step ===
+  // Replaces kernel_pre_step for the centroid→volume→deviation pipeline.
+  // After all blocks for this cell have atomicAdd'd their centroid sums,
+  // the last block reads them, computes volume_deviation, and zeros
+  // the accumulators for the next step.
+  if (tid == 0) {
+    __threadfence();  // ensure all centroid atomicAdds are globally visible
+    int total_blocks = gridDim.x * gridDim.y;
+    int arrived = atomicAdd(&d_block_arrival_fused[cell_idx], 1);
+    if (arrived == total_blocks - 1) {
+      // Read accumulated centroid sums
+      float sum_dx   = d_centroid_sums[cell_idx * 3 + 0];
+      float sum_dy   = d_centroid_sums[cell_idx * 3 + 1];
+      float sum_phi2 = d_centroid_sums[cell_idx * 3 + 2];
+
+      // Compute volume + deviation
+      float volume = sum_phi2 * dA;
+      d_volumes[cell_idx] = volume;
+      d_volume_deviations_out[cell_idx] = d_target_area[cell_idx] - volume;
+
+      // Compute centroid
+      if (sum_phi2 > 1e-8f) {
+        float cx = ref_x[cell_idx] + sum_dx / sum_phi2;
+        float cy = ref_y[cell_idx] + sum_dy / sum_phi2;
+        cx = fmodf(fmodf(cx, (float)Nx) + (float)Nx, (float)Nx);
+        cy = fmodf(fmodf(cy, (float)Ny) + (float)Ny, (float)Ny);
+        d_centroids_x[cell_idx] = cx;
+        d_centroids_y[cell_idx] = cy;
+      }
+
+      // Zero accumulators for next step (perimeters zeroed in kernel_pre_step
+      // so host sync can read the current value first)
+      d_centroid_sums[cell_idx * 3 + 0] = 0.0f;
+      d_centroid_sums[cell_idx * 3 + 1] = 0.0f;
+      d_centroid_sums[cell_idx * 3 + 2] = 0.0f;
+      d_block_arrival_fused[cell_idx] = 0;
+
+      // Zero velocity kernel accumulators for next step
+      d_integrals_x_zero[cell_idx] = 0.0f;
+      d_integrals_y_zero[cell_idx] = 0.0f;
+      d_block_arrival_zero[cell_idx] = 0;
     }
   }
 }
