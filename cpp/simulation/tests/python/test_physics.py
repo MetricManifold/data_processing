@@ -531,6 +531,14 @@ class TestMSDScaling:
         record_metric("msd_scaling", "growth_ratio", msd_long / max(msd_short, 1e-10),
                       expected=2.0, tolerance=1.5)
 
+        # MSD vs lag curve
+        lags = list(range(1, n // 2, max(1, n // 20)))
+        msd_curve = [msd_at_lag(lag) for lag in lags]
+        record_timeseries("msd_scaling", lags,
+                          {"MSD(lag)": msd_curve},
+                          xlabel="Lag (frames)", ylabel="MSD (px²)",
+                          title="MSD vs lag (should grow, not flatten)")
+
         # MSD should grow with lag (not be constant = caged)
         assert msd_long > msd_short * 1.2, \
             f"MSD not growing: lag=n/4 → {msd_short:.2f}, lag=n/2 → {msd_long:.2f}"
