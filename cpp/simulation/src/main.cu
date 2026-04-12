@@ -782,7 +782,7 @@ int main(int argc, char *argv[]) {
   bool enable_visualizer = false;
   int visualize_interval = 100;
   float v_A_override = -1.0f; // -1 means use default from params
-  float tau_override = -1.0f;  // -1 means use default from params
+  bool tau_set = false;
   bool use_abp = false;       // Use ABP model instead of Run-and-Tumble
   bool safe_mode = false;   // Limit memory allocation to 1GB
   bool use_fcc = true;        // Use FCC lattice (default) vs simple cubic
@@ -878,7 +878,8 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--v-A-sigma" && i + 1 < argc) {
       params.v_A_sigma = atof(argv[++i]);
     } else if (arg == "--tau" && i + 1 < argc) {
-      tau_override = atof(argv[++i]);
+      params.tau = atof(argv[++i]);
+      tau_set = true;
     } else if (arg == "--abp") {
       use_abp = true;
     } else if (arg == "--gamma" && i + 1 < argc) {
@@ -965,11 +966,6 @@ int main(int argc, char *argv[]) {
   // Apply v_A override
   if (v_A_override >= 0.0f) {
     params.v_A = v_A_override;
-  }
-  
-  // Apply tau override
-  if (tau_override > 0.0f) {
-    params.tau = tau_override;
   }
 
   // Apply motility model selection
@@ -1409,11 +1405,11 @@ int main(int argc, char *argv[]) {
       }
 
       // Restore tau if user explicitly overrode it
-      if (tau_override > 0.0f) {
-        if (cp.tau != tau_override) {
-          printf("  Override tau: %.1f -> %.1f\n", cp.tau, tau_override);
+      if (tau_set) {
+        if (cp.tau != params.tau) {
+          printf("  Override tau: %.1f -> %.1f\n", cp.tau, params.tau);
         }
-        cp.tau = tau_override;
+        cp.tau = params.tau;
       }
 
       // If user specified --v-A or --v-A-sigma on command line, regenerate
