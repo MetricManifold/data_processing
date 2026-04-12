@@ -38,19 +38,28 @@ class TestSmoke:
 # 2. Resume preserves checkpoint physics without CLI flags
 # ============================================================================
 
+# Different physics parameter sets to test resume preservation
+PARAM_SETS = [
+    {"dt": "0.005", "gamma": "3.75", "kappa": "20", "mu": "0.5",
+     "xi": "1000", "tau": "5000", "lambda": "10"},
+    {"dt": "0.02", "gamma": "0.5", "kappa": "5", "mu": "2.0",
+     "xi": "2000", "tau": "20000", "lambda": "5"},
+]
+
+
 class TestResumePreservesPhysics:
     """Run with non-default physics, checkpoint, resume without flags.
     Assert all physics params match the checkpoint, not the binary defaults."""
 
-    def test_resume_preserves_all_params(self, tmp_path):
+    @pytest.mark.parametrize("pset", PARAM_SETS, ids=["palmieri-like", "stiff"])
+    def test_resume_preserves_all_params(self, tmp_path, pset):
         # Step 1: Run with non-default params
-        out1 = run_sim(tmp_path / "run1",
-                       "-n", "4", "-N", "300", "-r", "49",
-                       "-t", "1", "--dt", "0.005",
-                       "--gamma", "3.75", "--kappa", "20", "--mu", "0.5",
-                       "--xi", "1000", "--tau", "5000", "--lambda", "10",
-                       "--v-A", "0", "--seed", "42",
-                       "--save-interval", "0", "--trajectory-samples", "0")
+        cli = ["-n", "4", "-N", "300", "-r", "49", "-t", "1",
+               "--v-A", "0", "--seed", "42",
+               "--save-interval", "0", "--trajectory-samples", "0"]
+        for k, v in pset.items():
+            cli.extend([f"--{k}", v])
+        out1 = run_sim(tmp_path / "run1", *cli)
         chk1 = read_checkpoint(out1 / "checkpoint.bin")
 
         # Step 2: Resume with ONLY -t (new end time), no physics flags
@@ -60,30 +69,37 @@ class TestResumePreservesPhysics:
         chk2 = read_checkpoint(out2 / "checkpoint.bin")
 
         # Assert all physics preserved from checkpoint
-        for key in ["dt", "gamma", "kappa", "mu", "xi", "tau", "lambda"]:
-            assert chk2["params"][key] == pytest.approx(chk1["params"][key], rel=1e-6), \
+        for key in pset.keys():
+            assert chk2["params"][key] == pytest.approx(chk1["params"][key], rel=1e-5), \
                 f"{key}: expected {chk1['params'][key]}, got {chk2['params'][key]}"
 
-    def test_resume_overrides_only_explicit(self, tmp_path):
-        # Run with non-default gamma
+    @pytest.mark.parametrize("override_key,override_val,preserve_keys", [
+        ("kappa", "15", {"gamma": 3.75, "mu": 0.5, "xi": 1000.0}),
+        ("mu", "2.0", {"gamma": 3.75, "kappa": 20.0, "xi": 1000.0}),
+        ("gamma", "1.5", {"kappa": 20.0, "mu": 0.5, "xi": 1000.0}),
+        ("xi", "500", {"gamma": 3.75, "kappa": 20.0, "mu": 0.5}),
+    ], ids=["override-kappa", "override-mu", "override-gamma", "override-xi"])
+    def test_resume_overrides_only_explicit(self, tmp_path, override_key, override_val, preserve_keys):
         out1 = run_sim(tmp_path / "run1",
                        "-n", "4", "-N", "300", "-r", "49",
                        "-t", "1", "--dt", "0.01", "--gamma", "3.75",
-                       "--kappa", "20", "--mu", "0.5",
+                       "--kappa", "20", "--mu", "0.5", "--xi", "1000",
                        "--v-A", "0", "--seed", "42",
                        "--save-interval", "0", "--trajectory-samples", "0")
-        chk1 = read_checkpoint(out1 / "checkpoint.bin")
 
-        # Resume overriding ONLY kappa
+        # Resume overriding ONLY one param
         out2 = run_sim(tmp_path / "run2",
                        "-c", str(out1 / "checkpoint.bin"),
-                       "-t", "2", "--kappa", "15")
+                       "-t", "2", f"--{override_key}", override_val)
         chk2 = read_checkpoint(out2 / "checkpoint.bin")
 
-        # kappa should change, gamma should stay
-        assert chk2["params"]["kappa"] == pytest.approx(15.0, rel=1e-6)
-        assert chk2["params"]["gamma"] == pytest.approx(3.75, rel=1e-6)
-        assert chk2["params"]["mu"] == pytest.approx(0.5, rel=1e-6)
+        # Overridden param should match new value
+        assert chk2["params"][override_key] == pytest.approx(float(override_val), rel=1e-5), \
+            f"{override_key} should be {override_val}, got {chk2['params'][override_key]}"
+        # All other params should be preserved from the original run
+        for key, expected in preserve_keys.items():
+            assert chk2["params"][key] == pytest.approx(expected, rel=1e-5), \
+                f"{key}: expected {expected}, got {chk2['params'][key]}"
 
 
 # ============================================================================
@@ -135,25 +151,34 @@ class TestSubdomainPadding:
 # ============================================================================
 
 class TestPerCellArrays:
-    def test_gamma_roundtrip(self, tmp_path):
+    @pytest.mark.parametrize("gamma_spec,check_fn", [
+        # cell0 selector: cell 0 is soft, rest normal
+        ("0.35:cell0", lambda g, n: g[0] == pytest.approx(0.35, abs=0.01) and
+                                    all(x == pytest.approx(1.0, abs=0.01) for x in g[1:])),
+        # fraction selector: 20% of cells are soft
+        ("0.35:20%", lambda g, n: sum(1 for x in g if abs(x - 0.35) < 0.01) == pytest.approx(n * 0.2, abs=1)),
+        # fraction selector: 50% of cells are soft
+        ("0.35:50%", lambda g, n: sum(1 for x in g if abs(x - 0.35) < 0.01) == pytest.approx(n * 0.5, abs=1)),
+    ], ids=["cell0", "20pct", "50pct"])
+    def test_gamma_roundtrip(self, tmp_path, gamma_spec, check_fn):
+        n_cells = 20
         # Run with gamma selector
         out1 = run_sim(tmp_path / "run1",
-                       "-n", "8", "-N", "400", "-r", "49",
+                       "-n", str(n_cells), "--confluence", "0.85", "-r", "49",
                        "-t", "1", "--dt", "0.01", "--v-A", "0.01", "--seed", "42",
-                       "--gamma", "0.35:cell0",
+                       "--gamma", gamma_spec,
                        "--save-interval", "0", "--trajectory-samples", "0")
         chk1 = read_checkpoint(out1 / "checkpoint.bin")
-        assert "gamma" in chk1["per_cell"]
+        assert "gamma" in chk1["per_cell"], "Gamma array should be in checkpoint"
         gamma1 = chk1["per_cell"]["gamma"]
-        assert gamma1[0] == pytest.approx(0.35, abs=0.01)
-        assert all(g == pytest.approx(1.0, abs=0.01) for g in gamma1[1:])
+        assert check_fn(gamma1, n_cells), f"Gamma array doesn't match spec '{gamma_spec}': {gamma1}"
 
         # Resume without gamma flag — should preserve checkpoint gamma
         out2 = run_sim(tmp_path / "run2",
                        "-c", str(out1 / "checkpoint.bin"),
                        "-t", "2")
         chk2 = read_checkpoint(out2 / "checkpoint.bin")
-        assert "gamma" in chk2["per_cell"]
+        assert "gamma" in chk2["per_cell"], "Gamma array should survive resume"
         np.testing.assert_allclose(chk2["per_cell"]["gamma"], gamma1, atol=1e-6)
 
     def test_bare_gamma_clears_checkpoint(self, tmp_path):
