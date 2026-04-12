@@ -662,29 +662,49 @@ static int run_batch(const BatchConfig &config, int base_seed) {
   int ckpt_interval = (config.checkpoint_interval > 0) ? config.checkpoint_interval : 8000000;
 
   int step_count = 0;
+  int batch_size = 10;  // Queue this many steps before checking print/save
   while (sims[0]->current_time < t_end && !g_shutdown_requested) {
-    step_count++;
-    bool is_print_step = (step_count % config.print_interval == 0);
-    bool is_ckpt_step = (step_count % ckpt_interval == 0);
+    // Determine how many pure-compute steps we can batch before next event
+    int steps_to_next_print = config.print_interval - (step_count % config.print_interval);
+    int steps_to_next_ckpt = ckpt_interval - (step_count % ckpt_interval);
+    int steps_to_next_traj = traj_intervals[0] - (step_count % traj_intervals[0]);
+    int steps_to_end = (int)((t_end - sims[0]->current_time) / dt + 0.5f);
+    int batch = batch_size;
+    if (steps_to_next_print > 0) batch = std::min(batch, steps_to_next_print);
+    if (steps_to_next_ckpt > 0) batch = std::min(batch, steps_to_next_ckpt);
+    if (traj_intervals[0] > 0 && steps_to_next_traj > 0) batch = std::min(batch, steps_to_next_traj);
+    if (steps_to_end > 0) batch = std::min(batch, steps_to_end);
+    batch = std::max(batch, 1);
 
-    for (int s = 0; s < num_systems; ++s) {
-      bool save_traj = (step_count % traj_intervals[s] == 0);
-      bool need_sync = save_traj || is_print_step || is_ckpt_step;
-      sims[s]->integrator.step(sims[s]->domain, dt, save_traj, need_sync);
-      sims[s]->current_time += dt;
-      sims[s]->current_step++;
+    // Queue batch of pure-compute steps (no sync, no save)
+    for (int b = 0; b < batch; ++b) {
+      step_count++;
+      bool is_last = (b == batch - 1);
+      bool is_print_step = (step_count % config.print_interval == 0);
+      bool is_ckpt_step = (step_count % ckpt_interval == 0);
+      bool save_traj = (traj_intervals[0] > 0 && step_count % traj_intervals[0] == 0);
+      bool need_sync = is_last && (save_traj || is_print_step || is_ckpt_step);
 
-      if (save_traj) {
-        sims[s]->save_trajectory();
+      for (int s = 0; s < num_systems; ++s) {
+        sims[s]->integrator.step(sims[s]->domain, dt, save_traj && is_last, need_sync);
+        sims[s]->current_time += dt;
+        sims[s]->current_step++;
+
+        if (save_traj && is_last) {
+          sims[s]->save_trajectory();
+        }
       }
     }
+
+    // Handle events at batch boundary
+    bool is_print_step = (step_count % config.print_interval == 0);
+    bool is_ckpt_step = (step_count % ckpt_interval == 0);
 
     if (is_print_step) {
       printf("Step %7d | t=%.4f\n", sims[0]->current_step, sims[0]->current_time);
       fflush(stdout);
     }
 
-    // Periodic per-system checkpoints (enables batch resume)
     if (is_ckpt_step) {
       printf("Checkpoint at step %d (t=%.2f)...\n", sims[0]->current_step, sims[0]->current_time);
       for (int s = 0; s < num_systems; ++s) {
@@ -1372,12 +1392,28 @@ int main(int argc, char *argv[]) {
         cp.adhesion_J = params.adhesion_J;
       }
 
+      // Restore subdomain_padding if explicitly set
+      if (subdomain_padding_set) {
+        if (cp.subdomain_padding != params.subdomain_padding) {
+          printf("  Override subdomain_padding: %.2f -> %.2f\n", cp.subdomain_padding, params.subdomain_padding);
+        }
+        cp.subdomain_padding = params.subdomain_padding;
+      }
+
       // Restore v_A if user explicitly overrode it
       if (v_A_override >= 0.0f) {
         if (cp.v_A != v_A_override) {
           printf("  Override v_A: %.6f -> %.6f\n", cp.v_A, v_A_override);
         }
         cp.v_A = v_A_override;
+      }
+
+      // Restore tau if user explicitly overrode it
+      if (tau_override > 0.0f) {
+        if (cp.tau != tau_override) {
+          printf("  Override tau: %.1f -> %.1f\n", cp.tau, tau_override);
+        }
+        cp.tau = tau_override;
       }
 
       // If user specified --v-A or --v-A-sigma on command line, regenerate
