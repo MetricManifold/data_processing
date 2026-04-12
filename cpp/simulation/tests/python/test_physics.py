@@ -159,6 +159,16 @@ class TestVolumeConservation:
                       expected=math.pi * R**2, tolerance="3%", unit="px²")
         record_phi_from_checkpoint("volume_conservation_16c", chk,
                                   f"16-cell (ΣV err={abs(total_vol-target)/target:.4f})")
+
+        # Time series: per-cell volumes from checkpoint
+        vols = [c["volume"] for c in chk["cells"]]
+        cell_ids = list(range(N))
+        target_line = [math.pi * R**2] * N
+        record_timeseries("volume_conservation_16c", cell_ids,
+                          {"volume": vols, "target πR²": target_line},
+                          xlabel="Cell ID", ylabel="Volume (px²)",
+                          title=f"Per-cell volumes (N={N}, target={math.pi*R**2:.0f})")
+
         assert total_vol == pytest.approx(target, rel=0.03), \
             f"Total volume {total_vol:.1f} should be within 3% of {target:.1f}"
 
@@ -189,8 +199,21 @@ class TestPeriodicBoundaryCrossing:
         # Final checkpoint volume should still be near target
         chk = read_checkpoint(out / "checkpoint.bin")
         target = math.pi * 49**2
-        assert chk["cells"][0]["volume"] == pytest.approx(target, rel=0.05), \
-            f"Volume {chk['cells'][0]['volume']:.1f} after boundary crossing should be near {target:.1f}"
+        vol = chk["cells"][0]["volume"]
+        record_metric("periodic_crossing", "final_volume", vol,
+                      expected=target, tolerance="5%", unit="px²")
+
+        # Time series: trajectory x,y showing the wrap
+        t_vals = [t for t in times if 0 in traj[t]]
+        x_vals = [traj[t][0][0] for t in t_vals]
+        y_vals = [traj[t][0][1] for t in t_vals]
+        record_timeseries("periodic_crossing", t_vals,
+                          {"x (wrapped)": x_vals, "y (wrapped)": y_vals},
+                          xlabel="Time", ylabel="Position (px)",
+                          title="Motile cell crossing periodic boundary")
+
+        assert vol == pytest.approx(target, rel=0.05), \
+            f"Volume {vol:.1f} after boundary crossing should be near {target:.1f}"
 
 
 # ============================================================================
@@ -218,6 +241,25 @@ class TestMotileCell:
         if dy > Nx / 2: dy -= Nx
         if dy < -Nx / 2: dy += Nx
         displacement = math.sqrt(dx**2 + dy**2)
+        record_metric("motile_cell", "displacement", displacement,
+                      expected=1.0, tolerance=5.0, unit="px")
+
+        # Time series: unwrapped trajectory
+        t_vals = [t for t in times if 0 in traj[t]]
+        ux, uy = [traj[t_vals[0]][0][0]], [traj[t_vals[0]][0][1]]
+        for t in t_vals[1:]:
+            x, y = traj[t][0][:2]
+            ddx, ddy = x - ux[-1], y - uy[-1]
+            if ddx > Nx/2: ddx -= Nx
+            if ddx < -Nx/2: ddx += Nx
+            if ddy > Nx/2: ddy -= Nx
+            if ddy < -Nx/2: ddy += Nx
+            ux.append(ux[-1]+ddx); uy.append(uy[-1]+ddy)
+        record_timeseries("motile_cell", t_vals,
+                          {"x (unwrapped)": ux, "y (unwrapped)": uy},
+                          xlabel="Time", ylabel="Position (px)",
+                          title=f"Motile cell trajectory (v_A=0.01, displacement={displacement:.1f}px)")
+
         assert displacement > 0.5, \
             f"Motile cell should have moved > 0.5 px, got {displacement:.2f}"
 
@@ -264,6 +306,16 @@ class TestInterfaceWidth:
             r_10 = below_10[below_10 > r_90]
             if len(r_10) > 0:
                 width = r_10[0] - r_90
+                record_metric("interface_width", "width", float(width),
+                              expected=lam, tolerance=3*lam, unit="px")
+                record_metric("interface_width", "width/λ", width/lam)
+
+                # Time series: radial profile
+                record_timeseries("interface_width",
+                                  list(range(len(profile))), {"φ(r)": profile.tolist()},
+                                  xlabel="Radius (px)", ylabel="φ",
+                                  title=f"Radial profile (width={width}px = {width/lam:.1f}λ)")
+
                 # Interface width should be O(λ) — between 0.5λ and 4λ
                 assert 0.5 * lam < width < 4 * lam, \
                     f"Interface width {width} should be O(λ={lam}), got {width/lam:.1f}λ"
@@ -289,6 +341,10 @@ class TestCellExpansion:
         chk = read_checkpoint(out / "checkpoint.bin")
         target = math.pi * R**2
         vol = chk["cells"][0]["volume"]
+        record_metric("cell_expansion", "final_volume", vol,
+                      expected=target, tolerance="2%", unit="px²")
+        record_phi_from_checkpoint("cell_expansion", chk,
+                                  f"Cell expansion (V={vol:.0f}, target={target:.0f})")
         # Should be within 2% of target after relaxation
         assert vol == pytest.approx(target, rel=0.02), \
             f"After relaxation, volume {vol:.1f} should be within 2% of {target:.1f}"
@@ -341,6 +397,19 @@ class TestContactEquilibrium:
         # Distance should be stable (not growing or shrinking dramatically)
         d_start = np.mean(distances[:3])
         d_end = np.mean(distances[-3:])
+
+        record_metric("contact_equilibrium", "d_start", d_start, unit="px")
+        record_metric("contact_equilibrium", "d_end", d_end,
+                      expected=d_start, tolerance="30%", unit="px")
+        record_metric("contact_equilibrium", "d_end/R", d_end / R,
+                      expected=2.0, tolerance=2.0)
+
+        # Time series
+        t_vals = [t for t in times if 0 in traj[t] and 1 in traj[t]]
+        record_timeseries("contact_equilibrium", t_vals[:len(distances)],
+                          {"d(t)": distances, "2R": [2*R]*len(distances)},
+                          xlabel="Time", ylabel="Distance (px)",
+                          title="Contact equilibrium stability")
 
         # Should not merge (d → 0) or fly apart (d → Lx/2)
         assert d_end > R, f"Cells merged: d_end={d_end:.1f} < R={R}"
@@ -456,6 +525,11 @@ class TestMSDScaling:
 
         msd_short = msd_at_lag(n // 4)
         msd_long = msd_at_lag(n // 2)
+
+        record_metric("msd_scaling", "MSD(n/4)", msd_short, unit="px²")
+        record_metric("msd_scaling", "MSD(n/2)", msd_long, unit="px²")
+        record_metric("msd_scaling", "growth_ratio", msd_long / max(msd_short, 1e-10),
+                      expected=2.0, tolerance=1.5)
 
         # MSD should grow with lag (not be constant = caged)
         assert msd_long > msd_short * 1.2, \

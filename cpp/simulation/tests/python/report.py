@@ -141,6 +141,7 @@ def generate_report():
 
     html = []
     html.append("<!DOCTYPE html><html><head>")
+    html.append('<meta charset="utf-8">')
     html.append("<title>Cell Sim Test Report</title>")
     html.append("<style>")
     html.append("""
@@ -225,7 +226,7 @@ th { background: #f0f0f0; font-weight: 600; }
     html.append("</body></html>")
 
     report_path = d / "report.html"
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(html))
     print(f"\n{'='*60}")
     print(f"Test report: {report_path}")
