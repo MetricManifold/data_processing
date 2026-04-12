@@ -8,7 +8,7 @@ import math
 import pytest
 import numpy as np
 from conftest import run_sim, read_checkpoint, read_trajectory
-from report import record_metric, record_phi_from_checkpoint
+from report import record_metric, record_phi_from_checkpoint, record_timeseries
 
 
 # ============================================================================
@@ -26,10 +26,26 @@ class TestSingleCellSteadyState:
         chk = read_checkpoint(out / "checkpoint.bin")
         target_area = math.pi * 49**2
         vol = chk["cells"][0]["volume"]
-        record_metric("single_cell_volume", "target_area", target_area)
-        record_metric("single_cell_volume", "actual_volume", vol)
-        record_metric("single_cell_volume", "rel_error", abs(vol - target_area) / target_area)
-        record_phi_from_checkpoint("single_cell_steady", chk, "Single cell steady state (t=100)")
+        record_metric("single_cell_steady", "volume", vol,
+                      expected=target_area, tolerance="1%", unit="px²")
+        record_metric("single_cell_steady", "rel_error", abs(vol - target_area) / target_area,
+                      expected=0, tolerance=0.01)
+
+        # Time series: volume from trajectory (use L_n column 11 as proxy)
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(traj.keys())
+        if times:
+            # Volume from checkpoint per-frame isn't in trajectory, use centroid displacement
+            x_vals = [traj[t][0][0] for t in times if 0 in traj[t]]
+            y_vals = [traj[t][0][1] for t in times if 0 in traj[t]]
+            t_vals = [t for t in times if 0 in traj[t]]
+            record_timeseries("single_cell_steady", t_vals,
+                              {"x": x_vals, "y": y_vals},
+                              xlabel="Time", ylabel="Position (px)",
+                              title="Single cell centroid (should be stationary)")
+
+        record_phi_from_checkpoint("single_cell_steady", chk,
+                                  f"Single cell steady state (V={vol:.0f}, target={target_area:.0f})")
         assert vol == pytest.approx(target_area, rel=0.01), \
             f"Volume {vol:.1f} should be within 1% of target {target_area:.1f}"
 
@@ -81,9 +97,30 @@ class TestTwoCellRepulsion:
 
         # Should be near 2R = 98
         R = 49
-        record_metric("two_cell_repulsion", "final_distance", dist)
-        record_metric("two_cell_repulsion", "d/R", dist / R)
-        record_phi_from_checkpoint("two_cell_repulsion", chk, f"Two-cell repulsion (d={dist:.0f}px, d/R={dist/R:.2f})")
+        record_metric("two_cell_repulsion", "separation d", dist,
+                      expected=2*R, tolerance="50%", unit="px")
+        record_metric("two_cell_repulsion", "d/R", dist / R,
+                      expected=2.0, tolerance=1.0)
+
+        # Time series: centroid distance over trajectory
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        t_list, d_list = [], []
+        for t in sorted(traj.keys()):
+            if 0 in traj[t] and 1 in traj[t]:
+                x0, y0 = traj[t][0][:2]; x1, y1 = traj[t][1][:2]
+                ddx = abs(x1-x0); ddy = abs(y1-y0)
+                if ddx > Nx/2: ddx = Nx-ddx
+                if ddy > Nx/2: ddy = Nx-ddy
+                t_list.append(t)
+                d_list.append(math.sqrt(ddx**2+ddy**2))
+        if t_list:
+            record_timeseries("two_cell_repulsion", t_list,
+                              {"d(t)": d_list, "2R": [2*R]*len(t_list)},
+                              xlabel="Time", ylabel="Distance (px)",
+                              title="Two-cell separation vs time")
+
+        record_phi_from_checkpoint("two_cell_repulsion", chk,
+                                  f"Two-cell (d={dist:.0f}px, d/R={dist/R:.2f})")
         assert dist > 1.5 * R, f"Cells too close: d={dist:.1f}, expected > {1.5*R}"
         assert dist < 4 * R, f"Cells too far: d={dist:.1f}, expected < {4*R}"
 
@@ -116,10 +153,12 @@ class TestVolumeConservation:
         chk = read_checkpoint(out / "checkpoint.bin")
         total_vol = sum(c["volume"] for c in chk["cells"])
         target = N * math.pi * R**2
-        record_metric("volume_conservation_16c", "total_volume", total_vol)
-        record_metric("volume_conservation_16c", "target", target)
-        record_metric("volume_conservation_16c", "rel_error", abs(total_vol - target) / target)
-        record_phi_from_checkpoint("volume_conservation_16c", chk, f"16-cell volume conservation (err={abs(total_vol-target)/target:.4f})")
+        record_metric("volume_conservation_16c", "total_volume", total_vol,
+                      expected=target, tolerance="3%", unit="px²")
+        record_metric("volume_conservation_16c", "per_cell_avg", total_vol / N,
+                      expected=math.pi * R**2, tolerance="3%", unit="px²")
+        record_phi_from_checkpoint("volume_conservation_16c", chk,
+                                  f"16-cell (ΣV err={abs(total_vol-target)/target:.4f})")
         assert total_vol == pytest.approx(target, rel=0.03), \
             f"Total volume {total_vol:.1f} should be within 3% of {target:.1f}"
 
@@ -352,9 +391,12 @@ class TestGammaAffectsShape:
         if soft_ln and ctrl_ln:
             mean_soft = np.mean(soft_ln)
             mean_ctrl = np.mean(ctrl_ln)
-            record_metric("gamma_shape", "soft_Ln", mean_soft)
-            record_metric("gamma_shape", "ctrl_Ln", mean_ctrl)
-            record_metric("gamma_shape", "ratio", mean_soft / mean_ctrl)
+            record_metric("gamma_shape", "soft_Ln", mean_soft, unit="")
+            record_metric("gamma_shape", "ctrl_Ln", mean_ctrl, unit="")
+            record_metric("gamma_shape", "soft/ctrl ratio", mean_soft / mean_ctrl,
+                          expected=1.0, tolerance=0.15)
+            record_phi_from_checkpoint("gamma_shape", read_checkpoint(out / "checkpoint.bin"),
+                                      f"Soft cell γ=0.35 (L_n ratio={mean_soft/mean_ctrl:.3f})")
             # Soft cell should be more deformed (higher L_n)
             # L_n = perimeter / (2*sqrt(pi*area)) — 1.0 for a perfect circle
             print(f"L_n: soft={mean_soft:.4f}, ctrl={mean_ctrl:.4f}, ratio={mean_soft/mean_ctrl:.3f}")

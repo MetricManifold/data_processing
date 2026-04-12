@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 
 # Register the report plugin
-from report import pytest_sessionfinish, record_metric, record_snapshot, record_phi_from_checkpoint  # noqa: F401
+from report import pytest_sessionfinish, record_metric, record_snapshot, record_phi_from_checkpoint, record_timeseries  # noqa: F401
 
 import pytest
 import numpy as np
