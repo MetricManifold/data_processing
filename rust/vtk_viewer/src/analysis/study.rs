@@ -500,6 +500,13 @@ pub struct PairedGroupMetrics {
     pub paired_metrics: BTreeMap<String, MetricValue>,
 }
 
+/// Per-run parameter summary (included in study output).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunParamsSummary {
+    pub path: String,
+    pub params: super::output::RunParams,
+}
+
 /// Full study output.
 #[derive(Debug, Clone, Serialize)]
 pub struct StudyResult {
@@ -507,6 +514,9 @@ pub struct StudyResult {
     pub description: String,
     pub n_runs_total: usize,
     pub n_groups: usize,
+    /// Per-run parameters (path, params with bbox_mean/subdomain_padding)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub run_params: Vec<RunParamsSummary>,
     /// Data quality warnings
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -598,6 +608,12 @@ pub fn run_study(
     }
 
     let n_runs_total = runs.len();
+
+    // Collect per-run params for output
+    let run_params: Vec<RunParamsSummary> = runs.iter().map(|ar| RunParamsSummary {
+        path: ar.result.path.clone(),
+        params: ar.result.params.clone(),
+    }).collect();
 
     // 3. Group and aggregate
     let ac = &config.analysis;
@@ -727,6 +743,7 @@ pub fn run_study(
             description: config.study.description.clone(),
             n_runs_total,
             n_groups: paired.len(),
+            run_params,
             warnings,
             groups: Vec::new(),
             paired,
@@ -740,6 +757,7 @@ pub fn run_study(
             description: config.study.description.clone(),
             n_runs_total,
             n_groups: groups.len(),
+            run_params,
             warnings: Vec::new(),
             groups,
             paired: Vec::new(),
