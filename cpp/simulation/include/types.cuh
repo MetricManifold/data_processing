@@ -74,7 +74,7 @@ struct SimParams {
   int halo_width = 4;          // Ghost cell width for periodic BC
   int min_subdomain_size = 16; // Minimum subdomain dimension
   float subdomain_padding =
-      0.6f; // Bbox buffer beyond cell extent, in units of R
+      0.5f; // Bbox buffer beyond cell extent, in units of R
 
   // Motility model: Run-and-Tumble (discrete Poisson reorientations) or
   // Active Brownian Particle (continuous rotational diffusion)
@@ -84,7 +84,7 @@ struct SimParams {
   MotilityModel motility_model = MotilityModel::RunAndTumble;
 
   // Per-cell motility disorder (added after MotilityModel for checkpoint compat)
-  // Not stored in checkpoint — set via CLI only. Old checkpoints read v_A_sigma=0.
+  // Stored in checkpoint (v4+). Old checkpoints read v_A_sigma=0.
   float v_A_sigma = 0.0f; // Std dev for per-cell v_A (log-normal disorder, 0 = uniform)
 
   // Per-cell stiffness overrides (population or per-cell)

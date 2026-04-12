@@ -663,10 +663,9 @@ bool load_checkpoint(Domain &domain, const std::string &filename,
   int num_cells = header.num_cells;
 
   // Handle SimParams size mismatch for old checkpoints
-  // v3 and earlier didn't have motility_model or v_A_sigma in SimParams
-  // Old SimParams size = current size - sizeof(MotilityModel) - sizeof(v_A_sigma)
-  size_t v3_sim_params_size =
-      sizeof(SimParams) - sizeof(SimParams::MotilityModel) - sizeof(float);
+  // v3 SimParams had 18 fields (Nx through subdomain_padding) = 72 bytes.
+  // Hardcoded because the struct has grown since then.
+  constexpr size_t v3_sim_params_size = 72;
 
   if (header.version <= 3 || header.sim_params_size == 0) {
     // Old checkpoint without motility_model or v_A_sigma fields

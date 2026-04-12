@@ -789,6 +789,13 @@ int main(int argc, char *argv[]) {
   float confluence = -1.0f;   // -1 = not set (must provide -N or --confluence)
   bool subdomain_padding_set = false; // Track if user explicitly set padding
   bool adhesion_J_set = false; // Track if user explicitly set --adhesion
+  bool dt_set = false;
+  bool lambda_set = false;
+  bool kappa_set = false;
+  bool mu_set = false;
+  bool xi_set = false;
+  bool target_radius_set = false;
+  bool v_A_sigma_set = false;
   bool gamma_base_set = false; // Track if bare --gamma was already set
   std::vector<cellsim::SimParams::GammaOverride> gamma_overrides;
   bool gamma_overrides_set = false;
@@ -812,6 +819,7 @@ int main(int argc, char *argv[]) {
     } else if (arg == "-r" && i + 1 < argc) {
       // -r is shorthand for --radius (bare value only)
       params.target_radius = static_cast<float>(atof(argv[++i]));
+      target_radius_set = true;
     } else if (arg == "-N" && i + 1 < argc) {
       int size = atoi(argv[++i]);
       params.Nx = size;
@@ -821,8 +829,10 @@ int main(int argc, char *argv[]) {
       params.t_end = atof(argv[++i]);
     } else if ((arg == "-dt" || arg == "--dt") && i + 1 < argc) {
       params.dt = atof(argv[++i]);
+      dt_set = true;
     } else if ((arg == "--lambda" || arg == "-l") && i + 1 < argc) {
       params.lambda = atof(argv[++i]);
+      lambda_set = true;
     } else if (arg == "-o" && i + 1 < argc) {
       output_dir = argv[++i];
     } else if ((arg == "-s" || arg == "--min-spacing") && i + 1 < argc) {
@@ -877,6 +887,7 @@ int main(int argc, char *argv[]) {
       v_A_override = atof(argv[++i]);
     } else if (arg == "--v-A-sigma" && i + 1 < argc) {
       params.v_A_sigma = atof(argv[++i]);
+      v_A_sigma_set = true;
     } else if (arg == "--tau" && i + 1 < argc) {
       params.tau = atof(argv[++i]);
       tau_set = true;
@@ -897,10 +908,13 @@ int main(int argc, char *argv[]) {
       if (is_bare) gamma_base_set = true;
     } else if (arg == "--kappa" && i + 1 < argc) {
       params.kappa = atof(argv[++i]);
+      kappa_set = true;
     } else if (arg == "--mu" && i + 1 < argc) {
       params.mu = atof(argv[++i]);
+      mu_set = true;
     } else if (arg == "--xi" && i + 1 < argc) {
       params.xi = atof(argv[++i]);
+      xi_set = true;
     } else if (arg == "--adhesion" && i + 1 < argc) {
       params.adhesion_J = atof(argv[++i]);
       adhesion_J_set = true;
@@ -1318,7 +1332,6 @@ int main(int argc, char *argv[]) {
     // Save command-line overrides before loading checkpoint (which overwrites
     // params)
     float cmd_t_end = params.t_end;
-    float cmd_dt = params.dt;
     float cmd_v_A = params.v_A;
     int cmd_save_interval = save_interval;
     int cmd_checkpoint_interval = checkpoint_interval;
@@ -1355,29 +1368,42 @@ int main(int argc, char *argv[]) {
       // time)
       sim.domain.params.t_end = cmd_t_end;
 
-      // #8: Always restore physics parameters from CLI (checkpoint stores
-      // equilibration values; production runs may use different params).
-      // Print info when overriding.
+      // #8: Only restore physics parameters that were explicitly set on CLI.
+      // Without this guard, checkpoint values are silently clobbered by
+      // process defaults (e.g. gamma=1.0 overwrites checkpoint gamma=3.75).
       auto &cp = sim.domain.params;
-      if (cp.dt != cmd_dt) {
-        printf("  Override dt: %.4f -> %.4f\n", cp.dt, cmd_dt);
-        cp.dt = cmd_dt;
+
+      if (dt_set && cp.dt != params.dt) {
+        printf("  Override dt: %.4f -> %.4f\n", cp.dt, params.dt);
+        cp.dt = params.dt;
       }
-      if (cp.gamma != params.gamma) {
+      if (lambda_set && cp.lambda != params.lambda) {
+        printf("  Override lambda: %.3f -> %.3f\n", cp.lambda, params.lambda);
+        cp.lambda = params.lambda;
+      }
+      if ((gamma_base_set) && cp.gamma != params.gamma) {
         printf("  Override gamma: %.4f -> %.4f\n", cp.gamma, params.gamma);
         cp.gamma = params.gamma;
       }
-      if (cp.kappa != params.kappa) {
+      if (kappa_set && cp.kappa != params.kappa) {
         printf("  Override kappa: %.4f -> %.4f\n", cp.kappa, params.kappa);
         cp.kappa = params.kappa;
       }
-      if (cp.mu != params.mu) {
+      if (mu_set && cp.mu != params.mu) {
         printf("  Override mu: %.4f -> %.4f\n", cp.mu, params.mu);
         cp.mu = params.mu;
       }
-      if (cp.xi != params.xi) {
+      if (xi_set && cp.xi != params.xi) {
         printf("  Override xi: %.1f -> %.1f\n", cp.xi, params.xi);
         cp.xi = params.xi;
+      }
+      if (target_radius_set && cp.target_radius != params.target_radius) {
+        printf("  Override target_radius: %.1f -> %.1f\n", cp.target_radius, params.target_radius);
+        cp.target_radius = params.target_radius;
+      }
+      if (use_abp && cp.motility_model != SimParams::MotilityModel::ABP) {
+        printf("  Override motility_model: RunAndTumble -> ABP\n");
+        cp.motility_model = SimParams::MotilityModel::ABP;
       }
 
       // #7: Restore adhesion_J unconditionally when explicitly set (allows --adhesion 0)
@@ -1415,7 +1441,7 @@ int main(int argc, char *argv[]) {
       // If user specified --v-A or --v-A-sigma on command line, regenerate
       // per-cell v_A instead of using checkpoint values (needed when starting
       // production from an equilibration checkpoint with v_A=0)
-      if (v_A_override >= 0.0f || params.v_A_sigma > 0.0f) {
+      if (v_A_override >= 0.0f || v_A_sigma_set) {
         sim.loaded_v_A.clear();
         sim.domain.params.v_A_sigma = params.v_A_sigma;
         printf("  Per-cell v_A will be regenerated (--v-A or --v-A-sigma specified)\n");
