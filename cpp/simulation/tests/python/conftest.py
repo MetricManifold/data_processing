@@ -160,10 +160,36 @@ def read_checkpoint(path):
         sp_buf = f.read(sp_size)
 
         params = {}
-        # Two layouts coexist:
-        #   baseline (sp_size=72 or 92): lambda@28, gamma@32, ..., subdomain_padding@68
-        #   sim_v2   (sp_size=88):       lambda@24, gamma@28, ..., subdomain_padding@56
-        if sp_size == 88:
+        # Three layouts coexist:
+        #   baseline (sp_size=72 or 92): lambda@28, gamma@32, ..., subdomain_padding@68 (f32)
+        #   sim_v2 v5 (sp_size=88):      lambda@24, gamma@28, ..., subdomain_padding@56 (f32)
+        #   sim_v2 v6 (sp_size=144):     scalars as f64, int fields at end
+        if sp_size == 144:
+            # sim_v2 v6 layout: 2 ints + 13 doubles + 6 ints + 1 bool + pad
+            fields_i = [("Nx", 0), ("Ny", 4)]
+            fields_d = [
+                ("dx", 8), ("dy", 16),
+                ("dt", 24), ("t_end", 32),
+                ("lambda", 40), ("gamma", 48),
+                ("kappa", 56), ("target_radius", 64),
+                ("mu", 72), ("v_A", 80),
+                ("xi", 88), ("tau", 96),
+                ("subdomain_padding", 104),
+            ]
+            fields_i2 = [
+                ("halo_width", 112),
+                ("save_interval", 116),
+                ("print_interval", 120),
+                ("trajectory_samples", 124),
+                ("seed", 128),
+                ("polarity_seed", 132),
+            ]
+            for name, off in fields_i + fields_i2:
+                params[name] = struct.unpack_from("<i", sp_buf, off)[0]
+            for name, off in fields_d:
+                params[name] = struct.unpack_from("<d", sp_buf, off)[0]
+            params["abp"] = bool(sp_buf[136])
+        elif sp_size == 88:
             # sim_v2 layout
             fields = [
                 ("Nx", "i", 0), ("Ny", "i", 4),
