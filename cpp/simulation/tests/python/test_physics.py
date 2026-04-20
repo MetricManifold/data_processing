@@ -8,7 +8,7 @@ import math
 import pytest
 import numpy as np
 from conftest import run_sim, read_checkpoint, read_trajectory, requires_flag
-from report import record_metric, record_phi_from_checkpoint, record_timeseries
+from report import record_metric, record_phi_from_checkpoint, record_timeseries, record_trajectory
 
 
 # ============================================================================
@@ -279,7 +279,8 @@ class TestMotileCell:
         record_metric("motile_cell", "displacement", displacement,
                       expected=1.0, tolerance=0.3, unit="px")
 
-        # Time series: unwrapped trajectory
+        # Unwrap the trajectory across periodic boundaries, then plot as a
+        # 2D path (x vs y) — what a trajectory actually looks like.
         t_vals = [t for t in times if 0 in traj[t]]
         ux, uy = [traj[t_vals[0]][0][0]], [traj[t_vals[0]][0][1]]
         for t in t_vals[1:]:
@@ -290,10 +291,8 @@ class TestMotileCell:
             if ddy > Nx/2: ddy -= Nx
             if ddy < -Nx/2: ddy += Nx
             ux.append(ux[-1]+ddx); uy.append(uy[-1]+ddy)
-        record_timeseries("motile_cell", t_vals,
-                          {"x (unwrapped)": ux, "y (unwrapped)": uy},
-                          xlabel="Time", ylabel="Position (px)",
-                          title=f"Motile cell trajectory (v_A=0.01, displacement={displacement:.1f}px)")
+        record_trajectory("motile_cell", ux, uy,
+                          title=f"Motile cell path (v_A=0.01, |Δr|={displacement:.1f}px)")
 
         assert displacement > 0.5, \
             f"Motile cell should have moved > 0.5 px, got {displacement:.2f}"

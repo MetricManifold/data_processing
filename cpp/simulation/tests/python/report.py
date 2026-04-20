@@ -17,7 +17,13 @@ import numpy as np
 _metrics = {}       # test_name -> list of {key, value, expected, tolerance, status}
 _snapshots = {}     # test_name -> filename
 _timeseries = {}    # test_name -> filename
+_trajectories = {}  # test_name -> filename (xy path chart)
+_skipped = {}       # test_name -> reason
 _report_dir = None
+
+
+def record_skip(test_name, reason):
+    _skipped[test_name] = reason
 
 
 def get_report_dir():
@@ -106,6 +112,35 @@ def record_timeseries(test_name, x, y_dict, xlabel="Time", ylabel="Value", title
     _timeseries[test_name] = fname
 
 
+def record_trajectory(test_name, xs, ys, title="", xlabel="x (px)", ylabel="y (px)"):
+    """Save an (x, y) path plot with start/end markers. Use for 2D trajectories."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    d = get_report_dir()
+    fname = f"{_safe_name(test_name)}_traj.png"
+    out = d / fname
+
+    fig, ax = plt.subplots(1, 1, figsize=(4.5, 4.5))
+    ax.plot(xs, ys, "-", color="#2266cc", linewidth=1.5, alpha=0.85)
+    ax.plot(xs[0], ys[0], "o", color="#1a7a3a", markersize=8, label="start")
+    ax.plot(xs[-1], ys[-1], "s", color="#c22222", markersize=8, label="end")
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(title or test_name, fontsize=10)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc="best")
+    plt.tight_layout()
+    plt.savefig(out, dpi=100, bbox_inches="tight")
+    plt.close()
+    _trajectories[test_name] = fname
+
+
 def record_phi_from_checkpoint(test_name, chk, title=""):
     """Composite all cell phi fields onto the domain grid and save snapshot."""
     Nx = chk["params"]["Nx"]
@@ -179,14 +214,17 @@ img.chart { width: 320px; border: 1px solid #ccc; border-radius: 3px; }
     n_fail = sum(1 for m_list in _metrics.values() for m in m_list if m.get("status") == "FAIL")
     n_info = sum(1 for m_list in _metrics.values() for m in m_list if m.get("status") == "INFO")
     n_tests = len(_metrics)
+    n_skip = len(_skipped)
     html.append(f'<div class="summary-bar">')
     html.append(f'<div><div class="stat pass">{n_pass}</div><div class="label">PASS</div></div>')
     if n_fail:
         html.append(f'<div><div class="stat fail">{n_fail}</div><div class="label">FAIL</div></div>')
     html.append(f'<div><div class="stat info">{n_info}</div><div class="label">INFO</div></div>')
+    if n_skip:
+        html.append(f'<div><div class="stat" style="color:#b58900">{n_skip}</div><div class="label">SKIPPED</div></div>')
     html.append(f'<div><div class="stat">{len(_snapshots)}</div><div class="label">Snapshots</div></div>')
-    html.append(f'<div><div class="stat">{len(_timeseries)}</div><div class="label">Charts</div></div>')
-    html.append(f'<div><div class="stat">{n_tests}</div><div class="label">Tests</div></div>')
+    html.append(f'<div><div class="stat">{len(_timeseries) + len(_trajectories)}</div><div class="label">Charts</div></div>')
+    html.append(f'<div><div class="stat">{n_tests}</div><div class="label">Tests w/ metrics</div></div>')
     html.append(f'</div>')
 
     # Summary table — one row per test, key metric only
@@ -210,12 +248,15 @@ img.chart { width: 320px; border: 1px solid #ccc; border-radius: 3px; }
     for test_name, entries in sorted(_metrics.items()):
         html.append(f'<div class="test-card">')
 
-        # Visuals column (snapshot + chart stacked)
-        has_visuals = test_name in _snapshots or test_name in _timeseries
+        # Visuals column (snapshot + chart + trajectory)
+        has_visuals = (test_name in _snapshots or test_name in _timeseries
+                       or test_name in _trajectories)
         if has_visuals:
             html.append(f'<div class="visuals">')
             if test_name in _snapshots:
                 html.append(f'<img src="{_snapshots[test_name]}" class="snap">')
+            if test_name in _trajectories:
+                html.append(f'<img src="{_trajectories[test_name]}" class="chart">')
             if test_name in _timeseries:
                 html.append(f'<img src="{_timeseries[test_name]}" class="chart">')
             html.append(f'</div>')
@@ -236,6 +277,14 @@ img.chart { width: 320px; border: 1px solid #ccc; border-radius: 3px; }
                        f'<td class="{scls}">{status}</td></tr>')
         html.append("</table>")
         html.append(f'</div></div>')
+
+    # Skipped tests (e.g. @slow without --run-slow)
+    if _skipped:
+        html.append('<h2>Skipped</h2>')
+        html.append('<table><tr><th>Test</th><th>Reason</th></tr>')
+        for tn, reason in sorted(_skipped.items()):
+            html.append(f'<tr><td class="test-name">{tn}</td><td>{reason}</td></tr>')
+        html.append('</table>')
 
     # Remaining snapshots (tests without metrics)
     remaining_snaps = {k: v for k, v in _snapshots.items() if k not in _metrics}

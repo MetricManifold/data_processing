@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 
 # Register the report plugin
-from report import pytest_sessionfinish, record_metric, record_snapshot, record_phi_from_checkpoint, record_timeseries  # noqa: F401
+from report import pytest_sessionfinish, record_metric, record_snapshot, record_phi_from_checkpoint, record_timeseries, record_trajectory, record_skip  # noqa: F401
 
 import pytest
 import numpy as np
@@ -72,6 +72,25 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Capture skip reasons for the HTML report."""
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when == "setup" and rep.skipped:
+        # rep.longrepr for skips is (filename, lineno, reason) or a str
+        reason = ""
+        lr = rep.longrepr
+        if isinstance(lr, tuple) and len(lr) == 3:
+            reason = str(lr[2])
+        elif lr is not None:
+            reason = str(lr)
+        # strip leading "Skipped: "
+        if reason.startswith("Skipped: "):
+            reason = reason[len("Skipped: "):]
+        record_skip(item.nodeid, reason or "skipped")
 
 
 CELL_SIM = _find_binary()

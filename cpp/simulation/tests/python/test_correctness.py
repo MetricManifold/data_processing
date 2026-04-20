@@ -99,19 +99,49 @@ class TestTrajectoryIntegrity:
             f"checkpoint time {time_f64} disagrees with t_end=0.5"
 
     @pytest.mark.slow
-    def test_time_advances_past_float32_precision_wall(self, sim):
-        """End-to-end guard for cur_time=f32 regression. With dt=0.01, f32 += dt
-        stalls around t=2^18=262144. Runs to t=270000 and asserts timestamps
-        keep advancing. N=1, ~30M steps, ~10-15 min — hence @slow."""
-        out = sim("-n", "1", "-N", "128", "-r", "20",
-                  "-t", "270000", "--dt", "0.01", "--v-A", "0",
-                  "--seed", "42", "--trajectory-samples", "10",
-                  "--print-interval", "0", timeout=1800)
-        data, _ = read_trajectory(out / "trajectory.txt")
+    def test_time_advances_past_float32_precision_wall(self, sim, tmp_path):
+        """End-to-end guard for cur_time=f32 regression. Rather than marching
+        17M steps from t=0 to cross the f32 stall point at t=2^14=16384 (for
+        dt=0.001), we generate a short checkpoint, hex-patch its cur_time to
+        just below the stall point, then resume. If cur_time were still f32,
+        timestamps past 2^14 would collapse; with f64 they advance."""
+        import struct, subprocess
+        from conftest import CELL_SIM
+        # 1. Short initial run to generate a v5 checkpoint
+        out1 = sim("-n", "1", "-N", "64", "-r", "15", "-t", "0.5",
+                   "--dt", "0.001", "--v-A", "0", "--seed", "42",
+                   "--trajectory-samples", "0")
+        ckpt_src = out1 / "checkpoint.bin"
+        assert ckpt_src.exists()
+
+        # 2. Hex-patch step_count (offset 8, i32) and time_f64 (offset 12) to
+        # place the run just below the f32 stall point. The sim loop uses
+        # step_count<target_step so we need to shift both consistently.
+        ckpt_bytes = bytearray(ckpt_src.read_bytes())
+        magic, version = struct.unpack_from("<II", ckpt_bytes, 0)
+        assert version >= 5
+        t_patch = 16380.0
+        dt_patch = 0.001
+        struct.pack_into("<i", ckpt_bytes, 8, int(t_patch / dt_patch))
+        struct.pack_into("<d", ckpt_bytes, 12, t_patch)
+        run2 = tmp_path / "resumed"
+        run2.mkdir()
+        (run2 / "checkpoint.bin").write_bytes(bytes(ckpt_bytes))
+
+        # 3. Resume ~8000 steps past the stall point. Use a large
+        # trajectory_samples so traj_every ≈ total_steps / samples is small
+        # enough to produce multiple writes in the narrow 8000-step window.
+        cmd = [CELL_SIM, "-c", str(run2 / "checkpoint.bin"),
+               "-t", "16388", "--trajectory-samples", "50000",
+               "--print-interval", "0", "-o", str(run2)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        assert r.returncode == 0, f"resume failed: {r.stderr}"
+
+        data, _ = read_trajectory(run2 / "trajectory.txt")
         times = sorted(data.keys())
-        past_cap = [t for t in times if t > 262144.0]
+        past_cap = [t for t in times if t > 16384.0]
         assert len(past_cap) >= 2, \
-            f"only {len(past_cap)} frames past t=262144 — f32 regression?"
+            f"only {len(past_cap)} frames past t=2^14 — f32 regression?"
         for i in range(1, len(past_cap)):
             assert past_cap[i] > past_cap[i-1], \
                 f"stalled past cap: {past_cap[i-1]} == {past_cap[i]}"
