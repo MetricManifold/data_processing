@@ -2,9 +2,10 @@
 Tier 1: Code correctness tests.
 These test plumbing, not physics — CLI overrides, checkpoint round-trips, etc.
 """
+import math
 import pytest
 import numpy as np
-from conftest import run_sim, read_checkpoint
+from conftest import run_sim, read_checkpoint, read_trajectory, requires_flag
 
 
 # ============================================================================
@@ -32,6 +33,88 @@ class TestSmoke:
             assert np.isfinite(c["volume"])
             assert c["volume"] > 0
             assert not np.any(np.isnan(c["phi"]))
+
+
+# ============================================================================
+# 1b. Trajectory integrity (header, monotonic timestamps, no NaN)
+# ============================================================================
+
+class TestTrajectoryIntegrity:
+    """Regression: sim_v2 had cur_time as float32 which capped at t=2^18=262144,
+    causing duplicate timestamps with stale physics. Fixed in v5 by switching
+    to double. This test runs past the float32 cap to catch regressions."""
+
+    def test_header_fields_present(self, sim):
+        """Trajectory header must declare N, Lx, Ly, dim, tau, v_A."""
+        out = sim("-n", "4", "-N", "200", "-r", "49", "-t", "2", "--dt", "0.01",
+                  "--v-A", "0.01", "--tau", "1000", "--seed", "42",
+                  "--trajectory-samples", "20")
+        text = (out / "trajectory.txt").read_text()
+        header_line = next(
+            (line for line in text.splitlines()
+             if line.startswith("#") and "v_A=" in line),
+            None)
+        assert header_line is not None, "missing header line with v_A="
+        for key in ("N", "Lx", "Ly", "dim", "tau", "v_A"):
+            assert f"{key}=" in header_line, f"{key} missing from header: {header_line}"
+
+    def test_timestamps_strictly_increasing(self, sim):
+        """Every unique timestamp must be strictly greater than the previous."""
+        out = sim("-n", "2", "-N", "128", "-r", "20", "-t", "1", "--dt", "0.01",
+                  "--v-A", "0", "--seed", "42", "--trajectory-samples", "50")
+        data, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(data.keys())
+        for i in range(1, len(times)):
+            assert times[i] > times[i-1], \
+                f"non-monotonic: t[{i-1}]={times[i-1]} >= t[{i}]={times[i]}"
+
+    def test_rows_per_frame_consistent(self, sim):
+        """Every frame must have exactly N rows."""
+        N = 4
+        out = sim("-n", str(N), "-N", "200", "-r", "49", "-t", "1", "--dt", "0.01",
+                  "--v-A", "0", "--seed", "42", "--trajectory-samples", "20")
+        data, _ = read_trajectory(out / "trajectory.txt")
+        for t, cells in data.items():
+            assert len(cells) == N, f"frame t={t} has {len(cells)} cells, expected {N}"
+
+    def test_checkpoint_stores_time_as_double(self, sim):
+        """Fast regression: v5 checkpoint must store cur_time as f64.
+        With cur_time=f32, the cap at t=2^18=262144 silently breaks long runs.
+        Binary layout v5: magic(4), ver(4), step(4), time(8), N(4), ...
+        """
+        import struct
+        out = sim("-n", "1", "-N", "128", "-r", "20", "-t", "0.5", "--dt", "0.01",
+                  "--v-A", "0", "--seed", "42", "--trajectory-samples", "0")
+        ckpt = (out / "checkpoint.bin").read_bytes()
+        magic, version = struct.unpack_from("<II", ckpt, 0)
+        assert magic == 0x43454C4C, f"bad magic 0x{magic:08X}"
+        assert version >= 5, \
+            f"checkpoint version {version} < 5 — cur_time may still be f32"
+        # v5 layout: num_cells at offset 20 (after magic+ver+step+time_f64)
+        num_cells = struct.unpack_from("<i", ckpt, 20)[0]
+        assert num_cells == 1, \
+            f"v5 layout broken: num_cells at offset 20 = {num_cells}, expected 1"
+        time_f64 = struct.unpack_from("<d", ckpt, 12)[0]
+        assert abs(time_f64 - 0.5) < 0.02, \
+            f"checkpoint time {time_f64} disagrees with t_end=0.5"
+
+    @pytest.mark.slow
+    def test_time_advances_past_float32_precision_wall(self, sim):
+        """End-to-end guard for cur_time=f32 regression. With dt=0.01, f32 += dt
+        stalls around t=2^18=262144. Runs to t=270000 and asserts timestamps
+        keep advancing. N=1, ~30M steps, ~10-15 min — hence @slow."""
+        out = sim("-n", "1", "-N", "128", "-r", "20",
+                  "-t", "270000", "--dt", "0.01", "--v-A", "0",
+                  "--seed", "42", "--trajectory-samples", "10",
+                  "--print-interval", "0", timeout=1800)
+        data, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(data.keys())
+        past_cap = [t for t in times if t > 262144.0]
+        assert len(past_cap) >= 2, \
+            f"only {len(past_cap)} frames past t=262144 — f32 regression?"
+        for i in range(1, len(past_cap)):
+            assert past_cap[i] > past_cap[i-1], \
+                f"stalled past cap: {past_cap[i-1]} == {past_cap[i]}"
 
 
 # ============================================================================
@@ -231,3 +314,315 @@ class TestPerimeter:
         assert len(ln_values) > 0, "No trajectory data found after t=1"
         assert all(np.isfinite(v) for v in ln_values), "L_n has NaN/Inf"
         assert all(v > 0 for v in ln_values), f"L_n has zero values: min={min(ln_values)}"
+
+
+# ============================================================================
+# 8. Trajectory sanity: monotonic time, no NaN, polarity unit vectors
+# ============================================================================
+
+class TestTrajectorySanity:
+    """Tests from validate_correctness.py not already covered."""
+
+    def test_monotonic_time_and_no_nan(self, sim):
+        """Time strictly increases, no NaN/Inf in any field."""
+        out = sim("-n", "8", "-N", "512", "-r", "49", "-t", "10", "--dt", "0.01",
+                  "--v-A", "0.01", "--seed", "42", "--save-interval", "0",
+                  "--trajectory-samples", "200")
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        times = sorted(traj.keys())
+        assert len(times) >= 2
+        # Strict monotonic
+        for i in range(1, len(times)):
+            assert times[i] > times[i - 1]
+        # No NaN/Inf in any field
+        for t, cells in traj.items():
+            for cid, vals in cells.items():
+                for v in vals:
+                    assert np.isfinite(v), f"Non-finite value at t={t}, cell={cid}"
+
+    def test_polarization_unit_vectors(self, sim):
+        """Polarity (px, py) should be unit vectors."""
+        out = sim("-n", "4", "-N", "256", "-r", "49", "-t", "10", "--dt", "0.01",
+                  "--v-A", "0.01", "--tau", "1000", "--seed", "42",
+                  "--save-interval", "0", "--trajectory-samples", "100")
+        traj, _ = read_trajectory(out / "trajectory.txt")
+        for t, cells in traj.items():
+            for cid, vals in cells.items():
+                if len(vals) >= 6:
+                    px, py = vals[4], vals[5]
+                    mag = np.sqrt(px**2 + py**2)
+                    assert abs(mag - 1.0) < 0.01, \
+                        f"Polarity not unit: |p|={mag:.4f} at t={t}, cell={cid}"
+
+    def test_phi_range_in_checkpoint(self, sim):
+        """Phase field values should be approximately in [0, 1]."""
+        out = sim("-n", "4", "-N", "256", "-r", "49", "-t", "5", "--dt", "0.01",
+                  "--v-A", "0", "--seed", "42", "--save-interval", "0",
+                  "--trajectory-samples", "0")
+        chk = read_checkpoint(out / "checkpoint.bin")
+        for c in chk["cells"]:
+            phi = c["phi"]
+            assert phi.min() >= -0.1, f"Cell {c['id']}: phi_min={phi.min():.4f}"
+            assert phi.max() <= 1.1, f"Cell {c['id']}: phi_max={phi.max():.4f}"
+            # Cell should have some interior (phi > 0.9) and interface
+            inner = phi[4:-4, 4:-4] if phi.ndim == 2 else phi
+            assert np.sum(inner > 0.9) > 0, f"Cell {c['id']}: no interior (phi>0.9)"
+
+
+# ============================================================================
+# 9. Bbox remap: field continuity after forced resize
+# ============================================================================
+
+class TestBboxRemap:
+    """Tests bbox remap doesn't introduce field discontinuities."""
+
+    def test_moving_cell_field_smooth(self, sim):
+        """A motile cell forces bbox remaps. The field should remain smooth
+        (no d²φ spikes at remap boundaries)."""
+        out = sim("-n", "1", "-N", "300", "-r", "49", "-t", "500", "--dt", "0.01",
+                  "--v-A", "0.05", "--tau", "100000", "--seed", "42",
+                  "--save-interval", "0", "--trajectory-samples", "0")
+        chk = read_checkpoint(out / "checkpoint.bin")
+        cell = chk["cells"][0]
+        phi = cell["phi"]
+
+        # Compute second derivative along both axes
+        d2x = np.zeros_like(phi)
+        d2y = np.zeros_like(phi)
+        d2x[:, 1:-1] = phi[:, 2:] + phi[:, :-2] - 2 * phi[:, 1:-1]
+        d2y[1:-1, :] = phi[2:, :] + phi[:-2, :] - 2 * phi[1:-1, :]
+
+        # Only check interface region (0.01 < phi < 0.99)
+        interface = (phi > 0.01) & (phi < 0.99)
+        if np.sum(interface) < 10:
+            pytest.skip("No interface region found")
+
+        # A remap artifact shows as an anomalous spike in d².
+        # Check that max |d²| in the interface is below threshold.
+        d2_interface = np.abs(d2x[interface])
+        d2_max = np.max(d2_interface)
+        d2_median = np.median(d2_interface)
+        # Spikes should be < 10× the median (smooth fields have ~uniform d²)
+        assert d2_max < d2_median * 15 + 0.05, \
+            f"d²φ/dx² spike: max={d2_max:.4f}, median={d2_median:.4f} (ratio={d2_max/d2_median:.1f})"
+
+        # Same for y
+        d2y_interface = np.abs(d2y[interface])
+        d2y_max = np.max(d2y_interface)
+        d2y_median = np.median(d2y_interface)
+        assert d2y_max < d2y_median * 15 + 0.05, \
+            f"d²φ/dy² spike: max={d2y_max:.4f}, median={d2y_median:.4f} (ratio={d2y_max/d2y_median:.1f})"
+
+
+# ============================================================================
+# 10. Chain-job resume: trajectory stitches cleanly
+# ============================================================================
+
+class TestChainResume:
+    """Checkpoint → resume → verify trajectory continuity."""
+
+    def test_resume_trajectory_continuous(self, tmp_path):
+        """Run, checkpoint, resume — checkpoint state should be continuous."""
+        run1 = run_sim(tmp_path / "run1",
+                       "-n", "4", "-N", "300", "-r", "49", "-t", "5", "--dt", "0.01",
+                       "--v-A", "0.01", "--seed", "42",
+                       "--save-interval", "0", "--trajectory-samples", "50",
+                       "--polarity-seed", "100")
+
+        chk1 = read_checkpoint(run1 / "checkpoint.bin")
+        t_end_1 = chk1["time"]
+
+        # Resume from checkpoint — run to t=20
+        run2 = run_sim(tmp_path / "run2",
+                       "-c", str(run1 / "checkpoint.bin"),
+                       "-t", "20",
+                       "--save-interval", "0", "--trajectory-samples", "50",
+                       "-o", str(tmp_path / "run2"))
+
+        # Final checkpoint validates resume completed
+        chk2 = read_checkpoint(run2 / "checkpoint.bin")
+        assert chk2["time"] == pytest.approx(20.0, abs=0.1)
+        assert chk2["num_cells"] == chk1["num_cells"]
+
+        # Physics params preserved
+        for key in ["dt", "lambda", "gamma", "kappa", "mu", "target_radius", "v_A", "xi", "tau"]:
+            if key in chk1["params"] and key in chk2["params"]:
+                assert chk1["params"][key] == pytest.approx(chk2["params"][key], rel=1e-4), \
+                    f"Param {key} changed: {chk1['params'][key]} -> {chk2['params'][key]}"
+
+        # Volumes should be conserved across resume
+        for c1, c2 in zip(chk1["cells"], chk2["cells"]):
+            assert c1["id"] == c2["id"]
+            assert c2["volume"] == pytest.approx(c1["volume"], rel=0.05), \
+                f"Cell {c1['id']} volume changed: {c1['volume']:.1f} -> {c2['volume']:.1f}"
+
+        # Cells shouldn't have teleported
+        Nx = chk1["params"]["Nx"]
+        for c1, c2 in zip(chk1["cells"], chk2["cells"]):
+            dx = abs(c2["centroid"][0] - c1["centroid"][0])
+            dy = abs(c2["centroid"][1] - c1["centroid"][1])
+            if dx > Nx / 2: dx = Nx - dx
+            if dy > Nx / 2: dy = Nx - dy
+            dist = np.sqrt(dx**2 + dy**2)
+            # With v_A=0.01 and 15 TU, max displacement is v_A*t = 0.15 px
+            # but with random walk it could be more — allow generous bound
+            assert dist < 20.0, \
+                f"Cell {c1['id']} jumped {dist:.1f} px between checkpoint and resume"
+
+
+# ============================================================================
+# 11. Seed determinism: same seed → identical output
+# ============================================================================
+
+class TestSeedDeterminism:
+    """Same seed + same parameters → reproducible to within fast-math tolerance.
+
+    With -use_fast_math and non-deterministic CUDA atomics, bit-identical
+    results are not achievable. We assert volumes/centroids agree to tolerances
+    dominated by float32 round-off accumulated over 500 steps.
+    """
+
+    def test_same_seed_same_result(self, tmp_path):
+        """Two runs with identical seeds should reproduce within fast-math tolerance."""
+        args = ["-n", "4", "-N", "300", "-r", "49", "-t", "5", "--dt", "0.01",
+                "--v-A", "0.01", "--seed", "42", "--polarity-seed", "100",
+                "--save-interval", "0", "--trajectory-samples", "0"]
+
+        run_a = run_sim(tmp_path / "runA", *args)
+        run_b = run_sim(tmp_path / "runB", *args)
+
+        chk_a = read_checkpoint(run_a / "checkpoint.bin")
+        chk_b = read_checkpoint(run_b / "checkpoint.bin")
+
+        assert chk_a["time"] == chk_b["time"]
+        assert chk_a["num_cells"] == chk_b["num_cells"]
+
+        for ca, cb in zip(chk_a["cells"], chk_b["cells"]):
+            # volume ~ 7600; 1e-2 absolute = ~1 ppm relative
+            assert ca["volume"] == pytest.approx(cb["volume"], abs=1e-2), \
+                f"Cell {ca['id']}: volumes differ ({ca['volume']:.4f} vs {cb['volume']:.4f})"
+            assert ca["centroid"][0] == pytest.approx(cb["centroid"][0], abs=0.01)
+            assert ca["centroid"][1] == pytest.approx(cb["centroid"][1], abs=0.01)
+
+
+# ============================================================================
+# 12. Confluence flag computes correct domain size
+# ============================================================================
+
+class TestConfluence:
+    """--confluence should set domain size so πR²N/(L²) = target packing."""
+
+    def test_confluence_domain_size(self, tmp_path):
+        """Check that L is computed correctly for given N, R, and confluence."""
+        R = 49.0
+        N = 16
+        target_phi = 0.89
+
+        out = run_sim(tmp_path / "run",
+                      "-n", str(N), "-r", str(int(R)),
+                      "--confluence", str(target_phi),
+                      "-t", "0.1", "--dt", "0.01",
+                      "--v-A", "0", "--seed", "42",
+                      "--save-interval", "0", "--trajectory-samples", "0")
+
+        chk = read_checkpoint(out / "checkpoint.bin")
+        Lx = chk["params"]["Nx"]
+        Ly = chk["params"]["Ny"]
+
+        actual_phi = N * math.pi * R**2 / (Lx * Ly)
+        assert actual_phi == pytest.approx(target_phi, abs=0.02), \
+            f"Confluence {actual_phi:.4f} should be ≈ {target_phi} (domain {Lx}×{Ly})"
+
+    def test_confluence_independent_of_N(self, tmp_path):
+        """Different N values with same confluence should give same packing fraction."""
+        R = 20.0  # smaller R for faster test
+        target_phi = 0.85
+        phis = []
+        for N in [4, 16]:
+            out = run_sim(tmp_path / f"run_N{N}",
+                          "-n", str(N), "-r", str(int(R)),
+                          "--confluence", str(target_phi),
+                          "-t", "0.1", "--dt", "0.01",
+                          "--v-A", "0", "--seed", "42",
+                          "--save-interval", "0", "--trajectory-samples", "0")
+            chk = read_checkpoint(out / "checkpoint.bin")
+            Lx = chk["params"]["Nx"]
+            Ly = chk["params"]["Ny"]
+            phi = N * math.pi * R**2 / (Lx * Ly)
+            phis.append(phi)
+
+        assert phis[0] == pytest.approx(phis[1], abs=0.03), \
+            f"Confluence should be consistent: N=4→{phis[0]:.3f}, N=16→{phis[1]:.3f}"
+
+
+# ============================================================================
+# 13. v_A_sigma quenched disorder persists across resume
+# ============================================================================
+
+class TestVASigma:
+    """Per-cell v_A values with --v-A-sigma should persist across resume."""
+
+    @requires_flag("--v-A-sigma")
+    def test_disorder_persists(self, tmp_path):
+        """Run with v_A_sigma, checkpoint, resume — per-cell v_A should be identical."""
+        run1 = run_sim(tmp_path / "run1",
+                       "-n", "8", "-N", "400", "-r", "49", "-t", "2", "--dt", "0.01",
+                       "--v-A", "0.01", "--v-A-sigma", "0.005", "--seed", "42",
+                       "--save-interval", "0", "--trajectory-samples", "0")
+
+        chk1 = read_checkpoint(run1 / "checkpoint.bin")
+        va1 = chk1["per_cell"].get("v_A")
+        assert va1 is not None, "No per-cell v_A array in checkpoint"
+        assert len(va1) == 8
+
+        # Values should have some spread (not all identical)
+        assert np.std(va1) > 0.001, \
+            f"v_A_sigma didn't produce disorder: std={np.std(va1):.6f}"
+
+        # Resume
+        run2 = run_sim(tmp_path / "run2",
+                       "-c", str(run1 / "checkpoint.bin"),
+                       "-t", "4",
+                       "-o", str(tmp_path / "run2"))
+
+        chk2 = read_checkpoint(run2 / "checkpoint.bin")
+        va2 = chk2["per_cell"].get("v_A")
+        assert va2 is not None, "No per-cell v_A array after resume"
+
+        np.testing.assert_array_almost_equal(va1, va2, decimal=6,
+            err_msg="Per-cell v_A changed after resume")
+
+    @requires_flag("--v-A-sigma")
+    def test_sigma_zero_gives_uniform(self, tmp_path):
+        """--v-A-sigma 0 should give all cells the same v_A."""
+        out = run_sim(tmp_path / "run",
+                      "-n", "8", "-N", "400", "-r", "49", "-t", "1", "--dt", "0.01",
+                      "--v-A", "0.01", "--v-A-sigma", "0", "--seed", "42",
+                      "--save-interval", "0", "--trajectory-samples", "0")
+
+        chk = read_checkpoint(out / "checkpoint.bin")
+        va = chk["per_cell"].get("v_A")
+        if va is not None:
+            assert np.std(va) < 1e-6, f"v_A_sigma=0 should give uniform v_A, got std={np.std(va)}"
+
+
+# ============================================================================
+# 14. Large N placement (N=32000 removed: too slow for CI, but documented)
+# ============================================================================
+
+class TestLargeN:
+    """Large N runs without OOM or placement failure."""
+
+    @pytest.mark.slow
+    def test_large_n_placement(self, tmp_path):
+        """N=32000 should place all cells and run 1 step without crash."""
+        out = run_sim(tmp_path / "run",
+                      "-n", "32000", "-r", "49", "--confluence", "0.89",
+                      "-t", "0.01", "--dt", "0.01",
+                      "--v-A", "0", "--seed", "42",
+                      "--save-interval", "0", "--trajectory-samples", "0")
+        chk = read_checkpoint(out / "checkpoint.bin")
+        assert chk["num_cells"] == 32000
+        for c in chk["cells"]:
+            assert np.isfinite(c["volume"])
+            assert c["volume"] > 0

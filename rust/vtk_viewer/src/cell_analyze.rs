@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -43,6 +43,9 @@ enum Commands {
         /// Output JSON file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Directory for SVG plots (default: no plots)
+        #[arg(long)]
+        plot_dir: Option<PathBuf>,
         /// Comma-separated list of observables (default: all)
         #[arg(long, value_delimiter = ',')]
         observables: Option<Vec<String>>,
@@ -120,9 +123,35 @@ enum Commands {
         /// Speed averaging window in trajectory frames (for --shade-speed, default: 5)
         #[arg(long, default_value_t = 5)]
         speed_window: usize,
+        /// Draw polarity arrows at cell centroids. Requires trajectory.txt
+        #[arg(long)]
+        show_polarity: bool,
+        /// Overlay per-cell energy (½v²) as a heat colormap on cell interiors
+        #[arg(long)]
+        show_energy: bool,
     },
     /// List available observables
     List,
+    /// Validate trajectory/checkpoint integrity. Exits 0 on pass, 1 on any failure.
+    Check {
+        /// Simulation output directory (must contain trajectory.txt; checkpoint.bin optional)
+        dir: PathBuf,
+        /// Expected number of cells (skip check if not provided)
+        #[arg(long)]
+        n_cells: Option<usize>,
+        /// Expected number of frames in trajectory (skip check if not provided)
+        #[arg(long)]
+        expected_frames: Option<usize>,
+        /// Expected first timestamp (within 1% tolerance; skip if not provided)
+        #[arg(long)]
+        t_start: Option<f64>,
+        /// Expected last timestamp (within 1% tolerance; skip if not provided)
+        #[arg(long)]
+        t_end: Option<f64>,
+        /// Emit JSON report in addition to text
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -132,6 +161,7 @@ fn main() -> Result<()> {
         Commands::Run {
             dir,
             output,
+            plot_dir,
             observables,
             tau,
             cell_radius,
@@ -151,6 +181,10 @@ fn main() -> Result<()> {
                 sq_frames,
                 subsample,
             )?;
+            if let Some(ref pd) = plot_dir {
+                std::fs::create_dir_all(pd)?;
+                plot_run_result(&result, pd, cell_radius)?;
+            }
             write_json(&result, &output)?;
         }
         Commands::Study {
@@ -226,7 +260,7 @@ fn main() -> Result<()> {
 
             write_json(&result, &output)?;
         }
-        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window } => {
+        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy } => {
             let is_dir = input.is_dir();
             let is_vtk = input.extension().map_or(false, |e| e == "vtk");
             // Activate per-cell rendering when user wants colored contours or speed shading
@@ -436,7 +470,36 @@ fn main() -> Result<()> {
                     (phi, nx, ny, title)
                 };
 
-                let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells, &centroids);
+                // Load trajectory data for polarity/energy overlays
+                let overlays = if show_polarity || show_energy {
+                    let traj_path = input.parent().unwrap_or(Path::new(".")).join("trajectory.txt");
+                    if traj_path.exists() {
+                        let traj = load_trajectory(&traj_path)?;
+                        // Find the last frame
+                        if let Some((_, cells)) = traj.frames.last() {
+                            let mut pol: Vec<(f64, f64, f64, f64)> = Vec::new(); // (cx, cy, px, py)
+                            let mut energy: Vec<(f64, f64, f64)> = Vec::new(); // (cx, cy, ke)
+                            for c in cells.values() {
+                                if show_polarity {
+                                    pol.push((c.x, c.y, c.px, c.py));
+                                }
+                                if show_energy {
+                                    energy.push((c.x, c.y, 0.5 * (c.vx * c.vx + c.vy * c.vy)));
+                                }
+                            }
+                            Some((pol, energy))
+                        } else { None }
+                    } else {
+                        eprintln!("  Warning: --show-polarity/--show-energy requires trajectory.txt");
+                        None
+                    }
+                } else { None };
+
+                let polarity_data = overlays.as_ref().map(|(p, _)| p.as_slice()).unwrap_or(&[]);
+                let energy_data = overlays.as_ref().map(|(_, e)| e.as_slice()).unwrap_or(&[]);
+
+                let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells, &centroids,
+                    polarity_data, energy_data);
 
                 let out_path = if output.extension().map_or(true, |e| e != "png") {
                     output.with_extension("png")
@@ -446,6 +509,10 @@ fn main() -> Result<()> {
                 write_png(&out_path, &img_data, nx, ny)?;
                 eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), nx, ny);
             }
+        }
+        Commands::Check { dir, n_cells, expected_frames, t_start, t_end, json } => {
+            let exit_code = run_check(&dir, n_cells, expected_frames, t_start, t_end, json.as_deref())?;
+            std::process::exit(exit_code);
         }
         Commands::List => {
             println!("Available observables:");
@@ -470,6 +537,9 @@ fn main() -> Result<()> {
                     "burst_detection" => "Speed burst events (|v| > μ+3σ), frequency, duration, amplitude",
                     "velocity_distribution" => "Velocity distribution P(v_x), kurtosis for cell 0 and population",
                     "polarity_tau" => "Persistence time τ from polarity autocorrelation ⟨p̂(t+Δt)·p̂(t)⟩ = exp(-Δt/τ)",
+                    "hexatic_order" => "Hexatic order ψ₆ per cell + g₆(r) orientational correlation",
+                    "voronoi_shape" => "Voronoi shape index q = P/√A from Delaunay dual",
+                    "kinetic_energy" => "Kinetic energy time series KE(t) = ½Σ(v²)",
                     _ => "",
                 };
                 println!("  {:<22} {}", name, desc);
@@ -495,6 +565,235 @@ fn parse_observables(input: Option<Vec<String>>) -> Result<Vec<String>> {
             Ok(names)
         }
     }
+}
+
+/// Trajectory/checkpoint integrity checker. Returns process exit code.
+fn run_check(
+    dir: &std::path::Path,
+    expected_n_cells: Option<usize>,
+    expected_frames: Option<usize>,
+    expected_t_start: Option<f64>,
+    expected_t_end: Option<f64>,
+    json_out: Option<&std::path::Path>,
+) -> Result<i32> {
+    use std::io::{BufRead, BufReader};
+
+    #[derive(serde::Serialize)]
+    struct CheckResult {
+        name: String,
+        passed: bool,
+        detail: String,
+    }
+
+    let mut results: Vec<CheckResult> = Vec::new();
+    let mut push = |name: &str, passed: bool, detail: String| {
+        results.push(CheckResult { name: name.to_string(), passed, detail });
+    };
+
+    let traj_path = dir.join("trajectory.txt");
+    if !traj_path.exists() {
+        println!("FAIL: trajectory.txt not found in {}", dir.display());
+        return Ok(1);
+    }
+
+    // Parse trajectory
+    let f = std::fs::File::open(&traj_path)?;
+    let reader = BufReader::new(f);
+
+    let mut header_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut timestamps: Vec<f64> = Vec::new();
+    let mut rows_per_t: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut any_nan = false;
+    let mut any_non_numeric = false;
+    let mut row_count: usize = 0;
+
+    for line in reader.lines() {
+        let line = match line { Ok(l) => l, Err(_) => continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        if trimmed.starts_with('#') {
+            for tok in trimmed.split_whitespace() {
+                if let Some((k, v)) = tok.split_once('=') {
+                    header_fields.insert(k.to_string(), v.to_string());
+                }
+            }
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 4 { continue; }
+        let t = match parts[0].parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => { any_non_numeric = true; continue; }
+        };
+        if !t.is_finite() { any_nan = true; continue; }
+        // Check x,y for NaN
+        for idx in [2usize, 3] {
+            if idx < parts.len() {
+                match parts[idx].parse::<f64>() {
+                    Ok(v) if !v.is_finite() => any_nan = true,
+                    Err(_) => any_non_numeric = true,
+                    _ => {}
+                }
+            }
+        }
+        let t_bits = t.to_bits();
+        *rows_per_t.entry(t_bits).or_insert(0) += 1;
+        if rows_per_t[&t_bits] == 1 {
+            timestamps.push(t);
+        }
+        row_count += 1;
+    }
+
+    // Check 1: header present with required keys
+    let required_keys = ["N", "Lx", "Ly", "dim", "tau", "v_A"];
+    let missing: Vec<&str> = required_keys.iter().filter(|k| !header_fields.contains_key(**k)).copied().collect();
+    push("trajectory_header",
+         missing.is_empty(),
+         if missing.is_empty() {
+             format!("all keys present: {}", required_keys.join(", "))
+         } else {
+             format!("MISSING keys: {}", missing.join(", "))
+         });
+
+    // Check 2: no NaN/non-numeric
+    push("trajectory_no_nan", !any_nan && !any_non_numeric,
+         if any_nan { "NaN/Inf found in data".to_string() }
+         else if any_non_numeric { "non-numeric tokens found".to_string() }
+         else { "all values finite".to_string() });
+
+    // Check 3: timestamps strictly increasing
+    let mut monotonic = true;
+    let mut first_bad: Option<(usize, f64, f64)> = None;
+    for i in 1..timestamps.len() {
+        if timestamps[i] <= timestamps[i-1] {
+            monotonic = false;
+            if first_bad.is_none() {
+                first_bad = Some((i, timestamps[i-1], timestamps[i]));
+            }
+        }
+    }
+    push("timestamps_monotonic", monotonic,
+         if monotonic { format!("{} unique timestamps strictly increasing", timestamps.len()) }
+         else { format!("NON-MONOTONIC at frame {}: {:.6} → {:.6}",
+                        first_bad.unwrap().0, first_bad.unwrap().1, first_bad.unwrap().2) });
+
+    // Check 4: rows per timestamp consistent (== N_cells from header)
+    let header_n: Option<usize> = header_fields.get("N").and_then(|v| v.parse().ok());
+    let expected_rows_per_frame = expected_n_cells.or(header_n);
+    let mut bad_frame: Option<(f64, usize)> = None;
+    if let Some(n) = expected_rows_per_frame {
+        for &t in &timestamps {
+            let c = rows_per_t[&t.to_bits()];
+            if c != n {
+                bad_frame = Some((t, c));
+                break;
+            }
+        }
+    }
+    push("rows_per_frame_consistent", bad_frame.is_none(),
+         match (expected_rows_per_frame, bad_frame) {
+             (None, _) => "skipped (no expected N)".to_string(),
+             (Some(n), None) => format!("every frame has {} rows", n),
+             (Some(n), Some((t, c))) => format!("frame t={:.3} has {} rows (expected {})", t, c, n),
+         });
+
+    // Check 5: number of frames matches expected_frames (if provided)
+    if let Some(ef) = expected_frames {
+        let tol = (ef as f64 * 0.02).max(2.0); // 2% tolerance, min 2
+        let diff = (timestamps.len() as f64 - ef as f64).abs();
+        push("frame_count",
+             diff <= tol,
+             format!("got {}, expected {} (tol ±{:.0})", timestamps.len(), ef, tol));
+    } else {
+        push("frame_count", true, format!("{} frames (no expectation)", timestamps.len()));
+    }
+
+    // Check 6: frame interval approximately constant
+    if timestamps.len() >= 3 {
+        let intervals: Vec<f64> = (1..timestamps.len()).map(|i| timestamps[i] - timestamps[i-1]).collect();
+        let mean: f64 = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        let max_dev = intervals.iter().map(|&x| (x - mean).abs()).fold(0.0f64, f64::max);
+        let rel_dev = if mean > 0.0 { max_dev / mean } else { 1.0 };
+        push("frame_interval_uniform",
+             rel_dev < 0.10,
+             format!("mean Δt = {:.3}, max deviation {:.1}%", mean, 100.0 * rel_dev));
+    }
+
+    // Check 7: t_start / t_end match expectations
+    if let Some(ts_exp) = expected_t_start {
+        if let Some(&ts_got) = timestamps.first() {
+            let tol = (ts_exp.abs() * 0.01).max(1.0);
+            push("t_start",
+                 (ts_got - ts_exp).abs() <= tol,
+                 format!("got {:.3}, expected {:.3} (tol ±{:.1})", ts_got, ts_exp, tol));
+        }
+    }
+    if let Some(te_exp) = expected_t_end {
+        if let Some(&te_got) = timestamps.last() {
+            let tol = (te_exp.abs() * 0.01).max(1.0);
+            push("t_end",
+                 (te_got - te_exp).abs() <= tol,
+                 format!("got {:.3}, expected {:.3} (tol ±{:.1})", te_got, te_exp, tol));
+        }
+    }
+
+    // Check 8: checkpoint.bin consistency (optional)
+    let ckpt_path = dir.join("checkpoint.bin");
+    if ckpt_path.exists() {
+        match analysis::checkpoint::load_checkpoint_header_only(&ckpt_path) {
+            Ok((ckpt_t, ckpt_n, ckpt_ver)) => {
+                let mut ok = true;
+                let mut msgs: Vec<String> = Vec::new();
+                msgs.push(format!("v{} step_t={:.3} N={}", ckpt_ver, ckpt_t, ckpt_n));
+                if let Some(&last_t) = timestamps.last() {
+                    let tol = (ckpt_t.abs() * 0.01).max(1.0);
+                    if (ckpt_t - last_t).abs() > tol {
+                        ok = false;
+                        msgs.push(format!("checkpoint t={:.3} disagrees with last trajectory t={:.3}", ckpt_t, last_t));
+                    }
+                }
+                if let Some(n) = expected_rows_per_frame {
+                    if ckpt_n as usize != n {
+                        ok = false;
+                        msgs.push(format!("checkpoint N={} disagrees with expected {}", ckpt_n, n));
+                    }
+                }
+                push("checkpoint_consistency", ok, msgs.join("; "));
+            }
+            Err(e) => {
+                push("checkpoint_consistency", false, format!("failed to parse checkpoint: {}", e));
+            }
+        }
+    } else {
+        push("checkpoint_consistency", true, "no checkpoint.bin (skipped)".to_string());
+    }
+
+    // Report
+    let all_pass = results.iter().all(|r| r.passed);
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    println!("=== cell_analyze check: {} ===", dir.display());
+    for r in &results {
+        let mark = if r.passed { "PASS" } else { "FAIL" };
+        println!("  [{}] {:<28} {}", mark, r.name, r.detail);
+    }
+    println!("--- rows parsed: {} ---", row_count);
+    println!("=== {} / {} checks passed ===", passed, total);
+
+    if let Some(p) = json_out {
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "dir": dir.display().to_string(),
+            "all_pass": all_pass,
+            "passed": passed,
+            "total": total,
+            "checks": results.iter().map(|r| serde_json::json!({
+                "name": r.name, "passed": r.passed, "detail": r.detail
+            })).collect::<Vec<_>>(),
+        }))?;
+        std::fs::write(p, json)?;
+    }
+
+    Ok(if all_pass { 0 } else { 1 })
 }
 
 fn analyze_single_run(
@@ -645,6 +944,28 @@ fn analyze_single_run(
     } else {
         None
     };
+
+    let hex_order = if has("hexatic_order") {
+        eprintln!("  Computing hexatic order ψ₆ and g₆(r)...");
+        Some(compute_hexatic_order(&pos, cell_radius))
+    } else {
+        None
+    };
+
+    let vor_shape = if has("voronoi_shape") {
+        eprintln!("  Computing Voronoi shape index q = P/√A...");
+        Some(compute_voronoi_shape(&pos, cell_radius))
+    } else {
+        None
+    };
+
+    let kin_energy = if has("kinetic_energy") {
+        eprintln!("  Computing kinetic energy time series...");
+        Some(compute_kinetic_energy(&traj))
+    } else {
+        None
+    };
+
     let se = match (&diffusion, &overlap) {
         (Some(d), Some(o)) => {
             let val = stokes_einstein(d.d_eff, o.tau_alpha);
@@ -703,7 +1024,288 @@ fn analyze_single_run(
         burst_detection: bursts,
         velocity_distribution: vel_dist,
         polarity_tau: pol_tau,
+        hexatic_order: hex_order,
+        voronoi_shape: vor_shape,
+        kinetic_energy: kin_energy,
     })
+}
+
+// ============================================================================
+// SVG plot generation for single-run observables
+// ============================================================================
+
+fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Result<()> {
+    use plotters::prelude::*;
+
+    let n_cells = result.params.n_cells;
+    let label = format!("N={}", n_cells);
+
+    // --- Hexatic order plots ---
+    if let Some(ref h) = result.hexatic_order {
+        // 1. g₆(r) line plot
+        if !h.g6_r.is_empty() {
+            let r_norm: Vec<f64> = h.g6_r.iter().map(|r| r / (2.0 * cell_radius)).collect();
+            let out_path = plot_dir.join("g6_r.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let x_min = r_norm.first().copied().unwrap_or(0.0) - 0.1;
+            let x_max = r_norm.last().copied().unwrap_or(5.0) + 0.1;
+            let y_min = h.g6_values.iter().copied().fold(f64::INFINITY, f64::min) - 0.02;
+            let y_max = h.g6_values.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 0.02;
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(
+                    format!("g₆(r) — {}", label),
+                    ("sans-serif", 22).into_font(),
+                )
+                .margin(15)
+                .x_label_area_size(45)
+                .y_label_area_size(65)
+                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+
+            chart.configure_mesh()
+                .x_desc("r / (2R)")
+                .y_desc("g₆(r)")
+                .x_label_style(("sans-serif", 16))
+                .y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18))
+                .light_line_style(TRANSPARENT)
+                .draw()?;
+
+            // Zero line
+            chart.draw_series(LineSeries::new(
+                vec![(x_min, 0.0), (x_max, 0.0)],
+                ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1),
+            ))?;
+
+            chart.draw_series(LineSeries::new(
+                r_norm.iter().zip(h.g6_values.iter()).map(|(&x, &y)| (x, y)),
+                ShapeStyle::from(&BLUE).stroke_width(2),
+            ))?.label(&label);
+
+            // Data points
+            chart.draw_series(
+                r_norm.iter().zip(h.g6_values.iter()).map(|(&x, &y)| {
+                    Circle::new((x, y), 3, BLUE.filled())
+                }),
+            )?;
+
+            chart.configure_series_labels()
+                .position(SeriesLabelPosition::UpperRight)
+                .background_style(WHITE.mix(0.8))
+                .draw()?;
+
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+
+        // 2. ψ₆ histogram
+        if !h.psi6_per_cell.is_empty() {
+            let out_path = plot_dir.join("psi6_histogram.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let n_bins = 20usize;
+            let mut counts = vec![0u32; n_bins];
+            for &v in &h.psi6_per_cell {
+                let b = ((v * n_bins as f64) as usize).min(n_bins - 1);
+                counts[b] += 1;
+            }
+            let max_count = *counts.iter().max().unwrap_or(&1);
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(
+                    format!("|ψ₆| distribution — {} (⟨ψ₆⟩={:.3})", label, h.psi6_mean),
+                    ("sans-serif", 20).into_font(),
+                )
+                .margin(15)
+                .x_label_area_size(45)
+                .y_label_area_size(55)
+                .build_cartesian_2d(0.0..1.0f64, 0u32..(max_count + 1))?;
+
+            chart.configure_mesh()
+                .x_desc("|ψ₆|")
+                .y_desc("Count")
+                .x_label_style(("sans-serif", 16))
+                .y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18))
+                .light_line_style(TRANSPARENT)
+                .draw()?;
+
+            let bin_w = 1.0 / n_bins as f64;
+            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
+                let x0 = i as f64 * bin_w;
+                Rectangle::new(
+                    [(x0, 0), (x0 + bin_w * 0.9, c)],
+                    BLUE.mix(0.7).filled(),
+                )
+            }))?;
+
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- Voronoi shape index plot ---
+    if let Some(ref v) = result.voronoi_shape {
+        if !v.q_per_cell.is_empty() {
+            let out_path = plot_dir.join("voronoi_q_histogram.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let q_min = v.q_per_cell.iter().copied().fold(f64::INFINITY, f64::min);
+            let q_max = v.q_per_cell.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let range_pad = (q_max - q_min).max(0.1) * 0.15;
+            let hist_min = (q_min - range_pad).max(3.4);
+            let hist_max = q_max + range_pad;
+
+            let n_bins = 20usize;
+            let bin_w = (hist_max - hist_min) / n_bins as f64;
+            let mut counts = vec![0u32; n_bins];
+            for &q in &v.q_per_cell {
+                let b = ((q - hist_min) / bin_w) as usize;
+                if b < n_bins { counts[b] += 1; }
+            }
+            let max_count = *counts.iter().max().unwrap_or(&1);
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(
+                    format!("Voronoi q = P/√A — {} (⟨q⟩={:.3})", label, v.q_mean),
+                    ("sans-serif", 20).into_font(),
+                )
+                .margin(15)
+                .x_label_area_size(45)
+                .y_label_area_size(55)
+                .build_cartesian_2d(hist_min..hist_max, 0u32..(max_count + 1))?;
+
+            chart.configure_mesh()
+                .x_desc("q = P/√A")
+                .y_desc("Count")
+                .x_label_style(("sans-serif", 16))
+                .y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18))
+                .light_line_style(TRANSPARENT)
+                .draw()?;
+
+            // Histogram bars
+            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
+                let x0 = hist_min + i as f64 * bin_w;
+                Rectangle::new(
+                    [(x0, 0), (x0 + bin_w * 0.9, c)],
+                    BLUE.mix(0.7).filled(),
+                )
+            }))?;
+
+            // Reference lines: regular hexagon q = 3.722, circle q = 2√π ≈ 3.545
+            let hex_q = 3.722;
+            let circle_q = 2.0 * std::f64::consts::PI.sqrt();
+            for (ref_q, color, lbl) in [
+                (hex_q, &GREEN, "hexagon"),
+                (circle_q, &RED, "circle"),
+            ] {
+                if ref_q > hist_min && ref_q < hist_max {
+                    chart.draw_series(LineSeries::new(
+                        vec![(ref_q, 0), (ref_q, max_count)],
+                        ShapeStyle::from(color).stroke_width(2),
+                    ))?.label(lbl);
+                }
+            }
+
+            chart.configure_series_labels()
+                .position(SeriesLabelPosition::UpperRight)
+                .background_style(WHITE.mix(0.8))
+                .draw()?;
+
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- MSD plot ---
+    if let Some(ref msd) = result.msd {
+        if !msd.lag_times.is_empty() {
+            let out_path = plot_dir.join("msd.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let t: Vec<f64> = msd.lag_times.iter().filter(|&&t| t > 0.0).copied().collect();
+            let m: Vec<f64> = msd.lag_times.iter().zip(msd.values.iter())
+                .filter(|(&t, _)| t > 0.0).map(|(_, &v)| v).collect();
+            if !t.is_empty() {
+                let t_log: Vec<f64> = t.iter().map(|v| v.log10()).collect();
+                let m_log: Vec<f64> = m.iter().map(|v| v.log10()).collect();
+                let x_min = t_log.first().copied().unwrap_or(0.0) - 0.1;
+                let x_max = t_log.last().copied().unwrap_or(5.0) + 0.1;
+                let y_min = m_log.iter().copied().fold(f64::INFINITY, f64::min) - 0.2;
+                let y_max = m_log.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 0.2;
+
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(format!("MSD — {}", label), ("sans-serif", 22).into_font())
+                    .margin(15)
+                    .x_label_area_size(45)
+                    .y_label_area_size(65)
+                    .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+
+                chart.configure_mesh()
+                    .x_desc("log₁₀(Δt)")
+                    .y_desc("log₁₀(MSD)")
+                    .x_label_style(("sans-serif", 16))
+                    .y_label_style(("sans-serif", 16))
+                    .axis_desc_style(("sans-serif", 18))
+                    .light_line_style(TRANSPARENT)
+                    .draw()?;
+
+                chart.draw_series(LineSeries::new(
+                    t_log.iter().zip(m_log.iter()).map(|(&x, &y)| (x, y)),
+                    ShapeStyle::from(&BLUE).stroke_width(2),
+                ))?;
+
+                root.present()?;
+                eprintln!("  Plot: {}", out_path.display());
+            }
+        }
+    }
+
+    // --- Kinetic energy plot ---
+    if let Some(ref ke) = result.kinetic_energy {
+        if !ke.times.is_empty() {
+            let out_path = plot_dir.join("kinetic_energy.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let x_min = *ke.times.first().unwrap();
+            let x_max = *ke.times.last().unwrap();
+            let y_min = ke.ke_per_cell.iter().copied().fold(f64::INFINITY, f64::min) * 0.9;
+            let y_max = ke.ke_per_cell.iter().copied().fold(f64::NEG_INFINITY, f64::max) * 1.1;
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("KE per cell — {}", label), ("sans-serif", 22).into_font())
+                .margin(15)
+                .x_label_area_size(45)
+                .y_label_area_size(65)
+                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+
+            chart.configure_mesh()
+                .x_desc("t")
+                .y_desc("½⟨v²⟩")
+                .x_label_style(("sans-serif", 16))
+                .y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18))
+                .light_line_style(TRANSPARENT)
+                .draw()?;
+
+            chart.draw_series(LineSeries::new(
+                ke.times.iter().zip(ke.ke_per_cell.iter()).map(|(&x, &y)| (x, y)),
+                ShapeStyle::from(&BLUE).stroke_width(2),
+            ))?;
+
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// RdYlBu_r colormap approximation: 0=blue, 0.5=yellow, 1=dark red.
@@ -954,11 +1556,11 @@ fn render_single_vtk(
             owned_centroids = load_centroids_for_vtk(vtk_path, time);
             &owned_centroids
         };
-        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents);
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents, &[], &[]);
         Ok((img_data, nx, ny, title))
     } else {
         let empty_centroids = Vec::new();
-        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids);
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids, &[], &[]);
         Ok((img_data, nx, ny, title))
     }
 }
@@ -967,8 +1569,14 @@ fn render_single_vtk(
 fn render_phi_to_rgb(
     phi: &[f32], nx: usize, ny: usize,
     label_cells: bool, centroids: &[(u32, f64, f64, bool)],
+    polarity: &[(f64, f64, f64, f64)],   // (cx, cy, px, py)
+    energy: &[(f64, f64, f64)],           // (cx, cy, ke)
 ) -> (Vec<u8>, usize, usize) {
     let mut img_data = vec![0u8; nx * ny * 3];
+
+    // If energy overlay, build a per-pixel KE map for coloring
+    let ke_max = energy.iter().map(|e| e.2).fold(0.0f64, f64::max);
+
     for y in 0..ny {
         for x in 0..nx {
             let val = phi[y * nx + x] as f64;
@@ -978,6 +1586,95 @@ fn render_phi_to_rgb(
             img_data[idx] = r;
             img_data[idx + 1] = g;
             img_data[idx + 2] = b;
+        }
+    }
+
+    // Energy overlay: tint cell interiors by KE (blue=low, red=high)
+    if !energy.is_empty() && ke_max > 1e-20 {
+        let cell_radius = 49.0; // approximate
+        let r_sq = (cell_radius * 1.5) * (cell_radius * 1.5);
+        for y in 0..ny {
+            for x in 0..nx {
+                let val = phi[y * nx + x] as f64;
+                if val < 0.3 { continue; } // only color inside cells
+                // Find nearest cell
+                let mut best_ke = 0.0;
+                let mut best_d2 = f64::MAX;
+                for &(cx, cy, ke) in energy {
+                    let mut dx = x as f64 - ((cx % nx as f64) + nx as f64) % nx as f64;
+                    let mut dy = y as f64 - ((cy % ny as f64) + ny as f64) % ny as f64;
+                    if dx > nx as f64 / 2.0 { dx -= nx as f64; }
+                    if dx < -(nx as f64 / 2.0) { dx += nx as f64; }
+                    if dy > ny as f64 / 2.0 { dy -= ny as f64; }
+                    if dy < -(ny as f64 / 2.0) { dy += ny as f64; }
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 && d2 < r_sq {
+                        best_d2 = d2;
+                        best_ke = ke;
+                    }
+                }
+                if best_d2 < r_sq {
+                    let frac = (best_ke / ke_max).clamp(0.0, 1.0);
+                    let (er, eg, eb) = rdylbu_colormap(frac);
+                    let alpha = val.clamp(0.3, 1.0) * 0.6; // blend strength
+                    let iy = ny - 1 - y;
+                    let idx = (iy * nx + x) * 3;
+                    img_data[idx] = (img_data[idx] as f64 * (1.0 - alpha) + er as f64 * alpha) as u8;
+                    img_data[idx+1] = (img_data[idx+1] as f64 * (1.0 - alpha) + eg as f64 * alpha) as u8;
+                    img_data[idx+2] = (img_data[idx+2] as f64 * (1.0 - alpha) + eb as f64 * alpha) as u8;
+                }
+            }
+        }
+    }
+
+    // Polarity arrows
+    if !polarity.is_empty() {
+        let arrow_len = 25.0;
+        let arrow_color: [u8; 3] = [255, 255, 0]; // yellow
+        for &(cx, cy, px, py) in polarity {
+            let cx_w = ((cx % nx as f64) + nx as f64) % nx as f64;
+            let cy_w = ((cy % ny as f64) + ny as f64) % ny as f64;
+            // Draw line from centroid in polarity direction
+            let ex = cx_w + px * arrow_len;
+            let ey = cy_w + py * arrow_len;
+            // Bresenham-style line
+            let steps = 40;
+            for s in 0..=steps {
+                let t = s as f64 / steps as f64;
+                let lx = (cx_w + t * (ex - cx_w)) as i32;
+                let ly = (cy_w + t * (ey - cy_w)) as i32;
+                let lx = ((lx % nx as i32) + nx as i32) as usize % nx;
+                let ly = ((ly % ny as i32) + ny as i32) as usize % ny;
+                let iy = ny - 1 - ly;
+                let idx = (iy * nx + lx) * 3;
+                // Thicker line: draw 3×3
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        let px = (lx as i32 + dx).clamp(0, nx as i32 - 1) as usize;
+                        let py = (iy as i32 + dy).clamp(0, ny as i32 - 1) as usize;
+                        let pidx = (py * nx + px) * 3;
+                        img_data[pidx] = arrow_color[0];
+                        img_data[pidx+1] = arrow_color[1];
+                        img_data[pidx+2] = arrow_color[2];
+                    }
+                }
+            }
+            // Arrowhead: small triangle at tip
+            let tip_x = ((ex as i32 % nx as i32) + nx as i32) as usize % nx;
+            let tip_y = ((ey as i32 % ny as i32) + ny as i32) as usize % ny;
+            let tip_iy = ny - 1 - tip_y;
+            for dy in -3i32..=3 {
+                for dx in -3i32..=3 {
+                    if dx * dx + dy * dy <= 9 {
+                        let px = (tip_x as i32 + dx).clamp(0, nx as i32 - 1) as usize;
+                        let py = (tip_iy as i32 + dy).clamp(0, ny as i32 - 1) as usize;
+                        let pidx = (py * nx + px) * 3;
+                        img_data[pidx] = 255;
+                        img_data[pidx+1] = 200;
+                        img_data[pidx+2] = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -1048,6 +1745,24 @@ fn phi_colormap(val: f64) -> (u8, u8, u8) {
     let g = g0 + (g1 - g0) * frac;
     let b = b0 + (b1 - b0) * frac;
     ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// Blue→White→Red colormap for energy overlay (0=blue, 0.5=white, 1=red).
+fn rdylbu_colormap(frac: f64) -> (u8, u8, u8) {
+    let t = frac.clamp(0.0, 1.0);
+    if t < 0.5 {
+        let f = t * 2.0;
+        let r = (49.0 + (255.0 - 49.0) * f) as u8;
+        let g = (54.0 + (255.0 - 54.0) * f) as u8;
+        let b = (149.0 + (255.0 - 149.0) * f) as u8;
+        (r, g, b)
+    } else {
+        let f = (t - 0.5) * 2.0;
+        let r = 255;
+        let g = (255.0 * (1.0 - f)) as u8;
+        let b = (255.0 * (1.0 - f)) as u8;
+        (r, g, b)
+    }
 }
 
 fn write_json<T: serde::Serialize>(data: &T, output: &Option<PathBuf>) -> Result<()> {

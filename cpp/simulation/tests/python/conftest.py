@@ -20,19 +20,76 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def _find_binary():
-    """Find cell_sim executable."""
+    """Find the simulation binary to test.
+
+    Precedence:
+      1. $SIM_BINARY env var — absolute path to a binary
+      2. $SIM_NAME (default: cell_sim_v2) — searches known build dirs
+    """
+    env = os.environ.get("SIM_BINARY")
+    if env:
+        if not Path(env).exists():
+            pytest.skip(f"SIM_BINARY={env} does not exist")
+        return env
+
+    name = os.environ.get("SIM_NAME", "cell_sim_v2")
+    # conftest.py lives at <repo>/cpp/simulation/tests/python/conftest.py
+    repo = Path(__file__).parents[4]  # data_processing/
     candidates = [
-        Path(__file__).parents[2] / "build" / "bin" / "cell_sim.exe",
-        Path(__file__).parents[2] / "build" / "bin" / "cell_sim",
-        Path(__file__).parents[2] / "build" / "bin" / "Release" / "cell_sim.exe",
+        # sim_v2 builds (preferred on sim-v2 branch)
+        repo.parent / "data_processing_v2" / "cpp" / "sim_v2" / "build" / "bin" / "Release" / f"{name}.exe",
+        repo.parent / "data_processing_v2" / "cpp" / "sim_v2" / "build" / "bin" / "Release" / name,
+        repo / "cpp" / "sim_v2" / "build" / "bin" / "Release" / f"{name}.exe",
+        repo / "cpp" / "sim_v2" / "build" / "bin" / "Release" / name,
+        # Baseline build
+        repo / "cpp" / "simulation" / "build" / "bin" / f"{name}.exe",
+        repo / "cpp" / "simulation" / "build" / "bin" / name,
+        repo / "cpp" / "simulation" / "build" / "bin" / "Release" / f"{name}.exe",
     ]
     for p in candidates:
         if p.exists():
             return str(p)
-    pytest.skip("cell_sim binary not found — build first")
+    pytest.skip(f"Simulation binary ({name}) not found — build first")
+
+
+# ---------------------------------------------------------------------------
+# Markers: 'slow' is deselected by default; opt-in with `--run-slow`.
+# ---------------------------------------------------------------------------
+
+def pytest_addoption(parser):
+    parser.addoption("--run-slow", action="store_true", default=False,
+                     help="run tests marked @pytest.mark.slow")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: mark test as slow (skipped unless --run-slow)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-slow"):
+        return
+    skip_slow = pytest.mark.skip(reason="slow test; use --run-slow to enable")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
 
 
 CELL_SIM = _find_binary()
+
+
+# Detect which CLI flags the binary supports (from --help output).
+try:
+    _help_result = subprocess.run([CELL_SIM, "-h"], capture_output=True, text=True, timeout=10)
+    _HELP_TEXT = (_help_result.stdout or "") + (_help_result.stderr or "")
+except Exception:
+    _HELP_TEXT = ""
+
+
+def requires_flag(flag):
+    """Pytest decorator: skip test if binary doesn't support `flag`."""
+    return pytest.mark.skipif(
+        flag not in _HELP_TEXT,
+        reason=f"binary does not support {flag}")
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +120,11 @@ def read_checkpoint(path):
         assert magic == 0x43454C4C, f"Bad magic: {hex(magic)}"
         version = struct.unpack("<I", f.read(4))[0]
         step = struct.unpack("<i", f.read(4))[0]
-        time_val = struct.unpack("<f", f.read(4))[0]
+        # v5+: cur_time is f64 (8 bytes). Earlier versions: f32 (4 bytes).
+        if version >= 5:
+            time_val = struct.unpack("<d", f.read(8))[0]
+        else:
+            time_val = struct.unpack("<f", f.read(4))[0]
         num_cells = struct.unpack("<i", f.read(4))[0]
 
         # Runtime options
@@ -80,7 +141,25 @@ def read_checkpoint(path):
         sp_buf = f.read(sp_size)
 
         params = {}
-        if len(sp_buf) >= 72:
+        # Two layouts coexist:
+        #   baseline (sp_size=72 or 92): lambda@28, gamma@32, ..., subdomain_padding@68
+        #   sim_v2   (sp_size=88):       lambda@24, gamma@28, ..., subdomain_padding@56
+        if sp_size == 88:
+            # sim_v2 layout
+            fields = [
+                ("Nx", "i", 0), ("Ny", "i", 4),
+                ("dx", "f", 8), ("dy", "f", 12),
+                ("dt", "f", 16), ("t_end", "f", 20),
+                ("lambda", "f", 24), ("gamma", "f", 28),
+                ("kappa", "f", 32), ("target_radius", "f", 36),
+                ("mu", "f", 40), ("v_A", "f", 44),
+                ("xi", "f", 48), ("tau", "f", 52),
+                ("subdomain_padding", "f", 56), ("halo_width", "i", 60),
+            ]
+            for name, fmt, off in fields:
+                params[name] = struct.unpack_from(f"<{fmt}", sp_buf, off)[0]
+        elif len(sp_buf) >= 72:
+            # baseline layout
             params["Nx"] = struct.unpack_from("<i", sp_buf, 0)[0]
             params["Ny"] = struct.unpack_from("<i", sp_buf, 4)[0]
             params["dx"] = struct.unpack_from("<f", sp_buf, 8)[0]
@@ -97,8 +176,8 @@ def read_checkpoint(path):
             params["tau"] = struct.unpack_from("<f", sp_buf, 56)[0]
             params["halo_width"] = struct.unpack_from("<i", sp_buf, 60)[0]
             params["subdomain_padding"] = struct.unpack_from("<f", sp_buf, 68)[0]
-        if len(sp_buf) >= 92:
-            params["adhesion_J"] = struct.unpack_from("<f", sp_buf, 88)[0]
+            if len(sp_buf) >= 92:
+                params["adhesion_J"] = struct.unpack_from("<f", sp_buf, 88)[0]
 
         # Cells
         halo = params.get("halo_width", 4)
@@ -174,9 +253,11 @@ def read_trajectory(path):
             cid = int(parts[1])
             x, y = float(parts[2]), float(parts[3])
             vx, vy = float(parts[4]), float(parts[5])
+            px = float(parts[6]) if len(parts) > 6 else 0.0
+            py = float(parts[7]) if len(parts) > 7 else 0.0
             if t not in data:
                 data[t] = {}
-            data[t][cid] = (x, y, vx, vy)
+            data[t][cid] = (x, y, vx, vy, px, py)
     return data, header_params
 
 

@@ -16,7 +16,7 @@ pub struct CheckpointHeader {
     pub magic: u32,
     pub version: u32,
     pub step: i32,
-    pub time: f32,
+    pub time: f64,
     pub num_cells: i32,
     pub save_interval: i32,
     pub checkpoint_interval: i32,
@@ -151,9 +151,15 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     f.read_exact(&mut buf4)?;
     let step = i32::from_le_bytes(buf4);
 
-    // Time (float, not double!)
-    f.read_exact(&mut buf4)?;
-    let time = f32::from_le_bytes(buf4);
+    // Time: v5+ stores f64 (sim_v2 fix for float32 precision wall at t=2^18).
+    //       v2-v4 stores f32.
+    let time: f64 = if version >= 5 {
+        f.read_exact(&mut buf8)?;
+        f64::from_le_bytes(buf8)
+    } else {
+        f.read_exact(&mut buf4)?;
+        f32::from_le_bytes(buf4) as f64
+    };
 
     // num_cells
     f.read_exact(&mut buf4)?;
@@ -171,13 +177,17 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     let mut flags = [0u8; 4];
     f.read_exact(&mut flags)?;
 
-    // Detect old vs new v4 format
+    // Detect old vs new v4 format. v5 has a clean layout (no padding guess).
     let sim_params_size;
     if version <= 3 {
         sim_params_size = 76u32; // approximate old size
+    } else if version >= 5 {
+        // v5: sim_params_size immediately follows flags (44-byte header: time is f64).
+        f.read_exact(&mut buf4)?;
+        sim_params_size = u32::from_le_bytes(buf4);
     } else {
         // Check for old format: read bytes at offset 36
-        let pos = f.stream_position()?;
+        let _pos = f.stream_position()?;
         f.read_exact(&mut buf4)?;
         let val_at_36 = u32::from_le_bytes(buf4);
         f.read_exact(&mut buf4)?;
@@ -351,6 +361,35 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     })
 }
 
+/// Lightweight header-only read. Returns (time, num_cells, version).
+/// Used by `cell_analyze check` for fast validation without loading phi fields.
+pub fn load_checkpoint_header_only(path: &Path) -> Result<(f64, i32, u32)> {
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("Opening checkpoint: {}", path.display()))?;
+    let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
+
+    f.read_exact(&mut buf4)?;
+    let magic = u32::from_le_bytes(buf4);
+    if magic != 0x43454C4C {
+        anyhow::bail!("bad magic 0x{:08X}", magic);
+    }
+    f.read_exact(&mut buf4)?;
+    let version = u32::from_le_bytes(buf4);
+    f.read_exact(&mut buf4)?;
+    let _step = i32::from_le_bytes(buf4);
+    let time: f64 = if version >= 5 {
+        f.read_exact(&mut buf8)?;
+        f64::from_le_bytes(buf8)
+    } else {
+        f.read_exact(&mut buf4)?;
+        f32::from_le_bytes(buf4) as f64
+    };
+    f.read_exact(&mut buf4)?;
+    let num_cells = i32::from_le_bytes(buf4);
+    Ok((time, num_cells, version))
+}
+
 /// Read mean bounding box width and subdomain_padding from a checkpoint.
 pub fn read_bbox_stats(path: &Path) -> Result<(f64, Option<f64>)> {
     let mut f = std::fs::File::open(path)?;
@@ -363,9 +402,14 @@ pub fn read_bbox_stats(path: &Path) -> Result<(f64, Option<f64>)> {
     f.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
 
-    // step, time, num_cells
-    f.read_exact(&mut buf4)?;
-    f.read_exact(&mut buf4)?;
+    // step, time, num_cells. v5+: time is f64 (8 bytes); earlier: f32 (4 bytes).
+    f.read_exact(&mut buf4)?;  // step
+    if version >= 5 {
+        let mut t8 = [0u8; 8];
+        f.read_exact(&mut t8)?;
+    } else {
+        f.read_exact(&mut buf4)?;  // time (f32)
+    }
     f.read_exact(&mut buf4)?;
     let num_cells = i32::from_le_bytes(buf4) as usize;
 
