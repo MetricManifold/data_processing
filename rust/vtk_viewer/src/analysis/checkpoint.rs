@@ -143,8 +143,8 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     // Version
     f.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if version < 2 || version > 5 {
-        anyhow::bail!("Unsupported checkpoint version {} (expected 2-5)", version);
+    if version < 2 || version > 6 {
+        anyhow::bail!("Unsupported checkpoint version {} (expected 2-6)", version);
     }
 
     // Step
@@ -177,12 +177,12 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     let mut flags = [0u8; 4];
     f.read_exact(&mut flags)?;
 
-    // Detect old vs new v4 format. v5 has a clean layout (no padding guess).
+    // Detect old vs new v4 format. v5+ has a clean layout (no padding guess).
     let sim_params_size;
     if version <= 3 {
         sim_params_size = 76u32; // approximate old size
     } else if version >= 5 {
-        // v5: sim_params_size immediately follows flags (44-byte header: time is f64).
+        // v5+: sim_params_size immediately follows flags (44-byte header: time is f64).
         f.read_exact(&mut buf4)?;
         sim_params_size = u32::from_le_bytes(buf4);
     } else {
@@ -215,39 +215,60 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         sim_params_size,
     };
 
-    // Read SimParams — we only need a few fields
-    let sp_start = f.stream_position()?;
+    // Read SimParams — we only need a few fields.
+    // Three layouts coexist:
+    //   baseline (sp_size=72 or 92): lambda@28, gamma@32, target_radius@40 (f32)
+    //   sim_v2 v5 (sp_size=88):      lambda@24, gamma@28, target_radius@36 (f32)
+    //   sim_v2 v6 (sp_size=144):     scalars as f64; Nx/Ny i32, then 13 f64, then ints
+    let _sp_start = f.stream_position()?;
     let mut sp_buf = vec![0u8; sim_params_size as usize];
     f.read_exact(&mut sp_buf)?;
 
-    // SimParams layout (first fields): Nx(i32), Ny(i32), dx(f32), dy(f32), dt(f32), ...
-    let nx = i32::from_le_bytes(sp_buf[0..4].try_into()?);
-    let ny = i32::from_le_bytes(sp_buf[4..8].try_into()?);
-    let dx = f32::from_le_bytes(sp_buf[8..12].try_into()?);
-    let dy = f32::from_le_bytes(sp_buf[12..16].try_into()?);
-    let dt = f32::from_le_bytes(sp_buf[16..20].try_into()?);
-
-    // SimParams layout (from types.cuh):
-    // 0: Nx(i32), 4: Ny(i32), 8: dx(f32), 12: dy(f32), 16: dt(f32),
-    // 20: t_end(f32), 24: save_interval(i32), 28: lambda(f32), 32: gamma(f32),
-    // 36: kappa(f32), 40: target_radius(f32), 44: mu(f32),
-    // 48: v_A(f32), 52: xi(f32), 56: tau(f32),
-    // 60: halo_width(i32), 64: min_subdomain_size(i32), 68: subdomain_padding(f32)
-    let v_a = if sp_buf.len() > 52 {
-        f32::from_le_bytes(sp_buf[48..52].try_into().unwrap_or([0;4]))
-    } else { 0.0 };
-    let tau = if sp_buf.len() > 60 {
-        f32::from_le_bytes(sp_buf[56..60].try_into().unwrap_or([0;4]))
-    } else { 10000.0 };
-    let target_radius = if sp_buf.len() > 44 {
-        f32::from_le_bytes(sp_buf[40..44].try_into().unwrap_or([0;4]))
-    } else { 49.0 };
-    let halo_width = if sp_buf.len() > 64 {
-        i32::from_le_bytes(sp_buf[60..64].try_into().unwrap_or([0;4]))
-    } else { 4 };
-    let lambda = if sp_buf.len() > 32 {
-        f32::from_le_bytes(sp_buf[28..32].try_into().unwrap_or([0;4]))
-    } else { 7.0 };
+    let (nx, ny, dx, dy, dt, lambda, target_radius, v_a, tau, halo_width);
+    if sim_params_size == 144 {
+        // sim_v2 v6 layout (f64 scalars)
+        nx = i32::from_le_bytes(sp_buf[0..4].try_into()?);
+        ny = i32::from_le_bytes(sp_buf[4..8].try_into()?);
+        dx = f64::from_le_bytes(sp_buf[8..16].try_into()?) as f32;
+        dy = f64::from_le_bytes(sp_buf[16..24].try_into()?) as f32;
+        dt = f64::from_le_bytes(sp_buf[24..32].try_into()?) as f32;
+        // t_end@32, lambda@40, gamma@48, kappa@56, target_radius@64, mu@72,
+        // v_A@80, xi@88, tau@96, subdomain_padding@104, halo_width@112
+        lambda = f64::from_le_bytes(sp_buf[40..48].try_into()?) as f32;
+        target_radius = f64::from_le_bytes(sp_buf[64..72].try_into()?) as f32;
+        v_a = f64::from_le_bytes(sp_buf[80..88].try_into()?) as f32;
+        tau = f64::from_le_bytes(sp_buf[96..104].try_into()?) as f32;
+        halo_width = i32::from_le_bytes(sp_buf[112..116].try_into()?);
+    } else if sim_params_size == 88 {
+        // sim_v2 v5 layout (f32 scalars, sim_v2's own field order)
+        nx = i32::from_le_bytes(sp_buf[0..4].try_into()?);
+        ny = i32::from_le_bytes(sp_buf[4..8].try_into()?);
+        dx = f32::from_le_bytes(sp_buf[8..12].try_into()?);
+        dy = f32::from_le_bytes(sp_buf[12..16].try_into()?);
+        dt = f32::from_le_bytes(sp_buf[16..20].try_into()?);
+        // t_end@20, lambda@24, gamma@28, kappa@32, target_radius@36, mu@40,
+        // v_A@44, xi@48, tau@52, subdomain_padding@56, halo@60
+        lambda = f32::from_le_bytes(sp_buf[24..28].try_into()?);
+        target_radius = f32::from_le_bytes(sp_buf[36..40].try_into()?);
+        v_a = f32::from_le_bytes(sp_buf[44..48].try_into()?);
+        tau = f32::from_le_bytes(sp_buf[52..56].try_into()?);
+        halo_width = i32::from_le_bytes(sp_buf[60..64].try_into()?);
+    } else {
+        // baseline sim layout:
+        // 0: Nx, 4: Ny, 8: dx, 12: dy, 16: dt, 20: t_end, 24: save_interval,
+        // 28: lambda, 32: gamma, 36: kappa, 40: target_radius, 44: mu,
+        // 48: v_A, 52: xi, 56: tau, 60: halo_width
+        nx = i32::from_le_bytes(sp_buf[0..4].try_into()?);
+        ny = i32::from_le_bytes(sp_buf[4..8].try_into()?);
+        dx = f32::from_le_bytes(sp_buf[8..12].try_into()?);
+        dy = f32::from_le_bytes(sp_buf[12..16].try_into()?);
+        dt = f32::from_le_bytes(sp_buf[16..20].try_into()?);
+        lambda = if sp_buf.len() > 32 { f32::from_le_bytes(sp_buf[28..32].try_into()?) } else { 7.0 };
+        target_radius = if sp_buf.len() > 44 { f32::from_le_bytes(sp_buf[40..44].try_into()?) } else { 49.0 };
+        v_a = if sp_buf.len() > 52 { f32::from_le_bytes(sp_buf[48..52].try_into()?) } else { 0.0 };
+        tau = if sp_buf.len() > 60 { f32::from_le_bytes(sp_buf[56..60].try_into()?) } else { 10000.0 };
+        halo_width = if sp_buf.len() > 64 { i32::from_le_bytes(sp_buf[60..64].try_into()?) } else { 4 };
+    }
 
     let params = SimParams { nx, ny, dx, dy, dt, target_radius, v_a, tau, halo_width, lambda };
 
