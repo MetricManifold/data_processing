@@ -241,6 +241,12 @@ img.chart { width: 320px; border: 1px solid #ccc; border-radius: 3px; }
         html.append(f'<tr><td class="test-name">{test_name}</td><td>{key_entry["key"]}</td>'
                     f'<td class="metric-val">{val}</td><td class="metric-val">{exp}</td>'
                     f'<td class="{scls}">{status}</td></tr>')
+    # Skipped tests: one row each with the reason in the "Key Metric" column
+    for test_name, reason in sorted(_skipped.items()):
+        short = test_name.split("::")[-1]
+        html.append(f'<tr><td class="test-name">{short}</td>'
+                    f'<td colspan="3" style="color:#666;font-style:italic;">{reason}</td>'
+                    f'<td style="color:#b58900;font-weight:700;">SKIP</td></tr>')
     html.append('</table>')
 
     # Test cards — compact layout
