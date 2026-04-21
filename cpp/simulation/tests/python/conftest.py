@@ -20,7 +20,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def _find_binary():
-    """Find the simulation binary to test.
+    """Find the simulation-under-test binary (default: cell_sim_v2).
 
     Precedence:
       1. $SIM_BINARY env var — absolute path to a binary
@@ -39,6 +39,8 @@ def _find_binary():
         # sim_v2 builds (preferred on sim-v2 branch)
         repo.parent / "data_processing_v2" / "cpp" / "sim_v2" / "build" / "bin" / "Release" / f"{name}.exe",
         repo.parent / "data_processing_v2" / "cpp" / "sim_v2" / "build" / "bin" / "Release" / name,
+        repo.parent / "data_processing_v2" / "cpp" / "sim_v2" / "build" / "bin" / f"{name}.exe",
+        repo.parent / "data_processing_v2" / "cpp" / "sim_v2" / "build" / "bin" / name,
         repo / "cpp" / "sim_v2" / "build" / "bin" / "Release" / f"{name}.exe",
         repo / "cpp" / "sim_v2" / "build" / "bin" / "Release" / name,
         # Baseline build
@@ -50,6 +52,31 @@ def _find_binary():
         if p.exists():
             return str(p)
     pytest.skip(f"Simulation binary ({name}) not found — build first")
+
+
+def _find_baseline_binary():
+    """Find the *baseline* cell_sim binary (for migration / parity tests).
+
+    Returns None if not found (caller should skip the test).
+    Precedence:
+      1. $BASELINE_BINARY env var
+      2. known build dirs for cell_sim (production/cluster-deployed build)
+    """
+    env = os.environ.get("BASELINE_BINARY")
+    if env:
+        return env if Path(env).exists() else None
+
+    repo = Path(__file__).parents[4]
+    candidates = [
+        repo / "cpp" / "simulation" / "build" / "bin" / "cell_sim.exe",
+        repo / "cpp" / "simulation" / "build" / "bin" / "cell_sim",
+        repo / "cpp" / "simulation" / "build" / "bin" / "Release" / "cell_sim.exe",
+        repo / "cpp" / "simulation" / "build" / "bin" / "Release" / "cell_sim",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +121,7 @@ def pytest_runtest_makereport(item, call):
 
 
 CELL_SIM = _find_binary()
+BASELINE_SIM = _find_baseline_binary()
 
 
 # Detect which CLI flags the binary supports (from --help output).
@@ -104,6 +132,16 @@ except Exception:
     _HELP_TEXT = ""
 
 
+# Baseline help text (for parity checks).
+_BASELINE_HELP_TEXT = ""
+if BASELINE_SIM is not None:
+    try:
+        _br = subprocess.run([BASELINE_SIM, "-h"], capture_output=True, text=True, timeout=10)
+        _BASELINE_HELP_TEXT = (_br.stdout or "") + (_br.stderr or "")
+    except Exception:
+        pass
+
+
 def requires_flag(flag):
     """Pytest decorator: skip test if binary doesn't support `flag`."""
     return pytest.mark.skipif(
@@ -111,19 +149,41 @@ def requires_flag(flag):
         reason=f"binary does not support {flag}")
 
 
+def requires_baseline():
+    """Pytest decorator: skip test if baseline cell_sim is unavailable."""
+    return pytest.mark.skipif(
+        BASELINE_SIM is None,
+        reason="baseline cell_sim binary not found — set $BASELINE_BINARY or build cpp/simulation")
+
+
 # ---------------------------------------------------------------------------
 # Simulation runner
 # ---------------------------------------------------------------------------
 
-def run_sim(tmp_path, *args, timeout=120):
-    """Run cell_sim with given args, return output directory Path."""
+def run_sim(tmp_path, *args, timeout=120, binary=None, extra_output_flags=("--save-final-checkpoint",)):
+    """Run a simulation binary with given args, return output directory Path.
+
+    binary : path to the executable (default: CELL_SIM).
+    extra_output_flags : appended after -o <outdir>. Default adds
+        --save-final-checkpoint. Pass () to suppress.
+    """
+    exe = binary or CELL_SIM
     outdir = tmp_path / "output"
     outdir.mkdir(parents=True, exist_ok=True)
-    cmd = [CELL_SIM] + list(args) + ["-o", str(outdir), "--save-final-checkpoint"]
+    cmd = [exe] + list(args) + ["-o", str(outdir)] + list(extra_output_flags)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
-        pytest.fail(f"cell_sim failed (rc={result.returncode}):\n{result.stderr}\n{result.stdout}")
+        pytest.fail(f"{Path(exe).name} failed (rc={result.returncode}):\n"
+                    f"cmd: {' '.join(cmd)}\n{result.stderr}\n{result.stdout}")
     return outdir
+
+
+def run_baseline(tmp_path, *args, timeout=120, extra_output_flags=("--save-final-checkpoint",)):
+    """Run the baseline cell_sim binary. Skips if not available."""
+    if BASELINE_SIM is None:
+        pytest.skip("baseline cell_sim binary not available")
+    return run_sim(tmp_path, *args, timeout=timeout, binary=BASELINE_SIM,
+                   extra_output_flags=extra_output_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -315,4 +375,33 @@ def sim(tmp_path):
     """Fixture that returns a run_sim helper bound to tmp_path."""
     def _run(*args, **kwargs):
         return run_sim(tmp_path, *args, **kwargs)
+    return _run
+
+
+@pytest.fixture
+def baseline_sim(tmp_path):
+    """Fixture that runs the baseline cell_sim binary bound to tmp_path.
+
+    Skips the test if the baseline binary is not available.
+    Each call writes to a *subdirectory* of tmp_path so it composes with
+    the `sim` fixture in the same test (avoiding output collisions).
+    """
+    counter = {"n": 0}
+    def _run(*args, **kwargs):
+        counter["n"] += 1
+        sub = tmp_path / f"baseline_{counter['n']}"
+        sub.mkdir(parents=True, exist_ok=True)
+        return run_baseline(sub, *args, **kwargs)
+    return _run
+
+
+@pytest.fixture
+def v2_sim(tmp_path):
+    """Run sim_v2 into a named subdirectory (pairs with baseline_sim)."""
+    counter = {"n": 0}
+    def _run(*args, **kwargs):
+        counter["n"] += 1
+        sub = tmp_path / f"v2_{counter['n']}"
+        sub.mkdir(parents=True, exist_ok=True)
+        return run_sim(sub, *args, **kwargs)
     return _run
