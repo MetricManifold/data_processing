@@ -1,255 +1,138 @@
 #pragma once
-
-#define _USE_MATH_DEFINES
-#include <cmath>
-#include <cstdint>
-#include <vector>
 #include <cuda_runtime.h>
+#include <cmath>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace cellsim {
-
-// Adhesion h(φ) exponent: h(φ) = φ²(1-φ)^ADHESION_N, peaks at φ* = 2/(N+2).
-// "φ² matching" normalization: h_norm(φ*) = φ*² (adhesion density matches
-// repulsion density at the h peak). For n=4: norm = 1/(2/3)^4 = 81/16.
-// Compile-time tunable — update both N and H_PEAK_INV together.
-#define ADHESION_N 4
-// h_peak_inv = 1/(N/(N+2))^N = ((N+2)/N)^N.  For n=4: (3/2)^4 = 81/16 = 5.0625
-#define ADHESION_H_PEAK_INV 5.0625f
-
-//=============================================================================
-// Simulation Parameters
-//=============================================================================
-
-// CHECKPOINT COMPATIBILITY RULE:
-// SimParams is serialized via raw memcpy in checkpoints. To maintain backward
-// compatibility with old checkpoints:
-//   1. ONLY append new fields at the END of this struct
-//   2. NEVER reorder, remove, or change the type of existing fields
-//   3. New fields MUST have sensible zero-initialized defaults (0.0f, 0, -1)
-//      because old checkpoints will have zeros in those positions
-//   4. sizeof(SimParams) is recorded in the checkpoint header as sim_params_size
-//   5. On load, io.cu reads min(stored_size, current_size) and zero-inits the rest
-// If you need a non-zero default for a new field, add a fixup in io.cu's load path.
+// ---------------------------------------------------------------------------
+// Simulation parameters
+// ---------------------------------------------------------------------------
+// Scalar physics/numerical knobs use double precision so that time accumulation
+// (cur_time += dt), step-count math (t_end / dt), and derived coefficients
+// never lose precision. Per-pixel φ and per-cell state remain single precision
+// — they live on the GPU and are multiplied into f32 math regardless.
 struct SimParams {
-  // Domain size
-  int Nx = 800;    // Global domain width
-  int Ny = 800;    // Global domain height
-  float dx = 1.0f; // Grid spacing x
-  float dy = 1.0f; // Grid spacing y
+    int Nx = 0, Ny = 0;
+    double dx = 1.0, dy = 1.0;
+    double dt = 0.01;
+    double t_end = 100.0;
+    double lambda = 7.0;
+    double gamma = 1.0;
+    double kappa = 10.0;
+    double target_radius = 20.0;
+    double mu = 1.0;
+    double v_A = 0.0;
+    double xi = 1500.0;
+    double tau = 10000.0;
+    double subdomain_padding = 0.6;
+    int halo = 4;
+    int save_interval = 0;
+    int print_interval = 100;
+    int trajectory_samples = 100;
+    unsigned int seed = 0;
+    unsigned int polarity_seed = 0;
+    bool abp = false;
 
-  // Time stepping
-  float dt = 0.01f;        // Time step (Palmieri SI S5: dt = 0.01)
-  float t_end = 100.0f;    // End time
-  int save_interval = 100; // Steps between saves
-
-  // Interface parameters (from paper Table 1)
-  float lambda = 7.0f; // Interface width λ = 7
-  float gamma = 1.0f;  // Gradient coefficient γ = 1
-  float bulk_coeff() const { return 30.0f / (lambda * lambda); } // 30/λ²
-
-  // Interaction
-  float kappa = 10.0f; // Interaction strength κ = 10
-  float interaction_coeff() const { return 30.0f * kappa / (lambda * lambda); }
-
-  // Volume constraint
-  float target_radius = 49.0f; // Target cell radius R = 49
-  float target_area() const { return M_PI * target_radius * target_radius; }
-  float mu = 1.0f; // Volume constraint strength μ = 1 (from paper Table 1)
-  float volume_coeff() const { return mu / target_area(); }
-
-  // Motility
-  float v_A = 0.0f;       // Active motility speed (default 0 = no motility)
-  float xi = 1.5e3f;     // Friction coefficient ξ = 1.5 × 10^3
-  float tau = 1.0e4f;    // Reorientation time τ = 10000 (run-and-tumble persistence)
-
-  float motility_coeff() const {
-    return 60.0f * kappa / (xi * lambda * lambda);
-  } // 60κ/(ξλ²)
-
-  // Subdomain management
-  int halo_width = 4;          // Ghost cell width for periodic BC
-  int min_subdomain_size = 16; // Minimum subdomain dimension
-  float subdomain_padding =
-      0.6f; // Bbox buffer beyond cell extent, in units of R
-
-  // Motility model: Run-and-Tumble (discrete Poisson reorientations) or
-  // Active Brownian Particle (continuous rotational diffusion)
-  // NOTE: This field is at the END of the struct for backward compatibility
-  // with v3 checkpoints that didn't have this field.
-  enum class MotilityModel { RunAndTumble, ABP };
-  MotilityModel motility_model = MotilityModel::RunAndTumble;
-
-  // Per-cell motility disorder (added after MotilityModel for checkpoint compat)
-  // Stored in checkpoint (v4+). Old checkpoints read v_A_sigma=0.
-  float v_A_sigma = 0.0f; // Std dev for per-cell v_A (log-normal disorder, 0 = uniform)
-
-  // Per-cell stiffness overrides (population or per-cell)
-  // Parsed from repeated --gamma flags: --gamma 1.0 --gamma 0.35:20% --gamma 0.5:cell0
-  struct GammaOverride {
-    float value;
-    enum class Type { Fraction, Cells, Nearest, Cluster } type;
-    float fraction;             // used when type == Fraction or Cluster (0-1)
-    std::vector<int> cell_ids;  // used when type == Cells
-    float pos_x = 0.0f;        // used when type == Nearest or Cluster
-    float pos_y = 0.0f;
-  };
-  // NOTE: gamma_overrides live on Simulation/Integrator, NOT here,
-  // because SimParams is raw-serialized in checkpoints (no std::vector allowed).
-
-  // Per-cell radius overrides (population or per-cell)
-  // Parsed from repeated --radius flags: --radius 49 --radius 40:20% --radius 49:cv0.10
-  struct RadiusOverride {
-    float value;
-    enum class Type { Fraction, Cells, CV } type;
-    float fraction;             // used when type == Fraction (0-1)
-    std::vector<int> cell_ids;  // used when type == Cells
-    float cv;                   // used when type == CV (coefficient of variation)
-  };
-  // NOTE: radius_overrides live on Simulation/Integrator, NOT here.
-
-  // Legacy: --soft-cell / --gamma-soft (backward compat, maps to gamma_overrides)
-  int soft_cell_id = -1;
-  float gamma_soft = 0.35f;
-
-  // Cell-cell adhesion: gradient coupling (surface tension reduction)
-  // F_adh = J Σ_{i<j} ∫ ∇φ_i·∇φ_j dA  (negative at shared interfaces → favorable)
-  // δF/δφ_i = -J Σ_{j≠i} ∇²φ_j
-  // Implemented via sum field: scatter Σφ_k, compute ∇²(Σφ_k) - ∇²φ_i in fused kernel.
-  // Attractive from afar + repulsive at deep overlap → equilibrium at d ≈ 2R.
-  // No nucleation, no bulk force, no squishing.  Standard in Nonomura/Löber models.
-  // J=0 (default): adhesion disabled.
-  float adhesion_J = 0.0f;
+    __host__ __device__ double bulk_coeff()        const { return 30.0 / (lambda * lambda); }
+    __host__ __device__ double interaction_coeff() const { return 30.0 * kappa / (lambda * lambda); }
+    __host__ __device__ double target_area()       const { return M_PI * target_radius * target_radius; }
+    __host__ __device__ double volume_coeff()      const { return mu / target_area(); }
+    __host__ __device__ double motility_coeff()    const { return 60.0 * kappa / (xi * lambda * lambda); }
+    __host__ __device__ double dA()                const { return dx * dy; }
 };
 
-//=============================================================================
-// Bounding Box - Subdomain definition with periodic wrapping
-//=============================================================================
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+static constexpr int K_MAX = 48;          // max neighbors per cell
+static constexpr int HASH_MAX_PER_BIN = 128;  // bin capacity; must exceed max cells per bin.
+                                              // With small domains (e.g. 2x2 bin grid, 72 cells)
+                                              // one bin easily holds 30+ cells. Silent overflow
+                                              // drops cells from the hash → asymmetric neighbor
+                                              // lists → cells fuse. 128 is safe for all tested sizes.
 
-struct BoundingBox {
-  int x0, y0; // Lower-left corner (in global coords)
-  int x1, y1; // Upper-right corner (exclusive)
-
-  __host__ __device__ int width() const { return x1 - x0; }
-  __host__ __device__ int height() const { return y1 - y0; }
-  __host__ __device__ int size() const { return width() * height(); }
-
-  // Check if a global coordinate is inside this box (with periodic wrapping)
-  __host__ __device__ bool contains(int gx, int gy, int Nx, int Ny) const {
-    // Wrap to [0, N)
-    int wx = ((gx % Nx) + Nx) % Nx;
-    int wy = ((gy % Ny) + Ny) % Ny;
-
-    // Handle periodic box that wraps around domain edge
-    bool in_x, in_y;
-    if (x0 < 0) {
-      in_x = (wx >= (x0 + Nx)) || (wx < x1);
-    } else if (x1 > Nx) {
-      in_x = (wx >= x0) || (wx < (x1 - Nx));
-    } else {
-      in_x = (wx >= x0) && (wx < x1);
-    }
-
-    if (y0 < 0) {
-      in_y = (wy >= (y0 + Ny)) || (wy < y1);
-    } else if (y1 > Ny) {
-      in_y = (wy >= y0) || (wy < (y1 - Ny));
-    } else {
-      in_y = (wy >= y0) && (wy < y1);
-    }
-
-    return in_x && in_y;
-  }
-
-  // Convert global coords to local subdomain coords
-  __host__ __device__ void global_to_local(int gx, int gy, int &lx, int &ly,
-                                           int Nx, int Ny) const {
-    lx = ((gx - x0) % Nx + Nx) % Nx;
-    ly = ((gy - y0) % Ny + Ny) % Ny;
-    // Clamp to subdomain size (handles wraparound)
-    if (lx >= width())
-      lx -= Nx;
-    if (ly >= height())
-      ly -= Ny;
-  }
-
-  // Convert local subdomain coords to global coords
-  __host__ __device__ void local_to_global(int lx, int ly, int &gx, int &gy,
-                                           int Nx, int Ny) const {
-    gx = ((x0 + lx) % Nx + Nx) % Nx;
-    gy = ((y0 + ly) % Ny + Ny) % Ny;
-  }
-
-  // Check if two bounding boxes overlap (considering periodic BC)
-  __host__ __device__ bool overlaps(const BoundingBox &other, int Nx,
-                                    int Ny) const {
-    // This is complex with periodic BC - check if any corner of one box is in
-    // the other Simplified: check if distance between centers is less than sum
-    // of half-widths
-    float cx1 = x0 + width() * 0.5f;
-    float cy1 = y0 + height() * 0.5f;
-    float cx2 = other.x0 + other.width() * 0.5f;
-    float cy2 = other.y0 + other.height() * 0.5f;
-
-    // Periodic distance
-    float dx = fabsf(cx2 - cx1);
-    float dy = fabsf(cy2 - cy1);
-    if (dx > Nx * 0.5f)
-      dx = Nx - dx;
-    if (dy > Ny * 0.5f)
-      dy = Ny - dy;
-
-    float hw = (width() + other.width()) * 0.5f;
-    float hh = (height() + other.height()) * 0.5f;
-
-    return (dx < hw) && (dy < hh);
-  }
-
-  // Expand box by a margin (for halo cells)
-  __host__ BoundingBox expanded(int margin) const {
-    return {x0 - margin, y0 - margin, x1 + margin, y1 + margin};
-  }
+// ---------------------------------------------------------------------------
+// Neighbor entry stored in the per-cell neighbor list.
+// We store identity only. Positions and dimensions are fetched from the
+// current OX/OY/W/H arrays inside k_fused so coordinates are always in
+// the "now" frame — never stale across non-rebuild steps.
+// ---------------------------------------------------------------------------
+struct NeighborEntry {
+    int cell_id;
 };
 
-//=============================================================================
-// 2D Vector helper
-//=============================================================================
+// ---------------------------------------------------------------------------
+// All GPU arrays — SoA layout
+// ---------------------------------------------------------------------------
+struct CellArrays {
+    int num_cells = 0;
+    size_t slot_size = 0;
+    int max_side = 0;
 
-struct Vec2 {
-  float x, y;
+    // Phi double buffer (contiguous pool)
+    float*  phi_pool     = nullptr;
+    float** phi_ptrs     = nullptr;   // [N] current read
+    float** phi_out_ptrs = nullptr;   // [N] current write
 
-  __host__ __device__ Vec2() : x(0), y(0) {}
-  __host__ __device__ Vec2(float x_, float y_) : x(x_), y(y_) {}
+    // Geometry
+    int* offsets_x   = nullptr;
+    int* offsets_y   = nullptr;
+    int* widths      = nullptr;
+    int* heights     = nullptr;
+    int* old_widths  = nullptr;
+    int* old_heights = nullptr;
+    int* shift_x     = nullptr;
+    int* shift_y     = nullptr;
 
-  __host__ __device__ Vec2 operator+(const Vec2 &v) const {
-    return {x + v.x, y + v.y};
-  }
-  __host__ __device__ Vec2 operator-(const Vec2 &v) const {
-    return {x - v.x, y - v.y};
-  }
-  __host__ __device__ Vec2 operator*(float s) const { return {x * s, y * s}; }
-  __host__ __device__ float dot(const Vec2 &v) const {
-    return x * v.x + y * v.y;
-  }
-  __host__ __device__ float norm() const { return sqrtf(x * x + y * y); }
-  __host__ __device__ Vec2 normalized() const {
-    float n = norm();
-    return n > 1e-8f ? Vec2{x / n, y / n} : Vec2{0, 0};
-  }
+    // Per-cell dynamics
+    float* velocities_x = nullptr;
+    float* velocities_y = nullptr;
+    float* volumes       = nullptr;
+    float* volume_devs   = nullptr;
+    float* centroids_x   = nullptr;
+    float* centroids_y   = nullptr;
+    float* ref_x         = nullptr;
+    float* ref_y         = nullptr;
+    float* perimeters    = nullptr;
+    float* moment_x      = nullptr;
+    float* moment_y      = nullptr;
+
+    // Polarization
+    float* polar_x = nullptr;
+    float* polar_y = nullptr;
+    float* polar_theta = nullptr;  // persistent angle; (polar_x, polar_y) are derived
+
+    // Per-cell constants (set once at init)
+    float* two_gamma      = nullptr;
+    float* two_gamma_bulk = nullptr;
+    float* vol_coeff      = nullptr;
+    float* tgt_area       = nullptr;
+    float* tgt_radius     = nullptr;
+    float* v_A_cell       = nullptr;
+
+    // Neighbor list
+    NeighborEntry* nbr_list  = nullptr;   // [N * K_MAX]
+    int*           nbr_count = nullptr;   // [N]
+
+    // Spatial hash
+    int* hash_ids    = nullptr;
+    int* hash_counts = nullptr;
+    int  hash_bin_sz = 0;
+    int  hash_nx = 0, hash_ny = 0;
+
+    // Resize tracking
+    int* d_max_wh = nullptr;   // [2]
+
+    // RNG
+    void* rng_states = nullptr;
 };
 
-//=============================================================================
-// Cell state flags
-//=============================================================================
-
-enum class CellState : uint8_t {
-  Active = 0,   // Normal active cell
-  Dividing = 1, // Cell is dividing
-  Dying = 2,    // Cell is dying/being removed
-  Frozen = 3    // Cell is frozen (for debugging)
+// ---------------------------------------------------------------------------
+// Host-side cell for initialization
+// ---------------------------------------------------------------------------
+struct CellHost {
+    double cx, cy, radius, gamma, v_A;
+    int ox, oy, w, h;
 };
-
-} // namespace cellsim

@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 
 # Register the report plugin
-from report import pytest_sessionfinish, record_metric, record_snapshot, record_phi_from_checkpoint, record_timeseries, record_trajectory, record_skip  # noqa: F401
+from report import pytest_sessionfinish, record_metric, record_snapshot, record_phi_from_checkpoint, record_timeseries, record_trajectory, record_skip, record_comparison_panel  # noqa: F401
 
 import pytest
 import numpy as np
@@ -122,6 +122,14 @@ def pytest_runtest_makereport(item, call):
 
 CELL_SIM = _find_binary()
 BASELINE_SIM = _find_baseline_binary()
+
+# Post-cutover guard: if the auto-detected "baseline" is actually the same
+# binary as the sim under test (e.g. after the 2026-04-23 sim_v2 cutover
+# replaced cell_sim in-tree), treat baseline as absent. Historical baseline
+# is preserved under the `baseline-v1-final` git tag; rebuild it there to
+# re-enable these tests. Override by setting $BASELINE_BINARY.
+if BASELINE_SIM is not None and os.path.abspath(BASELINE_SIM) == os.path.abspath(CELL_SIM):
+    BASELINE_SIM = None
 
 
 # Detect which CLI flags the binary supports (from --help output).
