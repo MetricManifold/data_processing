@@ -227,6 +227,39 @@ void Simulation::upload_phi() {
 }
 
 // ---------------------------------------------------------------------------
+// Apply log-normal disorder to per-cell v_A (fresh init only).
+// Matches baseline semantics: `v_A_sigma` is the DESIRED STD of the output
+// distribution (not log-space sigma). We back-solve the log-normal params:
+//     cv        = v_A_sigma / v_A                     (coefficient of variation)
+//     sigma_ln  = sqrt(log(1 + cv²))
+//     mu_ln     = log(v_A) - ½ sigma_ln²
+// Then sample v_A_i = exp(mu_ln + sigma_ln · Z), Z ~ N(0,1) via Box-Muller.
+// This gives E[v_A_i] = v_A and Std[v_A_i] = v_A_sigma exactly in the limit.
+// Deterministic in params.seed. Does nothing when v_A_sigma <= 0 or v_A == 0.
+// On resume, per-cell v_A is loaded from the VA_A sidecar and this function
+// is NOT called — existing disorder is preserved bit-for-bit.
+// ---------------------------------------------------------------------------
+void Simulation::apply_v_A_disorder() {
+    if (v_A_sigma <= 0.0) return;
+    if (params.v_A <= 0.0) return;
+    int n = (int)h_cells.size();
+    if (n == 0) return;
+    double cv       = v_A_sigma / params.v_A;
+    double sigma_ln = std::sqrt(std::log(1.0 + cv * cv));
+    double mu_ln    = std::log(params.v_A) - 0.5 * sigma_ln * sigma_ln;
+    // Distinct RNG stream from placement (seed XOR golden ratio) for
+    // reproducibility without correlation with cell positions.
+    unsigned s = (params.seed ? params.seed : 42) ^ 0x9E3779B9u;
+    srand(s);
+    for (int i = 0; i < n; i++) {
+        double u1 = ((double)rand() + 1.0) / ((double)RAND_MAX + 2.0);
+        double u2 = ((double)rand() + 1.0) / ((double)RAND_MAX + 2.0);
+        double z  = std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI * u2);
+        h_cells[i].v_A = std::exp(mu_ln + sigma_ln * z);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parse gamma_spec: "<f>", "<f>:cell<k>", or "<f>:<p>%" and apply to h_cells.
 // Default (empty spec): every cell gets params.gamma.
 // Bare number: every cell gets that value AND params.gamma is already updated
@@ -306,6 +339,7 @@ void Simulation::init(const SimParams& p, int n_cells) {
 
     place_cells(n_cells, params.target_radius);
     apply_gamma_spec();
+    apply_v_A_disorder();
     compute_bboxes();
     alloc_gpu();
     upload_phi();
@@ -553,7 +587,7 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     }
 
     // Optional per-cell magic-tagged arrays
-    std::vector<float> per_vA, per_gamma, per_radius;
+    std::vector<float> per_vA, per_gamma, per_radius, per_polar_theta;
     while (true) {
         long pos = ftell(f);
         uint32_t m;
@@ -561,13 +595,15 @@ bool Simulation::init_from_checkpoint(const std::string& path,
         int32_t count = 0;
         if (m == 0x56415F41 /* 'VA_A' */ ||
             m == 0x47414D41 /* 'GAMA' */ ||
-            m == 0x52414449 /* 'RADI' */) {
+            m == 0x52414449 /* 'RADI' */ ||
+            m == 0x504F4C52 /* 'POLR' */) {
             fread(&count, 4, 1, f);
             std::vector<float> data(count);
             fread(data.data(), sizeof(float), count, f);
-            if (m == 0x56415F41) per_vA = std::move(data);
+            if      (m == 0x56415F41) per_vA = std::move(data);
             else if (m == 0x47414D41) per_gamma = std::move(data);
-            else per_radius = std::move(data);
+            else if (m == 0x52414449) per_radius = std::move(data);
+            else                      per_polar_theta = std::move(data);
         } else {
             fseek(f, pos, SEEK_SET);
             break;
@@ -584,7 +620,8 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     std::vector<float> h_tg(n), h_tgb(n), h_ta(n), h_vc(n), h_tr(n);
     std::vector<float> h_vA(n), h_px(n), h_py(n), h_th(n);
 
-    // RNG for init polarity angle (CPU), matches fresh-init convention
+    // RNG for init polarity angle (CPU) — used as fallback when the
+    // checkpoint lacks a POLR block (legacy v6 checkpoints).
     srand(params.seed ? params.seed : 42);
 
     // If user supplied --gamma on resume, it overrides the checkpoint's per-cell array.
@@ -609,8 +646,15 @@ bool Simulation::init_from_checkpoint(const std::string& path,
         h_vc[i] = (float)(params.mu / (M_PI * R * R));
         h_tr[i] = (float)R;
         h_vA[i] = (float)vA;
-        // fresh polarization angle on resume
-        float theta = (float)(rand() % 10000) / 10000.0f * 2.0f * (float)M_PI;
+        // Polarity: prefer checkpoint's persisted theta (POLR block). If the
+        // checkpoint predates POLR (legacy v6), fall back to a fresh random
+        // angle — same behaviour as pre-fix sim_v2.
+        float theta;
+        if (i < (int)per_polar_theta.size()) {
+            theta = per_polar_theta[i];
+        } else {
+            theta = (float)(rand() % 10000) / 10000.0f * 2.0f * (float)M_PI;
+        }
         h_th[i] = theta;
         h_px[i] = cosf(theta); h_py[i] = sinf(theta);
     }
@@ -691,7 +735,9 @@ void Simulation::run() {
     // Open trajectory file. Header is written when the file is empty, regardless
     // of step_count — resumes into a fresh output_dir still need the header so
     // downstream tools (cell_analyze) can parse domain/N/tau/v_A.
-    {
+    // Skipped entirely when traj_every==0 (user passed --trajectory-samples 0)
+    // so disabled runs leave no trace on disk.
+    if (traj_every > 0) {
         std::string tp = out_dir + "/trajectory.txt";
         traj_fp = fopen(tp.c_str(), "a");
         if (traj_fp) {
@@ -716,6 +762,8 @@ void Simulation::run() {
             save_checkpoint(out_dir);
         if (traj_fp && traj_every > 0 && step_count % traj_every == 0)
             write_trajectory();
+        if (vtk_interval > 0 && step_count % vtk_interval == 0)
+            write_vtk();
     }
     if (traj_fp) { fclose(traj_fp); traj_fp = nullptr; }
 
@@ -766,6 +814,91 @@ void Simulation::write_trajectory() {
                 px[i], py[i], theta, vA[i], Ln, vol[i]);
     }
     fflush(traj_fp);
+}
+
+// ---------------------------------------------------------------------------
+// VTK output (legacy BINARY STRUCTURED_POINTS)
+// ---------------------------------------------------------------------------
+// Composite phase-field grid: per voxel, max(φ_i) across all cells.
+// Binary format chosen over ASCII for ~10× smaller files and ~5× faster
+// writes. Consumers: ParaView (native), pyvista, vtk_viewer.
+//
+// VTK legacy binary requires BIG-ENDIAN f32 payloads regardless of host
+// byte order (see https://vtk.org/wp-content/uploads/2015/04/file-formats.pdf
+// §6). We byteswap on Windows/Linux x86 hosts before writing.
+//
+// Scatter is host-side: phi pool is downloaded tile-by-tile and composited
+// onto an Nx*Ny float buffer. This is intentionally simple — VTK output is
+// off by default (vtk_interval=0), so per-frame cost here is not on the
+// critical path. When enabled for visualisation it's still << one sim step.
+// ---------------------------------------------------------------------------
+void Simulation::write_vtk() {
+    CK(cudaDeviceSynchronize());
+    int n = cells.num_cells;
+    int Nx = params.Nx, Ny = params.Ny;
+    int halo = params.halo;
+
+    std::vector<int> h_ox(n), h_oy(n), h_w(n), h_h(n);
+    CK(cudaMemcpy(h_ox.data(), cells.offsets_x, n * sizeof(int), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_oy.data(), cells.offsets_y, n * sizeof(int), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_w.data(),  cells.widths,    n * sizeof(int), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_h.data(),  cells.heights,   n * sizeof(int), cudaMemcpyDeviceToHost));
+
+    std::vector<float*> h_phi(n);
+    CK(cudaMemcpy(h_phi.data(), cells.phi_ptrs, n * sizeof(float*),
+                  cudaMemcpyDeviceToHost));
+
+    // Global composite buffer (zero-initialised).
+    std::vector<float> grid((size_t)Nx * Ny, 0.0f);
+
+    for (int i = 0; i < n; i++) {
+        int w = h_w[i], h = h_h[i];
+        int ox = h_ox[i], oy = h_oy[i];
+        std::vector<float> tile((size_t)w * h);
+        CK(cudaMemcpy(tile.data(), h_phi[i], (size_t)w * h * sizeof(float),
+                      cudaMemcpyDeviceToHost));
+        // Scatter inner region (strip halo) with periodic wrap, taking max.
+        for (int ly = halo; ly < h - halo; ly++) {
+            int gy = ((oy + ly) % Ny + Ny) % Ny;
+            for (int lx = halo; lx < w - halo; lx++) {
+                int gx = ((ox + lx) % Nx + Nx) % Nx;
+                float v = tile[(size_t)ly * w + lx];
+                float& g = grid[(size_t)gy * Nx + gx];
+                if (v > g) g = v;
+            }
+        }
+    }
+
+    // Byte-swap f32 → big-endian for VTK legacy payload.
+    auto swap_f32 = [](float f) {
+        uint32_t u; std::memcpy(&u, &f, 4);
+        u = ((u & 0x000000FFu) << 24) |
+            ((u & 0x0000FF00u) << 8)  |
+            ((u & 0x00FF0000u) >> 8)  |
+            ((u & 0xFF000000u) >> 24);
+        std::memcpy(&f, &u, 4); return f;
+    };
+    std::vector<float> be(grid.size());
+    for (size_t k = 0; k < grid.size(); k++) be[k] = swap_f32(grid[k]);
+
+    char fn[512];
+    snprintf(fn, sizeof(fn), "%s/output_%06d.vtk", out_dir.c_str(), step_count);
+    FILE* f = fopen(fn, "wb");
+    if (!f) { fprintf(stderr, "Failed to open %s\n", fn); return; }
+    // Header: ASCII (newline-terminated lines), no trailing spaces.
+    fprintf(f, "# vtk DataFile Version 3.0\n");
+    fprintf(f, "cell_sim phase-field composite step=%d t=%.6f\n",
+            step_count, cur_time);
+    fprintf(f, "BINARY\n");
+    fprintf(f, "DATASET STRUCTURED_POINTS\n");
+    fprintf(f, "DIMENSIONS %d %d 1\n", Nx, Ny);
+    fprintf(f, "ORIGIN 0 0 0\n");
+    fprintf(f, "SPACING 1 1 1\n");
+    fprintf(f, "POINT_DATA %lld\n", (long long)Nx * Ny);
+    fprintf(f, "SCALARS phi float 1\n");
+    fprintf(f, "LOOKUP_TABLE default\n");
+    fwrite(be.data(), sizeof(float), be.size(), f);
+    fclose(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +993,12 @@ void Simulation::save_checkpoint(const std::string& dir) {
     }
     write_per_cell(0x52414449 /* 'RADI' */, cells.tgt_radius);
     write_per_cell(0x56415F41 /* 'VA_A' */, cells.v_A_cell);
+    // 'POLR' — persisted polarity angle (rad). Added post-cutover so that
+    // resumes preserve the motility state rather than re-seeding to random
+    // angles (which would scramble the first ~τ of any motile resume).
+    // Legacy v6 checkpoints without POLR fall back to the random init
+    // path in init_from_checkpoint(), preserving backward compatibility.
+    write_per_cell(0x504F4C52 /* 'POLR' */, cells.polar_theta);
 
     fclose(f);
     printf("Saved checkpoint: step=%d, t=%.4f, cells=%d (%s)\n", cs, ct, n, fn);

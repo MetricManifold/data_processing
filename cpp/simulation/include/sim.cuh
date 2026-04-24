@@ -29,6 +29,15 @@ struct Simulation {
     bool save_final_checkpoint = true;
     int checkpoint_interval = 0;  // steps; 0 = disabled
     std::string gamma_spec;       // e.g. "0.35", "0.35:cell0", "0.35:20%"
+    // Log-normal disorder σ on v_A, applied at *fresh init only*. On resume
+    // the per-cell v_A is loaded from the VA_A checkpoint sidecar. Set via
+    // --v-A-sigma on the CLI; default 0 = no disorder (all cells share v_A).
+    double v_A_sigma = 0.0;
+    // Steps between binary VTK composite-field dumps. 0 = disabled (default).
+    // When >0, writes output_NNNNNN.vtk into out_dir on matching steps.
+    // Binary VTK legacy format; composite = per-voxel max(φ_i) over cells.
+    // Disabled by default to avoid saturating disk on cluster runs.
+    int vtk_interval = 0;
 
     void init(const SimParams& p, int n_cells);
     // Resume from checkpoint. Loads SimParams, per-cell state, phi, step, time.
@@ -46,10 +55,12 @@ struct Simulation {
     void alloc_gpu();
     void upload_phi();
     void apply_gamma_spec();  // parses gamma_spec, writes per-cell gamma into h_cells
+    void apply_v_A_disorder(); // applies log-normal σ to h_cells[i].v_A (fresh init only)
     void finalize_init();  // rng, hash, ref, initial reduce (used by both init paths)
     void step();
     void print_status();
     void write_trajectory();
+    void write_vtk();
     void save_checkpoint(const std::string& dir);
 
     size_t max_slot() const {

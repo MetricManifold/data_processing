@@ -1,48 +1,50 @@
 """
-CPU reference implementation of the sim_v2 phase-field PDE.
+CPU reference implementation of the cell-simulation phase-field PDE.
 
-This module exists so Phase-H tests have an auditable, independent
-ground truth for the core equation sim_v2 solves. It is deliberately
-single-file and uses the same data layout as sim_v2 (per-cell tile
-buffers with a halo border) so the math can be reviewed line-by-line
-against ``cpp/sim_v2/src/kernels.cu`` :: ``k_fused``.
+This module is the "naive, correct" ground truth against which the
+production simulator is validated. Design priorities, in order:
 
-Equation solved per interior pixel of cell i's tile:
+  1. **Readability.** Each cell owns a full ``(Ny, Nx)`` field on the
+     periodic domain. No tiles, no bboxes, no halos, no REMAP/RESIZE
+     bookkeeping. The only thing on the page is the physics.
+  2. **Traceability.** The lines below the ``var_deriv = ...`` comment
+     map one-to-one with the production kernel, so a reviewer can
+     diff them side-by-side.
+  3. **Correctness over speed.** A 1000-step run of a small 200×200
+     case takes a couple of seconds — fine for Phase-H tests, we
+     never scale this.
+
+Equation solved per cell ``i`` on the full domain ``(x, y)``:
 
     dφᵢ/dt = γ ∇²φᵢ
-             − (30 γ / λ²) · φᵢ · (1 − φᵢ) · (1 − 2φᵢ)         (bulk double-well)
-             + (2 μ / A₀) · (A₀ − Vᵢ) · φᵢ                     (volume constraint)
-             − (30 κ / λ²) · φᵢ · Σⱼ∈ℕᵢ φⱼ²                    (soft repulsion)
-             − (vₓ · ∂φᵢ/∂x + v_y · ∂φᵢ/∂y)                    (advection)
+             − (30 γ / λ²) · φᵢ · (1 − φᵢ) · (1 − 2φᵢ)    (bulk double-well)
+             + (2 μ / A₀) · (A₀ − Vᵢ) · φᵢ                (volume constraint)
+             − (30 κ / λ²) · φᵢ · Σⱼ≠ᵢ φⱼ²                (soft repulsion)
+             − (vₓ · ∂φᵢ/∂x + v_y · ∂φᵢ/∂y)                (advection)
 
-which sim_v2 writes as ``np = pv + dt·(−0.5·var_deriv − advection)`` with
-``var_deriv = −2γ·lap + 60γ/λ²·bulk + −4·(μ/A₀)·(A₀−V)·pv + 60κ/λ²·pv·S``.
+written in the production kernel as
+``np = pv + dt·(−0.5·var_deriv − advection)`` with
 
-Tile conventions (match sim_v2):
-  * Each cell owns an ``(h, w)`` float tile ``phi``, with a ``halo`` pixel
-    border held at 0. Only the inner region
-    ``(halo ≤ lx < w−halo, halo ≤ ly < h−halo)`` is updated.
-  * Cell i's tile is anchored at global ``(OX[i], OY[i])``; tile-local
-    ``(lx, ly)`` ↔ global ``(OX[i]+lx, OY[i]+ly)``.
-  * Laplacian/gradient stencils CLAMP at tile edges
-    (``max(lx-1,0)``/``min(lx+1,w-1)``) — matches sim_v2 kernel.
-  * Neighbor sum S at tile-local ``(lx, ly)`` of cell i: for each
-    neighbor j, the corresponding tile-local position in j's tile is
-    ``(nlx, nly) = (lx - (OX[j]-OX[i]), ly - (OY[j]-OY[i]))`` with the
-    integer delta reduced into ``[−Nx/2, Nx/2)``. Contribution included
-    only when ``(nlx, nly)`` is in j's INNER region.
+    var_deriv = −2γ·lap + 60γ/λ²·bulk + −4·(μ/A₀)·(A₀−V)·pv + 60κ/λ²·pv·S
 
-Provenance anchor (sim_v2 ``k_fused`` lines ~380-410):
-    bulk       = tgb · pv · (1 − pv) · (1 − 2 pv)           (tgb = 60γ/λ²)
-    constraint = −4 · vc · vd · pv                          (vc = μ/A₀, vd = A₀−V)
-    repulsion  = two_keff · pv · S                          (two_keff = 60κ/λ²)
-    var_deriv  = −tg · lap + bulk + constraint + repulsion  (tg = 2γ)
-    np         = pv + dt · (−0.5 · var_deriv − (vx·gx + vy·gy))
+The velocity ``(vₓ, v_y)`` is updated at end of step to
+
+    vₓ = mc · Σ_domain(pv · gₓ · S) · dA + v_A · pₓ        (mc = 60κ/(ξ λ²))
+
+(and similarly for y), so the next step's advection uses the repulsion-
+driven momentum plus the active self-propulsion ``v_A·p̂``. The run-
+and-tumble polarity ``p̂`` is kept fixed here — for parity tests we
+run with ``tau`` large enough that no tumble fires during the window.
+
+Boundary conditions: periodic on the full domain. The production
+simulator uses clamp-at-tile-edge stencils, but the cell's support
+is far from the tile edge in every test, so clamp and periodic are
+equivalent to f32 round-off.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -53,7 +55,7 @@ import numpy as np
 
 @dataclass
 class CPUParams:
-    """Subset of sim_v2 ``SimParams`` needed by the reference."""
+    """Subset of the production ``SimParams`` needed by the reference."""
     Nx: int
     Ny: int
     dx: float = 1.0
@@ -63,8 +65,8 @@ class CPUParams:
     gamma: float = 1.0
     kappa: float = 10.0
     mu: float = 1.0
+    xi: float = 1500.0
     target_radius: float = 20.0
-    halo: int = 4
 
     @property
     def target_area(self) -> float:
@@ -74,72 +76,49 @@ class CPUParams:
     def dA(self) -> float:
         return self.dx * self.dy
 
+    @property
+    def motility_coeff(self) -> float:
+        """``mc = 60·κ / (ξ·λ²)`` — matches ``SimParams::motility_coeff``."""
+        return 60.0 * self.kappa / (self.xi * self.lambd ** 2)
+
 
 # ---------------------------------------------------------------------------
-# Per-cell state (mirrors sim_v2 ``CellArrays``)
+# Per-cell state — one full-domain field per cell
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CPUCell:
-    phi: np.ndarray      # (h, w), float64; halo pixels held at 0
-    ox: int
-    oy: int
-    vx: float = 0.0
+    phi: np.ndarray      # (Ny, Nx) float64, periodic domain, no halo
+    vx: float = 0.0      # advection velocity in x (includes v_A·pₓ carry-over)
     vy: float = 0.0
-    vol: float = 0.0
-
-    @property
-    def h(self) -> int:
-        return self.phi.shape[0]
-
-    @property
-    def w(self) -> int:
-        return self.phi.shape[1]
+    vol: float = 0.0     # Σφ² · dA
+    v_A: float = 0.0     # active motility magnitude (per cell)
+    px: float = 0.0      # run-and-tumble polarity, held fixed during integrate()
+    py: float = 0.0
 
 
 # ---------------------------------------------------------------------------
-# Clamp-stencil helpers (operate on a single tile)
+# Periodic stencils
 # ---------------------------------------------------------------------------
 
-def _clamped_neighbors(phi: np.ndarray):
-    """Return (E, W, N, S, NE, NW, SE, SW) with clamp-at-edge BCs.
-
-    Mirrors sim_v2 ``max(srx-1, 0)`` / ``min(srx+1, old_w-1)`` exactly.
-    """
-    E  = np.empty_like(phi); E[:,  :-1] = phi[:, 1:];   E[:, -1]  = phi[:, -1]
-    W  = np.empty_like(phi); W[:,  1:]  = phi[:, :-1];  W[:,  0]  = phi[:,  0]
-    N  = np.empty_like(phi); N[:-1, :]  = phi[1:, :];   N[-1, :]  = phi[-1, :]
-    S  = np.empty_like(phi); S[1:, :]   = phi[:-1, :];  S[0,  :]  = phi[0,  :]
-    NE = np.empty_like(phi); NE[:-1, :-1] = phi[1:, 1:]
-    NE[-1, :] = N[-1, :]; NE[:, -1] = E[:, -1]
-    NW = np.empty_like(phi); NW[:-1, 1:]  = phi[1:, :-1]
-    NW[-1, :] = N[-1, :]; NW[:,  0] = W[:,  0]
-    SE = np.empty_like(phi); SE[1:,  :-1] = phi[:-1, 1:]
-    SE[0,  :] = S[0,  :]; SE[:, -1] = E[:, -1]
-    SW = np.empty_like(phi); SW[1:,  1:]  = phi[:-1, :-1]
-    SW[0,  :] = S[0,  :]; SW[:,  0] = W[:,  0]
-    return E, W, N, S, NE, NW, SE, SW
-
-
-def laplacian_9pt_clamped(phi: np.ndarray, h: float) -> np.ndarray:
-    """9-point isotropic Laplacian with clamp-at-edge BCs (tile-local)."""
-    E, W, N, S, NE, NW, SE, SW = _clamped_neighbors(phi)
+def laplacian_9pt(phi: np.ndarray, h: float) -> np.ndarray:
+    """9-point isotropic Laplacian, periodic BCs."""
+    E  = np.roll(phi, -1, axis=1)
+    W  = np.roll(phi,  1, axis=1)
+    N  = np.roll(phi, -1, axis=0)
+    S  = np.roll(phi,  1, axis=0)
+    NE = np.roll(E,   -1, axis=0)
+    SE = np.roll(E,    1, axis=0)
+    NW = np.roll(W,   -1, axis=0)
+    SW = np.roll(W,    1, axis=0)
     return (4.0 * (E + W + N + S) + (NE + NW + SE + SW) - 20.0 * phi) / (6.0 * h * h)
 
 
-def gradients_clamped(phi: np.ndarray, dx: float, dy: float):
-    """Central-difference gradients with clamp-at-edge BCs (tile-local)."""
-    E, W, N, S, *_ = _clamped_neighbors(phi)
-    gx = (E - W) / (2.0 * dx)
-    gy = (N - S) / (2.0 * dy)
+def gradients(phi: np.ndarray, dx: float, dy: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Central-difference gradients, periodic BCs."""
+    gx = (np.roll(phi, -1, axis=1) - np.roll(phi, 1, axis=1)) / (2.0 * dx)
+    gy = (np.roll(phi, -1, axis=0) - np.roll(phi, 1, axis=0)) / (2.0 * dy)
     return gx, gy
-
-
-def _pdelta_int(d: int, L: int) -> int:
-    """Reduce signed integer delta into [−L/2, L/2). Matches sim_v2."""
-    if d >  L // 2: d -= L
-    if d < -L // 2: d += L
-    return d
 
 
 # ---------------------------------------------------------------------------
@@ -148,50 +127,26 @@ def _pdelta_int(d: int, L: int) -> int:
 
 def step(cells: List[CPUCell], p: CPUParams) -> List[CPUCell]:
     """Advance all cells by one ``dt``. Returns a new list of CPUCell."""
-    halo = p.halo
-    tg = 2.0 * p.gamma
+    tg  = 2.0 * p.gamma
     tgb = 60.0 * p.gamma / (p.lambd ** 2)
     two_keff = 60.0 * p.kappa / (p.lambd ** 2)
     vc = p.mu / p.target_area
+    mc = p.motility_coeff
+
+    # Σⱼ φⱼ² on the full domain, computed once per step.
+    psq = [c.phi * c.phi for c in cells]
+    S_total = np.sum(psq, axis=0) if psq else np.zeros_like(cells[0].phi)
 
     out: List[CPUCell] = []
     for i, ci in enumerate(cells):
-        w, h = ci.w, ci.h
         phi = ci.phi
+        S = S_total - psq[i]        # neighbour-only contribution
         vd = p.target_area - ci.vol
 
-        lap = laplacian_9pt_clamped(phi, p.dx)
-        gx, gy = gradients_clamped(phi, p.dx, p.dy)
+        lap = laplacian_9pt(phi, p.dx)
+        gx, gy = gradients(phi, p.dx, p.dy)
 
-        # Inner-region mask (sim_v2: halo ≤ lx < w−halo && halo ≤ ly < h−halo).
-        inner = np.zeros((h, w), dtype=bool)
-        inner[halo:h - halo, halo:w - halo] = True
-
-        # ---- Neighbor interaction S(lx, ly) ----
-        # For each neighbor j, every tile-local (lx, ly) inside i's inner
-        # region maps to (nlx, nly) = (lx − dx_int, ly − dy_int) in j's
-        # tile. Contribution φⱼ²(nlx, nly) included only when that
-        # position is in j's INNER region.
-        S = np.zeros((h, w), dtype=np.float64)
-        for j, cj in enumerate(cells):
-            if j == i:
-                continue
-            dx_int = _pdelta_int(cj.ox - ci.ox, p.Nx)
-            dy_int = _pdelta_int(cj.oy - ci.oy, p.Ny)
-            nw, nh = cj.w, cj.h
-            # Valid i-tile lx range: halo ≤ lx < w−halo AND halo ≤ lx−dx < nw−halo
-            lx_lo = max(halo,       dx_int + halo)
-            lx_hi = min(w - halo,   dx_int + nw - halo)
-            ly_lo = max(halo,       dy_int + halo)
-            ly_hi = min(h - halo,   dy_int + nh - halo)
-            if lx_lo >= lx_hi or ly_lo >= ly_hi:
-                continue
-            nly_lo = ly_lo - dy_int; nly_hi = ly_hi - dy_int
-            nlx_lo = lx_lo - dx_int; nlx_hi = lx_hi - dx_int
-            phi_j_block = cj.phi[nly_lo:nly_hi, nlx_lo:nlx_hi]
-            S[ly_lo:ly_hi, lx_lo:lx_hi] += phi_j_block * phi_j_block
-
-        # ---- PDE update ----
+        # --- PDE update (mirrors production kernel line-for-line) ---
         bulk       = tgb * phi * (1.0 - phi) * (1.0 - 2.0 * phi)
         constraint = -4.0 * vc * vd * phi
         repulsion  = two_keff * phi * S
@@ -199,16 +154,20 @@ def step(cells: List[CPUCell], p: CPUParams) -> List[CPUCell]:
         advection  = ci.vx * gx + ci.vy * gy
         phi_new    = phi + p.dt * (-0.5 * var_deriv - advection)
 
-        # Halo pixels zeroed (sim_v2: ``if (!inner) np = 0.0f``).
-        phi_new = np.where(inner, phi_new, 0.0)
+        vol_new = float((phi_new * phi_new).sum()) * p.dA
 
-        vol_new = float((phi_new * phi_new).sum() * p.dA)
+        # --- End-of-step velocity update (used next step) ---
+        # vₓ = mc · Σ_domain(pv · gₓ · S) · dA + v_A · pₓ
+        vx_int = mc * float((phi * gx * S).sum()) * p.dA
+        vy_int = mc * float((phi * gy * S).sum()) * p.dA
+        vx_new = vx_int + ci.v_A * ci.px
+        vy_new = vy_int + ci.v_A * ci.py
 
         out.append(CPUCell(
             phi=phi_new,
-            ox=ci.ox, oy=ci.oy,
-            vx=ci.vx, vy=ci.vy,
+            vx=vx_new, vy=vy_new,
             vol=vol_new,
+            v_A=ci.v_A, px=ci.px, py=ci.py,
         ))
 
     return out
@@ -226,25 +185,56 @@ def integrate(cells: List[CPUCell], p: CPUParams, n_steps: int) -> List[CPUCell]
 # Checkpoint → CPUCell list
 # ---------------------------------------------------------------------------
 
-def cells_from_checkpoint(ckpt: dict, halo: int = 4) -> List[CPUCell]:
-    """Build a ``CPUCell`` list from ``conftest.read_checkpoint`` output.
+def cells_from_checkpoint(
+    ckpt: dict,
+    *,
+    v_A: Optional[float] = None,
+    polarities: Optional[Sequence[Tuple[float, float]]] = None,
+) -> List[CPUCell]:
+    """Build CPUCells from a production checkpoint.
 
-    The checkpoint stores the full tile (halo-included) at its raw tile
-    offset ``(ox, oy) = (x0 − halo, y0 − halo)``. Velocities/volumes
-    come from the checkpoint so advection and constraint terms match the
-    state sim_v2 would see on resume.
+    The checkpoint stores each cell's φ as a halo-padded tile anchored
+    at ``bbox``. We paint it into a zero-initialized full ``(Ny, Nx)``
+    array — the halo pixels are 0 so they leave the background
+    unchanged. All other per-cell fields (velocity, volume) are read
+    through so the first step after resume sees the same state as the
+    production simulator.
+
+    ``v_A`` (scalar, applied to all cells) and ``polarities`` (list of
+    ``(pₓ, p_y)``, per cell) are optional because the checkpoint does
+    not persist polarity. For v_A parity tests the caller should
+    extract the polarity from the first trajectory snapshot.
     """
+    Nx = int(ckpt["params"]["Nx"])
+    Ny = int(ckpt["params"]["Ny"])
+    halo = int(ckpt["params"].get("halo_width", 4))
+    n = len(ckpt["cells"])
+
+    if polarities is None:
+        polarities = [(0.0, 0.0)] * n
+    assert len(polarities) == n, \
+        f"polarities length {len(polarities)} != num_cells {n}"
+
     cells: List[CPUCell] = []
-    for c in ckpt["cells"]:
-        phi_tile = c["phi"].astype(np.float64)
-        x0 = int(c["bbox"][0]); y0 = int(c["bbox"][1])
+    for idx, c in enumerate(ckpt["cells"]):
+        phi_tile = c["phi"].astype(np.float64)        # (h_t, w_t) w/ halo
+        x0 = int(c["bbox"][0]);  y0 = int(c["bbox"][1])
+        ox, oy = x0 - halo, y0 - halo                  # tile origin in global px
+        h_t, w_t = phi_tile.shape
+
+        full = np.zeros((Ny, Nx), dtype=np.float64)
+        ys = (oy + np.arange(h_t)) % Ny
+        xs = (ox + np.arange(w_t)) % Nx
+        full[np.ix_(ys, xs)] = phi_tile
+
         vx, vy = c.get("velocity", (0.0, 0.0))
+        px, py = polarities[idx]
         cells.append(CPUCell(
-            phi=phi_tile,
-            ox=x0 - halo,
-            oy=y0 - halo,
+            phi=full,
             vx=float(vx), vy=float(vy),
             vol=float(c.get("volume", 0.0)),
+            v_A=float(v_A) if v_A is not None else 0.0,
+            px=float(px), py=float(py),
         ))
     return cells
 
@@ -259,6 +249,91 @@ def cpu_params_from_checkpoint(ckpt: dict) -> CPUParams:
         gamma=float(p["gamma"]),
         kappa=float(p["kappa"]),
         mu=float(p["mu"]),
+        xi=float(p.get("xi", 1500.0)),
         target_radius=float(p["target_radius"]),
-        halo=int(p.get("halo_width", 4)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Comparison helpers (full-domain aware)
+# ---------------------------------------------------------------------------
+
+def centroid_of_phi(phi: np.ndarray, dx: float = 1.0, dy: float = 1.0) -> Tuple[float, float]:
+    """Σ(x·φ²) / Σ(φ²) with non-periodic indexing — good enough for
+    tests where support is compact and far from the periodic edges.
+    """
+    psq = phi * phi
+    total = float(psq.sum())
+    if total <= 0:
+        return (float("nan"), float("nan"))
+    h, w = psq.shape
+    ys = np.arange(h, dtype=np.float64) * dy
+    xs = np.arange(w, dtype=np.float64) * dx
+    cx = float((xs[None, :] * psq).sum() / total)
+    cy = float((ys[:, None] * psq).sum() / total)
+    return cx, cy
+
+
+def periodic_centroid_of_phi(phi: np.ndarray,
+                             dx: float = 1.0, dy: float = 1.0) -> Tuple[float, float]:
+    """Periodic-aware centroid using the circular-mean trick.
+
+    For a φ² mass distribution on a periodic grid of shape (h, w), a
+    plain Σxφ²/Σφ² is wrong when the cell's support wraps the edge —
+    it lands near the box centre, not on the cell. The fix is to map
+    each grid index to an angle on the unit circle, take the φ²-
+    weighted mean of (cos θ, sin θ), and map the angle back to a
+    linear coordinate. Works for any periodic 1-D distribution and
+    extends factor-wise to 2-D.
+
+    Returns (cx, cy) in physical coordinates (not indices). Assumes
+    the grid spans [0, w·dx) × [0, h·dy).
+    """
+    psq = phi * phi
+    total = float(psq.sum())
+    if total <= 0:
+        return (float("nan"), float("nan"))
+    h, w = psq.shape
+    tx = 2.0 * np.pi * np.arange(w, dtype=np.float64) / w
+    ty = 2.0 * np.pi * np.arange(h, dtype=np.float64) / h
+    # Weighted means of (cos, sin).
+    ux = float((np.cos(tx)[None, :] * psq).sum()) / total
+    vx = float((np.sin(tx)[None, :] * psq).sum()) / total
+    uy = float((np.cos(ty)[:, None] * psq).sum()) / total
+    vy = float((np.sin(ty)[:, None] * psq).sum()) / total
+    ang_x = (np.arctan2(vx, ux) + 2.0 * np.pi) % (2.0 * np.pi)
+    ang_y = (np.arctan2(vy, uy) + 2.0 * np.pi) % (2.0 * np.pi)
+    cx = ang_x * (w * dx) / (2.0 * np.pi)
+    cy = ang_y * (h * dy) / (2.0 * np.pi)
+    return float(cx), float(cy)
+
+
+def composite_phi_sq(cells: List[CPUCell]) -> np.ndarray:
+    """Σᵢ φᵢ²(x, y) on the full domain."""
+    if not cells:
+        raise ValueError("no cells to composite")
+    g = np.zeros_like(cells[0].phi)
+    for c in cells:
+        g += c.phi * c.phi
+    return g
+
+
+def phi_at_bbox(cell: CPUCell, bbox: Tuple[int, int, int, int],
+                halo: int) -> np.ndarray:
+    """Extract a halo-padded tile from a CPU cell's full-domain φ,
+    aligned with the production simulator's ``bbox = (x0, y0, x1, y1)``.
+
+    Used for tile-level comparisons: the production simulator stores φ
+    in a tile of dimensions ``(y1-y0+2·halo, x1-x0+2·halo)`` anchored at
+    ``(x0-halo, y0-halo)``. This function slices the CPU's full field
+    at the same global coordinates so the two arrays can be subtracted
+    pixel-by-pixel.
+    """
+    x0, y0, x1, y1 = bbox
+    Ny, Nx = cell.phi.shape
+    ox, oy = x0 - halo, y0 - halo
+    w_t = (x1 - x0) + 2 * halo
+    h_t = (y1 - y0) + 2 * halo
+    ys = (oy + np.arange(h_t)) % Ny
+    xs = (ox + np.arange(w_t)) % Nx
+    return cell.phi[np.ix_(ys, xs)]

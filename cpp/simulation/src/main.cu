@@ -17,17 +17,21 @@ static void usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  -n <num>              Number of cells (default: 8)\n");
     printf("  -r <radius>           Target radius (default: 20)\n");
+    printf("  --radius <f>          Target radius (alias for -r)\n");
     printf("  -N <size>             Domain size LxL\n");
     printf("  --confluence <f>      Packing fraction -> auto domain size\n");
     printf("  -t <time>             End time (default: 100)\n");
     printf("  --dt <step>           Time step (default: 0.01)\n");
+    printf("  -dt <step>            Time step (alias for --dt)\n");
     printf("  --v-A <f>             Active motility speed\n");
+    printf("  --v-A-sigma <f>       Log-normal disorder σ on v_A (fresh init only)\n");
     printf("  --tau <f>             Reorientation time (default: 10000)\n");
     printf("  --gamma <spec>        Surface tension. <spec> = <f> | <f>:cell<k> | <f>:<p>%%\n");
     printf("  --kappa <f>           Interaction strength (default: 10.0)\n");
     printf("  --mu <f>              Volume constraint (default: 1.0)\n");
     printf("  --xi <f>              Friction (default: 1500)\n");
     printf("  --lambda <f>          Interface width (default: 7.0)\n");
+    printf("  -l <f>                Interface width (alias for --lambda)\n");
     printf("  --subdomain-padding <f>  Bbox padding as fraction of R (default: 0.6)\n");
     printf("  --abp                 Use ABP instead of run-and-tumble\n");
     printf("  -o <dir>              Output directory (default: ./output)\n");
@@ -37,8 +41,9 @@ static void usage(const char* prog) {
     printf("  --save-final-checkpoint    Save final checkpoint at t_end (default: on)\n");
     printf("  --no-save-final-checkpoint Disable final checkpoint save\n");
     printf("  --print-interval <n>  Console print interval (default: 100)\n");
-    printf("  --trajectory-samples <n>  Number of trajectory snapshots\n");
+    printf("  --trajectory-samples <n>  Number of trajectory snapshots (default 100; 0=off)\n");
     printf("  --trajectory-interval <n> Steps between trajectory saves (alt. to --trajectory-samples)\n");
+    printf("  --vtk-interval <n>    Write binary VTK composite field every N steps (0=off, default)\n");
     printf("  --save-individual-fields  Write per-cell phi (accepted, no-op stub in v2)\n");
     printf("  --use-diagnostics         Enable diagnostic outputs (accepted, no-op stub in v2)\n");
     printf("  --observable-interval <n> Diagnostic cadence (accepted, no-op stub in v2)\n");
@@ -62,15 +67,20 @@ int main(int argc, char** argv) {
     bool save_final = true;
     int checkpoint_interval = 0;
     int trajectory_interval = 0;  // Alt. to --trajectory-samples; >0 enables.
+    double v_A_sigma = 0.0;       // Log-normal disorder σ on v_A at fresh init.
+    int vtk_interval = 0;         // Steps between binary VTK dumps; 0 = off.
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-n") && i+1<argc) { ncells = atoi(argv[++i]); ncells_set = true; }
         else if (!strcmp(argv[i], "-r") && i+1<argc) { p.target_radius = atof(argv[++i]); ov.target_radius = true; }
+        else if (!strcmp(argv[i], "--radius") && i+1<argc) { p.target_radius = atof(argv[++i]); ov.target_radius = true; }
         else if (!strcmp(argv[i], "-N") && i+1<argc) { p.Nx = atoi(argv[++i]); p.Ny = p.Nx; nx_set = true; }
         else if (!strcmp(argv[i], "--confluence") && i+1<argc) confluence = atof(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i+1<argc) { p.t_end = atof(argv[++i]); ov.t_end = true; }
         else if (!strcmp(argv[i], "--dt") && i+1<argc) { p.dt = atof(argv[++i]); ov.dt = true; }
+        else if (!strcmp(argv[i], "-dt") && i+1<argc) { p.dt = atof(argv[++i]); ov.dt = true; }
         else if (!strcmp(argv[i], "--v-A") && i+1<argc) { p.v_A = atof(argv[++i]); ov.v_A = true; }
+        else if (!strcmp(argv[i], "--v-A-sigma") && i+1<argc) { v_A_sigma = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--tau") && i+1<argc) { p.tau = atof(argv[++i]); ov.tau = true; }
         else if (!strcmp(argv[i], "--gamma") && i+1<argc) {
             gamma_spec = argv[++i];
@@ -84,6 +94,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--mu") && i+1<argc) { p.mu = atof(argv[++i]); ov.mu = true; }
         else if (!strcmp(argv[i], "--xi") && i+1<argc) { p.xi = atof(argv[++i]); ov.xi = true; }
         else if (!strcmp(argv[i], "--lambda") && i+1<argc) { p.lambda = atof(argv[++i]); ov.lambda = true; }
+        else if (!strcmp(argv[i], "-l") && i+1<argc) { p.lambda = atof(argv[++i]); ov.lambda = true; }
         else if (!strcmp(argv[i], "--subdomain-padding") && i+1<argc) {
             p.subdomain_padding = atof(argv[++i]); ov.subdomain_padding = true;
         }
@@ -108,6 +119,9 @@ int main(int argc, char** argv) {
         // once we know t_end and dt (after parsing finishes).
         else if (!strcmp(argv[i], "--trajectory-interval") && i+1<argc) {
             trajectory_interval = atoi(argv[++i]);
+        }
+        else if (!strcmp(argv[i], "--vtk-interval") && i+1<argc) {
+            vtk_interval = atoi(argv[++i]);
         }
         // Accept-and-ignore stubs: baseline-compatible flags whose payloads
         // (per-cell VTK, GPU diagnostics, stress tensor, mem cap) are not yet
@@ -158,6 +172,8 @@ int main(int argc, char** argv) {
     sim.save_final_checkpoint = save_final;
     sim.checkpoint_interval = checkpoint_interval;
     sim.gamma_spec = gamma_spec;
+    sim.v_A_sigma = v_A_sigma;
+    sim.vtk_interval = vtk_interval;
 
     if (!ckpt_path.empty()) {
         if (!sim.init_from_checkpoint(ckpt_path, p, ov)) return 1;

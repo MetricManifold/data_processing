@@ -314,20 +314,30 @@ def read_checkpoint(path):
                 "phi": phi.reshape(h, w),
             })
 
-        # Optional per-cell arrays
+        # Optional per-cell magic-tagged arrays. Order-independent parser:
+        # the binary may emit blocks in any order (writer has historically
+        # emitted GAMA, RADI, VA_A, POLR in that order but we don't depend
+        # on it). Keep reading 4-byte magics until we hit an unknown one.
+        magic_to_name = {
+            0x56415F41: "v_A",
+            0x47414D41: "gamma",
+            0x52414449: "radius",
+            0x504F4C52: "polar_theta",
+        }
         per_cell = {}
-        for name, magic_val in [("v_A", 0x56415F41), ("gamma", 0x47414D41), ("radius", 0x52414449)]:
+        while True:
             pos = f.tell()
             raw = f.read(4)
             if len(raw) < 4:
                 break
             m = struct.unpack("<I", raw)[0]
-            if m == magic_val:
-                count = struct.unpack("<i", f.read(4))[0]
-                data = np.frombuffer(f.read(count * 4), dtype=np.float32).copy()
-                per_cell[name] = data
-            else:
-                f.seek(pos)  # seek back, try next
+            name = magic_to_name.get(m)
+            if name is None:
+                f.seek(pos)  # not one of ours — stop
+                break
+            count = struct.unpack("<i", f.read(4))[0]
+            data = np.frombuffer(f.read(count * 4), dtype=np.float32).copy()
+            per_cell[name] = data
 
         return {
             "version": version,
@@ -345,12 +355,26 @@ def read_checkpoint(path):
 # ---------------------------------------------------------------------------
 
 def read_trajectory(path):
-    """Read trajectory.txt, return dict of {time: {cell_id: (x, y, vx, vy, ...)}}."""
+    """Read trajectory.txt, return (data, header_params).
+
+    data: dict of {time: {cell_id: (x, y, vx, vy, px, py)}}.
+    header_params: dict including key=value pairs from the
+      `# v_A=... N=... Lx=... Ly=... dim=... dt=... tau=...` metadata line, plus
+      `_columns` — the ordered list of column names from the `# Format: ...`
+      line (when present). This lets tests assert column-name → position
+      mapping rather than relying on hard-coded indices.
+    """
     path = Path(path)
     data = {}
     header_params = {}
     with open(path) as f:
         for line in f:
+            stripped = line.strip()
+            if stripped.startswith("# Format:"):
+                # `# Format: time cell_id x y vx vy ...`
+                cols = stripped[len("# Format:"):].split()
+                header_params["_columns"] = cols
+                continue
             if line.startswith("# v_A=") or line.startswith("# v_A ="):
                 for kv in line.strip("# \n").split():
                     if "=" in kv:
