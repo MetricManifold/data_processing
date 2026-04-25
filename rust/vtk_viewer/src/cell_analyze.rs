@@ -945,26 +945,10 @@ fn analyze_single_run(
         None
     };
 
-    let hex_order = if has("hexatic_order") {
-        eprintln!("  Computing hexatic order ψ₆ and g₆(r)...");
-        Some(compute_hexatic_order(&pos, cell_radius))
-    } else {
-        None
-    };
-
-    let vor_shape = if has("voronoi_shape") {
-        eprintln!("  Computing Voronoi shape index q = P/√A...");
-        Some(compute_voronoi_shape(&pos, cell_radius))
-    } else {
-        None
-    };
-
-    let kin_energy = if has("kinetic_energy") {
-        eprintln!("  Computing kinetic energy time series...");
-        Some(compute_kinetic_energy(&traj))
-    } else {
-        None
-    };
+    // TODO: hexatic_order, voronoi_shape, kinetic_energy — not yet implemented in observables.rs
+    let _hex_order: Option<()> = None;
+    let _vor_shape: Option<()> = None;
+    let _kin_energy: Option<()> = None;
 
     let se = match (&diffusion, &overlap) {
         (Some(d), Some(o)) => {
@@ -1024,9 +1008,6 @@ fn analyze_single_run(
         burst_detection: bursts,
         velocity_distribution: vel_dist,
         polarity_tau: pol_tau,
-        hexatic_order: hex_order,
-        voronoi_shape: vor_shape,
-        kinetic_energy: kin_energy,
     })
 }
 
@@ -1040,187 +1021,9 @@ fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Res
     let n_cells = result.params.n_cells;
     let label = format!("N={}", n_cells);
 
-    // --- Hexatic order plots ---
-    if let Some(ref h) = result.hexatic_order {
-        // 1. g₆(r) line plot
-        if !h.g6_r.is_empty() {
-            let r_norm: Vec<f64> = h.g6_r.iter().map(|r| r / (2.0 * cell_radius)).collect();
-            let out_path = plot_dir.join("g6_r.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
+    // --- Hexatic order plots --- (TODO: not yet implemented in observables.rs)
 
-            let x_min = r_norm.first().copied().unwrap_or(0.0) - 0.1;
-            let x_max = r_norm.last().copied().unwrap_or(5.0) + 0.1;
-            let y_min = h.g6_values.iter().copied().fold(f64::INFINITY, f64::min) - 0.02;
-            let y_max = h.g6_values.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 0.02;
-
-            let mut chart = ChartBuilder::on(&root)
-                .caption(
-                    format!("g₆(r) — {}", label),
-                    ("sans-serif", 22).into_font(),
-                )
-                .margin(15)
-                .x_label_area_size(45)
-                .y_label_area_size(65)
-                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
-
-            chart.configure_mesh()
-                .x_desc("r / (2R)")
-                .y_desc("g₆(r)")
-                .x_label_style(("sans-serif", 16))
-                .y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18))
-                .light_line_style(TRANSPARENT)
-                .draw()?;
-
-            // Zero line
-            chart.draw_series(LineSeries::new(
-                vec![(x_min, 0.0), (x_max, 0.0)],
-                ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1),
-            ))?;
-
-            chart.draw_series(LineSeries::new(
-                r_norm.iter().zip(h.g6_values.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&BLUE).stroke_width(2),
-            ))?.label(&label);
-
-            // Data points
-            chart.draw_series(
-                r_norm.iter().zip(h.g6_values.iter()).map(|(&x, &y)| {
-                    Circle::new((x, y), 3, BLUE.filled())
-                }),
-            )?;
-
-            chart.configure_series_labels()
-                .position(SeriesLabelPosition::UpperRight)
-                .background_style(WHITE.mix(0.8))
-                .draw()?;
-
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-
-        // 2. ψ₆ histogram
-        if !h.psi6_per_cell.is_empty() {
-            let out_path = plot_dir.join("psi6_histogram.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            let n_bins = 20usize;
-            let mut counts = vec![0u32; n_bins];
-            for &v in &h.psi6_per_cell {
-                let b = ((v * n_bins as f64) as usize).min(n_bins - 1);
-                counts[b] += 1;
-            }
-            let max_count = *counts.iter().max().unwrap_or(&1);
-
-            let mut chart = ChartBuilder::on(&root)
-                .caption(
-                    format!("|ψ₆| distribution — {} (⟨ψ₆⟩={:.3})", label, h.psi6_mean),
-                    ("sans-serif", 20).into_font(),
-                )
-                .margin(15)
-                .x_label_area_size(45)
-                .y_label_area_size(55)
-                .build_cartesian_2d(0.0..1.0f64, 0u32..(max_count + 1))?;
-
-            chart.configure_mesh()
-                .x_desc("|ψ₆|")
-                .y_desc("Count")
-                .x_label_style(("sans-serif", 16))
-                .y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18))
-                .light_line_style(TRANSPARENT)
-                .draw()?;
-
-            let bin_w = 1.0 / n_bins as f64;
-            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
-                let x0 = i as f64 * bin_w;
-                Rectangle::new(
-                    [(x0, 0), (x0 + bin_w * 0.9, c)],
-                    BLUE.mix(0.7).filled(),
-                )
-            }))?;
-
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Voronoi shape index plot ---
-    if let Some(ref v) = result.voronoi_shape {
-        if !v.q_per_cell.is_empty() {
-            let out_path = plot_dir.join("voronoi_q_histogram.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            let q_min = v.q_per_cell.iter().copied().fold(f64::INFINITY, f64::min);
-            let q_max = v.q_per_cell.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let range_pad = (q_max - q_min).max(0.1) * 0.15;
-            let hist_min = (q_min - range_pad).max(3.4);
-            let hist_max = q_max + range_pad;
-
-            let n_bins = 20usize;
-            let bin_w = (hist_max - hist_min) / n_bins as f64;
-            let mut counts = vec![0u32; n_bins];
-            for &q in &v.q_per_cell {
-                let b = ((q - hist_min) / bin_w) as usize;
-                if b < n_bins { counts[b] += 1; }
-            }
-            let max_count = *counts.iter().max().unwrap_or(&1);
-
-            let mut chart = ChartBuilder::on(&root)
-                .caption(
-                    format!("Voronoi q = P/√A — {} (⟨q⟩={:.3})", label, v.q_mean),
-                    ("sans-serif", 20).into_font(),
-                )
-                .margin(15)
-                .x_label_area_size(45)
-                .y_label_area_size(55)
-                .build_cartesian_2d(hist_min..hist_max, 0u32..(max_count + 1))?;
-
-            chart.configure_mesh()
-                .x_desc("q = P/√A")
-                .y_desc("Count")
-                .x_label_style(("sans-serif", 16))
-                .y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18))
-                .light_line_style(TRANSPARENT)
-                .draw()?;
-
-            // Histogram bars
-            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
-                let x0 = hist_min + i as f64 * bin_w;
-                Rectangle::new(
-                    [(x0, 0), (x0 + bin_w * 0.9, c)],
-                    BLUE.mix(0.7).filled(),
-                )
-            }))?;
-
-            // Reference lines: regular hexagon q = 3.722, circle q = 2√π ≈ 3.545
-            let hex_q = 3.722;
-            let circle_q = 2.0 * std::f64::consts::PI.sqrt();
-            for (ref_q, color, lbl) in [
-                (hex_q, &GREEN, "hexagon"),
-                (circle_q, &RED, "circle"),
-            ] {
-                if ref_q > hist_min && ref_q < hist_max {
-                    chart.draw_series(LineSeries::new(
-                        vec![(ref_q, 0), (ref_q, max_count)],
-                        ShapeStyle::from(color).stroke_width(2),
-                    ))?.label(lbl);
-                }
-            }
-
-            chart.configure_series_labels()
-                .position(SeriesLabelPosition::UpperRight)
-                .background_style(WHITE.mix(0.8))
-                .draw()?;
-
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
+    // --- Voronoi shape index plot --- (TODO: not yet implemented in observables.rs)
 
     // --- MSD plot ---
     if let Some(ref msd) = result.msd {
@@ -1267,43 +1070,7 @@ fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Res
         }
     }
 
-    // --- Kinetic energy plot ---
-    if let Some(ref ke) = result.kinetic_energy {
-        if !ke.times.is_empty() {
-            let out_path = plot_dir.join("kinetic_energy.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            let x_min = *ke.times.first().unwrap();
-            let x_max = *ke.times.last().unwrap();
-            let y_min = ke.ke_per_cell.iter().copied().fold(f64::INFINITY, f64::min) * 0.9;
-            let y_max = ke.ke_per_cell.iter().copied().fold(f64::NEG_INFINITY, f64::max) * 1.1;
-
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("KE per cell — {}", label), ("sans-serif", 22).into_font())
-                .margin(15)
-                .x_label_area_size(45)
-                .y_label_area_size(65)
-                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
-
-            chart.configure_mesh()
-                .x_desc("t")
-                .y_desc("½⟨v²⟩")
-                .x_label_style(("sans-serif", 16))
-                .y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18))
-                .light_line_style(TRANSPARENT)
-                .draw()?;
-
-            chart.draw_series(LineSeries::new(
-                ke.times.iter().zip(ke.ke_per_cell.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&BLUE).stroke_width(2),
-            ))?;
-
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
+    // --- Kinetic energy plot --- (TODO: not yet implemented in observables.rs)
 
     Ok(())
 }
