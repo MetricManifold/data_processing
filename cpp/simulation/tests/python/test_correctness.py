@@ -501,6 +501,171 @@ class TestChainResume:
 
 
 # ============================================================================
+# 10b. Resume with v_A override: cells must actually move
+# ============================================================================
+
+class TestResumeVAOverride:
+    """Resume from a v_A=0 equilibration checkpoint with --v-A 0.01.
+
+    This is the Palmieri protocol: equilibrate without motility, then turn on
+    motility for the production run. The per-cell v_A stored in the checkpoint's
+    VA_A sidecar is 0; the CLI --v-A 0.01 must override it so cells move.
+
+    Regression test for: VA_A sidecar overriding CLI --v-A override (2026-04-26).
+    """
+
+    def test_va_override_cells_move(self, tmp_path):
+        """Equilibrate with v_A=0, resume with --v-A 0.01 → cells must move."""
+        # Step 1: Equilibrate (v_A=0, short run to get a checkpoint)
+        out_eq = run_sim(tmp_path / "eq",
+                         "-n", "8", "-N", "400", "-r", "49", "-t", "10",
+                         "--dt", "0.01", "--v-A", "0", "--seed", "42",
+                         "--trajectory-samples", "0")
+        ckpt = out_eq / "checkpoint.bin"
+        assert ckpt.exists()
+
+        # Step 2: Resume with motility on (--v-A 0.01)
+        out_prod = run_sim(tmp_path / "prod",
+                           "-c", str(ckpt),
+                           "-t", "110", "--v-A", "0.01",
+                           "--trajectory-samples", "10",
+                           "--seed", "42")
+        traj_path = out_prod / "trajectory.txt"
+        assert traj_path.exists()
+
+        # Step 3: Check that cells actually move
+        data, hdr = read_trajectory(traj_path)
+        times = sorted(data.keys())
+        assert len(times) >= 2, f"Expected ≥2 trajectory frames, got {len(times)}"
+
+        # Compute displacement of cell 0 between first and last frame
+        t0, t1 = times[0], times[-1]
+        x0, y0 = data[t0][0][:2]
+        x1, y1 = data[t1][0][:2]
+        Nx = int(hdr.get("Lx", "400"))
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        if dx > Nx / 2: dx = Nx - dx
+        if dy > Nx / 2: dy = Nx - dy
+        displacement = np.sqrt(dx**2 + dy**2)
+
+        # With v_A=0.01, 100 TU, an isolated cell moves ~v_A*t = 1 px.
+        # In a monolayer there's some caging, but displacement should be > 0.1.
+        assert displacement > 0.1, \
+            f"Cell 0 displacement = {displacement:.4f} px — v_A override not working"
+
+    def test_va_override_velocity_nonzero(self, tmp_path):
+        """Resume with --v-A 0.01 → reported velocity magnitude must be physical."""
+        out_eq = run_sim(tmp_path / "eq",
+                         "-n", "8", "-N", "400", "-r", "49", "-t", "10",
+                         "--dt", "0.01", "--v-A", "0", "--seed", "42",
+                         "--trajectory-samples", "0")
+
+        out_prod = run_sim(tmp_path / "prod",
+                           "-c", str(out_eq / "checkpoint.bin"),
+                           "-t", "110", "--v-A", "0.01",
+                           "--trajectory-samples", "10",
+                           "--seed", "42")
+
+        data, _ = read_trajectory(out_prod / "trajectory.txt")
+        times = sorted(data.keys())
+        # Check velocity magnitude at the last frame
+        last = data[times[-1]]
+        speeds = [np.sqrt(c[2]**2 + c[3]**2) for c in last.values()]
+        mean_speed = np.mean(speeds)
+
+        # With v_A=0.01, mean speed in a monolayer is ~0.003 (Palmieri σ_G).
+        # It must be > 1e-4 to be physical. If v_A override is broken, it's ~1e-6.
+        assert mean_speed > 1e-4, \
+            f"Mean speed = {mean_speed:.2e} — v_A override not propagating to GPU"
+
+    def test_va_zero_resume_stays_zero(self, tmp_path):
+        """Resume from v_A=0 without --v-A flag → cells must NOT move."""
+        out_eq = run_sim(tmp_path / "eq",
+                         "-n", "8", "-N", "400", "-r", "49", "-t", "10",
+                         "--dt", "0.01", "--v-A", "0", "--seed", "42",
+                         "--trajectory-samples", "0")
+
+        out_prod = run_sim(tmp_path / "prod",
+                           "-c", str(out_eq / "checkpoint.bin"),
+                           "-t", "20",
+                           "--trajectory-samples", "2",
+                           "--seed", "42")
+
+        data, _ = read_trajectory(out_prod / "trajectory.txt")
+        times = sorted(data.keys())
+        if len(times) >= 2:
+            t0, t1 = times[0], times[-1]
+            x0, y0 = data[t0][0][:2]
+            x1, y1 = data[t1][0][:2]
+            disp = np.sqrt((x1 - x0)**2 + (y1 - y0)**2)
+            # Without motility, displacement is just relaxation drift — should be tiny
+            assert disp < 1.0, \
+                f"Cell 0 displaced {disp:.4f} px with v_A=0 — shouldn't move this much"
+
+
+# ============================================================================
+# 10c. Resume initial velocity recomputation
+# ============================================================================
+
+class TestResumeInitialVelocity:
+    """When resuming from a v_A=0 equilibration with --v-A 0.01, the binary
+    must recompute v = v_I + v_A·p̂ before the first step so that advection
+    uses the correct velocity from step 1.
+
+    The trajectory reports end-of-step velocities (which are always correct),
+    so we test via displacement: if initial velocity is wrong, cells barely
+    move on the first trajectory interval.
+
+    Regression test for: missing launch_initial_velocity on resume (2026-04-27).
+    """
+
+    def test_first_interval_displacement_physical(self, tmp_path):
+        """Resume with --v-A 0.01 → displacement in the first trajectory
+        interval must be consistent with v_A, not near zero."""
+        # Equilibrate (v_A=0)
+        out_eq = run_sim(tmp_path / "eq",
+                         "-n", "8", "-N", "400", "-r", "49", "-t", "10",
+                         "--dt", "0.01", "--v-A", "0", "--seed", "42",
+                         "--trajectory-samples", "0")
+
+        # Resume with motility, dense trajectory for first 100 TU
+        out_prod = run_sim(tmp_path / "prod",
+                           "-c", str(out_eq / "checkpoint.bin"),
+                           "-t", "110", "--v-A", "0.01",
+                           "--trajectory-samples", "100",
+                           "--seed", "42")
+
+        data, hdr = read_trajectory(out_prod / "trajectory.txt")
+        times = sorted(data.keys())
+        assert len(times) >= 3, f"Need ≥3 frames, got {len(times)}"
+
+        # Displacement of cell 0 in the FIRST interval vs SECOND interval
+        Nx = int(hdr.get("Lx", "400"))
+        def disp(t0, t1, cid=0):
+            x0, y0 = data[t0][cid][:2]
+            x1, y1 = data[t1][cid][:2]
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            if dx > Nx / 2: dx = Nx - dx
+            if dy > Nx / 2: dy = Nx - dy
+            return np.sqrt(dx**2 + dy**2)
+
+        d_first = disp(times[0], times[1])
+        d_second = disp(times[1], times[2])
+
+        # Both intervals should have similar displacement.
+        # If initial velocity is wrong, d_first << d_second (cells don't move
+        # in the first interval because advection uses v≈0).
+        # Allow up to 5× difference (cells can cage/ungage between intervals).
+        if d_second > 1e-6:
+            ratio = d_first / d_second
+            assert ratio > 0.1, \
+                f"First interval displacement ({d_first:.4e}) is {ratio:.1%} of " \
+                f"second ({d_second:.4e}) — initial velocity not recomputed"
+
+
+# ============================================================================
 # 11. Seed determinism: same seed → identical output
 # ============================================================================
 

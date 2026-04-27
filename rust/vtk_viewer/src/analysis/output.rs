@@ -48,6 +48,12 @@ pub struct RunResult {
     pub velocity_distribution: Option<VelocityDistributionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polarity_tau: Option<PolarityTauResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hexatic_order: Option<HexaticOrderResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voronoi_shape: Option<VoronoiShapeResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kinetic_energy: Option<KineticEnergyResult>,
 }
 
 /// Parameters extracted from the trajectory header.

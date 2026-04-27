@@ -32,7 +32,7 @@ def _find_binary():
             pytest.skip(f"SIM_BINARY={env} does not exist")
         return env
 
-    name = os.environ.get("SIM_NAME", "cell_sim_v2")
+    name = os.environ.get("SIM_NAME", "cell_sim")
     # conftest.py lives at <repo>/cpp/simulation/tests/python/conftest.py
     repo = Path(__file__).parents[4]  # data_processing/
     candidates = [

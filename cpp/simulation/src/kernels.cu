@@ -279,17 +279,18 @@ k_fused(
     const int tid = threadIdx.x;
     const int BS = 256;
 
-    // Shared: reused between neighbor-load phase and reduction phase
+    // Shared: neighbor metadata persists through both phases; reduction buffers after it
     extern __shared__ char smem[];
     float** s_phi = (float**)smem;                         // K_MAX ptrs
     int*    s_meta = (int*)(smem + K_MAX * sizeof(float*)); // K_MAX*4 ints
+    // Reduction scratch starts after neighbor metadata
+    float*  s_reduce = (float*)(smem + K_MAX * sizeof(float*) + K_MAX * 4 * sizeof(int));
 
     // Per-cell constants
     int width = W[ci], height = H[ci];
     const float* phi  = phi_in[ci];
     float*       pout = phi_out[ci];
     int oxi = OX[ci], oyi = OY[ci];
-    float vx = vx_in[ci], vy = vy_in[ci];
     float vd = vdev[ci];
     float rx = RX[ci], ry = RY[ci];
     float tg = d_tg[ci], tgb = d_tgb[ci], vc = d_vc[ci];
@@ -325,183 +326,182 @@ k_fused(
     }
     __syncthreads();
 
-    // Per-thread accumulators
-    float a_vix = 0, a_viy = 0;
-    float a_cdx = 0, a_cdy = 0, a_p2 = 0;
-    float a_grd = 0;
-    float a_mx = 0, a_my = 0;
-
     int total = width * height;
-
-    // Branchless stride: advance (lx, ly) by BS pixels each iteration
     int stride_dy = BS / width;
     int stride_dx = BS - stride_dy * width;
-    int lx = tid % width;
-    int ly = tid / width;
 
-    for (int flat = tid; flat < total; flat += BS) {
-        // Source coordinates in old buffer
-        int srx = lx + sx, sry = ly + sy;
-        bool src_ok;
-        if constexpr (REMAP) {
-            src_ok = (srx >= 0 && srx < old_w && sry >= 0 && sry < old_h);
-        } else {
-            src_ok = true;  // no shift, always valid
-        }
-        float pv = src_ok ? __ldg(&phi[sry * old_w + srx]) : 0.0f;
-
-        bool inner = (lx >= halo && lx < width - halo &&
-                      ly >= halo && ly < height - halo);
-        float np = pv;
-
-        if (src_ok && inner) {
-            // 9-point isotropic Laplacian + central-difference gradients
-            int xm = max(srx - 1, 0), xp = min(srx + 1, old_w - 1);
-            int ym = max(sry - 1, 0), yp = min(sry + 1, old_h - 1);
-
-            float pE  = __ldg(&phi[sry * old_w + xp]);
-            float pW  = __ldg(&phi[sry * old_w + xm]);
-            float pN  = __ldg(&phi[yp  * old_w + srx]);
-            float pS  = __ldg(&phi[ym  * old_w + srx]);
-            float pNE = __ldg(&phi[yp  * old_w + xp]);
-            float pNW = __ldg(&phi[yp  * old_w + xm]);
-            float pSE = __ldg(&phi[ym  * old_w + xp]);
-            float pSW = __ldg(&phi[ym  * old_w + xm]);
-
-            float lap = (4.0f * (pE + pW + pN + pS)
-                         + (pNE + pNW + pSE + pSW)
-                         - 20.0f * pv) * inv_h2 / 6.0f;
-            float gx = (pE - pW) * inv_2dx;
-            float gy = (pN - pS) * inv_2dy;
-
-            // Neighbor interaction sum. No early-exit: even when pv≈0, a
-            // nonzero S is fine (the PDE multiplies pv*S on the next line).
-            // The early-exit was a speed hack with no math benefit and it
-            // introduced a subtle FP-threshold asymmetry.
-            float S = 0.0f;
-            for (int ni = 0; ni < k; ni++) {
-                int nrox = s_meta[ni * 4];
-                int nroy = s_meta[ni * 4 + 1];
-                int nw   = s_meta[ni * 4 + 2];
-                int nh   = s_meta[ni * 4 + 3];
-                int nlx = srx - nrox;
-                int nly = sry - nroy;
-                if (nlx >= halo && nlx < nw - halo &&
-                    nly >= halo && nly < nh - halo) {
-                    float pm = __ldg(&s_phi[ni][nly * nw + nlx]);
-                    S += pm * pm;
+    // ====== PHASE 1: Velocity integral only ======
+    // Iterate all pixels, accumulate φ·∇φ·S for the velocity reduction.
+    // This gives v^n = v_I(φ^n) + v_A·p̂^n BEFORE the PDE update.
+    {
+        float a_vix = 0, a_viy = 0;
+        int lx = tid % width, ly = tid / width;
+        for (int flat = tid; flat < total; flat += BS) {
+            int srx = lx + sx, sry = ly + sy;
+            bool src_ok;
+            if constexpr (REMAP) {
+                src_ok = (srx >= 0 && srx < old_w && sry >= 0 && sry < old_h);
+            } else { src_ok = true; }
+            float pv = src_ok ? __ldg(&phi[sry * old_w + srx]) : 0.0f;
+            bool inner = (lx >= halo && lx < width - halo &&
+                          ly >= halo && ly < height - halo);
+            if (src_ok && inner) {
+                float gx = (__ldg(&phi[sry * old_w + min(srx+1, old_w-1)])
+                          - __ldg(&phi[sry * old_w + max(srx-1, 0)])) * inv_2dx;
+                float gy = (__ldg(&phi[min(sry+1, old_h-1) * old_w + srx])
+                          - __ldg(&phi[max(sry-1, 0) * old_w + srx])) * inv_2dy;
+                float S = 0.0f;
+                for (int ni = 0; ni < k; ni++) {
+                    int nlx = srx - s_meta[ni*4], nly = sry - s_meta[ni*4+1];
+                    int nw = s_meta[ni*4+2], nh = s_meta[ni*4+3];
+                    if (nlx >= halo && nlx < nw-halo && nly >= halo && nly < nh-halo) {
+                        float pm = __ldg(&s_phi[ni][nly * nw + nlx]);
+                        S += pm * pm;
+                    }
                 }
+                a_vix += pv * gx * S;
+                a_viy += pv * gy * S;
             }
-
-            // PDE update
-            float bulk       = tgb * pv * (1.0f - pv) * (1.0f - 2.0f * pv);
-            float constraint = -4.0f * vc * vd * pv;
-            float repulsion  = two_keff * pv * S;
-            float var_deriv  = -tg * lap + bulk + constraint + repulsion;
-            float advection  = vx * gx + vy * gy;
-            np = pv + dt * (-0.5f * var_deriv - advection);
-
-            // Accumulate velocity integral (from OLD phi, for NEXT step)
-            a_vix += pv * gx * S;
-            a_viy += pv * gy * S;
-
-            // Perimeter
-            a_grd += sqrtf(gx * gx + gy * gy);
-
-            // Centroid + volume from NEW phi
-            float np2 = np * np;
-            float gxf = (float)(oxi + lx + sx);
-            float gyf = (float)(oyi + ly + sy);
-            float drx = pdelta(gxf - rx, (float)Nx);
-            float dry = pdelta(gyf - ry, (float)Ny);
-            a_cdx += drx * np2;
-            a_cdy += dry * np2;
-            a_p2  += np2;
-
-            if constexpr (MOMENTS) {
-                a_mx += drx * drx * np2;
-                a_my += dry * dry * np2;
-            }
+            lx += stride_dx; int wrap = lx >= width; lx -= wrap * width; ly += stride_dy + wrap;
         }
-
-        if (!inner) np = 0.0f;
-        pout[ly * width + lx] = np;
-
-        // Branchless stride advance
-        lx += stride_dx;
-        int wrap = lx >= width;
-        lx -= wrap * width;
-        ly += stride_dy + wrap;
-    }
-
-    // ---- Block reduction: 6 channels ----
-    __syncthreads();
-    float* sr = (float*)smem;
-    float *r0 = sr, *r1 = sr + BS, *r2 = sr + 2*BS;
-    float *r3 = sr + 3*BS, *r4 = sr + 4*BS, *r5 = sr + 5*BS;
-    r0[tid] = a_vix; r1[tid] = a_viy;
-    r2[tid] = a_cdx; r3[tid] = a_cdy;
-    r4[tid] = a_p2;  r5[tid] = a_grd;
-    __syncthreads();
-
-    for (int s = BS / 2; s > 32; s >>= 1) {
-        if (tid < s) {
-            r0[tid] += r0[tid+s]; r1[tid] += r1[tid+s];
-            r2[tid] += r2[tid+s]; r3[tid] += r3[tid+s];
-            r4[tid] += r4[tid+s]; r5[tid] += r5[tid+s];
-        }
+        // Reduce velocity integral (2 channels)
         __syncthreads();
-    }
-    if (tid < 32) {
-        float v0 = r0[tid]+r0[tid+32], v1 = r1[tid]+r1[tid+32];
-        float v2 = r2[tid]+r2[tid+32], v3 = r3[tid]+r3[tid+32];
-        float v4 = r4[tid]+r4[tid+32], v5 = r5[tid]+r5[tid+32];
-        for (int off = 16; off > 0; off >>= 1) {
-            v0 += __shfl_down_sync(0xffffffff, v0, off);
-            v1 += __shfl_down_sync(0xffffffff, v1, off);
-            v2 += __shfl_down_sync(0xffffffff, v2, off);
-            v3 += __shfl_down_sync(0xffffffff, v3, off);
-            v4 += __shfl_down_sync(0xffffffff, v4, off);
-            v5 += __shfl_down_sync(0xffffffff, v5, off);
-        }
-        if (tid == 0) {
-            // Velocity for next step
-            vx_in[ci] = mc * v0 * dA + d_vA[ci] * d_px[ci];
-            vy_in[ci] = mc * v1 * dA + d_vA[ci] * d_py[ci];
-            // Volume
-            float vol = v4 * dA;
-            d_vol[ci] = vol;
-            d_vdev[ci] = d_ta[ci] - vol;
-            // Centroid
-            if (v4 > 1e-8f) {
-                float ccx = rx + v2 / v4;
-                float ccy = ry + v3 / v4;
-                ccx = fmodf(fmodf(ccx, (float)Nx) + Nx, (float)Nx);
-                ccy = fmodf(fmodf(ccy, (float)Ny) + Ny, (float)Ny);
-                d_cx[ci] = ccx;
-                d_cy[ci] = ccy;
-            }
-            d_peri[ci] = v5 * dA;
-        }
-    }
-
-    // Second moments (rare path)
-    if constexpr (MOMENTS) {
+        float* sr = s_reduce;
+        sr[tid] = a_vix; sr[tid + BS] = a_viy;
         __syncthreads();
-        float *m0 = (float*)smem, *m1 = m0 + BS;
-        m0[tid] = a_mx; m1[tid] = a_my;
-        __syncthreads();
-        for (int s = BS / 2; s > 32; s >>= 1) {
-            if (tid < s) { m0[tid] += m0[tid+s]; m1[tid] += m1[tid+s]; }
+        for (int s = BS/2; s > 32; s >>= 1) {
+            if (tid < s) { sr[tid] += sr[tid+s]; sr[tid+BS] += sr[tid+BS+s]; }
             __syncthreads();
         }
         if (tid < 32) {
-            float mx = m0[tid]+m0[tid+32], my = m1[tid]+m1[tid+32];
+            float v0 = sr[tid]+sr[tid+32], v1 = sr[tid+BS]+sr[tid+BS+32];
             for (int off = 16; off > 0; off >>= 1) {
-                mx += __shfl_down_sync(0xffffffff, mx, off);
-                my += __shfl_down_sync(0xffffffff, my, off);
+                v0 += __shfl_down_sync(0xffffffff, v0, off);
+                v1 += __shfl_down_sync(0xffffffff, v1, off);
             }
-            if (tid == 0) { d_mx[ci] = mx; d_my[ci] = my; }
+            if (tid == 0) {
+                vx_in[ci] = mc * v0 * dA + d_vA[ci] * d_px[ci];
+                vy_in[ci] = mc * v1 * dA + d_vA[ci] * d_py[ci];
+            }
+        }
+    }
+    // All threads must see the new velocity before Phase 2.
+    __syncthreads();
+    float vx = vx_in[ci], vy = vy_in[ci];
+
+    // ====== PHASE 2: PDE update with correct velocity ======
+    {
+        float a_cdx = 0, a_cdy = 0, a_p2 = 0, a_grd = 0;
+        float a_mx = 0, a_my = 0;
+        int lx = tid % width, ly = tid / width;
+        for (int flat = tid; flat < total; flat += BS) {
+            int srx = lx + sx, sry = ly + sy;
+            bool src_ok;
+            if constexpr (REMAP) {
+                src_ok = (srx >= 0 && srx < old_w && sry >= 0 && sry < old_h);
+            } else { src_ok = true; }
+            float pv = src_ok ? __ldg(&phi[sry * old_w + srx]) : 0.0f;
+            bool inner = (lx >= halo && lx < width - halo &&
+                          ly >= halo && ly < height - halo);
+            float np = pv;
+            if (src_ok && inner) {
+                int xm = max(srx-1, 0), xp = min(srx+1, old_w-1);
+                int ym = max(sry-1, 0), yp = min(sry+1, old_h-1);
+                float pE  = __ldg(&phi[sry * old_w + xp]);
+                float pW  = __ldg(&phi[sry * old_w + xm]);
+                float pN  = __ldg(&phi[yp  * old_w + srx]);
+                float pS  = __ldg(&phi[ym  * old_w + srx]);
+                float pNE = __ldg(&phi[yp  * old_w + xp]);
+                float pNW = __ldg(&phi[yp  * old_w + xm]);
+                float pSE = __ldg(&phi[ym  * old_w + xp]);
+                float pSW = __ldg(&phi[ym  * old_w + xm]);
+                float lap = (4.0f*(pE+pW+pN+pS) + (pNE+pNW+pSE+pSW) - 20.0f*pv) * inv_h2 / 6.0f;
+                float gx = (pE - pW) * inv_2dx;
+                float gy = (pN - pS) * inv_2dy;
+                float S = 0.0f;
+                for (int ni = 0; ni < k; ni++) {
+                    int nlx = srx - s_meta[ni*4], nly = sry - s_meta[ni*4+1];
+                    int nw = s_meta[ni*4+2], nh = s_meta[ni*4+3];
+                    if (nlx >= halo && nlx < nw-halo && nly >= halo && nly < nh-halo) {
+                        float pm = __ldg(&s_phi[ni][nly * nw + nlx]);
+                        S += pm * pm;
+                    }
+                }
+                float bulk       = tgb * pv * (1.0f - pv) * (1.0f - 2.0f * pv);
+                float constraint = -4.0f * vc * vd * pv;
+                float repulsion  = two_keff * pv * S;
+                float var_deriv  = -tg * lap + bulk + constraint + repulsion;
+                float advection  = vx * gx + vy * gy;
+                np = pv + dt * (-0.5f * var_deriv - advection);
+                a_grd += sqrtf(gx * gx + gy * gy);
+                float np2 = np * np;
+                float gxf = (float)(oxi + lx + sx);
+                float gyf = (float)(oyi + ly + sy);
+                float drx = pdelta(gxf - rx, (float)Nx);
+                float dry = pdelta(gyf - ry, (float)Ny);
+                a_cdx += drx * np2; a_cdy += dry * np2; a_p2 += np2;
+                if constexpr (MOMENTS) {
+                    a_mx += drx * drx * np2;
+                    a_my += dry * dry * np2;
+                }
+            }
+            if (!inner) np = 0.0f;
+            pout[ly * width + lx] = np;
+            lx += stride_dx; int wrap = lx >= width; lx -= wrap * width; ly += stride_dy + wrap;
+        }
+
+        // ---- Block reduction: 4 channels (centroid + volume + perimeter) ----
+        __syncthreads();
+        float* sr = s_reduce;
+        float *r0 = sr, *r1 = sr + BS, *r2 = sr + 2*BS, *r3 = sr + 3*BS;
+        r0[tid] = a_cdx; r1[tid] = a_cdy; r2[tid] = a_p2; r3[tid] = a_grd;
+        __syncthreads();
+        for (int s = BS/2; s > 32; s >>= 1) {
+            if (tid < s) { r0[tid] += r0[tid+s]; r1[tid] += r1[tid+s]; r2[tid] += r2[tid+s]; r3[tid] += r3[tid+s]; }
+            __syncthreads();
+        }
+        if (tid < 32) {
+            float v0 = r0[tid]+r0[tid+32], v1 = r1[tid]+r1[tid+32];
+            float v2 = r2[tid]+r2[tid+32], v3 = r3[tid]+r3[tid+32];
+            for (int off = 16; off > 0; off >>= 1) {
+                v0 += __shfl_down_sync(0xffffffff, v0, off);
+                v1 += __shfl_down_sync(0xffffffff, v1, off);
+                v2 += __shfl_down_sync(0xffffffff, v2, off);
+                v3 += __shfl_down_sync(0xffffffff, v3, off);
+            }
+            if (tid == 0) {
+                float vol = v2 * dA;
+                d_vol[ci] = vol;
+                d_vdev[ci] = d_ta[ci] - vol;
+                if (v2 > 1e-8f) {
+                    float ccx = rx + v0 / v2;
+                    float ccy = ry + v1 / v2;
+                    ccx = fmodf(fmodf(ccx, (float)Nx) + Nx, (float)Nx);
+                    ccy = fmodf(fmodf(ccy, (float)Ny) + Ny, (float)Ny);
+                    d_cx[ci] = ccx;
+                    d_cy[ci] = ccy;
+                }
+                d_peri[ci] = v3 * dA;
+            }
+        }
+        // Second moments (rare path)
+        if constexpr (MOMENTS) {
+            __syncthreads();
+            float *m0 = s_reduce, *m1 = m0 + BS;
+            m0[tid] = a_mx; m1[tid] = a_my;
+            __syncthreads();
+            for (int s = BS/2; s > 32; s >>= 1) {
+                if (tid < s) { m0[tid] += m0[tid+s]; m1[tid] += m1[tid+s]; }
+                __syncthreads();
+            }
+            if (tid < 32) {
+                float mx = m0[tid]+m0[tid+32], my = m1[tid]+m1[tid+32];
+                for (int off = 16; off > 0; off >>= 1) {
+                    mx += __shfl_down_sync(0xffffffff, mx, off);
+                    my += __shfl_down_sync(0xffffffff, my, off);
+                }
+                if (tid == 0) { d_mx[ci] = mx; d_my[ci] = my; }
+            }
         }
     }
 }
@@ -513,7 +513,7 @@ void launch_fused(CellArrays& c, const SimParams& p,
 
     bool remap  = (step % 10 == 0);
     bool moment = (step % 10 == 9);
-    size_t smem = 6 * 256 * sizeof(float);
+    size_t smem = K_MAX * sizeof(float*) + K_MAX * 4 * sizeof(int) + 4 * 256 * sizeof(float);
     float ih2   = 1.0f / (p.dx * p.dx);
     float i2dx  = 0.5f / p.dx;
     float i2dy  = 0.5f / p.dy;

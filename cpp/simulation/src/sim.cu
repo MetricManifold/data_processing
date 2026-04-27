@@ -632,6 +632,13 @@ bool Simulation::init_from_checkpoint(const std::string& path,
         per_gamma.clear();   // discard checkpoint's per-cell gamma
     }
 
+    // If user supplied --v-A on resume, it overrides the checkpoint's per-cell
+    // VA_A sidecar. Without this, resuming from a v_A=0 equilibration with
+    // --v-A 0.01 would silently keep v_A=0 for all cells.
+    if (ov.v_A) {
+        per_vA.clear();      // discard checkpoint's per-cell v_A
+    }
+
     for (int i = 0; i < n; i++) {
         auto& c = h_cells[i];
         double g = (i < (int)per_gamma.size()) ? (double)per_gamma[i] : c.gamma;
@@ -696,6 +703,14 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     CK(cudaMemcpy(cells.ref_y, ck_cy.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
     finalize_init();
+
+    // Recompute velocity from current phi + per-cell v_A + polarity.
+    // The checkpoint stores velocities from the last step of the previous run.
+    // If v_A changed (e.g. equilibration at v_A=0 → production at v_A=0.01),
+    // the stored velocity is missing the v_A·p̂ term. Recomputing ensures the
+    // first step's advection uses the correct v = v_I(φ) + v_A·p̂.
+    launch_initial_velocity(cells, params, cache_w, cache_h);
+
     CK(cudaDeviceSynchronize());
 
     printf("[SIM] resumed from %s: step=%d, t=%.4f, %d cells, %dx%d, t_end=%.1f\n",

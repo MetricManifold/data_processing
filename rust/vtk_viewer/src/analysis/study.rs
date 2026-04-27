@@ -752,6 +752,27 @@ pub fn run_study(
         // Unpaired analysis mode
         let groups = compute_group_metrics(&runs, &ac.group_by, tagged, &ac.metrics);
 
+        // Generate per-run diagnostic panels (single-condition mode)
+        if let Some(ref diag) = config.diagnostic {
+            std::fs::create_dir_all(output_dir).ok();
+            for run in &runs {
+                let run_path = run.trajectory.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                let mut out_name = diag.output.clone();
+                for (var_name, var_value) in &run.variables {
+                    out_name = out_name.replace(&format!("{{{}}}", var_name), var_value);
+                }
+                let out_path = output_dir.join(&out_name);
+                let tau = config.observables.tau;
+                // Single-run diagnostic: pass same path as both soft and ctrl
+                if let Err(e) = generate_comparison_with_config(
+                    &run_path, &run_path, &out_path, tagged, subsample, tau,
+                    "run", "_", diag,
+                ) {
+                    eprintln!("Diagnostic {:?} failed: {}", out_path, e);
+                }
+            }
+        }
+
         Ok(StudyResult {
             study_name: config.study.name.clone(),
             description: config.study.description.clone(),
@@ -873,6 +894,9 @@ fn analyze_run_for_study(
         burst_detection: None,
         velocity_distribution: vel_dist,
         polarity_tau: None,
+        hexatic_order: None,
+        voronoi_shape: None,
+        kinetic_energy: None,
     })
 }
 

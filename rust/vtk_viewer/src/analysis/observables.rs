@@ -1827,6 +1827,309 @@ fn fit_exp_decay(lag_times: &[f64], corr: &[f64]) -> (f64, f64) {
     (tau, r2)
 }
 
+// ============================================================================
+// Hexatic order parameter ψ₆
+// ============================================================================
+
+#[derive(Serialize, Clone, Debug)]
+pub struct HexaticOrderResult {
+    /// Mean |ψ₆| across all cells (time-averaged).
+    pub psi6_mean: f64,
+    /// Std of |ψ₆| across cells.
+    pub psi6_std: f64,
+    /// Per-cell time-averaged |ψ₆|.
+    pub psi6_per_cell: Vec<f64>,
+    /// g₆(r) orientational correlation function: radii (in pixels).
+    pub g6_r: Vec<f64>,
+    /// g₆(r) values.
+    pub g6_values: Vec<f64>,
+}
+
+/// Compute hexatic order ψ₆ from cell centroids.
+///
+/// For each cell i, find Delaunay-style neighbors (cells within cutoff = 3R),
+/// then ψ₆ᵢ = |1/nᵢ Σⱼ exp(6i·θᵢⱼ)| where θᵢⱼ = atan2(yⱼ-yᵢ, xⱼ-xᵢ).
+/// Also computes g₆(r) = ⟨ψ₆*(rᵢ)·ψ₆(rⱼ)⟩ vs |rᵢ-rⱼ|.
+pub fn compute_hexatic_order(pos: &UnwrappedPositions, cell_radius: f64) -> HexaticOrderResult {
+    let n_cells = pos.n_cells;
+    let n_times = pos.n_times;
+    let cutoff = 3.0 * cell_radius;
+    let cutoff2 = cutoff * cutoff;
+    let lx = pos.lx;
+    let ly = pos.ly;
+
+    // Per-cell accumulator for time-averaged |ψ₆|
+    let mut psi6_accum = vec![0.0f64; n_cells];
+    // For g₆(r): accumulate Re(ψ₆*(i)·ψ₆(j)) in radial bins
+    let n_bins = 40;
+    let bin_width = cutoff * 2.0 / n_bins as f64;
+    let mut g6_sum = vec![0.0f64; n_bins];
+    let mut g6_count = vec![0u64; n_bins];
+
+    for t in 0..n_times {
+        // Wrapped positions for this frame
+        let wx: Vec<f64> = (0..n_cells).map(|i| pos.positions[t][i][0].rem_euclid(lx)).collect();
+        let wy: Vec<f64> = (0..n_cells).map(|i| pos.positions[t][i][1].rem_euclid(ly)).collect();
+
+        // Compute ψ₆ for each cell (complex: re + im)
+        let mut psi6_re = vec![0.0f64; n_cells];
+        let mut psi6_im = vec![0.0f64; n_cells];
+        let mut n_nbr = vec![0u32; n_cells];
+
+        for i in 0..n_cells {
+            for j in (i + 1)..n_cells {
+                let mut dx = wx[j] - wx[i];
+                let mut dy = wy[j] - wy[i];
+                if dx > lx * 0.5 { dx -= lx; }
+                if dx < -lx * 0.5 { dx += lx; }
+                if dy > ly * 0.5 { dy -= ly; }
+                if dy < -ly * 0.5 { dy += ly; }
+                let r2 = dx * dx + dy * dy;
+                if r2 < cutoff2 && r2 > 1e-10 {
+                    let theta = dy.atan2(dx);
+                    let c6 = (6.0 * theta).cos();
+                    let s6 = (6.0 * theta).sin();
+                    psi6_re[i] += c6;
+                    psi6_im[i] += s6;
+                    n_nbr[i] += 1;
+                    // Reverse direction for j
+                    let c6r = (6.0 * (theta + PI)).cos();
+                    let s6r = (6.0 * (theta + PI)).sin();
+                    psi6_re[j] += c6r;
+                    psi6_im[j] += s6r;
+                    n_nbr[j] += 1;
+                }
+            }
+        }
+
+        // Normalize and accumulate
+        for i in 0..n_cells {
+            if n_nbr[i] > 0 {
+                let n = n_nbr[i] as f64;
+                psi6_re[i] /= n;
+                psi6_im[i] /= n;
+            }
+            let mag = (psi6_re[i] * psi6_re[i] + psi6_im[i] * psi6_im[i]).sqrt();
+            psi6_accum[i] += mag;
+        }
+
+        // g₆(r): correlate ψ₆ between all pairs
+        for i in 0..n_cells {
+            for j in (i + 1)..n_cells {
+                let mut dx = wx[j] - wx[i];
+                let mut dy = wy[j] - wy[i];
+                if dx > lx * 0.5 { dx -= lx; }
+                if dx < -lx * 0.5 { dx += lx; }
+                if dy > ly * 0.5 { dy -= ly; }
+                if dy < -ly * 0.5 { dy += ly; }
+                let r = (dx * dx + dy * dy).sqrt();
+                let bin = (r / bin_width) as usize;
+                if bin < n_bins {
+                    // Re(ψ₆*(i)·ψ₆(j))
+                    let dot = psi6_re[i] * psi6_re[j] + psi6_im[i] * psi6_im[j];
+                    g6_sum[bin] += dot;
+                    g6_count[bin] += 1;
+                }
+            }
+        }
+    }
+
+    let nt = n_times as f64;
+    let psi6_per_cell: Vec<f64> = psi6_accum.iter().map(|&v| v / nt).collect();
+    let psi6_mean = psi6_per_cell.iter().sum::<f64>() / n_cells as f64;
+    let psi6_var = psi6_per_cell.iter().map(|&v| (v - psi6_mean).powi(2)).sum::<f64>() / n_cells as f64;
+    let psi6_std = psi6_var.sqrt();
+
+    let g6_r: Vec<f64> = (0..n_bins).map(|i| (i as f64 + 0.5) * bin_width).collect();
+    let g6_values: Vec<f64> = (0..n_bins)
+        .map(|i| if g6_count[i] > 0 { g6_sum[i] / g6_count[i] as f64 } else { 0.0 })
+        .collect();
+
+    HexaticOrderResult {
+        psi6_mean,
+        psi6_std,
+        psi6_per_cell,
+        g6_r,
+        g6_values,
+    }
+}
+
+// ============================================================================
+// Voronoi shape index q = P/√A
+// ============================================================================
+
+#[derive(Serialize, Clone, Debug)]
+pub struct VoronoiShapeResult {
+    /// Mean Voronoi shape index q = P/√A across all cells (time-averaged).
+    pub q_mean: f64,
+    /// Std of q.
+    pub q_std: f64,
+    /// Per-cell time-averaged q.
+    pub q_per_cell: Vec<f64>,
+}
+
+/// Compute Voronoi shape index from cell centroids.
+///
+/// Uses a simple geometric construction: for each cell, find neighbors within
+/// cutoff, build the Voronoi polygon by intersecting perpendicular bisectors,
+/// compute P/√A.  Falls back to a nearest-neighbor polygon if Delaunay is
+/// too complex (we don't pull in a full Voronoi library).
+///
+/// Simpler approximation used here: for each cell i, find all neighbors j
+/// within cutoff. The Voronoi polygon vertex between neighbors j and k
+/// (adjacent in angular order) is the circumcenter of (i, j, k). Polygon
+/// P and A are computed from these vertices.
+pub fn compute_voronoi_shape(pos: &UnwrappedPositions, cell_radius: f64) -> VoronoiShapeResult {
+    let n_cells = pos.n_cells;
+    let n_times = pos.n_times;
+    let cutoff = 4.0 * cell_radius;
+    let cutoff2 = cutoff * cutoff;
+    let lx = pos.lx;
+    let ly = pos.ly;
+
+    let mut q_accum = vec![0.0f64; n_cells];
+    let mut q_count = vec![0u32; n_cells];
+
+    for t in 0..n_times {
+        let wx: Vec<f64> = (0..n_cells).map(|i| pos.positions[t][i][0].rem_euclid(lx)).collect();
+        let wy: Vec<f64> = (0..n_cells).map(|i| pos.positions[t][i][1].rem_euclid(ly)).collect();
+
+        for i in 0..n_cells {
+            // Find neighbors, sorted by angle
+            let mut nbrs: Vec<(f64, f64, f64)> = Vec::new(); // (angle, dx, dy)
+            for j in 0..n_cells {
+                if j == i { continue; }
+                let mut dx = wx[j] - wx[i];
+                let mut dy = wy[j] - wy[i];
+                if dx > lx * 0.5 { dx -= lx; }
+                if dx < -lx * 0.5 { dx += lx; }
+                if dy > ly * 0.5 { dy -= ly; }
+                if dy < -ly * 0.5 { dy += ly; }
+                let r2 = dx * dx + dy * dy;
+                if r2 < cutoff2 {
+                    nbrs.push((dy.atan2(dx), dx, dy));
+                }
+            }
+            if nbrs.len() < 3 { continue; }
+            nbrs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            // Build Voronoi polygon: vertex between consecutive neighbors
+            // j and k is the circumcenter of triangle (0,0), (dxⱼ,dyⱼ), (dxₖ,dyₖ)
+            let nn = nbrs.len();
+            let mut verts: Vec<(f64, f64)> = Vec::with_capacity(nn);
+            for idx in 0..nn {
+                let (_, ax, ay) = nbrs[idx];
+                let (_, bx, by) = nbrs[(idx + 1) % nn];
+                // Circumcenter of (0,0), (ax,ay), (bx,by)
+                let d = 2.0 * (ax * by - ay * bx);
+                if d.abs() < 1e-12 {
+                    // Degenerate — use midpoint of perpendicular bisectors
+                    verts.push(((ax + bx) * 0.25, (ay + by) * 0.25));
+                } else {
+                    let a2 = ax * ax + ay * ay;
+                    let b2 = bx * bx + by * by;
+                    let cx = (a2 * by - b2 * ay) / d;
+                    let cy = (bx * a2 - ax * b2) / d;
+                    verts.push((cx, cy));
+                }
+            }
+
+            // Polygon perimeter and area (shoelace)
+            let nv = verts.len();
+            let mut perim = 0.0;
+            let mut area = 0.0;
+            for vi in 0..nv {
+                let (x0, y0) = verts[vi];
+                let (x1, y1) = verts[(vi + 1) % nv];
+                perim += ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                area += x0 * y1 - x1 * y0;
+            }
+            area = area.abs() * 0.5;
+            if area > 1e-10 {
+                let q = perim / area.sqrt();
+                q_accum[i] += q;
+                q_count[i] += 1;
+            }
+        }
+    }
+
+    let q_per_cell: Vec<f64> = (0..n_cells)
+        .map(|i| if q_count[i] > 0 { q_accum[i] / q_count[i] as f64 } else { 0.0 })
+        .collect();
+    let valid: Vec<f64> = q_per_cell.iter().filter(|&&v| v > 0.0).copied().collect();
+    let q_mean = if valid.is_empty() { 0.0 } else { valid.iter().sum::<f64>() / valid.len() as f64 };
+    let q_var = if valid.len() < 2 { 0.0 } else {
+        valid.iter().map(|&v| (v - q_mean).powi(2)).sum::<f64>() / valid.len() as f64
+    };
+
+    VoronoiShapeResult {
+        q_mean,
+        q_std: q_var.sqrt(),
+        q_per_cell,
+    }
+}
+
+// ============================================================================
+// Kinetic energy time series
+// ============================================================================
+
+#[derive(Serialize, Clone, Debug)]
+pub struct KineticEnergyResult {
+    /// Time points.
+    pub times: Vec<f64>,
+    /// KE per cell = ½⟨v²⟩ at each time (averaged over all cells).
+    pub ke_per_cell: Vec<f64>,
+    /// Total KE = ½Σv² at each time.
+    pub ke_total: Vec<f64>,
+    /// Time-averaged KE per cell.
+    pub ke_mean: f64,
+}
+
+/// Compute kinetic energy time series from displacement velocities.
+pub fn compute_kinetic_energy(pos: &UnwrappedPositions) -> KineticEnergyResult {
+    let n_times = pos.n_times;
+    let n_cells = pos.n_cells;
+    if n_times < 2 {
+        return KineticEnergyResult {
+            times: vec![],
+            ke_per_cell: vec![],
+            ke_total: vec![],
+            ke_mean: 0.0,
+        };
+    }
+
+    let mut times = Vec::with_capacity(n_times - 1);
+    let mut ke_per_cell = Vec::with_capacity(n_times - 1);
+    let mut ke_total = Vec::with_capacity(n_times - 1);
+
+    for t in 1..n_times {
+        let dt = pos.times[t] - pos.times[t - 1];
+        if dt < 1e-30 { continue; }
+        let inv_dt = 1.0 / dt;
+        let mut sum_v2 = 0.0;
+        for i in 0..n_cells {
+            let dx = pos.positions[t][i][0] - pos.positions[t - 1][i][0];
+            let dy = pos.positions[t][i][1] - pos.positions[t - 1][i][1];
+            let v2 = (dx * inv_dt).powi(2) + (dy * inv_dt).powi(2);
+            sum_v2 += v2;
+        }
+        times.push((pos.times[t] + pos.times[t - 1]) * 0.5);
+        ke_total.push(0.5 * sum_v2);
+        ke_per_cell.push(0.5 * sum_v2 / n_cells as f64);
+    }
+
+    let ke_mean = if ke_per_cell.is_empty() { 0.0 } else {
+        ke_per_cell.iter().sum::<f64>() / ke_per_cell.len() as f64
+    };
+
+    KineticEnergyResult {
+        times,
+        ke_per_cell,
+        ke_total,
+        ke_mean,
+    }
+}
+
 pub const ALL_OBSERVABLES: &[&str] = &[
     "msd",
     "diffusion",
@@ -1846,6 +2149,9 @@ pub const ALL_OBSERVABLES: &[&str] = &[
     "burst_detection",
     "velocity_distribution",
     "polarity_tau",
+    "hexatic_order",
+    "voronoi_shape",
+    "kinetic_energy",
 ];
 
 /// Check if an observable name is valid.

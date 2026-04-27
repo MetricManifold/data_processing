@@ -137,35 +137,43 @@ def step(cells: List[CPUCell], p: CPUParams) -> List[CPUCell]:
     psq = [c.phi * c.phi for c in cells]
     S_total = np.sum(psq, axis=0) if psq else np.zeros_like(cells[0].phi)
 
+    # --- Pass 1: compute velocity v^n from φ^n for ALL cells ---
+    # v must be computed before the phi update so advection uses v(φ^n).
+    velocities = []
+    for i, ci in enumerate(cells):
+        phi = ci.phi
+        S = S_total - psq[i]
+        gx, gy = gradients(phi, p.dx, p.dy)
+        vx_int = mc * float((phi * gx * S).sum()) * p.dA
+        vy_int = mc * float((phi * gy * S).sum()) * p.dA
+        vx_n = vx_int + ci.v_A * ci.px
+        vy_n = vy_int + ci.v_A * ci.py
+        velocities.append((vx_n, vy_n))
+
+    # --- Pass 2: PDE update using the freshly computed v^n ---
     out: List[CPUCell] = []
     for i, ci in enumerate(cells):
         phi = ci.phi
-        S = S_total - psq[i]        # neighbour-only contribution
+        S = S_total - psq[i]
         vd = p.target_area - ci.vol
 
         lap = laplacian_9pt(phi, p.dx)
         gx, gy = gradients(phi, p.dx, p.dy)
 
-        # --- PDE update (mirrors production kernel line-for-line) ---
         bulk       = tgb * phi * (1.0 - phi) * (1.0 - 2.0 * phi)
         constraint = -4.0 * vc * vd * phi
         repulsion  = two_keff * phi * S
         var_deriv  = -tg * lap + bulk + constraint + repulsion
-        advection  = ci.vx * gx + ci.vy * gy
+
+        vx_n, vy_n = velocities[i]
+        advection  = vx_n * gx + vy_n * gy
         phi_new    = phi + p.dt * (-0.5 * var_deriv - advection)
 
         vol_new = float((phi_new * phi_new).sum()) * p.dA
 
-        # --- End-of-step velocity update (used next step) ---
-        # vₓ = mc · Σ_domain(pv · gₓ · S) · dA + v_A · pₓ
-        vx_int = mc * float((phi * gx * S).sum()) * p.dA
-        vy_int = mc * float((phi * gy * S).sum()) * p.dA
-        vx_new = vx_int + ci.v_A * ci.px
-        vy_new = vy_int + ci.v_A * ci.py
-
         out.append(CPUCell(
             phi=phi_new,
-            vx=vx_new, vy=vy_new,
+            vx=vx_n, vy=vy_n,
             vol=vol_new,
             v_A=ci.v_A, px=ci.px, py=ci.py,
         ))
