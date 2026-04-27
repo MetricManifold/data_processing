@@ -330,9 +330,9 @@ k_fused(
     int stride_dy = BS / width;
     int stride_dx = BS - stride_dy * width;
 
-    // ====== PHASE 1: Velocity integral only ======
-    // Iterate all pixels, accumulate φ·∇φ·S for the velocity reduction.
-    // This gives v^n = v_I(φ^n) + v_A·p̂^n BEFORE the PDE update.
+    // ====== PHASE 1: Heavy pass — stencil, neighbors, velocity integral ======
+    // Computes var_deriv, gx, gy per pixel and stores them in phi_out as scratch.
+    // Also accumulates velocity integral for reduction.
     {
         float a_vix = 0, a_viy = 0;
         int lx = tid % width, ly = tid / width;
@@ -345,11 +345,22 @@ k_fused(
             float pv = src_ok ? __ldg(&phi[sry * old_w + srx]) : 0.0f;
             bool inner = (lx >= halo && lx < width - halo &&
                           ly >= halo && ly < height - halo);
+
+            float var_deriv = 0.0f, gx = 0.0f, gy = 0.0f;
             if (src_ok && inner) {
-                float gx = (__ldg(&phi[sry * old_w + min(srx+1, old_w-1)])
-                          - __ldg(&phi[sry * old_w + max(srx-1, 0)])) * inv_2dx;
-                float gy = (__ldg(&phi[min(sry+1, old_h-1) * old_w + srx])
-                          - __ldg(&phi[max(sry-1, 0) * old_w + srx])) * inv_2dy;
+                int xm = max(srx-1, 0), xp = min(srx+1, old_w-1);
+                int ym = max(sry-1, 0), yp = min(sry+1, old_h-1);
+                float pE  = __ldg(&phi[sry * old_w + xp]);
+                float pW  = __ldg(&phi[sry * old_w + xm]);
+                float pN  = __ldg(&phi[yp  * old_w + srx]);
+                float pS  = __ldg(&phi[ym  * old_w + srx]);
+                float pNE = __ldg(&phi[yp  * old_w + xp]);
+                float pNW = __ldg(&phi[yp  * old_w + xm]);
+                float pSE = __ldg(&phi[ym  * old_w + xp]);
+                float pSW = __ldg(&phi[ym  * old_w + xm]);
+                float lap = (4.0f*(pE+pW+pN+pS) + (pNE+pNW+pSE+pSW) - 20.0f*pv) * inv_h2 / 6.0f;
+                gx = (pE - pW) * inv_2dx;
+                gy = (pN - pS) * inv_2dy;
                 float S = 0.0f;
                 for (int ni = 0; ni < k; ni++) {
                     int nlx = srx - s_meta[ni*4], nly = sry - s_meta[ni*4+1];
@@ -359,9 +370,17 @@ k_fused(
                         S += pm * pm;
                     }
                 }
+                float bulk       = tgb * pv * (1.0f - pv) * (1.0f - 2.0f * pv);
+                float constraint = -4.0f * vc * vd * pv;
+                float repulsion  = two_keff * pv * S;
+                var_deriv = -tg * lap + bulk + constraint + repulsion;
                 a_vix += pv * gx * S;
                 a_viy += pv * gy * S;
             }
+            // Store scratch: var_deriv only. gx/gy will be recomputed cheaply in Phase 2.
+            int pidx = ly * width + lx;
+            pout[pidx] = var_deriv;
+
             lx += stride_dx; int wrap = lx >= width; lx -= wrap * width; ly += stride_dy + wrap;
         }
         // Reduce velocity integral (2 channels)
@@ -385,11 +404,13 @@ k_fused(
             }
         }
     }
-    // All threads must see the new velocity before Phase 2.
     __syncthreads();
     float vx = vx_in[ci], vy = vy_in[ci];
 
-    // ====== PHASE 2: PDE update with correct velocity ======
+    // ====== PHASE 2: Lightweight pass — advection + phi write ======
+    // Reads scratch (var_deriv, gx, gy) from phi_out, applies advection with
+    // the freshly-computed velocity, writes final phi_new. No stencil, no
+    // neighbor reads — just memory + arithmetic.
     {
         float a_cdx = 0, a_cdy = 0, a_p2 = 0, a_grd = 0;
         float a_mx = 0, a_my = 0;
@@ -404,33 +425,14 @@ k_fused(
             bool inner = (lx >= halo && lx < width - halo &&
                           ly >= halo && ly < height - halo);
             float np = pv;
+            int pidx = ly * width + lx;
             if (src_ok && inner) {
-                int xm = max(srx-1, 0), xp = min(srx+1, old_w-1);
-                int ym = max(sry-1, 0), yp = min(sry+1, old_h-1);
-                float pE  = __ldg(&phi[sry * old_w + xp]);
-                float pW  = __ldg(&phi[sry * old_w + xm]);
-                float pN  = __ldg(&phi[yp  * old_w + srx]);
-                float pS  = __ldg(&phi[ym  * old_w + srx]);
-                float pNE = __ldg(&phi[yp  * old_w + xp]);
-                float pNW = __ldg(&phi[yp  * old_w + xm]);
-                float pSE = __ldg(&phi[ym  * old_w + xp]);
-                float pSW = __ldg(&phi[ym  * old_w + xm]);
-                float lap = (4.0f*(pE+pW+pN+pS) + (pNE+pNW+pSE+pSW) - 20.0f*pv) * inv_h2 / 6.0f;
-                float gx = (pE - pW) * inv_2dx;
-                float gy = (pN - pS) * inv_2dy;
-                float S = 0.0f;
-                for (int ni = 0; ni < k; ni++) {
-                    int nlx = srx - s_meta[ni*4], nly = sry - s_meta[ni*4+1];
-                    int nw = s_meta[ni*4+2], nh = s_meta[ni*4+3];
-                    if (nlx >= halo && nlx < nw-halo && nly >= halo && nly < nh-halo) {
-                        float pm = __ldg(&s_phi[ni][nly * nw + nlx]);
-                        S += pm * pm;
-                    }
-                }
-                float bulk       = tgb * pv * (1.0f - pv) * (1.0f - 2.0f * pv);
-                float constraint = -4.0f * vc * vd * pv;
-                float repulsion  = two_keff * pv * S;
-                float var_deriv  = -tg * lap + bulk + constraint + repulsion;
+                float var_deriv = pout[pidx];
+                // Recompute gradient cheaply from phi_in (4 reads, L1 cache hot from Phase 1)
+                float gx = (__ldg(&phi[sry * old_w + min(srx+1, old_w-1)])
+                          - __ldg(&phi[sry * old_w + max(srx-1, 0)])) * inv_2dx;
+                float gy = (__ldg(&phi[min(sry+1, old_h-1) * old_w + srx])
+                          - __ldg(&phi[max(sry-1, 0) * old_w + srx])) * inv_2dy;
                 float advection  = vx * gx + vy * gy;
                 np = pv + dt * (-0.5f * var_deriv - advection);
                 a_grd += sqrtf(gx * gx + gy * gy);
@@ -446,7 +448,7 @@ k_fused(
                 }
             }
             if (!inner) np = 0.0f;
-            pout[ly * width + lx] = np;
+            pout[pidx] = np;
             lx += stride_dx; int wrap = lx >= width; lx -= wrap * width; ly += stride_dy + wrap;
         }
 
