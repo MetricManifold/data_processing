@@ -7,12 +7,12 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Simulation parameters
+// sim_v3 simulation parameters
 // ---------------------------------------------------------------------------
-// Scalar physics/numerical knobs use double precision so that time accumulation
-// (cur_time += dt), step-count math (t_end / dt), and derived coefficients
-// never lose precision. Per-pixel φ and per-cell state remain single precision
-// — they live on the GPU and are multiplied into f32 math regardless.
+// Scalar physics/numerical knobs in double precision so time accumulation,
+// step-count math, and derived coefficients never lose precision. Per-pixel
+// phi and per-cell observables remain f32 — they live on the GPU.
+// ---------------------------------------------------------------------------
 struct SimParams {
     int Nx = 0, Ny = 0;
     double dx = 1.0, dy = 1.0;
@@ -26,8 +26,12 @@ struct SimParams {
     double v_A = 0.0;
     double xi = 1500.0;
     double tau = 10000.0;
+    // Retained for CLI/checkpoint compatibility. v3 uses a fixed power-of-2
+    // tile (TILE_T) and rebinds via COM recentre, so this is no longer used
+    // for resizing; we keep it in SimParams so `init_from_checkpoint` can
+    // round-trip pre-v7 checkpoint headers without surprises.
     double subdomain_padding = 0.6;
-    int halo = 4;
+    int halo = 0;                  // unused in v3 (kept for checkpoint round-trip)
     int save_interval = 0;
     int print_interval = 100;
     int trajectory_samples = 100;
@@ -44,95 +48,103 @@ struct SimParams {
 };
 
 // ---------------------------------------------------------------------------
-// Constants
+// Tile size and adaptive rect.
 // ---------------------------------------------------------------------------
-static constexpr int K_MAX = 48;          // max neighbors per cell
-static constexpr int HASH_MAX_PER_BIN = 128;  // bin capacity; must exceed max cells per bin.
-                                              // With small domains (e.g. 2x2 bin grid, 72 cells)
-                                              // one bin easily holds 30+ cells. Silent overflow
-                                              // drops cells from the hash → asymmetric neighbor
-                                              // lists → cells fuse. 128 is safe for all tested sizes.
+// The phi buffer is a fixed TILE_T x TILE_T tile per cell, but kernels
+// iterate only the *active rect* (rx0, ry0, rw, rh) inside it. The rect is
+// recomputed every REBIND_EVERY steps from the cell's second moments
+// (Cxx/Cyy), with the COM landing on (T/2, T/2). This lets the buffer
+// accommodate elongated cells (up to ~T-2 px) without paying full T^2
+// work for round cells.
+//
+// Sizing: at R=49, lambda=7 the tanh interface decays to <1e-3 by r =
+// R + 3*lambda = 70 px from COM. T=192 leaves T/2-1 = 95 px clearance,
+// adequate for round AND elongated cells (squished cells need extra room
+// along the long axis). T=128 was too tight for Palmieri R=49 — the
+// floor R+3*lambda already exceeded T/2-1, so the support was clipped.
+// The runtime guards against domains smaller than TILE_T to keep the
+// bbox-comparison helpers alias-free.
+//
+// All kernels iterate p = 0..rw*rh and decode (lx, ly) by /, %; T does
+// NOT need to be a power of two.
+// ---------------------------------------------------------------------------
+static constexpr int TILE_T        = 192;
+static constexpr int TILE_AREA     = TILE_T * TILE_T;
+static constexpr int REBIND_EVERY  = 10;
+
+// Adaptive rect parameters (host constants used in init / k_rebind).
+//   bbox_k       half-width = ceil(k * sigma + margin) per axis
+//   bbox_margin  px added on each side; sized to R/2 in k_rebind so rect
+//                over-covers the tanh tail (decays to <1e-3 at R + 3*lambda).
+//   bbox_align   round half-width up to multiple (so rw = 2*hw is warp-aligned)
+//   bbox_min     minimum half-width (avoids degenerate small rects)
+static constexpr float TILE_BBOX_K      = 2.0f;
+static constexpr int   TILE_BBOX_ALIGN  = 16;
+static constexpr int   TILE_BBOX_MIN    = 32;
 
 // ---------------------------------------------------------------------------
-// Neighbor entry stored in the per-cell neighbor list.
-// We store identity only. Positions and dimensions are fetched from the
-// current OX/OY/W/H arrays inside k_fused so coordinates are always in
-// the "now" frame — never stale across non-rebuild steps.
-// ---------------------------------------------------------------------------
-struct NeighborEntry {
-    int cell_id;
-};
-
-// ---------------------------------------------------------------------------
-// All GPU arrays — SoA layout
+// All GPU arrays — SoA layout. Vastly simplified from sim_v2:
+//   * no per-cell variable W/H, no halo, no shifts, no neighbour list,
+//     no spatial hash, no resize tracking, no second-moment scratch.
+//   * single contiguous phi pool of 2*N*TILE_AREA floats (double-buffered).
+//   * per-cell scalars: gamma_cell + v_A_cell only (other physics constants
+//     are global, broadcast to the kernel as launch arguments).
+//   * observables (Cx, Cy, V, perimeter, velocities) are computed inside
+//     the fused evolve kernel and exposed on the host for trajectory I/O.
 // ---------------------------------------------------------------------------
 struct CellArrays {
     int num_cells = 0;
-    size_t slot_size = 0;
-    int max_side = 0;
 
-    // Phi double buffer (contiguous pool)
-    float*  phi_pool     = nullptr;
-    float** phi_ptrs     = nullptr;   // [N] current read
-    float** phi_out_ptrs = nullptr;   // [N] current write
+    // Phi double buffer. `phi_in` points at the half currently holding state;
+    // `phi_out` points at the scratch half. After each step we std::swap them
+    // on the host (no kernel needed). Both point inside `phi_pool`.
+    float* phi_pool = nullptr;     // [2 * N * TILE_AREA]
+    float* phi_in   = nullptr;     // alias into phi_pool
+    float* phi_out  = nullptr;     // alias into phi_pool
 
-    // Geometry
-    int* offsets_x   = nullptr;
-    int* offsets_y   = nullptr;
-    int* widths      = nullptr;
-    int* heights     = nullptr;
-    int* old_widths  = nullptr;
-    int* old_heights = nullptr;
-    int* shift_x     = nullptr;
-    int* shift_y     = nullptr;
+    // Global sum field S(x,y) = sum_n phi_n(x,y)^2. Atomic-scatter target.
+    float* S = nullptr;            // [Nx * Ny]
 
-    // Per-cell dynamics
-    float* velocities_x = nullptr;
-    float* velocities_y = nullptr;
-    float* volumes       = nullptr;
-    float* volume_devs   = nullptr;
-    float* centroids_x   = nullptr;
-    float* centroids_y   = nullptr;
-    float* ref_x         = nullptr;
-    float* ref_y         = nullptr;
-    float* perimeters    = nullptr;
-    float* moment_x      = nullptr;
-    float* moment_y      = nullptr;
+    // Per-cell tile origin in global coords (gx0, gy0 interleaved).
+    int* origin = nullptr;         // [2 * N]
 
-    // Polarization
-    float* polar_x = nullptr;
-    float* polar_y = nullptr;
-    float* polar_theta = nullptr;  // persistent angle; (polar_x, polar_y) are derived
+    // Per-cell active rect (rx0, ry0, rw, rh) inside the TILE_T x TILE_T
+    // buffer. Set by k_rebind from second-moment statistics; iterated by
+    // every kernel that touches phi. Pixels outside the rect are
+    // guaranteed zero (rebind zeros them), so skipping them is exact.
+    int* rect = nullptr;           // [4 * N]
 
-    // Per-cell constants (set once at init)
-    float* two_gamma      = nullptr;
-    float* two_gamma_bulk = nullptr;
-    float* vol_coeff      = nullptr;
-    float* tgt_area       = nullptr;
-    float* tgt_radius     = nullptr;
-    float* v_A_cell       = nullptr;
+    // Per-cell observables produced by k_evolve_l1.
+    float* volumes      = nullptr; // [N] : sum phi (tile-local; multiply by dA for area)
+    float* Cx           = nullptr; // [N] : tile-local sum(phi^2 * lx)
+    float* Cy           = nullptr; // [N] : tile-local sum(phi^2 * ly)
+    float* Cxx          = nullptr; // [N] : tile-local sum(phi^2 * lx^2)
+    float* Cyy          = nullptr; // [N] : tile-local sum(phi^2 * ly^2)
+    float* perimeters   = nullptr; // [N] : sum |grad phi| (tile-local)
+    float* velocities_x = nullptr; // [N] : interaction integral + v_A * polar_x
+    float* velocities_y = nullptr; // [N] : interaction integral + v_A * polar_y
 
-    // Neighbor list
-    NeighborEntry* nbr_list  = nullptr;   // [N * K_MAX]
-    int*           nbr_count = nullptr;   // [N]
+    // Polarisation. theta is the persistent angle; (px, py) = (cos, sin).
+    float* polar_theta  = nullptr; // [N]
+    float* polar_x      = nullptr; // [N]
+    float* polar_y      = nullptr; // [N]
 
-    // Spatial hash
-    int* hash_ids    = nullptr;
-    int* hash_counts = nullptr;
-    int  hash_bin_sz = 0;
-    int  hash_nx = 0, hash_ny = 0;
+    // Per-cell physics scalars (gamma & v_A may vary per cell).
+    float* gamma_cell   = nullptr; // [N]
+    float* v_A_cell     = nullptr; // [N]
+    float* tgt_radius   = nullptr; // [N]  (kept per-cell so future R disorder is trivial)
 
-    // Resize tracking
-    int* d_max_wh = nullptr;   // [2]
-
-    // RNG
-    void* rng_states = nullptr;
+    // RNG state for k_polar (curandState, one per cell).
+    void* rng_states    = nullptr;
 };
 
 // ---------------------------------------------------------------------------
-// Host-side cell for initialization
+// Host-side cell descriptor used during initialisation only.
 // ---------------------------------------------------------------------------
 struct CellHost {
-    double cx, cy, radius, gamma, v_A;
-    int ox, oy, w, h;
+    double cx, cy;          // cell COM in global coords
+    double radius;          // target radius
+    double gamma;           // surface tension
+    double v_A;             // active speed
+    int    ox, oy;          // tile origin (global coord of phi_pool[n,0,0])
 };

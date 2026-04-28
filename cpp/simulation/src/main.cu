@@ -25,7 +25,7 @@ static void usage(const char* prog) {
     printf("  -dt <step>            Time step (alias for --dt)\n");
     printf("  --v-A <f>             Active motility speed\n");
     printf("  --v-A-sigma <f>       Log-normal disorder σ on v_A (fresh init only)\n");
-    printf("  --tau <f>             Reorientation time (default: 10000)\n");
+    printf("  --tau <f>             Reorientation time (default: 10000; <=0 disables tumbling)\n");
     printf("  --gamma <spec>        Surface tension. <spec> = <f> | <f>:cell<k> | <f>:<p>%%\n");
     printf("  --kappa <f>           Interaction strength (default: 10.0)\n");
     printf("  --mu <f>              Volume constraint (default: 1.0)\n");

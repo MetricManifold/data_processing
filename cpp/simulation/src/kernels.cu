@@ -1,573 +1,474 @@
-// kernels.cu — All CUDA kernels, written from scratch per PLAN.md
+// sim_v3 kernels — fixed-tile unified-pool architecture.
 //
 // Layout:
 //   1. Device helpers
-//   2. Spatial hash (insert + query)
-//   3. Pre-step (ref pts, shifts, bbox resize)
-//   4. Fused 1-CTA-per-cell PDE kernel
-//   5. Swap kernel
-//   6. Polarization update
-//   7. RNG init
-//   8. Initial reductions (centroid + volume)
-//   9. Initial velocity integral
+//   2. k_scatter_S       — atomicAdd phi^2 into global S
+//   3. k_evolve_l1       — fused two-pass evolve (reduce → broadcast → write)
+//   4. k_rebind          — COM-recentre tile (origin shift + tile copy)
+//   5. k_polar           — per-cell polarity update (RTP + ABP)
+//   6. k_init_phi        — tanh init profile
+//   7. k_initial_velocity — one-shot velocity reduce (init / resume)
+//   8. k_rng_init        — curand state seeding
+//
+// The reference design is in C:\Users\stevensilber\Downloads\testsim\src\sim.cu.
+// This file ports those kernels to the production codebase and adds:
+//   - per-cell gamma / v_A reads from CellArrays
+//   - perimeter accumulation in the evolve reduction
+//   - ABP polarity branch in k_polar (reference is RTP-only)
+//
+// All kernels assume a fixed power-of-two tile (TILE_T) and a unified phi
+// pool of N*TILE_AREA floats.  No neighbour list, no halo, no spatial hash.
 
 #include "kernels.cuh"
 #include <curand_kernel.h>
 #include <cstdio>
+#include <vector>
 
-// ===== 1. Device helpers =====================================================
+#ifndef PI
+#define PI 3.14159265358979323846f
+#endif
 
-__device__ __forceinline__ int wrap(int x, int N) {
-    return ((x % N) + N) % N;
+// ---------------------------------------------------------------------------
+// 1. Device helpers
+// ---------------------------------------------------------------------------
+
+// Robust periodic wrap for arbitrary int x.
+__device__ __forceinline__ int wrap_i(int x, int L) {
+    if (x >= 0 && x <  L) return x;
+    if (x <  0 && x > -L) return x + L;
+    int m = x % L;
+    return (m < 0) ? m + L : m;
 }
 
-__device__ __forceinline__ float pdelta(float d, float L) {
-    if (d >  L * 0.5f) d -= L;
-    if (d < -L * 0.5f) d += L;
-    return d;
-}
-
-// ===== 2. Spatial hash =======================================================
-
-__global__ void k_hash_insert(
-    const int* __restrict__ ox, const int* __restrict__ oy,
-    const int* __restrict__ w,  const int* __restrict__ h,
-    int* __restrict__ ids, int* __restrict__ counts,
-    int bsz, int gnx, int gny, int Nx, int Ny, int N)
+// 9-point isotropic Laplacian (h=1).
+__device__ __forceinline__ float lap9(
+    float c, float xm, float xp, float ym, float yp,
+    float xmym, float xpym, float xmyp, float xpyp)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    int cx = wrap(ox[i] + w[i] / 2, Nx);
-    int cy = wrap(oy[i] + h[i] / 2, Ny);
-    int bx = min(cx / bsz, gnx - 1);
-    int by = min(cy / bsz, gny - 1);
-    int bin = by * gnx + bx;
-    int slot = atomicAdd(&counts[bin], 1);
-    if (slot < HASH_MAX_PER_BIN)
-        ids[bin * HASH_MAX_PER_BIN + slot] = i;
-    else
-        printf("[HASH OVERFLOW] cell %d bin %d slot %d >= %d\n",
-               i, bin, slot, HASH_MAX_PER_BIN);
+    return (1.0f / 6.0f) * (
+        4.0f * (xm + xp + ym + yp)
+      + (xmym + xpym + xmyp + xpyp)
+      - 20.0f * c
+    );
 }
 
-__global__ void k_hash_query(
-    const int* __restrict__ ox, const int* __restrict__ oy,
-    const int* __restrict__ w,  const int* __restrict__ h,
-    const int* __restrict__ ids, const int* __restrict__ counts,
-    NeighborEntry* __restrict__ nlist, int* __restrict__ ncnt,
-    int bsz, int gnx, int gny, int Nx, int Ny, int N)
+// ---------------------------------------------------------------------------
+// 2. k_scatter_S — atomicAdd phi^2 into global S
+// ---------------------------------------------------------------------------
+// Iterates only the active rect (rx0, ry0, rw, rh) inside each cell's
+// TILE_T x TILE_T buffer. Pixels outside the rect are zero by
+// construction (k_rebind zeroes them), so skipping is exact.
+// ---------------------------------------------------------------------------
+__global__ void k_scatter_S(
+    const float* __restrict__ phi,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    float* __restrict__ S,
+    int N, int L)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-
-    int oxi = ox[i], oyi = oy[i], wi = w[i], hi = h[i];
-    int cx = wrap(oxi + wi / 2, Nx);
-    int cy = wrap(oyi + hi / 2, Ny);
-    int bx = min(cx / bsz, gnx - 1);
-    int by = min(cy / bsz, gny - 1);
-    int cnt = 0;
-
-    // Neighbor rule: bbox-overlap <=> neighbor. Outside a cell's bbox there
-    // is no phi (no memory allocated), so a non-overlapping pair cannot
-    // contribute to the interaction sum. No margin needed.
-
-    // 3x3 bin search with dedup for small grids
-    int visited[9]; int nv = 0;
-    for (int dby = -1; dby <= 1; dby++) {
-        for (int dbx = -1; dbx <= 1; dbx++) {
-            int nbx = (bx + dbx + gnx) % gnx;
-            int nby = (by + dby + gny) % gny;
-            int bin = nby * gnx + nbx;
-            bool dup = false;
-            for (int v = 0; v < nv; v++) if (visited[v] == bin) { dup = true; break; }
-            if (dup) continue;
-            visited[nv++] = bin;
-
-            int bc = min(counts[bin], HASH_MAX_PER_BIN);
-            for (int s = 0; s < bc && cnt < K_MAX; s++) {
-                int j = ids[bin * HASH_MAX_PER_BIN + s];
-                if (j == i) continue;
-                int dx = ox[j] - oxi;
-                int dy = oy[j] - oyi;
-                if (dx >  Nx / 2) dx -= Nx;
-                if (dx < -Nx / 2) dx += Nx;
-                if (dy >  Ny / 2) dy -= Ny;
-                if (dy < -Ny / 2) dy += Ny;
-                int wj = w[j], hj = h[j];
-                // AABB overlap: inner regions intersect iff the outer boxes
-                // do (halo is a subset of either box's extent).
-                if ((dx + wj > 0) && (dx < wi) &&
-                    (dy + hj > 0) && (dy < hi)) {
-                    nlist[i * K_MAX + cnt].cell_id = j;
-                    cnt++;
-                }
-            }
-        }
-    }
-    ncnt[i] = cnt;
-}
-
-void launch_hash_build(CellArrays& c, int Nx, int Ny) {
-    int n = c.num_cells;
-    if (n <= 1) return;
-
-    // Size bins to fit the largest cell. +1 slack so a cell exactly at a bin
-    // boundary can't straddle more than the 3x3 neighborhood we search.
-    int req = c.max_side + 1;
-    if (c.hash_bin_sz == 0 || req > c.hash_bin_sz) {
-        if (c.hash_ids) cudaFree(c.hash_ids);
-        if (c.hash_counts) cudaFree(c.hash_counts);
-        c.hash_bin_sz = req;
-        c.hash_nx = (Nx + req - 1) / req;
-        c.hash_ny = (Ny + req - 1) / req;
-        int nb = c.hash_nx * c.hash_ny;
-        cudaMalloc(&c.hash_ids, nb * HASH_MAX_PER_BIN * sizeof(int));
-        cudaMalloc(&c.hash_counts, nb * sizeof(int));
-    }
-    int nb = c.hash_nx * c.hash_ny;
-    cudaMemset(c.hash_counts, 0, nb * sizeof(int));
-
-    int blk = (n + 255) / 256;
-    k_hash_insert<<<blk, 256>>>(
-        c.offsets_x, c.offsets_y, c.widths, c.heights,
-        c.hash_ids, c.hash_counts,
-        c.hash_bin_sz, c.hash_nx, c.hash_ny, Nx, Ny, n);
-    k_hash_query<<<blk, 256>>>(
-        c.offsets_x, c.offsets_y, c.widths, c.heights,
-        c.hash_ids, c.hash_counts,
-        c.nbr_list, c.nbr_count,
-        c.hash_bin_sz, c.hash_nx, c.hash_ny, Nx, Ny, n);
-}
-
-// ===== 3. Pre-step ===========================================================
-
-__global__ void k_pre_step(
-    float* __restrict__ rx, float* __restrict__ ry,
-    int* __restrict__ ox, int* __restrict__ oy,
-    int* __restrict__ w, int* __restrict__ h,
-    int* __restrict__ ow, int* __restrict__ oh,
-    const float* __restrict__ cx, const float* __restrict__ cy,
-    const float* __restrict__ vol,
-    float* __restrict__ mx, float* __restrict__ my,
-    const float* __restrict__ tgt_r,
-    int* __restrict__ sx, int* __restrict__ sy,
-    int* __restrict__ d_maxwh,
-    bool do_resize, bool zero_mom, int max_side,
-    float sub_pad, float dA, int Nx, int Ny, int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-
-    int wi = w[i], hi = h[i];
-    ow[i] = wi; oh[i] = hi;
-
-    // Ref point = bbox center
-    float refx = fmodf(fmodf((float)ox[i] + wi * 0.5f, (float)Nx) + Nx, (float)Nx);
-    float refy = fmodf(fmodf((float)oy[i] + hi * 0.5f, (float)Ny) + Ny, (float)Ny);
-
-    int shx = 0, shy = 0;
-    int nw = wi, nh = hi;
-
-    float v = vol[i];
-    if (v > 1e-8f && do_resize) {
-        float cxi = cx[i], cyi = cy[i];
-
-        // Centroid shift – recenter if drift > 2 pixels
-        float scx = fmodf((float)ox[i] + wi * 0.5f, (float)Nx);
-        float scy = fmodf((float)oy[i] + hi * 0.5f, (float)Ny);
-        float dx = cxi - scx, dy = cyi - scy;
-        if (dx >  Nx * 0.5f) dx -= Nx;
-        if (dx < -Nx * 0.5f) dx += Nx;
-        if (dy >  Ny * 0.5f) dy -= Ny;
-        if (dy < -Ny * 0.5f) dy += Ny;
-        int csx = (int)roundf(dx), csy = (int)roundf(dy);
-        if (abs(csx) > 2) shx = csx;
-        if (abs(csy) > 2) shy = csy;
-
-        // Variance-based resize (parallel axis theorem)
-        float sp2 = v / dA;
-        float Mx = mx[i], My = my[i];
-        if (max_side > 0 && sp2 > 1.0f) {
-            float dc_x = cxi - refx, dc_y = cyi - refy;
-            if (dc_x >  Nx * 0.5f) dc_x -= Nx;
-            if (dc_x < -Nx * 0.5f) dc_x += Nx;
-            if (dc_y >  Ny * 0.5f) dc_y -= Ny;
-            if (dc_y < -Ny * 0.5f) dc_y += Ny;
-            float vx = Mx / sp2 - dc_x * dc_x;
-            float vy = My / sp2 - dc_y * dc_y;
-            if (vx > 4.0f && vy > 4.0f) {
-                float R = tgt_r[i];
-                int pad = (int)ceilf(sub_pad * R);
-                int tw = (2 * ((int)ceilf(2.0f * sqrtf(vx)) + pad)) & ~1;
-                int th = (2 * ((int)ceilf(2.0f * sqrtf(vy)) + pad)) & ~1;
-                tw = min(max(tw, 32), max_side);
-                th = min(max(th, 32), max_side);
-                if (tw != wi) { nw = tw; shx -= (tw - wi) / 2; }
-                if (th != hi) { nh = th; shy -= (th - hi) / 2; }
-            }
-        }
-    }
-
-    if (zero_mom) { mx[i] = 0.0f; my[i] = 0.0f; }
-
-    w[i] = nw; h[i] = nh;
-    sx[i] = shx; sy[i] = shy;
-    rx[i] = refx; ry[i] = refy;
-    if (do_resize) {
-        atomicMax(&d_maxwh[0], nw);
-        atomicMax(&d_maxwh[1], nh);
-    }
-}
-
-void launch_pre_step(CellArrays& c, const SimParams& p, int step,
-                     int& cache_w, int& cache_h) {
-    int n = c.num_cells;
-    if (n == 0) return;
-    bool resize = (step % 10 == 0);
-    bool zmom   = (step % 10 == 9);
-    if (resize) cudaMemset(c.d_max_wh, 0, 2 * sizeof(int));
-
-    k_pre_step<<<(n + 255) / 256, 256>>>(
-        c.ref_x, c.ref_y, c.offsets_x, c.offsets_y,
-        c.widths, c.heights, c.old_widths, c.old_heights,
-        c.centroids_x, c.centroids_y, c.volumes,
-        c.moment_x, c.moment_y, c.tgt_radius,
-        c.shift_x, c.shift_y, c.d_max_wh,
-        resize, zmom, c.max_side,
-        p.subdomain_padding, p.dA(), p.Nx, p.Ny, n);
-
-    if (resize) {
-        int hm[2];
-        cudaMemcpy(hm, c.d_max_wh, 2 * sizeof(int), cudaMemcpyDeviceToHost);
-        if (hm[0] > 0) cache_w = hm[0];
-        if (hm[1] > 0) cache_h = hm[1];
-    }
-}
-
-// ===== 4. Fused 1-CTA-per-cell kernel ========================================
-
-template <bool REMAP, bool MOMENTS>
-__global__ void __launch_bounds__(256, 4)
-k_fused(
-    float** __restrict__ phi_in,
-    float** __restrict__ phi_out,
-    const int* __restrict__ W,  const int* __restrict__ H,
-    const int* __restrict__ OX, const int* __restrict__ OY,
-    const int* __restrict__ OW, const int* __restrict__ OH,
-    const int* __restrict__ SX, const int* __restrict__ SY,
-    const NeighborEntry* __restrict__ nlist,
-    const int* __restrict__ ncnt,
-    // vx_in/vy_in/vdev are in/out (read by every thread, written by thread 0
-    // after __syncthreads). No __restrict__ because the output aliases the input.
-    float* vx_in, float* vy_in,
-    float* vdev,
-    const float* __restrict__ RX, const float* __restrict__ RY,
-    const float* __restrict__ d_tg,  const float* __restrict__ d_tgb,
-    const float* __restrict__ d_vc,  const float* __restrict__ d_ta,
-    const float* __restrict__ d_vA,
-    const float* __restrict__ d_px,  const float* __restrict__ d_py,
-    float* __restrict__ d_vol,  float* __restrict__ d_vdev,
-    float* __restrict__ d_cx,   float* __restrict__ d_cy,
-    float* __restrict__ d_peri,
-    float* __restrict__ d_mx,   float* __restrict__ d_my,
-    float two_keff, float inv_h2, float inv_2dx, float inv_2dy,
-    float dt, float dA, float mc,
-    int halo, int Nx, int Ny, int Ncells)
-{
-    int ci = blockIdx.x;
-    if (ci >= Ncells) return;
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const float* tile = phi + (size_t)n * TILE_AREA;
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    const int total = rw * rh;
+    const int BS  = blockDim.x;
     const int tid = threadIdx.x;
-    const int BS = 256;
 
-    // Shared: neighbor metadata persists through both phases; reduction buffers after it
-    extern __shared__ char smem[];
-    float** s_phi = (float**)smem;                         // K_MAX ptrs
-    int*    s_meta = (int*)(smem + K_MAX * sizeof(float*)); // K_MAX*4 ints
-    // Reduction scratch starts after neighbor metadata
-    float*  s_reduce = (float*)(smem + K_MAX * sizeof(float*) + K_MAX * 4 * sizeof(int));
-
-    // Per-cell constants
-    int width = W[ci], height = H[ci];
-    const float* phi  = phi_in[ci];
-    float*       pout = phi_out[ci];
-    int oxi = OX[ci], oyi = OY[ci];
-    float vd = vdev[ci];
-    float rx = RX[ci], ry = RY[ci];
-    float tg = d_tg[ci], tgb = d_tgb[ci], vc = d_vc[ci];
-
-    int old_w, old_h, sx, sy;
-    if constexpr (REMAP) {
-        old_w = OW[ci]; old_h = OH[ci]; sx = SX[ci]; sy = SY[ci];
-    } else {
-        old_w = width; old_h = height; sx = 0; sy = 0;
-    }
-
-    // Load neighbor metadata into shared memory.
-    // We fetch OX/OY/OW/OH of each neighbor from the CURRENT global arrays
-    // so the periodic delta is always the "now" delta — never stale from a
-    // rebuild 9 steps ago. Note: fused runs before swap, so OX/OY still hold
-    // the pre-swap (old-buffer) origins, which is the correct frame for the
-    // phi_in reads below. OW/OH hold each cell's own old-buffer dimensions.
-    int k = ncnt[ci];
-    int oxi_pre = OX[ci], oyi_pre = OY[ci];
-    for (int ni = tid; ni < k; ni += BS) {
-        int nid = nlist[ci * K_MAX + ni].cell_id;
-        s_phi[ni] = phi_in[nid];
-        int dx = OX[nid] - oxi_pre;
-        int dy = OY[nid] - oyi_pre;
-        if (dx >  Nx / 2) dx -= Nx;
-        if (dx < -Nx / 2) dx += Nx;
-        if (dy >  Ny / 2) dy -= Ny;
-        if (dy < -Ny / 2) dy += Ny;
-        s_meta[ni * 4 + 0] = dx;
-        s_meta[ni * 4 + 1] = dy;
-        s_meta[ni * 4 + 2] = OW[nid];
-        s_meta[ni * 4 + 3] = OH[nid];
-    }
-    __syncthreads();
-
-    int total = width * height;
-    int stride_dy = BS / width;
-    int stride_dx = BS - stride_dy * width;
-
-    // ====== PHASE 1: Heavy pass — stencil, neighbors, velocity integral ======
-    // Computes var_deriv, gx, gy per pixel and stores them in phi_out as scratch.
-    // Also accumulates velocity integral for reduction.
-    {
-        float a_vix = 0, a_viy = 0;
-        int lx = tid % width, ly = tid / width;
-        for (int flat = tid; flat < total; flat += BS) {
-            int srx = lx + sx, sry = ly + sy;
-            bool src_ok;
-            if constexpr (REMAP) {
-                src_ok = (srx >= 0 && srx < old_w && sry >= 0 && sry < old_h);
-            } else { src_ok = true; }
-            float pv = src_ok ? __ldg(&phi[sry * old_w + srx]) : 0.0f;
-            bool inner = (lx >= halo && lx < width - halo &&
-                          ly >= halo && ly < height - halo);
-
-            float var_deriv = 0.0f, gx = 0.0f, gy = 0.0f;
-            if (src_ok && inner) {
-                int xm = max(srx-1, 0), xp = min(srx+1, old_w-1);
-                int ym = max(sry-1, 0), yp = min(sry+1, old_h-1);
-                float pE  = __ldg(&phi[sry * old_w + xp]);
-                float pW  = __ldg(&phi[sry * old_w + xm]);
-                float pN  = __ldg(&phi[yp  * old_w + srx]);
-                float pS  = __ldg(&phi[ym  * old_w + srx]);
-                float pNE = __ldg(&phi[yp  * old_w + xp]);
-                float pNW = __ldg(&phi[yp  * old_w + xm]);
-                float pSE = __ldg(&phi[ym  * old_w + xp]);
-                float pSW = __ldg(&phi[ym  * old_w + xm]);
-                float lap = (4.0f*(pE+pW+pN+pS) + (pNE+pNW+pSE+pSW) - 20.0f*pv) * inv_h2 / 6.0f;
-                gx = (pE - pW) * inv_2dx;
-                gy = (pN - pS) * inv_2dy;
-                float S = 0.0f;
-                for (int ni = 0; ni < k; ni++) {
-                    int nlx = srx - s_meta[ni*4], nly = sry - s_meta[ni*4+1];
-                    int nw = s_meta[ni*4+2], nh = s_meta[ni*4+3];
-                    if (nlx >= halo && nlx < nw-halo && nly >= halo && nly < nh-halo) {
-                        float pm = __ldg(&s_phi[ni][nly * nw + nlx]);
-                        S += pm * pm;
-                    }
-                }
-                float bulk       = tgb * pv * (1.0f - pv) * (1.0f - 2.0f * pv);
-                float constraint = -4.0f * vc * vd * pv;
-                float repulsion  = two_keff * pv * S;
-                var_deriv = -tg * lap + bulk + constraint + repulsion;
-                a_vix += pv * gx * S;
-                a_viy += pv * gy * S;
-            }
-            // Store scratch: var_deriv only. gx/gy will be recomputed cheaply in Phase 2.
-            int pidx = ly * width + lx;
-            pout[pidx] = var_deriv;
-
-            lx += stride_dx; int wrap = lx >= width; lx -= wrap * width; ly += stride_dy + wrap;
+    int lx = rx0 + (tid % rw);
+    int ly = ry0 + (tid / rw);
+    for (int p = tid; p < total; p += BS) {
+        float v = tile[ly * TILE_T + lx];
+        if (v >= 1e-6f) {
+            int gx = wrap_i(gx0 + lx, L);
+            int gy = wrap_i(gy0 + ly, L);
+            atomicAdd(&S[gy * L + gx], v * v);
         }
-        // Reduce velocity integral (2 channels)
-        __syncthreads();
-        float* sr = s_reduce;
-        sr[tid] = a_vix; sr[tid + BS] = a_viy;
-        __syncthreads();
-        for (int s = BS/2; s > 32; s >>= 1) {
-            if (tid < s) { sr[tid] += sr[tid+s]; sr[tid+BS] += sr[tid+BS+s]; }
-            __syncthreads();
-        }
-        if (tid < 32) {
-            float v0 = sr[tid]+sr[tid+32], v1 = sr[tid+BS]+sr[tid+BS+32];
-            for (int off = 16; off > 0; off >>= 1) {
-                v0 += __shfl_down_sync(0xffffffff, v0, off);
-                v1 += __shfl_down_sync(0xffffffff, v1, off);
-            }
-            if (tid == 0) {
-                vx_in[ci] = mc * v0 * dA + d_vA[ci] * d_px[ci];
-                vy_in[ci] = mc * v1 * dA + d_vA[ci] * d_py[ci];
-            }
-        }
-    }
-    __syncthreads();
-    float vx = vx_in[ci], vy = vy_in[ci];
-
-    // ====== PHASE 2: Lightweight pass — advection + phi write ======
-    // Reads scratch (var_deriv, gx, gy) from phi_out, applies advection with
-    // the freshly-computed velocity, writes final phi_new. No stencil, no
-    // neighbor reads — just memory + arithmetic.
-    {
-        float a_cdx = 0, a_cdy = 0, a_p2 = 0, a_grd = 0;
-        float a_mx = 0, a_my = 0;
-        int lx = tid % width, ly = tid / width;
-        for (int flat = tid; flat < total; flat += BS) {
-            int srx = lx + sx, sry = ly + sy;
-            bool src_ok;
-            if constexpr (REMAP) {
-                src_ok = (srx >= 0 && srx < old_w && sry >= 0 && sry < old_h);
-            } else { src_ok = true; }
-            float pv = src_ok ? __ldg(&phi[sry * old_w + srx]) : 0.0f;
-            bool inner = (lx >= halo && lx < width - halo &&
-                          ly >= halo && ly < height - halo);
-            float np = pv;
-            int pidx = ly * width + lx;
-            if (src_ok && inner) {
-                float var_deriv = pout[pidx];
-                // Recompute gradient cheaply from phi_in (4 reads, L1 cache hot from Phase 1)
-                float gx = (__ldg(&phi[sry * old_w + min(srx+1, old_w-1)])
-                          - __ldg(&phi[sry * old_w + max(srx-1, 0)])) * inv_2dx;
-                float gy = (__ldg(&phi[min(sry+1, old_h-1) * old_w + srx])
-                          - __ldg(&phi[max(sry-1, 0) * old_w + srx])) * inv_2dy;
-                float advection  = vx * gx + vy * gy;
-                np = pv + dt * (-0.5f * var_deriv - advection);
-                a_grd += sqrtf(gx * gx + gy * gy);
-                float np2 = np * np;
-                float gxf = (float)(oxi + lx + sx);
-                float gyf = (float)(oyi + ly + sy);
-                float drx = pdelta(gxf - rx, (float)Nx);
-                float dry = pdelta(gyf - ry, (float)Ny);
-                a_cdx += drx * np2; a_cdy += dry * np2; a_p2 += np2;
-                if constexpr (MOMENTS) {
-                    a_mx += drx * drx * np2;
-                    a_my += dry * dry * np2;
-                }
-            }
-            if (!inner) np = 0.0f;
-            pout[pidx] = np;
-            lx += stride_dx; int wrap = lx >= width; lx -= wrap * width; ly += stride_dy + wrap;
-        }
-
-        // ---- Block reduction: 4 channels (centroid + volume + perimeter) ----
-        __syncthreads();
-        float* sr = s_reduce;
-        float *r0 = sr, *r1 = sr + BS, *r2 = sr + 2*BS, *r3 = sr + 3*BS;
-        r0[tid] = a_cdx; r1[tid] = a_cdy; r2[tid] = a_p2; r3[tid] = a_grd;
-        __syncthreads();
-        for (int s = BS/2; s > 32; s >>= 1) {
-            if (tid < s) { r0[tid] += r0[tid+s]; r1[tid] += r1[tid+s]; r2[tid] += r2[tid+s]; r3[tid] += r3[tid+s]; }
-            __syncthreads();
-        }
-        if (tid < 32) {
-            float v0 = r0[tid]+r0[tid+32], v1 = r1[tid]+r1[tid+32];
-            float v2 = r2[tid]+r2[tid+32], v3 = r3[tid]+r3[tid+32];
-            for (int off = 16; off > 0; off >>= 1) {
-                v0 += __shfl_down_sync(0xffffffff, v0, off);
-                v1 += __shfl_down_sync(0xffffffff, v1, off);
-                v2 += __shfl_down_sync(0xffffffff, v2, off);
-                v3 += __shfl_down_sync(0xffffffff, v3, off);
-            }
-            if (tid == 0) {
-                float vol = v2 * dA;
-                d_vol[ci] = vol;
-                d_vdev[ci] = d_ta[ci] - vol;
-                if (v2 > 1e-8f) {
-                    float ccx = rx + v0 / v2;
-                    float ccy = ry + v1 / v2;
-                    ccx = fmodf(fmodf(ccx, (float)Nx) + Nx, (float)Nx);
-                    ccy = fmodf(fmodf(ccy, (float)Ny) + Ny, (float)Ny);
-                    d_cx[ci] = ccx;
-                    d_cy[ci] = ccy;
-                }
-                d_peri[ci] = v3 * dA;
-            }
-        }
-        // Second moments (rare path)
-        if constexpr (MOMENTS) {
-            __syncthreads();
-            float *m0 = s_reduce, *m1 = m0 + BS;
-            m0[tid] = a_mx; m1[tid] = a_my;
-            __syncthreads();
-            for (int s = BS/2; s > 32; s >>= 1) {
-                if (tid < s) { m0[tid] += m0[tid+s]; m1[tid] += m1[tid+s]; }
-                __syncthreads();
-            }
-            if (tid < 32) {
-                float mx = m0[tid]+m0[tid+32], my = m1[tid]+m1[tid+32];
-                for (int off = 16; off > 0; off >>= 1) {
-                    mx += __shfl_down_sync(0xffffffff, mx, off);
-                    my += __shfl_down_sync(0xffffffff, my, off);
-                }
-                if (tid == 0) { d_mx[ci] = mx; d_my[ci] = my; }
-            }
-        }
+        lx += BS;
+        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
     }
 }
 
-void launch_fused(CellArrays& c, const SimParams& p,
-                  int max_w, int max_h, int step) {
-    int n = c.num_cells;
-    if (n == 0) return;
-
-    bool remap  = (step % 10 == 0);
-    bool moment = (step % 10 == 9);
-    size_t smem = K_MAX * sizeof(float*) + K_MAX * 4 * sizeof(int) + 4 * 256 * sizeof(float);
-    float ih2   = 1.0f / (p.dx * p.dx);
-    float i2dx  = 0.5f / p.dx;
-    float i2dy  = 0.5f / p.dy;
-
-    #define LAUNCH(R, M) k_fused<R, M><<<n, 256, smem>>>( \
-        c.phi_ptrs, c.phi_out_ptrs, \
-        c.widths, c.heights, c.offsets_x, c.offsets_y, \
-        c.old_widths, c.old_heights, c.shift_x, c.shift_y, \
-        c.nbr_list, c.nbr_count, \
-        c.velocities_x, c.velocities_y, c.volume_devs, \
-        c.ref_x, c.ref_y, \
-        c.two_gamma, c.two_gamma_bulk, c.vol_coeff, c.tgt_area, \
-        c.v_A_cell, c.polar_x, c.polar_y, \
-        c.volumes, c.volume_devs, c.centroids_x, c.centroids_y, \
-        c.perimeters, c.moment_x, c.moment_y, \
-        2.0f * p.interaction_coeff(), ih2, i2dx, i2dy, \
-        p.dt, p.dA(), p.motility_coeff(), \
-        p.halo, p.Nx, p.Ny, n)
-
-    if      ( remap &&  moment) LAUNCH(true,  true);
-    else if ( remap && !moment) LAUNCH(true,  false);
-    else if (!remap &&  moment) LAUNCH(false, true);
-    else                        LAUNCH(false, false);
-    #undef LAUNCH
+void launch_scatter_S(CellArrays& c, const SimParams& p) {
+    const int N = c.num_cells;
+    if (N == 0) return;
+    const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
+    cudaMemsetAsync(c.S, 0, Sbytes);
+    k_scatter_S<<<N, 256>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx);
 }
 
-// ===== 5. Swap ===============================================================
-
-__global__ void k_swap(
-    float** __restrict__ pin, float** __restrict__ pout,
-    int* __restrict__ ox, int* __restrict__ oy,
-    const int* __restrict__ sx, const int* __restrict__ sy,
-    int Nx, int Ny, int N)
+// ---------------------------------------------------------------------------
+// 3. k_evolve_l1 — fused two-pass evolve.
+// ---------------------------------------------------------------------------
+// One CTA per cell, BS=256 threads. phi is read from L1 (no shared-mem
+// caching — the 64KB shared variant tested in the reference forced 1 block
+// per SM and was slower). The compiler keeps a hot working set in registers
+// and the L1/texture cache picks up the spatial reuse from neighbouring
+// thread iterations.
+//
+// Pass 1 accumulates V, Ix, Iy (interaction integrals) and Cx, Cy
+// (tile-local centroid moments) per cell. A 5-channel block reduction
+// produces those scalars in shared memory; thread 0 broadcasts (Vn, vx, vy)
+// for use in Pass 2 and writes the per-cell observables.
+//
+// Pass 2 re-reads phi (L1-hot) and S (L2-hot), computes the full PDE RHS
+// (Laplacian + double-well + volume constraint + repulsion), advects with
+// the freshly-broadcast velocity, and writes phi_out. Perimeter
+// (sum |grad phi|) is accumulated in the same pass and reduced separately.
+//
+// Per-cell scalars read inline:
+//   gamma_cell[n], v_A_cell[n]   — vary per cell (gamma_spec / v_A_sigma)
+//   tgt_radius[n]                — used for piR2 / volume constraint
+// All other physics constants are passed as kernel arguments and broadcast
+// from constant-bandwidth registers.
+// ---------------------------------------------------------------------------
+__global__ void k_evolve_l1(
+    const float* __restrict__ phi,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    const float* __restrict__ S,
+    const float* __restrict__ gamma_cell,
+    const float* __restrict__ v_A_cell,
+    const float* __restrict__ tgt_radius,
+    const float* __restrict__ dirx,
+    const float* __restrict__ diry,
+    float* __restrict__ V_out,
+    float* __restrict__ Cx_out,
+    float* __restrict__ Cy_out,
+    float* __restrict__ Cxx_out,
+    float* __restrict__ Cyy_out,
+    float* __restrict__ peri_out,
+    float* __restrict__ vx_out,
+    float* __restrict__ vy_out,
+    float* __restrict__ phi_out,
+    int N, int L,
+    float lambda_, float kappa, float mu,
+    float xi, float dt)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    float* tmp = pin[i]; pin[i] = pout[i]; pout[i] = tmp;
-    ox[i] = wrap(ox[i] + sx[i], Nx);
-    oy[i] = wrap(oy[i] + sy[i], Ny);
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int BS  = blockDim.x;          // expect 256
+    const int tid = threadIdx.x;
+
+    const float* tile = phi     + (size_t)n * TILE_AREA;
+    float*       outp = phi_out + (size_t)n * TILE_AREA;
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    const int rect_total = rw * rh;
+    const float gam = gamma_cell[n];
+    const float vA  = v_A_cell[n];
+    const float R   = tgt_radius[n];
+
+    // ----- Pass 1: V, Ix, Iy, Cx, Cy, Cxx, Cyy -----
+    int lx0 = rx0 + (tid % rw);
+    int ly  = ry0 + (tid / rw);
+    int lx  = lx0;
+    float sV = 0.0f, sIx = 0.0f, sIy = 0.0f;
+    float sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f;
+    for (int p = tid; p < rect_total; p += BS) {
+        int idx = ly * TILE_T + lx;
+        float c   = __ldg(tile + idx);
+        float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
+        float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
+        float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
+        float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
+        float gx = 0.5f * (xp_ - xm_);
+        float gy = 0.5f * (yp_ - ym_);
+        int gxg = wrap_i(gx0 + lx, L);
+        int gyg = wrap_i(gy0 + ly, L);
+        float Sv   = S[gyg * L + gxg];
+        float Soth = Sv - c * c;
+        if (Soth < 0.0f) Soth = 0.0f;
+        float c2 = c * c;
+        float fx = (float)lx, fy = (float)ly;
+        sV   += c2;
+        sIx  += c * gx * Soth;
+        sIy  += c * gy * Soth;
+        sCx  += c2 * fx;
+        sCy  += c2 * fy;
+        sCxx += c2 * fx * fx;
+        sCyy += c2 * fy * fy;
+        lx += BS;
+        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
+    }
+
+    // 7-channel block reduction (7 * 256 floats = 7 KB shared).
+    __shared__ float sred[256 * 7];
+    __shared__ float sbroad[7];
+    sred[tid          ] = sV;
+    sred[tid +   256  ] = sIx;
+    sred[tid + 2*256  ] = sIy;
+    sred[tid + 3*256  ] = sCx;
+    sred[tid + 4*256  ] = sCy;
+    sred[tid + 5*256  ] = sCxx;
+    sred[tid + 6*256  ] = sCyy;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            sred[tid          ] += sred[tid + s          ];
+            sred[tid +   256  ] += sred[tid + s +   256  ];
+            sred[tid + 2*256  ] += sred[tid + s + 2*256  ];
+            sred[tid + 3*256  ] += sred[tid + s + 3*256  ];
+            sred[tid + 4*256  ] += sred[tid + s + 4*256  ];
+            sred[tid + 5*256  ] += sred[tid + s + 5*256  ];
+            sred[tid + 6*256  ] += sred[tid + s + 6*256  ];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        sbroad[0] = sred[0];
+        sbroad[1] = sred[256];
+        sbroad[2] = sred[2*256];
+        sbroad[3] = sred[3*256];
+        sbroad[4] = sred[4*256];
+        sbroad[5] = sred[5*256];
+        sbroad[6] = sred[6*256];
+    }
+    __syncthreads();
+    const float Vn  = sbroad[0];
+    const float Ixn = sbroad[1];
+    const float Iyn = sbroad[2];
+
+    const float invXi  = 1.0f / xi;
+    const float coeffV = 60.0f * kappa * invXi / (lambda_ * lambda_);
+    const float vx     = coeffV * Ixn + vA * dirx[n];
+    const float vy     = coeffV * Iyn + vA * diry[n];
+
+    if (tid == 0) {
+        V_out[n]   = Vn;
+        Cx_out[n]  = sbroad[3];
+        Cy_out[n]  = sbroad[4];
+        Cxx_out[n] = sbroad[5];
+        Cyy_out[n] = sbroad[6];
+        vx_out[n]  = vx;
+        vy_out[n]  = vy;
+    }
+
+    const float piR2 = PI * R * R;
+    const float volC = (2.0f * mu / piR2) * (piR2 - Vn);
+    const float dwC  = 30.0f * gam   / (lambda_ * lambda_);
+    const float repC = 30.0f * kappa / (lambda_ * lambda_);
+
+    // ----- Pass 2: PDE update + perimeter reduction -----
+    // Only writes pixels inside the rect. Pixels outside the rect of
+    // phi_out remain zero: alloc_gpu zeroes the pool initially, and
+    // k_rebind zeroes outside-new-rect on every rebind step. Between
+    // rebinds the rect doesn't grow, so the outside pixels of phi_out
+    // (which become phi_in two steps from now) stay clean.
+
+    lx = lx0; ly = ry0 + (tid / rw);
+    float sPeri = 0.0f;
+    for (int p = tid; p < rect_total; p += BS) {
+        int idx = ly * TILE_T + lx;
+        float c    = __ldg(tile + idx);
+        float xp_  = (lx + 1 < TILE_T)                     ? __ldg(tile + idx + 1)          : 0.0f;
+        float xm_  = (lx     > 0)                          ? __ldg(tile + idx - 1)          : 0.0f;
+        float yp_  = (ly + 1 < TILE_T)                     ? __ldg(tile + idx + TILE_T)     : 0.0f;
+        float ym_  = (ly     > 0)                          ? __ldg(tile + idx - TILE_T)     : 0.0f;
+        float xpyp = (lx + 1 < TILE_T && ly + 1 < TILE_T)  ? __ldg(tile + idx + TILE_T + 1) : 0.0f;
+        float xpym = (lx + 1 < TILE_T && ly     > 0)       ? __ldg(tile + idx - TILE_T + 1) : 0.0f;
+        float xmyp = (lx     > 0      && ly + 1 < TILE_T)  ? __ldg(tile + idx + TILE_T - 1) : 0.0f;
+        float xmym = (lx     > 0      && ly     > 0)       ? __ldg(tile + idx - TILE_T - 1) : 0.0f;
+
+        float lap = lap9(c, xm_, xp_, ym_, yp_, xmym, xpym, xmyp, xpyp);
+        float gx  = 0.5f * (xp_ - xm_);
+        float gy  = 0.5f * (yp_ - ym_);
+
+        int gxg = wrap_i(gx0 + lx, L);
+        int gyg = wrap_i(gy0 + ly, L);
+        float Sv   = S[gyg * L + gxg];
+        float Soth = Sv - c * c;
+        if (Soth < 0.0f) Soth = 0.0f;
+
+        float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
+        float rhs = gam * lap - dwC * dw + volC * c - repC * c * Soth;
+        float adv = vx * gx + vy * gy;
+        outp[idx] = c + dt * (rhs - adv);
+
+        sPeri += sqrtf(gx * gx + gy * gy);
+        lx += BS;
+        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
+    }
+
+    // 1-channel perimeter reduction. Reuse sred[0..256].
+    __syncthreads();
+    sred[tid] = sPeri;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sred[tid] += sred[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) peri_out[n] = sred[0];
 }
 
-void launch_swap(CellArrays& c, int Nx, int Ny) {
-    k_swap<<<(c.num_cells + 255) / 256, 256>>>(
-        c.phi_ptrs, c.phi_out_ptrs,
-        c.offsets_x, c.offsets_y, c.shift_x, c.shift_y,
-        Nx, Ny, c.num_cells);
+void launch_evolve(CellArrays& c, const SimParams& p) {
+    const int N = c.num_cells;
+    if (N == 0) return;
+    k_evolve_l1<<<N, 256>>>(
+        c.phi_in, c.origin, c.rect, c.S,
+        c.gamma_cell, c.v_A_cell, c.tgt_radius,
+        c.polar_x, c.polar_y,
+        c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy, c.perimeters,
+        c.velocities_x, c.velocities_y,
+        c.phi_out,
+        N, p.Nx,
+        (float)p.lambda, (float)p.kappa, (float)p.mu,
+        (float)p.xi,     (float)p.dt);
 }
 
-// ===== 6. Polarization =======================================================
-// We store theta directly to avoid losing precision through an atan2 round-trip
-// each step. (polar_x, polar_y) are kept in sync for the fused kernel.
+// ---------------------------------------------------------------------------
+// 4. k_rebind — COM-recentre tile + adapt rect from second moments.
+// ---------------------------------------------------------------------------
+// Reads V, Cx, Cy, Cxx, Cyy (tile-local) computed by the most recent
+// evolve pass, then:
+//   1. Compute COM = (Cx/V, Cy/V) and integer shift to land at (T/2, T/2).
+//   2. Compute sigma_x = sqrt(Cxx/V - mx^2), likewise sigma_y, and pick
+//      a new rect half-width hw = ceil(k*sigma + margin), aligned to
+//      bbox_align, clamped to [bbox_min, T/2 - 1].
+//   3. Copy phi_in -> phi_out with the shift; pixels outside the new rect
+//      are zeroed; out-of-source destinations are zeroed.
+//   4. Update origin += shift, write new rect.
+//
+// The caller std::swap(phi_in, phi_out) so the rebound tile becomes the
+// current state.
+// ---------------------------------------------------------------------------
+__global__ void k_rebind(
+    float* __restrict__ phi_in,
+    float* __restrict__ phi_out,
+    int* __restrict__ origin,
+    int* __restrict__ rect,
+    const float* __restrict__ V,
+    const float* __restrict__ Cx,
+    const float* __restrict__ Cy,
+    const float* __restrict__ Cxx,
+    const float* __restrict__ Cyy,
+    const float* __restrict__ tgt_radius,
+    int N,
+    float bbox_k, int bbox_align, int bbox_min, float lambda)
+{
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int BS  = blockDim.x;
+    const int tid = threadIdx.x;
+    const int Th  = TILE_T >> 1;
 
+    float* tin  = phi_in  + (size_t)n * TILE_AREA;
+    float* tout = phi_out + (size_t)n * TILE_AREA;
+
+    __shared__ int sshift[2];
+    __shared__ int srect[4];
+    if (tid == 0) {
+        float Vn = V[n];
+        float invV = (Vn > 1e-6f) ? 1.0f / Vn : 0.0f;
+        float mx = Cx[n] * invV;
+        float my = Cy[n] * invV;
+        int sx = __float2int_rn(mx) - Th;
+        int sy = __float2int_rn(my) - Th;
+        sshift[0] = sx;
+        sshift[1] = sy;
+        origin[2*n + 0] += sx;
+        origin[2*n + 1] += sy;
+
+        float varx = Cxx[n] * invV - mx * mx;
+        float vary = Cyy[n] * invV - my * my;
+        if (varx < 0.0f) varx = 0.0f;
+        if (vary < 0.0f) vary = 0.0f;
+        float sigx = sqrtf(varx);
+        float sigy = sqrtf(vary);
+        // Per-axis half-widths: hw = ceil(K*sigma + R/2). Margin scales
+        // with cell radius so the rect tracks shape change between rebinds.
+        // The hard floor is R + 3*lambda (where the tanh interface decays
+        // below ~1e-3): cell support cannot extend past that, so clamping
+        // there guarantees the active rect always covers the physical cell.
+        float R = tgt_radius[n];
+        float margin = 0.5f * R;
+        int support = (int)ceilf(R + 3.0f * lambda);
+        int hwx = (int)ceilf(bbox_k * sigx + margin);
+        int hwy = (int)ceilf(bbox_k * sigy + margin);
+        if (hwx < support) hwx = support;
+        if (hwy < support) hwy = support;
+        hwx = ((hwx + bbox_align - 1) / bbox_align) * bbox_align;
+        hwy = ((hwy + bbox_align - 1) / bbox_align) * bbox_align;
+        const int hmax = Th - 1;     // keep 1px stencil halo
+        if (hwx > hmax) hwx = hmax;
+        if (hwy > hmax) hwy = hmax;
+        if (hwx < bbox_min) hwx = bbox_min;
+        if (hwy < bbox_min) hwy = bbox_min;
+        srect[0] = Th - hwx;
+        srect[1] = Th - hwy;
+        srect[2] = 2 * hwx;
+        srect[3] = 2 * hwy;
+        rect[4*n + 0] = srect[0];
+        rect[4*n + 1] = srect[1];
+        rect[4*n + 2] = srect[2];
+        rect[4*n + 3] = srect[3];
+    }
+    __syncthreads();
+    const int sx = sshift[0];
+    const int sy = sshift[1];
+    const int rx0 = srect[0], ry0 = srect[1];
+    const int rx1 = rx0 + srect[2], ry1 = ry0 + srect[3];
+
+    // Phase 1: write shifted source data into phi_out (destination).
+    // Pixels in new rect get shifted source; outside = 0.
+    for (int p = tid; p < TILE_AREA; p += BS) {
+        int ox = p % TILE_T;
+        int oy = p / TILE_T;
+        float v = 0.0f;
+        if (ox >= rx0 && ox < rx1 && oy >= ry0 && oy < ry1) {
+            int sxi = ox + sx;
+            int syi = oy + sy;
+            if (sxi >= 0 && sxi < TILE_T && syi >= 0 && syi < TILE_T) {
+                v = tin[syi * TILE_T + sxi];
+            }
+        }
+        tout[p] = v;
+    }
+    __syncthreads();
+
+    // Phase 2: scrub source-buffer halo. After the caller swaps, this
+    // buffer becomes phi_out for the next evolve. Evolve only writes
+    // INSIDE the new rect, so any pixels outside-new-rect carry stale
+    // cell data from before this rebind (when the rect shrinks). On the
+    // following swap those stale pixels become phi_in and the boundary
+    // stencil reads them. Zeroing now is the cheapest fix; no race
+    // because Phase 1 above already finished reading from tin.
+    for (int p = tid; p < TILE_AREA; p += BS) {
+        int ox = p % TILE_T;
+        int oy = p / TILE_T;
+        bool inside = (ox >= rx0 && ox < rx1 && oy >= ry0 && oy < ry1);
+        if (!inside) tin[p] = 0.0f;
+    }
+}
+
+void launch_rebind(CellArrays& c, float lambda) {
+    const int N = c.num_cells;
+    if (N == 0) return;
+    k_rebind<<<N, 256>>>(c.phi_in, c.phi_out, c.origin, c.rect,
+                         c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy,
+                         c.tgt_radius, N,
+                         TILE_BBOX_K, TILE_BBOX_ALIGN, TILE_BBOX_MIN,
+                         lambda);
+}
+
+// ---------------------------------------------------------------------------
+// 5. k_polar — per-cell polarity update.
+// ---------------------------------------------------------------------------
+// theta is the persistent polar angle; (px, py) = (cos, sin) are the
+// derived unit vector. ABP: theta diffuses each step. RTP: with prob
+// (1 - exp(-dt/tau)) re-randomise theta uniformly.
+//
+// One thread per cell. Skipped entirely when v_A == 0 (no motility) or
+// when tau <= 0 (sentinel: hold polarity fixed forever).
+// ---------------------------------------------------------------------------
 __global__ void k_polar(
     curandState* __restrict__ st,
     float* __restrict__ theta_arr,
@@ -584,7 +485,7 @@ __global__ void k_polar(
         changed = true;
     } else {
         if (curand_uniform(&s) < 1.0f - expf(-dt / tau)) {
-            theta = curand_uniform(&s) * 6.2831853f;
+            theta = curand_uniform(&s) * 2.0f * PI;
             changed = true;
         }
     }
@@ -597,16 +498,196 @@ __global__ void k_polar(
 }
 
 void launch_polar(CellArrays& c, const SimParams& p) {
-    int n = c.num_cells;
-    if (n == 0 || p.v_A == 0.0f) return;
-    k_polar<<<(n + 255) / 256, 256>>>(
+    const int N = c.num_cells;
+    if (N == 0 || p.v_A == 0.0 || p.tau <= 0.0) return;
+    k_polar<<<(N + 255) / 256, 256>>>(
         (curandState*)c.rng_states,
         c.polar_theta, c.polar_x, c.polar_y,
-        p.dt, p.tau, p.abp, n);
+        (float)p.dt, (float)p.tau, p.abp, N);
 }
 
-// ===== 7. RNG init ===========================================================
+// ---------------------------------------------------------------------------
+// 6. k_init_phi — tanh init profile, fresh start only.
+// ---------------------------------------------------------------------------
+// phi(r) = 0.5 * (1 - tanh(2*(r - R_eff) / iw))
+// with R_eff = R + 0.7088*lambda - 0.5887*lambda^2/R and iw = sqrt(2)*lambda.
+// (These corrections compensate the f32 tanh interface so that the
+// converged volume matches pi*R^2 to ~1%.)
+// ---------------------------------------------------------------------------
+__global__ void k_init_phi(
+    float* phi, const int* origin,
+    const float* cx, const float* cy,
+    int N, int L, float R, float lambda_)
+{
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    float* tile = phi + (size_t)n * TILE_AREA;
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const float ccx = cx[n], ccy = cy[n];
 
+    const float R_eff = R + 0.7088f * lambda_ - 0.5887f * lambda_ * lambda_ / R;
+    const float iw    = 1.4142135f * lambda_;
+
+    for (int p = threadIdx.x; p < TILE_AREA; p += blockDim.x) {
+        int lx = p % TILE_T;
+        int ly = p / TILE_T;
+        float xg = (float)(gx0 + lx);
+        float yg = (float)(gy0 + ly);
+        float dx = xg - ccx;
+        float dy = yg - ccy;
+        if (dx >  0.5f * L) dx -= L;
+        if (dx < -0.5f * L) dx += L;
+        if (dy >  0.5f * L) dy -= L;
+        if (dy < -0.5f * L) dy += L;
+        float r = sqrtf(dx*dx + dy*dy);
+        tile[p] = 0.5f * (1.0f - tanhf(2.0f * (r - R_eff) / iw));
+    }
+}
+
+void launch_init_phi(CellArrays& c, const SimParams& p,
+                     const float* d_cx, const float* d_cy) {
+    const int N = c.num_cells;
+    if (N == 0) return;
+    k_init_phi<<<N, 256>>>(c.phi_in, c.origin, d_cx, d_cy,
+                            N, p.Nx,
+                            (float)p.target_radius, (float)p.lambda);
+}
+
+// ---------------------------------------------------------------------------
+// 7. k_initial_velocity — one-shot velocity reduction.
+// ---------------------------------------------------------------------------
+// Computes the same V/Cx/Cy/Ix/Iy reduction as k_evolve_l1's Pass 1, plus
+// perimeter, but does NOT advance phi. Used after init / resume so that the
+// first trajectory write contains a meaningful velocity (interaction +
+// active component), and so that downstream code doesn't see zero volumes.
+//
+// Implemented by reusing k_evolve_l1 with a tagged dt=0 fast path is
+// possible, but it's cleaner to have a dedicated kernel that skips Pass 2.
+// ---------------------------------------------------------------------------
+__global__ void k_initial_velocity(
+    const float* __restrict__ phi,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    const float* __restrict__ S,
+    const float* __restrict__ v_A_cell,
+    const float* __restrict__ dirx,
+    const float* __restrict__ diry,
+    float* __restrict__ V_out,
+    float* __restrict__ Cx_out,
+    float* __restrict__ Cy_out,
+    float* __restrict__ Cxx_out,
+    float* __restrict__ Cyy_out,
+    float* __restrict__ peri_out,
+    float* __restrict__ vx_out,
+    float* __restrict__ vy_out,
+    int N, int L,
+    float lambda_, float kappa, float xi)
+{
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int BS  = blockDim.x;
+    const int tid = threadIdx.x;
+
+    const float* tile = phi + (size_t)n * TILE_AREA;
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    const int rect_total = rw * rh;
+    const float vA = v_A_cell[n];
+
+    int lx = rx0 + (tid % rw);
+    int ly = ry0 + (tid / rw);
+    float sV = 0.0f, sIx = 0.0f, sIy = 0.0f;
+    float sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f, sP = 0.0f;
+    for (int p = tid; p < rect_total; p += BS) {
+        int idx = ly * TILE_T + lx;
+        float c   = __ldg(tile + idx);
+        float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
+        float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
+        float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
+        float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
+        float gx = 0.5f * (xp_ - xm_);
+        float gy = 0.5f * (yp_ - ym_);
+        int gxg = wrap_i(gx0 + lx, L);
+        int gyg = wrap_i(gy0 + ly, L);
+        float Sv   = S[gyg * L + gxg];
+        float Soth = Sv - c * c;
+        if (Soth < 0.0f) Soth = 0.0f;
+        float c2 = c * c;
+        float fx = (float)lx, fy = (float)ly;
+        sV   += c2;
+        sIx  += c * gx * Soth;
+        sIy  += c * gy * Soth;
+        sCx  += c2 * fx;
+        sCy  += c2 * fy;
+        sCxx += c2 * fx * fx;
+        sCyy += c2 * fy * fy;
+        sP   += sqrtf(gx * gx + gy * gy);
+        lx += BS;
+        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
+    }
+
+    __shared__ float sred[256 * 8];
+    sred[tid          ] = sV;
+    sred[tid +   256  ] = sIx;
+    sred[tid + 2*256  ] = sIy;
+    sred[tid + 3*256  ] = sCx;
+    sred[tid + 4*256  ] = sCy;
+    sred[tid + 5*256  ] = sCxx;
+    sred[tid + 6*256  ] = sCyy;
+    sred[tid + 7*256  ] = sP;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            sred[tid          ] += sred[tid + s          ];
+            sred[tid +   256  ] += sred[tid + s +   256  ];
+            sred[tid + 2*256  ] += sred[tid + s + 2*256  ];
+            sred[tid + 3*256  ] += sred[tid + s + 3*256  ];
+            sred[tid + 4*256  ] += sred[tid + s + 4*256  ];
+            sred[tid + 5*256  ] += sred[tid + s + 5*256  ];
+            sred[tid + 6*256  ] += sred[tid + s + 6*256  ];
+            sred[tid + 7*256  ] += sred[tid + s + 7*256  ];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float Vn  = sred[0];
+        float Ixn = sred[256];
+        float Iyn = sred[2*256];
+        float coeffV = 60.0f * kappa / (xi * lambda_ * lambda_);
+        V_out[n]    = Vn;
+        Cx_out[n]   = sred[3*256];
+        Cy_out[n]   = sred[4*256];
+        Cxx_out[n]  = sred[5*256];
+        Cyy_out[n]  = sred[6*256];
+        peri_out[n] = sred[7*256];
+        vx_out[n]   = coeffV * Ixn + vA * dirx[n];
+        vy_out[n]   = coeffV * Iyn + vA * diry[n];
+    }
+}
+
+void launch_initial_velocity(CellArrays& c, const SimParams& p) {
+    const int N = c.num_cells;
+    if (N == 0) return;
+    const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
+    cudaMemsetAsync(c.S, 0, Sbytes);
+    k_scatter_S<<<N, 256>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx);
+    k_initial_velocity<<<N, 256>>>(
+        c.phi_in, c.origin, c.rect, c.S,
+        c.v_A_cell, c.polar_x, c.polar_y,
+        c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy, c.perimeters,
+        c.velocities_x, c.velocities_y,
+        N, p.Nx,
+        (float)p.lambda, (float)p.kappa, (float)p.xi);
+}
+
+// ---------------------------------------------------------------------------
+// 8. k_rng_init
+// ---------------------------------------------------------------------------
 __global__ void k_rng_init(curandState* st, unsigned long seed, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -614,217 +695,8 @@ __global__ void k_rng_init(curandState* st, unsigned long seed, int N) {
 }
 
 void launch_rng_init(CellArrays& c, unsigned long seed) {
-    k_rng_init<<<(c.num_cells + 255) / 256, 256>>>(
-        (curandState*)c.rng_states, seed, c.num_cells);
-}
-
-// ===== 8. Initial centroid + volume reduction ================================
-
-__global__ void k_init_reduce(
-    float** __restrict__ phi_in,
-    const int* __restrict__ W, const int* __restrict__ H,
-    const int* __restrict__ OX, const int* __restrict__ OY,
-    const float* __restrict__ RX, const float* __restrict__ RY,
-    float* __restrict__ d_cx, float* __restrict__ d_cy,
-    float* __restrict__ d_vol,
-    int halo, int Nx, int Ny, int Ncells)
-{
-    int ci = blockIdx.z;
-    if (ci >= Ncells) return;
-    int w = W[ci], h = H[ci];
-    int lx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ly = blockIdx.y * blockDim.y + threadIdx.y;
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int BS = blockDim.x * blockDim.y;
-
-    float my_dx = 0, my_dy = 0, my_p2 = 0;
-    if (lx < w && ly < h &&
-        lx >= halo && lx < w - halo &&
-        ly >= halo && ly < h - halo) {
-        float p = phi_in[ci][ly * w + lx];
-        float p2 = p * p;
-        float gx = (float)(OX[ci] + lx);
-        float gy = (float)(OY[ci] + ly);
-        my_dx = pdelta(gx - RX[ci], (float)Nx) * p2;
-        my_dy = pdelta(gy - RY[ci], (float)Ny) * p2;
-        my_p2 = p2;
-    }
-
-    extern __shared__ float sm[];
-    float *s0 = sm, *s1 = sm + BS, *s2 = sm + 2 * BS;
-    s0[tid] = my_dx; s1[tid] = my_dy; s2[tid] = my_p2;
-    __syncthreads();
-    for (int s = BS / 2; s > 32; s >>= 1) {
-        if (tid < s) { s0[tid] += s0[tid+s]; s1[tid] += s1[tid+s]; s2[tid] += s2[tid+s]; }
-        __syncthreads();
-    }
-    if (tid < 32) {
-        float v0 = s0[tid]+s0[tid+32], v1 = s1[tid]+s1[tid+32], v2 = s2[tid]+s2[tid+32];
-        for (int off = 16; off > 0; off >>= 1) {
-            v0 += __shfl_down_sync(0xffffffff, v0, off);
-            v1 += __shfl_down_sync(0xffffffff, v1, off);
-            v2 += __shfl_down_sync(0xffffffff, v2, off);
-        }
-        if (tid == 0) {
-            atomicAdd(&d_cx[ci], v0);
-            atomicAdd(&d_cy[ci], v1);
-            atomicAdd(&d_vol[ci], v2);
-        }
-    }
-}
-
-__global__ void k_init_finalize(
-    float* __restrict__ cx, float* __restrict__ cy,
-    float* __restrict__ vol, float* __restrict__ vdev,
-    const float* __restrict__ rx, const float* __restrict__ ry,
-    const float* __restrict__ ta, float dA, int Nx, int Ny, int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    float sp2 = vol[i];
-    if (sp2 > 1e-8f) {
-        float ccx = rx[i] + cx[i] / sp2;
-        float ccy = ry[i] + cy[i] / sp2;
-        ccx = fmodf(fmodf(ccx, (float)Nx) + Nx, (float)Nx);
-        ccy = fmodf(fmodf(ccy, (float)Ny) + Ny, (float)Ny);
-        cx[i] = ccx; cy[i] = ccy;
-    }
-    float v = sp2 * dA;
-    vol[i] = v;
-    vdev[i] = ta[i] - v;
-}
-
-void launch_initial_reduce(CellArrays& c, const SimParams& p,
-                           int max_w, int max_h) {
-    int n = c.num_cells;
-    if (n == 0) return;
-    cudaMemset(c.centroids_x, 0, n * sizeof(float));
-    cudaMemset(c.centroids_y, 0, n * sizeof(float));
-    cudaMemset(c.volumes, 0, n * sizeof(float));
-
-    dim3 blk(32, 8);
-    dim3 grd((max_w + 31) / 32, (max_h + 7) / 8, n);
-    k_init_reduce<<<grd, blk, 3 * 256 * sizeof(float)>>>(
-        c.phi_ptrs, c.widths, c.heights,
-        c.offsets_x, c.offsets_y, c.ref_x, c.ref_y,
-        c.centroids_x, c.centroids_y, c.volumes,
-        p.halo, p.Nx, p.Ny, n);
-
-    k_init_finalize<<<(n + 255) / 256, 256>>>(
-        c.centroids_x, c.centroids_y,
-        c.volumes, c.volume_devs,
-        c.ref_x, c.ref_y, c.tgt_area,
-        p.dA(), p.Nx, p.Ny, n);
-}
-
-// ===== 9. Initial velocity integral ==========================================
-
-__global__ void k_vel_integral(
-    float** __restrict__ phi_in,
-    const int* __restrict__ W, const int* __restrict__ H,
-    const int* __restrict__ OX, const int* __restrict__ OY,
-    const NeighborEntry* __restrict__ nlist, const int* __restrict__ ncnt,
-    float* __restrict__ ix, float* __restrict__ iy,
-    float i2dx, float i2dy, int halo, int Nx, int Ny, int Ncells)
-{
-    int ci = blockIdx.z;
-    if (ci >= Ncells) return;
-    int w = W[ci], h = H[ci];
-    int lx = blockIdx.x * blockDim.x + threadIdx.x;
-    int ly = blockIdx.y * blockDim.y + threadIdx.y;
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int BS = blockDim.x * blockDim.y;
-
-    float mx = 0, my = 0;
-    if (lx < w && ly < h &&
-        lx >= halo && lx < w - halo &&
-        ly >= halo && ly < h - halo) {
-        const float* phi = phi_in[ci];
-        float pv = phi[ly * w + lx];
-        float gx = (phi[ly * w + lx + 1] - phi[ly * w + lx - 1]) * i2dx;
-        float gy = (phi[(ly + 1) * w + lx] - phi[(ly - 1) * w + lx]) * i2dy;
-
-        float S = 0;
-        int kn = ncnt[ci];
-        for (int ni = 0; ni < kn; ni++) {
-            int nid = nlist[ci * K_MAX + ni].cell_id;
-            int dx = OX[nid] - OX[ci];
-            int dy = OY[nid] - OY[ci];
-            if (dx >  Nx / 2) dx -= Nx;
-            if (dx < -Nx / 2) dx += Nx;
-            if (dy >  Ny / 2) dy -= Ny;
-            if (dy < -Ny / 2) dy += Ny;
-            int nw = W[nid], nh = H[nid];
-            int nlx = lx - dx, nly = ly - dy;
-            if (nlx >= halo && nlx < nw - halo &&
-                nly >= halo && nly < nh - halo) {
-                float pm = phi_in[nid][nly * nw + nlx];
-                S += pm * pm;
-            }
-        }
-        mx = pv * gx * S;
-        my = pv * gy * S;
-    }
-
-    extern __shared__ float sm[];
-    float *s0 = sm, *s1 = sm + BS;
-    s0[tid] = mx; s1[tid] = my;
-    __syncthreads();
-    for (int s = BS / 2; s > 32; s >>= 1) {
-        if (tid < s) { s0[tid] += s0[tid+s]; s1[tid] += s1[tid+s]; }
-        __syncthreads();
-    }
-    if (tid < 32) {
-        float v0 = s0[tid]+s0[tid+32], v1 = s1[tid]+s1[tid+32];
-        for (int off = 16; off > 0; off >>= 1) {
-            v0 += __shfl_down_sync(0xffffffff, v0, off);
-            v1 += __shfl_down_sync(0xffffffff, v1, off);
-        }
-        if (tid == 0) { atomicAdd(&ix[ci], v0); atomicAdd(&iy[ci], v1); }
-    }
-}
-
-__global__ void k_vel_finalize(
-    float* __restrict__ vx, float* __restrict__ vy,
-    const float* __restrict__ ix, const float* __restrict__ iy,
-    const float* __restrict__ px, const float* __restrict__ py,
-    const float* __restrict__ vA, float mc, float dA, int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    vx[i] = mc * ix[i] * dA + vA[i] * px[i];
-    vy[i] = mc * iy[i] * dA + vA[i] * py[i];
-}
-
-void launch_initial_velocity(CellArrays& c, const SimParams& p,
-                             int max_w, int max_h) {
-    int n = c.num_cells;
-    if (n == 0) return;
-
-    // Reuse moment_x/y as scratch accumulators — they're zeroed at init and
-    // only consumed from step 10 onward, so safe to clobber here then zero.
-    float* d_ix = c.moment_x;
-    float* d_iy = c.moment_y;
-    cudaMemset(d_ix, 0, n * sizeof(float));
-    cudaMemset(d_iy, 0, n * sizeof(float));
-
-    dim3 blk(32, 8);
-    dim3 grd((max_w + 31) / 32, (max_h + 7) / 8, n);
-    k_vel_integral<<<grd, blk, 2 * 256 * sizeof(float)>>>(
-        c.phi_ptrs, c.widths, c.heights,
-        c.offsets_x, c.offsets_y,
-        c.nbr_list, c.nbr_count,
-        d_ix, d_iy,
-        0.5f / p.dx, 0.5f / p.dy,
-        p.halo, p.Nx, p.Ny, n);
-
-    k_vel_finalize<<<(n + 255) / 256, 256>>>(
-        c.velocities_x, c.velocities_y,
-        d_ix, d_iy,
-        c.polar_x, c.polar_y,
-        c.v_A_cell, p.motility_coeff(), p.dA(), n);
-
-    // Restore moment buffers to zero so the first remap step reads valid data.
-    cudaMemset(d_ix, 0, n * sizeof(float));
-    cudaMemset(d_iy, 0, n * sizeof(float));
+    const int N = c.num_cells;
+    if (N == 0) return;
+    k_rng_init<<<(N + 255) / 256, 256>>>(
+        (curandState*)c.rng_states, seed, N);
 }
