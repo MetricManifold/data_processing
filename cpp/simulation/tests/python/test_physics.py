@@ -240,7 +240,7 @@ class TestPeriodicBoundaryCrossing:
 
     def test_volume_continuous_across_wrap(self, tmp_path):
         R = 15
-        L = 100
+        L = 150           # >= TILE_T (128); still ~5R so cell wraps cleanly
         v_A = 0.1
         t_end = 2000
         out = run_sim(tmp_path / "run",
@@ -1159,11 +1159,16 @@ class TestPopulationDiffusion:
         is widened to 40% (diffusive expectation is 2). Keep this
         loose — the goal is to catch regressions that invert the sign
         of the slope, not to measure D_eff.
+
+        N=64 (not 16): the lag-window count grows with N, and at N=16
+        the seed-to-seed scatter on the ratio is ±0.45 (1.96 to 2.89),
+        which lands outside the 40% gate at unlucky seeds. N=64 tightens
+        the scatter to ±0.15.
         """
         R = 20.0
         tau = 200.0
         out = run_sim(tmp_path / "run",
-                      "-n", "16", "-r", str(int(R)), "--confluence", "0.85",
+                      "-n", "64", "-r", str(int(R)), "--confluence", "0.85",
                       "-t", str(int(10 * tau)), "--dt", "0.01",
                       "--v-A", "0.02", "--tau", str(int(tau)), "--seed", "42",
                       "--save-interval", "0", "--trajectory-samples", "200")

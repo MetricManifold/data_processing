@@ -40,6 +40,24 @@ tmp_*
 !cpp/simulation/cluster/*.sh
 !cpp/simulation/cluster/*.c
 
+# Tests + fixtures
+!cpp/simulation/tests
+!cpp/simulation/tests/python
+!cpp/simulation/tests/python/*.py
+!cpp/simulation/tests/python/fixtures
+!cpp/simulation/tests/python/fixtures/**
+cpp/simulation/tests/python/__pycache__/
+cpp/simulation/tests/python/.pytest_cache/
+cpp/simulation/tests/python/test_report/
+cpp/simulation/tests/python/bench_*/
+cpp/simulation/tests/python/t1_hunt_*/
+cpp/simulation/tests/python/t1_synthetic_movie/
+cpp/simulation/tests/python/local_truth_*/
+cpp/simulation/tests/python/cpu_truth_pkg/
+cpp/simulation/tests/python/time_cpu_ref*.py
+cpp/simulation/tests/python/t1_hunt*.py
+cpp/simulation/tests/python/_render_synthetic_t1.py
+
 # Study files kept local + synced to Nibi (not in git)
 cpp/simulation/study/
 

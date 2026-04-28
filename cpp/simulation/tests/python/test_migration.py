@@ -103,7 +103,7 @@ class TestCheckpointFormatRead:
         v2_ckpt = v2_out / "checkpoint.bin"
         v2_data = read_checkpoint(v2_ckpt)
 
-        assert v2_data["version"] == 6, "sim_v2 must write v6 checkpoints"
+        assert v2_data["version"] == 7, "sim_v3 must write v7 checkpoints"
         assert v2_data["num_cells"] == 2
         assert v2_data["time"] >= 0.99, f"sim_v2 did not advance past resume point (t={v2_data['time']})"
         # Physics parameters must transfer unchanged (no silent corruption).
@@ -124,7 +124,7 @@ class TestCheckpointFormatRead:
         out2 = sim("-c", str(ckpt1), "-t", "1.0", "--dt", "0.01",
                    "--v-A", "0", "--seed", "11")
         d = read_checkpoint(out2 / "checkpoint.bin")
-        assert d["version"] == 6
+        assert d["version"] == 7
         assert d["time"] >= 0.99
 
     def test_golden_v6_checkpoint_still_parses(self, sim, tmp_path):
@@ -172,7 +172,8 @@ class TestCheckpointFormatRead:
         out = sim("-c", str(staged), "-t", "0.02", "--dt", "0.01",
                   "--v-A", "0", "--seed", "0")
         d = read_checkpoint(out / "checkpoint.bin")
-        assert d["version"] == 6
+        # sim_v3 reads v6 input and re-writes as v7 native format.
+        assert d["version"] == 7
         assert d["num_cells"] == 2
         for c in d["cells"]:
             assert np.isfinite(c["volume"]) and c["volume"] > 0
@@ -370,7 +371,7 @@ class TestCrossBinaryResume:
         v2_out = v2_sim("-c", str(b_ckpt), "-t", "2.0", "--dt", "0.01",
                         "--v-A", "0", "--seed", "31")
         v2_data = read_checkpoint(v2_out / "checkpoint.bin")
-        assert v2_data["version"] == 6
+        assert v2_data["version"] == 7  # sim_v3 writes v7 native
         assert v2_data["num_cells"] == b_data["num_cells"]
         assert v2_data["time"] > b_data["time"]
         # Per-cell phi survived the conversion: no NaN, positive volumes.
@@ -390,7 +391,7 @@ class TestCrossBinaryResume:
         out2 = sim("-c", str(c1), "-t", "1.0", "--dt", "0.01",
                    "--v-A", "0.02", "--tau", "50", "--seed", "22")
         d2 = read_checkpoint(out2 / "checkpoint.bin")
-        assert d2["version"] == 6
+        assert d2["version"] == 7  # sim_v3 writes v7 native
         assert d2["num_cells"] == d1["num_cells"]
         assert d2["time"] > d1["time"]
 
@@ -451,7 +452,7 @@ class TestPostprocessingCompat:
                   "--dt", "0.01", "--v-A", "0", "--seed", "14",
                   "--save-interval", "0", "--trajectory-samples", "0")
         d = read_checkpoint(out / "checkpoint.bin")
-        assert d["version"] == 6
+        assert d["version"] == 7  # sim_v3 writes v7 native
         assert d["num_cells"] == 2
         for c in d["cells"]:
             assert c["phi"].shape[0] > 0 and c["phi"].shape[1] > 0
@@ -778,9 +779,9 @@ class TestCpuReference:
         round-off even when sim vs CPU tiles end up at different
         origins and dimensions.
         """
-        # r=22, n=8, φ≈0.85 → L ≈ 124 > tile (78). By step 201 the cells
+        # n=12, r=22, φ≈0.85 → L ≈ 147 > TILE_T (128). By step 201 the cells
         # have jammed into contact and every interface sees a neighbour.
-        out_init = sim("-n", "8", "-r", "22", "--confluence", "0.85",
+        out_init = sim("-n", "12", "-r", "22", "--confluence", "0.85",
                        "-t", str(self._INIT_T_END), "--dt", "0.01",
                        "--v-A", "0", "--seed", "901",
                        "--save-interval", "0", "--trajectory-samples", "0",
@@ -906,7 +907,7 @@ class TestCpuReference:
                 {"id": 1, "cx": cx0 + dx0, "cy": cy0 + dy0},
             ]
             out_init = sim(
-                "-n", "1", "-r", "20", "--confluence", "0.2",
+                "-n", "1", "-r", "20", "-N", "200",
                 "-t", "0.01", "--dt", "0.01", "--v-A", "0",
                 "--seed", str(seed), "--save-interval", "0",
                 "--trajectory-samples", "0", "--print-interval", "0",
@@ -1096,7 +1097,7 @@ class TestCpuReference:
         stencil weight or sign flip would still blow up exponentially
         after alignment.
         """
-        out_init = sim("-n", "8", "-r", "22", "--confluence", "0.85",
+        out_init = sim("-n", "12", "-r", "22", "--confluence", "0.85",
                        "-t", str(self._INIT_T_END), "--dt", "0.01",
                        "--v-A", "0", "--seed", "903",
                        "--save-interval", "0", "--trajectory-samples", "0",
@@ -1205,7 +1206,7 @@ class TestCpuReference:
         A wrong coefficient (κ, μ, γ, λ) or a sign flip in the
         reference would cause systematic divergence in V(t).
         """
-        out_init = sim("-n", "8", "-r", "22", "--confluence", "0.85",
+        out_init = sim("-n", "12", "-r", "22", "--confluence", "0.85",
                        "-t", str(self._INIT_T_END), "--dt", "0.01",
                        "--v-A", "0", "--seed", "904",
                        "--save-interval", "0", "--trajectory-samples", "0",
@@ -1449,6 +1450,77 @@ class TestCpuReference:
                       expected=0.0, tolerance=self._TOL_MEAN_GLOBAL)
         self._record_panel(tname, sim_after, cpu_after,
                            f"Motile single cell — v_A={v_A}, N={n_ran} steps")
+
+    @pytest.mark.slow
+    def test_cpu_ref_packed_16c_motile(self, sim, request):
+        """Scenario E2: 16 cells packed at φ ≈ 0.85 with active motility.
+
+        Like packed_grid_8 but with v_A = 0.01 turned on. τ = 1×10⁶ so
+        no tumbles fire over 1000 steps and the CPU reference's
+        fixed-polarity assumption holds. Per-cell polarities are read
+        from the first trajectory snapshot of the resume run and passed
+        verbatim to the CPU ref. This stresses the v_A·p̂ branch on a
+        jammed configuration where the repulsion integral is non-zero
+        — a regime not exercised by motile_1c.
+        """
+        v_A = 0.01
+        tau = 1e6
+        n_resume_steps = 1000
+        dt = 0.01
+        # Init: 16 cells, R=22, φ≈0.85, run with v_A so polarities are
+        # initialised and cells reach near-jammed steady state.
+        out_init = sim(
+            "-n", "16", "-r", "22", "--confluence", "0.85",
+            "-t", str(self._INIT_T_END), "--dt", str(dt),
+            "--v-A", str(v_A), "--tau", str(tau),
+            "--seed", "920", "--polarity-seed", "920",
+            "--save-interval", "0", "--trajectory-samples", "0",
+            "--print-interval", "0",
+        )
+        ckpt = out_init / "checkpoint.bin"
+        ckpt_data = read_checkpoint(ckpt)
+        Nx = int(ckpt_data["params"]["Nx"])
+        Ny = int(ckpt_data["params"]["Ny"])
+        halo = int(ckpt_data["params"].get("halo_width", 4))
+
+        # Resume with same v_A; capture trajectory for per-cell polarities.
+        sim_after = self._resume_sim(
+            sim, ckpt, n_resume_steps, dt, seed=920,
+            v_A=v_A,
+            extra=["--tau", str(tau), "--polarity-seed", "920"],
+            trajectory_samples=5,
+        )
+        n_ran = sim_after["step"] - ckpt_data["step"]
+
+        traj, _ = read_trajectory(out_init / "trajectory.txt")
+        t_first = min(traj.keys())
+        n_cells = ckpt_data["num_cells"]
+        polarities = [(traj[t_first][cid][4], traj[t_first][cid][5])
+                      for cid in range(n_cells)]
+        for px, py in polarities:
+            assert math.hypot(px, py) > 0.5, "polarity not initialised"
+
+        cpu_after, _ = self._run_cpu_ref(
+            ckpt_data, n_ran, v_A=v_A, polarities=polarities,
+        )
+
+        linf, mean, rms = self._compare_global(
+            sim_after, cpu_after, "packed_16c_motile",
+            tol_linf=self._TOL_LINF_GLOBAL, tol_mean=self._TOL_MEAN_GLOBAL,
+            Nx=Nx, Ny=Ny, halo=halo,
+        )
+        tname = "cpu_ref_packed_16c_motile"
+        record_description(
+            tname,
+            f"16 cells at φ≈0.85 with v_A={v_A}, τ={tau:.0e} (no tumbles) "
+            f"over {n_ran} steps. Stresses the v_A·p̂ term in the jammed "
+            "regime — both repulsion-driven and active velocity components "
+            "are non-zero per cell."
+        )
+        record_metric(tname, "global max|Δφ²|", linf,
+                      expected=0.0, tolerance=self._TOL_LINF_GLOBAL)
+        record_metric(tname, "global mean|Δφ²|", mean,
+                      expected=0.0, tolerance=self._TOL_MEAN_GLOBAL)
 
     # ------------------------------------------------------------------
     # Long-horizon single-cell relaxation
@@ -2161,7 +2233,7 @@ class TestVtkBinaryOutput:
     """`--vtk-interval N` emits legacy-binary VTK composite phase fields."""
 
     def _run_with_vtk(self, sim, interval):
-        return sim("-n", "3", "-N", "120", "-r", "20",
+        return sim("-n", "3", "-N", "200", "-r", "20",
                    "-t", "0.5", "--dt", "0.01", "--seed", "1",
                    "--trajectory-samples", "0",
                    "--vtk-interval", str(interval))
@@ -2191,10 +2263,10 @@ class TestVtkBinaryOutput:
         hdr_text = head[:hdr_end].decode("ascii")
         assert "BINARY" in hdr_text, f"VTK not BINARY:\n{hdr_text}"
         assert "DATASET STRUCTURED_POINTS" in hdr_text
-        assert "DIMENSIONS 120 120 1" in hdr_text
+        assert "DIMENSIONS 200 200 1" in hdr_text
         assert "SCALARS phi float 1" in hdr_text
         # Payload size: Nx*Ny*4 bytes of big-endian f32.
-        payload_size = 120 * 120 * 4
+        payload_size = 200 * 200 * 4
         total_size = vtk_file.stat().st_size
         assert total_size == hdr_end + payload_size, (
             f"VTK payload size mismatch: total={total_size}, "
@@ -2243,7 +2315,7 @@ class TestVtkBinaryOutput:
 
     def test_vtk_disabled_when_interval_zero(self, sim):
         """`--vtk-interval 0` explicitly disables output (matches default)."""
-        out = sim("-n", "3", "-N", "120", "-r", "20",
+        out = sim("-n", "3", "-N", "200", "-r", "20",
                   "-t", "0.3", "--dt", "0.01", "--seed", "1",
                   "--trajectory-samples", "0",
                   "--vtk-interval", "0")

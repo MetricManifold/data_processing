@@ -292,27 +292,63 @@ def read_checkpoint(path):
             if len(sp_buf) >= 92:
                 params["adhesion_J"] = struct.unpack_from("<f", sp_buf, 88)[0]
 
-        # Cells
-        halo = params.get("halo_width", 4)
+        # Cells. v7 (sim_v3) writes a fixed power-of-two tile T followed
+        # by per-cell (id, ox, oy, cx, cy, vx, vy, volume, phi[T*T]).
+        # v3-v6 (legacy sim_v2) write per-cell variable W/H tiles with
+        # (id, x0, y0, x1, y1, ...) headers and a halo_width param.
         cells = []
-        for _ in range(num_cells):
-            cid = struct.unpack("<i", f.read(4))[0]
-            x0, y0, x1, y1 = struct.unpack("<4i", f.read(16))
-            cx, cy = struct.unpack("<2f", f.read(8))
-            vx, vy = struct.unpack("<2f", f.read(8))
-            volume = struct.unpack("<f", f.read(4))[0]
-            w = (x1 - x0) + 2 * halo
-            h = (y1 - y0) + 2 * halo
-            phi = np.frombuffer(f.read(w * h * 4), dtype=np.float32).copy()
-            cells.append({
-                "id": cid,
-                "bbox": (x0, y0, x1, y1),
-                "bbox_w": w, "bbox_h": h,
-                "centroid": (cx, cy),
-                "velocity": (vx, vy),
-                "volume": volume,
-                "phi": phi.reshape(h, w),
-            })
+        if version >= 7:
+            T = struct.unpack("<i", f.read(4))[0]
+            params["tile_T"] = T
+            # The Phase-H test framework treats every tile as
+            # halo + inner + halo and uses ``bbox[0] - halo_width`` to
+            # recover the global origin. sim_v3 has no halo concept, but
+            # to keep that helper working we expose an effective halo of
+            # 4 (the cell phi at the outer 4-pixel frame is < 1e-3 for
+            # the standard R=20..49, λ=7 setups). Adjust ``bbox`` so the
+            # subtraction gives back the real origin and the inner-only
+            # painting covers the central T-8 region.
+            FAKE_HALO = 4
+            params["halo_width"] = FAKE_HALO
+            for _ in range(num_cells):
+                cid = struct.unpack("<i", f.read(4))[0]
+                ox, oy = struct.unpack("<2i", f.read(8))
+                cx, cy = struct.unpack("<2f", f.read(8))
+                vx, vy = struct.unpack("<2f", f.read(8))
+                volume = struct.unpack("<f", f.read(4))[0]
+                phi = np.frombuffer(f.read(T * T * 4), dtype=np.float32).copy()
+                cells.append({
+                    "id": cid,
+                    # bbox[0]-halo == ox so the comparison helpers work.
+                    "bbox": (ox + FAKE_HALO, oy + FAKE_HALO,
+                             ox + T - FAKE_HALO, oy + T - FAKE_HALO),
+                    "bbox_w": T, "bbox_h": T,
+                    "origin": (ox, oy),
+                    "centroid": (cx, cy),
+                    "velocity": (vx, vy),
+                    "volume": volume,
+                    "phi": phi.reshape(T, T),
+                })
+        else:
+            halo = params.get("halo_width", 4)
+            for _ in range(num_cells):
+                cid = struct.unpack("<i", f.read(4))[0]
+                x0, y0, x1, y1 = struct.unpack("<4i", f.read(16))
+                cx, cy = struct.unpack("<2f", f.read(8))
+                vx, vy = struct.unpack("<2f", f.read(8))
+                volume = struct.unpack("<f", f.read(4))[0]
+                w = (x1 - x0) + 2 * halo
+                h = (y1 - y0) + 2 * halo
+                phi = np.frombuffer(f.read(w * h * 4), dtype=np.float32).copy()
+                cells.append({
+                    "id": cid,
+                    "bbox": (x0, y0, x1, y1),
+                    "bbox_w": w, "bbox_h": h,
+                    "centroid": (cx, cy),
+                    "velocity": (vx, vy),
+                    "volume": volume,
+                    "phi": phi.reshape(h, w),
+                })
 
         # Optional per-cell magic-tagged arrays. Order-independent parser:
         # the binary may emit blocks in any order (writer has historically
