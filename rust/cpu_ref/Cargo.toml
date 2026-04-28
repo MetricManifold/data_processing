@@ -1,0 +1,21 @@
+[package]
+name = "cpu_ref"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+byteorder = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+zip = { version = "2", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+
+[[bin]]
+name = "cpu_ref"
+path = "src/main.rs"
