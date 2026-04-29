@@ -14,6 +14,14 @@
 // Polarity update (RTP or ABP, per p.abp). Cheap: one thread per cell.
 void launch_polar(CellArrays& c, const SimParams& p);
 
+// Apply a list of scripted tumble events: for each i in [0, count),
+// theta[d_cid[i]] = d_theta[i]; px = cos(theta); py = sin(theta).
+// Used in deterministic-replay mode (--scripted-events).
+void launch_apply_scripted(CellArrays& c,
+                           const int* d_cid,
+                           const float* d_theta,
+                           int count);
+
 // Zero S then scatter phi^2 into it (one CTA per cell).
 void launch_scatter_S(CellArrays& c, const SimParams& p);
 

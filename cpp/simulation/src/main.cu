@@ -4,6 +4,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <algorithm>
+#include <cuda_runtime.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -51,6 +56,10 @@ static void usage(const char* prog) {
     printf("  --safe-mode               Cap GPU memory at 1 GB (accepted, no-op stub in v2)\n");
     printf("  --seed <n>            Placement RNG seed\n");
     printf("  --polarity-seed <n>   Polarity RNG seed\n");
+    printf("  --scripted-events <f> Pre-determined tumble events for deterministic replay\n");
+    printf("                        (file format: lines `t cid [old_theta] new_theta`,\n");
+    printf("                         3- or 4-col; '#' header lines ignored). Disables\n");
+    printf("                         the per-step PRNG tumble path entirely.\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -69,6 +78,7 @@ int main(int argc, char** argv) {
     int trajectory_interval = 0;  // Alt. to --trajectory-samples; >0 enables.
     double v_A_sigma = 0.0;       // Log-normal disorder σ on v_A at fresh init.
     int vtk_interval = 0;         // Steps between binary VTK dumps; 0 = off.
+    std::string scripted_events_path;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-n") && i+1<argc) { ncells = atoi(argv[++i]); ncells_set = true; }
@@ -136,6 +146,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--polarity-seed") && i+1<argc) {
             p.polarity_seed = atoi(argv[++i]); ov.polarity_seed = true;
         }
+        else if (!strcmp(argv[i], "--scripted-events") && i+1<argc) {
+            scripted_events_path = argv[++i];
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }
     }
@@ -185,6 +198,92 @@ int main(int argc, char** argv) {
         printf("v_A=%.4f, xi=%.1f, tau=%.1f, dt=%.4f, t_end=%.1f\n",
                p.v_A, p.xi, p.tau, p.dt, p.t_end);
         sim.init(p, ncells);
+    }
+
+    // ---- Optional: load scripted (pre-determined) tumble events.
+    // File format mirrors cpu_ref's --events output:
+    //   `# t cid [old_theta] new_theta`  (3- or 4-col; '#' lines ignored).
+    // Each event's `t` is converted to the step_count value at which
+    // Simulation::step() should fire it: step_count_at_start = round(t/dt) - 1.
+    if (!scripted_events_path.empty()) {
+        std::ifstream f(scripted_events_path);
+        if (!f) {
+            fprintf(stderr, "Error: cannot open --scripted-events file '%s'\n",
+                    scripted_events_path.c_str());
+            return 1;
+        }
+        std::string line;
+        const int N = sim.cells.num_cells;
+        const double dt = sim.params.dt;
+        // start_t = current cur_time at end of init (== ckpt.t for resume,
+        // 0 for fresh). Events at t <= start_t are rejected.
+        const double start_t = sim.cur_time;
+        const int    start_step = sim.step_count;
+        struct Evt { int step_at_start; int cid; float theta; };
+        std::vector<Evt> evs;
+        int lineno = 0;
+        while (std::getline(f, line)) {
+            ++lineno;
+            // strip leading whitespace
+            size_t p0 = line.find_first_not_of(" \t\r\n");
+            if (p0 == std::string::npos) continue;
+            if (line[p0] == '#') continue;
+            std::istringstream is(line);
+            std::vector<double> toks;
+            double v;
+            while (is >> v) toks.push_back(v);
+            double t, new_theta; int cid;
+            if (toks.size() == 3) {
+                t = toks[0]; cid = (int)toks[1]; new_theta = toks[2];
+            } else if (toks.size() == 4) {
+                t = toks[0]; cid = (int)toks[1]; new_theta = toks[3];
+            } else {
+                fprintf(stderr,
+                    "Error: %s line %d: expected 3 or 4 cols, got %zu\n",
+                    scripted_events_path.c_str(), lineno, toks.size());
+                return 1;
+            }
+            if (cid < 0 || cid >= N) {
+                fprintf(stderr,
+                    "Error: %s line %d: cid %d out of range (n_cells=%d)\n",
+                    scripted_events_path.c_str(), lineno, cid, N);
+                return 1;
+            }
+            if (t <= start_t) {
+                fprintf(stderr,
+                    "Error: %s line %d: t=%.6f <= start_t=%.6f\n",
+                    scripted_events_path.c_str(), lineno, t, start_t);
+                return 1;
+            }
+            int step_idx = (int)std::llround((t - start_t) / dt);
+            int step_at_start = start_step + step_idx - 1;
+            evs.push_back({step_at_start, cid, (float)new_theta});
+        }
+        std::sort(evs.begin(), evs.end(), [](const Evt& a, const Evt& b) {
+            if (a.step_at_start != b.step_at_start) return a.step_at_start < b.step_at_start;
+            return a.cid < b.cid;
+        });
+        // Hand off to sim.
+        sim.scripted_active = !evs.empty();
+        sim.scripted_cursor = 0;
+        sim.h_scripted_step.reserve(evs.size());
+        sim.h_scripted_cid.reserve(evs.size());
+        sim.h_scripted_theta.reserve(evs.size());
+        for (const auto& e : evs) {
+            sim.h_scripted_step.push_back(e.step_at_start);
+            sim.h_scripted_cid.push_back(e.cid);
+            sim.h_scripted_theta.push_back(e.theta);
+        }
+        if (!evs.empty()) {
+            cudaMalloc(&sim.d_scripted_cid,   evs.size() * sizeof(int));
+            cudaMalloc(&sim.d_scripted_theta, evs.size() * sizeof(float));
+            cudaMemcpy(sim.d_scripted_cid,   sim.h_scripted_cid.data(),
+                       evs.size() * sizeof(int),   cudaMemcpyHostToDevice);
+            cudaMemcpy(sim.d_scripted_theta, sim.h_scripted_theta.data(),
+                       evs.size() * sizeof(float), cudaMemcpyHostToDevice);
+        }
+        printf("[scripted] %zu events loaded from %s (PRNG tumble path disabled)\n",
+               evs.size(), scripted_events_path.c_str());
     }
 
     sim.run();

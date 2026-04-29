@@ -507,6 +507,38 @@ void launch_polar(CellArrays& c, const SimParams& p) {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. k_apply_scripted — write pre-determined (cid, theta) pairs.
+// ---------------------------------------------------------------------------
+// Used by --scripted-events deterministic replay. One thread per event.
+// ---------------------------------------------------------------------------
+__global__ void k_apply_scripted(
+    float* __restrict__ theta_arr,
+    float* __restrict__ px, float* __restrict__ py,
+    const int* __restrict__ cids,
+    const float* __restrict__ thetas,
+    int count)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int   c = cids[i];
+    float t = thetas[i];
+    theta_arr[c] = t;
+    px[c] = cosf(t);
+    py[c] = sinf(t);
+}
+
+void launch_apply_scripted(CellArrays& c,
+                           const int* d_cid,
+                           const float* d_theta,
+                           int count)
+{
+    if (count <= 0) return;
+    k_apply_scripted<<<(count + 31) / 32, 32>>>(
+        c.polar_theta, c.polar_x, c.polar_y,
+        d_cid, d_theta, count);
+}
+
+// ---------------------------------------------------------------------------
 // 6. k_init_phi — tanh init profile, fresh start only.
 // ---------------------------------------------------------------------------
 // phi(r) = 0.5 * (1 - tanh(2*(r - R_eff) / iw))

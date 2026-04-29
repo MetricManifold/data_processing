@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <random>
 
 #define CK(call) do {                                                      \
     cudaError_t e = (call);                                                \
@@ -306,6 +307,25 @@ void Simulation::finalize_init() {
 void Simulation::init(const SimParams& p, int n_cells) {
     params = p;
 
+    // If no seed was supplied, draw a non-deterministic one. Storing it
+    // back into params makes the actual seed reproducible (it gets written
+    // into the checkpoint SimParams blob) and avoids the historical bug
+    // where every "unseeded" run silently used seed=42.
+    if (params.seed == 0) {
+        std::random_device rd;
+        unsigned s = rd();
+        if (s == 0) s = 0xC0FFEEu;  // re-roll the unlikely 0
+        params.seed = s;
+    }
+    if (params.polarity_seed == 0) {
+        std::random_device rd;
+        unsigned s = rd();
+        if (s == 0) s = 0xDECAFBADu;
+        params.polarity_seed = s;
+    }
+    printf("[SIM] seed=%u polarity_seed=%u\n",
+           params.seed, params.polarity_seed);
+
     if (params.Nx < TILE_T || params.Ny < TILE_T) {
         fprintf(stderr,
                 "[FATAL] domain (%d x %d) smaller than TILE_T=%d. "
@@ -432,6 +452,24 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     if (ov.seed)               params.seed = cli.seed;
     if (ov.polarity_seed)      params.polarity_seed = cli.polarity_seed;
     if (ov.abp)                params.abp = cli.abp;
+
+    // Legacy checkpoints (or fresh CLI without --seed) may leave seed=0.
+    // Promote to a non-deterministic value so resumes never silently
+    // collide on the historical seed=42 fallback.
+    if (params.seed == 0) {
+        std::random_device rd;
+        unsigned s = rd();
+        if (s == 0) s = 0xC0FFEEu;
+        params.seed = s;
+    }
+    if (params.polarity_seed == 0) {
+        std::random_device rd;
+        unsigned s = rd();
+        if (s == 0) s = 0xDECAFBADu;
+        params.polarity_seed = s;
+    }
+    printf("[SIM] resume seed=%u polarity_seed=%u\n",
+           params.seed, params.polarity_seed);
 
     if (params.trajectory_samples > 0 && params.t_end > 0 && params.dt > 0) {
         long long total_steps = (long long)(params.t_end / params.dt + 0.5);
@@ -655,7 +693,26 @@ bool Simulation::init_from_checkpoint(const std::string& path,
 // 5. every 10 steps: rebind (writes shifted tile to phi_out), then swap.
 // ---------------------------------------------------------------------------
 void Simulation::step() {
-    launch_polar(cells, params);
+    if (scripted_active) {
+        // Deterministic replay: apply all events whose step_count matches
+        // the current value (events are sorted ascending). We then SKIP
+        // launch_polar entirely (PRNG path is disabled).
+        int begin = scripted_cursor;
+        const int total = (int)h_scripted_step.size();
+        while (scripted_cursor < total
+               && h_scripted_step[scripted_cursor] == step_count) {
+            scripted_cursor++;
+        }
+        int count = scripted_cursor - begin;
+        if (count > 0) {
+            launch_apply_scripted(cells,
+                                  d_scripted_cid + begin,
+                                  d_scripted_theta + begin,
+                                  count);
+        }
+    } else {
+        launch_polar(cells, params);
+    }
     launch_scatter_S(cells, params);
     launch_evolve(cells, params);
     std::swap(cells.phi_in, cells.phi_out);
@@ -980,4 +1037,6 @@ void Simulation::cleanup() {
     cf(cells.polar_theta); cf(cells.polar_x); cf(cells.polar_y);
     cf(cells.gamma_cell); cf(cells.v_A_cell); cf(cells.tgt_radius);
     cf(cells.rng_states);
+    cf(d_scripted_cid);
+    cf(d_scripted_theta);
 }

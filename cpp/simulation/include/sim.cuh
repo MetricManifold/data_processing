@@ -39,6 +39,18 @@ struct Simulation {
     // Steps between binary VTK composite-field dumps. 0 = disabled (default).
     int vtk_interval = 0;
 
+    // ---- Scripted (pre-determined) tumble events for deterministic replay.
+    // When `scripted_active` is true, the per-step PRNG-driven polarity
+    // update is skipped; instead the events listed here fire at the
+    // matching step_count value. Sorted ascending by step_count.
+    bool scripted_active = false;
+    std::vector<int>   h_scripted_step;   // length = total events
+    std::vector<int>   h_scripted_cid;
+    std::vector<float> h_scripted_theta;
+    int*   d_scripted_cid   = nullptr;    // device mirror of h_scripted_cid
+    float* d_scripted_theta = nullptr;
+    int    scripted_cursor  = 0;          // first unprocessed event idx
+
     void init(const SimParams& p, int n_cells);
     bool init_from_checkpoint(const std::string& path,
                               const SimParams& cli_params,
