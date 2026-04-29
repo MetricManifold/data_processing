@@ -54,12 +54,22 @@ pub struct CkptCell {
     pub phi_tile: Vec<f32>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Sidecars {
+    /// Per-cell tumble angles theta (radians). One f32 per cell.
+    pub polr: Option<Vec<f32>>,
+    pub va_a: Option<Vec<f32>>,
+    pub gama: Option<Vec<f32>>,
+    pub radi: Option<Vec<f32>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
     pub t: f64,
     pub params: CkptParams,
     pub tile_t: usize,
     pub cells: Vec<CkptCell>,
+    pub sidecars: Sidecars,
 }
 
 fn rd_u32_at(buf: &[u8], off: usize) -> u32 {
@@ -179,5 +189,47 @@ pub fn read(path: &Path) -> Result<Checkpoint> {
         });
     }
 
-    Ok(Checkpoint { t, params, tile_t, cells })
+    Ok(Checkpoint { t, params, tile_t, cells, sidecars: read_sidecars(&mut c) })
+}
+
+fn read_sidecars(c: &mut std::io::Cursor<&Vec<u8>>) -> Sidecars {
+    // Tagged sidecars at file tail: u32 magic + i32 count + count*f32 data.
+    // Magic values are little-endian-encoded ASCII; reading as u32 LE returns
+    // the tag in REVERSED character order.
+    //   on disk "RLOP" = u32 0x504F4C52 = ASCII "POLR"
+    //   on disk "A_AV" = u32 0x56415F41 = ASCII "VA_A"
+    //   on disk "AMAG" = u32 0x47414D41 = ASCII "GAMA"
+    //   on disk "IDAR" = u32 0x52414449 = ASCII "RADI"
+    let mut sc = Sidecars::default();
+    loop {
+        let pos = c.position();
+        let m = match c.read_u32::<LittleEndian>() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let count = match c.read_i32::<LittleEndian>() {
+            Ok(v) => v,
+            Err(_) => { c.set_position(pos); break; }
+        };
+        if count <= 0 || count > 1_000_000 {
+            c.set_position(pos); break;
+        }
+        let mut data = vec![0f32; count as usize];
+        let mut ok = true;
+        for v in data.iter_mut() {
+            match c.read_f32::<LittleEndian>() {
+                Ok(x) => *v = x,
+                Err(_) => { ok = false; break; }
+            }
+        }
+        if !ok { c.set_position(pos); break; }
+        match m {
+            0x504F4C52 => sc.polr = Some(data),    // 'POLR'
+            0x56415F41 => sc.va_a = Some(data),    // 'VA_A'
+            0x47414D41 => sc.gama = Some(data),    // 'GAMA'
+            0x52414449 => sc.radi = Some(data),    // 'RADI'
+            _ => { c.set_position(pos); break; }   // unknown tag, stop
+        }
+    }
+    sc
 }

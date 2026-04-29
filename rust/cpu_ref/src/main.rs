@@ -15,7 +15,7 @@ mod npz;
 mod sim;
 
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -104,6 +104,13 @@ struct Cli {
     /// Optional file: append every tumble event "t cid old_theta new_theta".
     #[arg(long)]
     events: Option<PathBuf>,
+
+    /// Pre-determined tumble events for deterministic replay (mirrors
+    /// the GPU's `--scripted-events`). When set, the per-step PRNG tumble
+    /// path is bypassed entirely. File format matches `events.txt`:
+    ///   `# t cid old_theta new_theta`  (3- or 4-col; `#` lines ignored).
+    #[arg(long)]
+    scripted_events: Option<PathBuf>,
 
     /// Log every N steps.
     #[arg(long, default_value_t = 2000)]
@@ -204,22 +211,34 @@ fn main() -> Result<()> {
 
     // Build cells: paint each checkpoint tile into a full-domain f64 field.
     let pseed = cli.polarity_seed as u64; // sign-cast preserves bits
+    let polr_sidecar: Option<Vec<f32>> = ckpt.sidecars.polr.clone();
+    if polr_sidecar.is_some() && pols.is_none() {
+        println!("[init] using POLR sidecar from checkpoint for initial polarities");
+    } else if pols.is_some() {
+        println!("[init] using --polarities file for initial polarities");
+    } else {
+        println!("[init] no POLR sidecar, no --polarities; seeding theta from PRNG (seed={})",
+                 cli.polarity_seed);
+    }
     let mut cells: Vec<Cell> = Vec::with_capacity(n);
     for (i, c) in ckpt.cells.iter().enumerate() {
         let mut phi = vec![0.0f64; nx * ny];
         paint_tile_periodic(&mut phi, nx, ny, &c.phi_tile, ckpt.tile_t, c.ox, c.oy);
         let mut rng = Xoshiro256Plus::seed_for_cell(pseed, i as u64);
-        // Initial theta: from explicit polarities file if given, else from PRNG.
-        let (theta_init, px_init, py_init) = match &pols {
-            Some(p) => {
-                let (px, py) = p[i];
-                (py.atan2(px), px, py)
-            }
-            None => {
-                let u = rng.next_f64();
-                let theta = u * std::f64::consts::TAU;
-                (theta, theta.cos(), theta.sin())
-            }
+        // Initial theta priority:
+        //   1. --polarities file (explicit)
+        //   2. POLR sidecar in checkpoint
+        //   3. PRNG (--polarity-seed)
+        let (theta_init, px_init, py_init) = if let Some(pp) = &pols {
+            let (px, py) = pp[i];
+            (py.atan2(px), px, py)
+        } else if let Some(polr) = &polr_sidecar {
+            let theta = polr[i] as f64;
+            (theta, theta.cos(), theta.sin())
+        } else {
+            let u = rng.next_f64();
+            let theta = u * std::f64::consts::TAU;
+            (theta, theta.cos(), theta.sin())
         };
         cells.push(Cell {
             phi,
@@ -301,11 +320,69 @@ fn main() -> Result<()> {
         Some(bw)
     } else { None };
 
+    // ---- Optional: load scripted (pre-determined) tumble events. ----
+    // File format: "# t cid [old_theta] new_theta" (3- or 4-col; '#' ignored).
+    // Each event's t is converted to step_i = round((t - ckpt.t) / dt).
+    // When scripted_active, the PRNG tumble path is bypassed (tau passed as
+    // 0.0 to step()), and tumbles are applied directly here.
+    let scripted: Vec<(u64, u32, f64)> = if let Some(path) = &cli.scripted_events {
+        let f = File::open(path)
+            .with_context(|| format!("opening scripted-events file {:?}", path))?;
+        let reader = BufReader::new(f);
+        let mut evs: Vec<(u64, u32, f64)> = Vec::new();
+        for (lineno, line) in reader.lines().enumerate() {
+            let line = line?;
+            let s = line.trim();
+            if s.is_empty() || s.starts_with('#') { continue; }
+            let toks: Vec<f64> = s.split_whitespace()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect();
+            let (t, cid, new_theta) = match toks.len() {
+                3 => (toks[0], toks[1] as i32, toks[2]),
+                4 => (toks[0], toks[1] as i32, toks[3]),
+                k => bail!("scripted-events {:?} line {}: expected 3 or 4 cols, got {}",
+                           path, lineno+1, k),
+            };
+            if cid < 0 || cid >= n as i32 {
+                bail!("scripted-events {:?} line {}: cid {} out of range (n={})",
+                      path, lineno+1, cid, n);
+            }
+            if t <= ckpt.t {
+                bail!("scripted-events {:?} line {}: t={} <= start_t={}",
+                      path, lineno+1, t, ckpt.t);
+            }
+            let step_i = ((t - ckpt.t) / dt).round() as u64;
+            evs.push((step_i, cid as u32, new_theta));
+        }
+        evs.sort_by_key(|&(s, c, _)| (s, c));
+        println!("[scripted] {} events loaded from {:?} (PRNG tumble path disabled)",
+                 evs.len(), path);
+        evs
+    } else { Vec::new() };
+    let scripted_active = !scripted.is_empty();
+    let effective_tau = if scripted_active { 0.0 } else { cli.tau };
+    let mut sc_cursor: usize = 0;
+
     let t_start = Instant::now();
     let mut k_idx = 1usize;
     for step_i in 1..=n_steps {
         let t_after = ckpt.t + (step_i as f64) * dt;
-        sim::step(&mut cells, &p, &mut ws, cli.tau, t_after, &mut events);
+
+        // Apply any scripted events whose step matches this step.
+        if scripted_active {
+            while sc_cursor < scripted.len() && scripted[sc_cursor].0 == step_i {
+                let (_, cid, new_theta) = scripted[sc_cursor];
+                let c = &mut cells[cid as usize];
+                let old_theta = c.theta;
+                c.theta = new_theta;
+                c.px = new_theta.cos();
+                c.py = new_theta.sin();
+                events.push(TumbleEvent { t: t_after, cid, old_theta, new_theta });
+                sc_cursor += 1;
+            }
+        }
+
+        sim::step(&mut cells, &p, &mut ws, effective_tau, t_after, &mut events);
 
         // Flush new tumble events to file (always: cheap, low rate).
         if let Some(bw) = events_w.as_mut() {
