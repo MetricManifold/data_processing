@@ -212,6 +212,15 @@ fn main() -> Result<()> {
     // Build cells: paint each checkpoint tile into a full-domain f64 field.
     let pseed = cli.polarity_seed as u64; // sign-cast preserves bits
     let polr_sidecar: Option<Vec<f32>> = ckpt.sidecars.polr.clone();
+    let gama_sidecar: Option<Vec<f32>> = ckpt.sidecars.gama.clone();
+    if let Some(g) = &gama_sidecar {
+        let n_uniq: std::collections::BTreeSet<i64> =
+            g.iter().map(|x| (*x as f64 * 1000.0).round() as i64).collect();
+        println!("[init] using GAMA sidecar: {} unique values, range=[{:.4}, {:.4}]",
+                 n_uniq.len(),
+                 g.iter().cloned().fold(f32::INFINITY, f32::min),
+                 g.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    }
     if polr_sidecar.is_some() && pols.is_none() {
         println!("[init] using POLR sidecar from checkpoint for initial polarities");
     } else if pols.is_some() {
@@ -240,12 +249,18 @@ fn main() -> Result<()> {
             let theta = u * std::f64::consts::TAU;
             (theta, theta.cos(), theta.sin())
         };
+        let cell_gamma = gama_sidecar
+            .as_ref()
+            .and_then(|g| g.get(i).copied())
+            .map(|v| v as f64)
+            .unwrap_or(ckpt.params.gamma);
         cells.push(Cell {
             phi,
             vx: c.vx as f64,
             vy: c.vy as f64,
             vol: c.volume as f64,
             v_a: cli.v_a,
+            gamma: cell_gamma,
             theta: theta_init,
             px: px_init,
             py: py_init,

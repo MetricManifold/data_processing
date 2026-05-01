@@ -122,6 +122,9 @@ pub struct Cell {
     pub vy: f64,
     pub vol: f64,
     pub v_a: f64,
+    /// Per-cell interface tension. Defaults to `Params.gamma` when no
+    /// GAMA sidecar is present in the checkpoint.
+    pub gamma: f64,
     /// Run-and-tumble polar angle (radians). `(px, py) = (cosθ, sinθ)` is
     /// recomputed from `theta` after every tumble.
     pub theta: f64,
@@ -191,9 +194,8 @@ pub fn step(
     let n_pix = nx * ny;
     let n_cells = cells.len();
 
-    // Pre-computed coefficients.
-    let two_g = 2.0 * p.gamma;
-    let tgb = 60.0 * p.gamma / (p.lambd * p.lambd);
+    // Pre-computed coefficients (global; gamma factors are per-cell).
+    let inv_lambda2 = 1.0 / (p.lambd * p.lambd);
     let two_keff = 60.0 * p.kappa / (p.lambd * p.lambd);
     let area_target = p.target_area();
     let vc = p.mu / area_target;
@@ -308,6 +310,9 @@ pub fn step(
             let phi = &c.phi;
             let vd = area_target - c.vol;
             let (vxn, vyn) = v_n[i];
+            // Per-cell gamma factors.
+            let two_g = 2.0 * c.gamma;
+            let tgb = 60.0 * c.gamma * inv_lambda2;
             for iy in 0..ny {
                 let row = iy * nx;
                 let row_n = yp1[iy] * nx;
