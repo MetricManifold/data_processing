@@ -39,6 +39,13 @@ struct Simulation {
     // Steps between binary VTK composite-field dumps. 0 = disabled (default).
     int vtk_interval = 0;
 
+    // Live CUDA-OpenGL viewer. Only honoured when the binary was compiled
+    // with -DENABLE_VISUALIZER=ON. Updates the window every
+    // `live_view_interval` steps (default: every step). Closing the window
+    // or pressing ESC tears down the viewer and the sim continues headless.
+    bool live_view = false;
+    int  live_view_interval = 1;
+
     // ---- Scripted (pre-determined) tumble events for deterministic replay.
     // When `scripted_active` is true, the per-step PRNG-driven polarity
     // update is skipped; instead the events listed here fire at the
@@ -70,7 +77,7 @@ struct Simulation {
     void print_status();
     void write_trajectory();
     void write_vtk();
-    void save_checkpoint(const std::string& dir);
+    void save_checkpoint(const std::string& dir, const std::string& tag = "");
 
     static int domain_for(int n, double R, double rho) {
         return (int)std::ceil(std::sqrt((double)n * M_PI * R * R / rho));

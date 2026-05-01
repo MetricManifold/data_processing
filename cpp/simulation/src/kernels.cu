@@ -16,7 +16,13 @@
 //   - perimeter accumulation in the evolve reduction
 //   - ABP polarity branch in k_polar (reference is RTP-only)
 //
-// All kernels assume a fixed power-of-two tile (TILE_T) and a unified phi
+// ---------------------------------------------------------------------------
+// CELL_SIM_BBOX_TELEMETRY \u2014 OPTIONAL build-time switch.
+//
+// SHOULD NOT BE ENABLED IN GENERAL. Off by default. Enable only for one-off
+// audits of bbox saturation: each rebind atomicMaxes the pre-clamp half-width
+// into a device counter. Cost is one global atomicMax per cell per rebind\n// (negligible vs the rebind itself) plus a 4-byte D2H copy at print_interval.
+// Host code prints a summary line in print_status() and a lifetime max at\n// end of run. Logs are quiet unless a clamp event occurs.\n//\n// To enable: add -DCELL_SIM_BBOX_TELEMETRY to the compiler command line\n// (e.g. via `cmake -DCMAKE_CUDA_FLAGS=-DCELL_SIM_BBOX_TELEMETRY ...`).\n// ---------------------------------------------------------------------------\n#ifdef CELL_SIM_BBOX_TELEMETRY\n__device__ int g_bbox_max_raw_hw = 0;\n__device__ int g_bbox_clamp_events = 0;\n#endif\n\n// All kernels assume a fixed power-of-two tile (TILE_T) and a unified phi
 // pool of N*TILE_AREA floats.  No neighbour list, no halo, no spatial hash.
 
 #include "kernels.cuh"
@@ -351,8 +357,9 @@ __global__ void k_rebind(
     const float* __restrict__ Cxx,
     const float* __restrict__ Cyy,
     const float* __restrict__ tgt_radius,
+    const float* __restrict__ gamma_cell,
     int N,
-    float bbox_k, int bbox_align, int bbox_min, float lambda)
+    float bbox_k, float gamma_ref, int bbox_align, int bbox_min)
 {
     const int n = blockIdx.x;
     if (n >= N) return;
@@ -383,21 +390,38 @@ __global__ void k_rebind(
         if (vary < 0.0f) vary = 0.0f;
         float sigx = sqrtf(varx);
         float sigy = sqrtf(vary);
-        // Per-axis half-widths: hw = ceil(K*sigma + R/2). Margin scales
+        // Per-axis half-widths: hw = ceil(K_eff*sigma + R/2). Margin scales
         // with cell radius so the rect tracks shape change between rebinds.
-        // The hard floor is R + 3*lambda (where the tanh interface decays
-        // below ~1e-3): cell support cannot extend past that, so clamping
-        // there guarantees the active rect always covers the physical cell.
+        // K (subdomain_padding) controls how aggressively the rect tracks
+        // the second moments; the only hard floor is bbox_min and the only
+        // ceiling is Th-1 (preserves stencil halo).
+        //
+        // Per-cell K scaling: softer cells (lower gamma) deform more between
+        // rebinds and squeeze through gaps with high transient aspect ratio,
+        // so they need extra padding. K_eff = K * sqrt(max(1, gamma_ref/gamma)).
+        // At gamma == gamma_ref this is a no-op; at gamma = gamma_ref/4
+        // (e.g. 0.25 vs 1.0) it doubles K. Stiffer-than-reference cells get
+        // the unscaled K -- they don't need the extra room.
         float R = tgt_radius[n];
+        float gn = gamma_cell[n];
+        float k_scale = 1.0f;
+        if (gn > 0.0f && gn < gamma_ref) {
+            k_scale = sqrtf(gamma_ref / gn);
+        }
+        float k_eff = bbox_k * k_scale;
         float margin = 0.5f * R;
-        int support = (int)ceilf(R + 3.0f * lambda);
-        int hwx = (int)ceilf(bbox_k * sigx + margin);
-        int hwy = (int)ceilf(bbox_k * sigy + margin);
-        if (hwx < support) hwx = support;
-        if (hwy < support) hwy = support;
+        int hwx = (int)ceilf(k_eff * sigx + margin);
+        int hwy = (int)ceilf(k_eff * sigy + margin);
         hwx = ((hwx + bbox_align - 1) / bbox_align) * bbox_align;
         hwy = ((hwy + bbox_align - 1) / bbox_align) * bbox_align;
         const int hmax = Th - 1;     // keep 1px stencil halo
+#ifdef CELL_SIM_BBOX_TELEMETRY
+        // Record peak unclamped hw and count clamp events. NOT enabled by
+        // default \u2014 see comment in kernels.cu file header.
+        int hwmax_pre = hwx > hwy ? hwx : hwy;
+        atomicMax(&g_bbox_max_raw_hw, hwmax_pre);
+        if (hwx > hmax || hwy > hmax) atomicAdd(&g_bbox_clamp_events, 1);
+#endif
         if (hwx > hmax) hwx = hmax;
         if (hwy > hmax) hwy = hmax;
         if (hwx < bbox_min) hwx = bbox_min;
@@ -449,14 +473,13 @@ __global__ void k_rebind(
     }
 }
 
-void launch_rebind(CellArrays& c, float lambda) {
+void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref) {
     const int N = c.num_cells;
     if (N == 0) return;
     k_rebind<<<N, 256>>>(c.phi_in, c.phi_out, c.origin, c.rect,
                          c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy,
-                         c.tgt_radius, N,
-                         TILE_BBOX_K, TILE_BBOX_ALIGN, TILE_BBOX_MIN,
-                         lambda);
+                         c.tgt_radius, c.gamma_cell, N,
+                         bbox_k, gamma_ref, TILE_BBOX_ALIGN, TILE_BBOX_MIN);
 }
 
 // ---------------------------------------------------------------------------

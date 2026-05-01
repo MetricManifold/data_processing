@@ -31,16 +31,35 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_executable(cell_sim
+# Optional CUDA + OpenGL live viewer. OFF by default. Enable locally with
+#   cmake -DENABLE_VISUALIZER=ON ...
+# Requires GLFW3 + OpenGL on the build host. SHOULD NOT BE ENABLED ON
+# CLUSTER BUILDS (headless nodes, no display).
+option(ENABLE_VISUALIZER "Build the live CUDA-OpenGL viewer (--live-view)" OFF)
+
+set(CELL_SIM_SOURCES
     src/main.cu
     src/kernels.cu
     src/sim.cu
 )
+if(ENABLE_VISUALIZER)
+    list(APPEND CELL_SIM_SOURCES src/visualizer.cu)
+endif()
+
+add_executable(cell_sim ${CELL_SIM_SOURCES})
 
 target_include_directories(cell_sim PRIVATE include)
 target_compile_options(cell_sim PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math --expt-relaxed-constexpr>
 )
+
+if(ENABLE_VISUALIZER)
+    find_package(OpenGL REQUIRED)
+    find_package(glfw3 CONFIG REQUIRED)
+    target_compile_definitions(cell_sim PRIVATE ENABLE_VISUALIZER)
+    target_link_libraries(cell_sim PRIVATE glfw OpenGL::GL)
+    message(STATUS "cell_sim: live viewer ENABLED (--live-view available)")
+endif()
 set_target_properties(cell_sim PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     CUDA_SEPARABLE_COMPILATION OFF

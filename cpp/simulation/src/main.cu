@@ -37,7 +37,7 @@ static void usage(const char* prog) {
     printf("  --xi <f>              Friction (default: 1500)\n");
     printf("  --lambda <f>          Interface width (default: 7.0)\n");
     printf("  -l <f>                Interface width (alias for --lambda)\n");
-    printf("  --subdomain-padding <f>  Bbox padding as fraction of R (default: 0.6)\n");
+    printf("  --subdomain-padding <f>  Adaptive-rect K: half-width = ceil(K*sigma + R/2) (default: 2.0)\n");
     printf("  --abp                 Use ABP instead of run-and-tumble\n");
     printf("  -o <dir>              Output directory (default: ./output)\n");
     printf("  -c <path>             Resume from checkpoint\n");
@@ -49,6 +49,8 @@ static void usage(const char* prog) {
     printf("  --trajectory-samples <n>  Number of trajectory snapshots (default 100; 0=off)\n");
     printf("  --trajectory-interval <n> Steps between trajectory saves (alt. to --trajectory-samples)\n");
     printf("  --vtk-interval <n>    Write binary VTK composite field every N steps (0=off, default)\n");
+    printf("  --live-view           Open live CUDA-OpenGL viewer (requires ENABLE_VISUALIZER build)\n");
+    printf("  --live-view-interval <n>  Steps between viewer updates (default: 1)\n");
     printf("  --save-individual-fields  Write per-cell phi (accepted, no-op stub in v2)\n");
     printf("  --use-diagnostics         Enable diagnostic outputs (accepted, no-op stub in v2)\n");
     printf("  --observable-interval <n> Diagnostic cadence (accepted, no-op stub in v2)\n");
@@ -78,6 +80,9 @@ int main(int argc, char** argv) {
     int trajectory_interval = 0;  // Alt. to --trajectory-samples; >0 enables.
     double v_A_sigma = 0.0;       // Log-normal disorder σ on v_A at fresh init.
     int vtk_interval = 0;         // Steps between binary VTK dumps; 0 = off.
+    bool live_view = false;       // Open CUDA-GL live window. Requires
+                                  // ENABLE_VISUALIZER build; otherwise warned + ignored.
+    int  live_view_interval = 1;  // Step cadence for viewer updates.
     std::string scripted_events_path;
 
     for (int i = 1; i < argc; i++) {
@@ -133,6 +138,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--vtk-interval") && i+1<argc) {
             vtk_interval = atoi(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--live-view")) { live_view = true; }
+        else if (!strcmp(argv[i], "--live-view-interval") && i+1<argc) {
+            live_view_interval = atoi(argv[++i]);
+        }
         // Accept-and-ignore stubs: baseline-compatible flags whose payloads
         // (per-cell VTK, GPU diagnostics, stress tensor, mem cap) are not yet
         // implemented in v2. Keeping the CLI surface intact prevents script
@@ -187,6 +196,15 @@ int main(int argc, char** argv) {
     sim.gamma_spec = gamma_spec;
     sim.v_A_sigma = v_A_sigma;
     sim.vtk_interval = vtk_interval;
+    sim.live_view = live_view;
+    sim.live_view_interval = (live_view_interval > 0) ? live_view_interval : 1;
+#ifndef ENABLE_VISUALIZER
+    if (live_view) {
+        fprintf(stderr, "[warn] --live-view ignored: binary not built with "
+                        "ENABLE_VISUALIZER. Rebuild with cmake -DENABLE_VISUALIZER=ON.\n");
+        sim.live_view = false;
+    }
+#endif
 
     if (!ckpt_path.empty()) {
         if (!sim.init_from_checkpoint(ckpt_path, p, ov)) return 1;

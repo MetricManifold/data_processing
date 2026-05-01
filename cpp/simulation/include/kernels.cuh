@@ -35,7 +35,7 @@ void launch_evolve(CellArrays& c, const SimParams& p);
 // Adjusts origin[n] and copies the (possibly shifted) tile into phi_out.
 // After this kernel, the *caller* must std::swap(phi_in, phi_out) so the
 // rebound tile becomes the current state.
-void launch_rebind(CellArrays& c, float lambda);
+void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref);
 
 // One-shot host helpers used only at init / resume.
 void launch_rng_init(CellArrays& c, unsigned long seed);

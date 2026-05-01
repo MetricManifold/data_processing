@@ -26,11 +26,12 @@ struct SimParams {
     double v_A = 0.0;
     double xi = 1500.0;
     double tau = 10000.0;
-    // Retained for CLI/checkpoint compatibility. v3 uses a fixed power-of-2
-    // tile (TILE_T) and rebinds via COM recentre, so this is no longer used
-    // for resizing; we keep it in SimParams so `init_from_checkpoint` can
-    // round-trip pre-v7 checkpoint headers without surprises.
-    double subdomain_padding = 0.6;
+    // Adaptive-rect half-width multiplier on cell sigma (per-axis):
+    //   hwx = ceil(subdomain_padding * sigma_x + R/2), clamped & aligned.
+    // Default 2.0; tighter values trade physics fidelity for speed. The
+    // field was a dead leftover in v3..v7 and is repurposed here, so
+    // resumes from older checkpoints reset it to the default at load.
+    double subdomain_padding = 2.0;
     int halo = 0;                  // unused in v3 (kept for checkpoint round-trip)
     int save_interval = 0;
     int print_interval = 100;
@@ -58,17 +59,24 @@ struct SimParams {
 // work for round cells.
 //
 // Sizing: at R=49, lambda=7 the tanh interface decays to <1e-3 by r =
-// R + 3*lambda = 70 px from COM. T=192 leaves T/2-1 = 95 px clearance,
-// adequate for round AND elongated cells (squished cells need extra room
-// along the long axis). T=128 was too tight for Palmieri R=49 — the
-// floor R+3*lambda already exceeded T/2-1, so the support was clipped.
+// R + 3*lambda = 70 px from COM (~10*lambda for FP-noise floor). For
+// elongated cells the LONG-AXIS extent is what counts: a cell at aspect
+// ratio a/b=5 reaches ~97 px from COM, needing hw >= 97 + 3*lambda =
+// 118 px for safe interface decay (>= 132 px for full FP-floor budget).
+// T=320 leaves T/2-1 = 159 px clearance — comfortably handles the
+// stretchy-cell-through-gap regime. T=192 (ceiling 95) was tight for
+// extreme deformation: a cell at aspect 4 already grazes the ceiling.
 // The runtime guards against domains smaller than TILE_T to keep the
 // bbox-comparison helpers alias-free.
+//
+// Per-cell memory cost (double-buffered, f32): 2*T^2*4 bytes/cell.
+// T=192 -> 295 KB/cell ; T=320 -> 819 KB/cell. At N=4608 that is
+// 3.8 GB — fine on H100/A100, irrelevant for typical N=288/1152 runs.
 //
 // All kernels iterate p = 0..rw*rh and decode (lx, ly) by /, %; T does
 // NOT need to be a power of two.
 // ---------------------------------------------------------------------------
-static constexpr int TILE_T        = 192;
+static constexpr int TILE_T        = 320;
 static constexpr int TILE_AREA     = TILE_T * TILE_T;
 static constexpr int REBIND_EVERY  = 10;
 
@@ -78,9 +86,8 @@ static constexpr int REBIND_EVERY  = 10;
 //                over-covers the tanh tail (decays to <1e-3 at R + 3*lambda).
 //   bbox_align   round half-width up to multiple (so rw = 2*hw is warp-aligned)
 //   bbox_min     minimum half-width (avoids degenerate small rects)
-static constexpr float TILE_BBOX_K      = 2.0f;
-static constexpr int   TILE_BBOX_ALIGN  = 16;
-static constexpr int   TILE_BBOX_MIN    = 32;
+static constexpr int TILE_BBOX_ALIGN = 16;
+static constexpr int TILE_BBOX_MIN   = 32;
 
 // ---------------------------------------------------------------------------
 // All GPU arrays — SoA layout. Vastly simplified from sim_v2:
