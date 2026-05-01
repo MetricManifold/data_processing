@@ -22,6 +22,9 @@ import struct
 import numpy as np
 import pytest
 
+from report import (record_metric, record_timeseries,
+                    record_comparison_panel, record_description)
+
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "cpu_ref_2tau"
 DOMAIN_L = 376.0   # IC has L = 376
@@ -233,6 +236,31 @@ class TestCutoverParity:
             print(f"\n[parity] artifacts copied to {dst}")
         print("\n[parity] " + "  ".join(f"{k}={v:.4g}"
               if isinstance(v, float) else f"{k}={v}" for k, v in summary.items()))
+
+        # --- HTML report integration ---
+        nodeid = request.node.nodeid
+        record_description(nodeid,
+            "GPU sim_v3 vs f64 Rust cpu_ref over 2τ. Trajectory drift |Δr|(t) "
+            "plus final phase-field error (Σφᵢ on full domain).")
+        record_metric(nodeid, "rms|Δr| envelope", rms_max, expected=0.0,
+                      tolerance=0.5, unit="px")
+        record_metric(nodeid, "max|Δr| p95", max_p95, expected=0.0,
+                      tolerance=0.5, unit="px")
+        record_metric(nodeid, "max|Δr| final", max_final, expected=0.0,
+                      tolerance=1.0, unit="px")
+        record_metric(nodeid, "max|Δr| any-frame", max_any, expected=0.0,
+                      tolerance=RADIUS / 5, unit="px")
+        if not np.isnan(phi_rms):
+            record_metric(nodeid, "phi RMS (final)", phi_rms, expected=0.0,
+                          tolerance=5e-2, unit="")
+            record_metric(nodeid, "phi max|err| (final)", phi_max,
+                          expected=0.0, tolerance=0.7, unit="")
+        record_timeseries(nodeid, ts, {"rms|Δr|": rms, "max|Δr|": mx},
+                          xlabel="t", ylabel="|Δr| (px)",
+                          title="GPU vs cpu_ref drift", ylog=True)
+        if not np.isnan(phi_rms):
+            record_comparison_panel(nodeid, phi_gpu, phi_gpu - phi_err_2d,
+                                    title="Final Σφᵢ: GPU | cpu_ref | |err|")
 
         # --- Assertions (envelopes from sm_75 + Linux x86_64 Rust f64) ---
         assert rms_max < 0.5, f"rms|Δr| envelope = {rms_max:.3f} > 0.5"
