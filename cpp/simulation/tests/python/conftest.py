@@ -86,6 +86,9 @@ def _find_baseline_binary():
 def pytest_addoption(parser):
     parser.addoption("--run-slow", action="store_true", default=False,
                      help="run tests marked @pytest.mark.slow")
+    parser.addoption("--parity-artifacts", action="store", default=None,
+                     metavar="DIR",
+                     help="directory to write parity-test artifacts (plots + npz)")
 
 
 def pytest_configure(config):

@@ -395,6 +395,10 @@ bool Simulation::init_from_checkpoint(const std::string& path,
 
     if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7)) {
         fread(&params, sp_sz, 1, f);
+        // subdomain_padding was a dead field in v6/v7 ckpts; reset to
+        // current default so resumed runs use a sane adaptive-rect K.
+        // CLI override below still wins.
+        params.subdomain_padding = SimParams{}.subdomain_padding;
     } else if (ver == 7) {
         fprintf(stderr, "v7 checkpoint with foreign SimParams (sp=%u, ours=%zu)\n",
                 sp_sz, sizeof(SimParams));
@@ -485,13 +489,16 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     std::vector<std::vector<float>> ck_phi(nc);
 
     if (ver == 7) {
-        // Native format: TILE_T-sized uniform tiles, full origin[] block.
+        // Native format: uniform tiles of size T_in. T_in usually matches the
+        // build's TILE_T but we accept any size and re-tile (centred) into
+        // TILE_T x TILE_T buffers, mirroring the legacy v3-v6 path.
         int32_t T_in = 0;
         fread(&T_in, 4, 1, f);
-        if (T_in != TILE_T) {
-            fprintf(stderr, "v7 checkpoint TILE_T mismatch: file=%d, build=%d\n",
-                    T_in, TILE_T);
-            fclose(f); return false;
+        const int Tin = T_in;
+        const size_t Tin_area = (size_t)Tin * Tin;
+        if (Tin != TILE_T) {
+            fprintf(stderr, "[ckpt] v7 TILE_T re-tile: file=%d build=%d\n",
+                    Tin, TILE_T);
         }
         for (int i = 0; i < nc; i++) {
             int32_t cid; fread(&cid, 4, 1, f);
@@ -501,11 +508,30 @@ bool Simulation::init_from_checkpoint(const std::string& path,
             fread(&ck_vx[i],  4, 1, f); fread(&ck_vy[i],  4, 1, f);
             fread(&ck_vol[i], 4, 1, f);
             ck_ox[i] = ox; ck_oy[i] = oy;
-            ck_phi[i].resize(TILE_AREA);
-            fread(ck_phi[i].data(), sizeof(float), TILE_AREA, f);
+            ck_phi[i].assign(TILE_AREA, 0.0f);
+            if (Tin == TILE_T) {
+                fread(ck_phi[i].data(), sizeof(float), TILE_AREA, f);
+            } else {
+                std::vector<float> tile_in(Tin_area);
+                fread(tile_in.data(), sizeof(float), Tin_area, f);
+                // Centre Tin x Tin inside TILE_T x TILE_T (or crop if larger).
+                int dx = (TILE_T - Tin) / 2;
+                int dy = (TILE_T - Tin) / 2;
+                ck_ox[i] = ox - dx;
+                ck_oy[i] = oy - dy;
+                for (int ly = 0; ly < Tin; ly++) {
+                    int dst_y = ly + dy;
+                    if (dst_y < 0 || dst_y >= TILE_T) continue;
+                    for (int lx = 0; lx < Tin; lx++) {
+                        int dst_x = lx + dx;
+                        if (dst_x < 0 || dst_x >= TILE_T) continue;
+                        ck_phi[i][dst_y * TILE_T + dst_x] = tile_in[ly * Tin + lx];
+                    }
+                }
+            }
             h_cells[i] = {ck_cx[i], ck_cy[i],
                           params.target_radius, params.gamma, params.v_A,
-                          ox, oy};
+                          ck_ox[i], ck_oy[i]};
         }
     } else {
         // Legacy v3-v6: variable W/H tiles. Re-tile each cell into a
@@ -718,7 +744,12 @@ void Simulation::step() {
     std::swap(cells.phi_in, cells.phi_out);
 
     if ((step_count + 1) % REBIND_EVERY == 0) {
-        launch_rebind(cells, (float)params.lambda);
+        // gamma_ref = baseline params.gamma (typically 1.0). Cells with
+        // gamma_cell < gamma_ref get a larger K via per-cell scaling in
+        // k_rebind (see comment there). Stiffer cells get the unscaled K.
+        launch_rebind(cells,
+                      (float)params.subdomain_padding,
+                      (float)params.gamma);
         std::swap(cells.phi_in, cells.phi_out);
     }
 
@@ -736,10 +767,25 @@ void Simulation::step() {
 // ---------------------------------------------------------------------------
 // run loop
 // ---------------------------------------------------------------------------
+#ifdef ENABLE_VISUALIZER
+#include "visualizer.cuh"
+#endif
+
 void Simulation::run() {
     int target_step = std::max(step_count, (int)(params.t_end / params.dt));
     int total = target_step - step_count;
     auto t0 = std::chrono::high_resolution_clock::now();
+
+#ifdef ENABLE_VISUALIZER
+    cellsim::Visualizer viz;
+    bool viz_active = false;
+    if (live_view) {
+        viz_active = viz.init(params.Nx, params.Ny);
+        if (!viz_active) {
+            fprintf(stderr, "[viz] init failed; continuing headless\n");
+        }
+    }
+#endif
 
     if (traj_every > 0) {
         std::string tp = out_dir + "/trajectory.txt";
@@ -761,7 +807,8 @@ void Simulation::run() {
         step();
         bool wrote_output = false;
         if (params.save_interval > 0 && step_count % params.save_interval == 0) {
-            save_checkpoint(out_dir);
+            char tag[32]; snprintf(tag, sizeof(tag), "%08d", step_count);
+            save_checkpoint(out_dir, tag);
             wrote_output = true;
         }
         if (checkpoint_interval > 0 && step_count % checkpoint_interval == 0) {
@@ -782,6 +829,25 @@ void Simulation::run() {
         if (wrote_output && params.print_interval > 0
             && step_count % params.print_interval == 0)
             print_status();
+
+#ifdef ENABLE_VISUALIZER
+        if (viz_active && (step_count % live_view_interval == 0)) {
+            if (viz.should_close()) {
+                viz.shutdown();
+                viz_active = false;
+                printf("[viz] window closed; sim continues headless\n");
+            } else {
+                viz.update(cells.S, cells.phi_in, cells.origin, cells.rect,
+                           cells.Cx, cells.Cy, cells.Cxx, cells.Cyy,
+                           cells.volumes,
+                           cells.velocities_x, cells.velocities_y,
+                           cells.gamma_cell, cells.tgt_radius,
+                           cells.num_cells, params.Nx, params.Ny, cur_time,
+                           (float)params.subdomain_padding,
+                           (float)params.lambda);
+            }
+        }
+#endif
     }
     if (traj_fp) { fclose(traj_fp); traj_fp = nullptr; }
 
@@ -793,6 +859,16 @@ void Simulation::run() {
     int denom = std::max(1, total);
     printf("[SIM] Done: %d steps, t=%.2f, wall=%.3fs (%.3f ms/step)\n",
            total, cur_time, wall, wall * 1000.0 / denom);
+#ifdef CELL_SIM_BBOX_TELEMETRY
+    extern __device__ int g_bbox_max_raw_hw;
+    extern __device__ int g_bbox_clamp_events;
+    int max_raw = 0, clamps = 0;
+    cudaMemcpyFromSymbol(&max_raw, g_bbox_max_raw_hw, sizeof(int));
+    cudaMemcpyFromSymbol(&clamps,  g_bbox_clamp_events, sizeof(int));
+    int ceiling = (TILE_T >> 1) - 1;
+    printf("[SIM] bbox-telemetry: lifetime max_raw_hw=%d (ceiling=%d, %.0f%% margin) total_clamp_events=%d\n",
+           max_raw, ceiling, 100.0 * (1.0 - (double)max_raw / ceiling), clamps);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +882,21 @@ void Simulation::print_status() {
     double tgt = params.target_area();
     printf("step=%d t=%.2f avg_vol=%.1f (target=%.1f, err=%.2f%%)\n",
            step_count, cur_time, avg, tgt, 100.0 * (avg - tgt) / tgt);
+#ifdef CELL_SIM_BBOX_TELEMETRY
+    // Read the device counters set in k_rebind. Off-default; see comment
+    // at the top of kernels.cu for why this should not be enabled in
+    // general production runs.
+    extern __device__ int g_bbox_max_raw_hw;
+    extern __device__ int g_bbox_clamp_events;
+    int max_raw = 0, clamps = 0;
+    cudaMemcpyFromSymbol(&max_raw, g_bbox_max_raw_hw, sizeof(int));
+    cudaMemcpyFromSymbol(&clamps,  g_bbox_clamp_events, sizeof(int));
+    int ceiling = (TILE_T >> 1) - 1;
+    if (clamps > 0 || max_raw >= (int)(0.9f * ceiling)) {
+        printf("  [bbox] max_raw_hw=%d (ceiling=%d, %.0f%% margin) clamp_events=%d\n",
+               max_raw, ceiling, 100.0 * (1.0 - (double)max_raw / ceiling), clamps);
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -930,7 +1021,7 @@ void Simulation::write_vtk() {
 //     phi[TILE_AREA](f32)
 //   sidecar arrays: GAMA, RADI, VA_A, POLR (each: magic(u32), N(i32), data[N](f32))
 // ---------------------------------------------------------------------------
-void Simulation::save_checkpoint(const std::string& dir) {
+void Simulation::save_checkpoint(const std::string& dir, const std::string& tag) {
     CK(cudaDeviceSynchronize());
     int n = cells.num_cells;
 
@@ -945,7 +1036,10 @@ void Simulation::save_checkpoint(const std::string& dir) {
     CK(cudaMemcpy(vy.data(),   cells.velocities_y, n*sizeof(float),    cudaMemcpyDeviceToHost));
 
     char fn[512];
-    snprintf(fn, sizeof(fn), "%s/checkpoint.bin", dir.c_str());
+    if (tag.empty())
+        snprintf(fn, sizeof(fn), "%s/checkpoint.bin", dir.c_str());
+    else
+        snprintf(fn, sizeof(fn), "%s/checkpoint_%s.bin", dir.c_str(), tag.c_str());
     FILE* f = fopen(fn, "wb");
     if (!f) { fprintf(stderr, "Failed to open %s\n", fn); return; }
 
