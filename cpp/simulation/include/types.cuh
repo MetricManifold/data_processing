@@ -76,7 +76,7 @@ struct SimParams {
 // All kernels iterate p = 0..rw*rh and decode (lx, ly) by /, %; T does
 // NOT need to be a power of two.
 // ---------------------------------------------------------------------------
-static constexpr int TILE_T        = 320;
+static constexpr int TILE_T        = 192;
 static constexpr int TILE_AREA     = TILE_T * TILE_T;
 static constexpr int REBIND_EVERY  = 10;
 

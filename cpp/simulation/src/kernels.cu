@@ -58,6 +58,39 @@ __device__ __forceinline__ float lap9(
     );
 }
 
+// Warp-level sum reduce (single value). 32-thread warp.
+__device__ __forceinline__ float warp_sum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v,  8);
+    v += __shfl_down_sync(0xffffffffu, v,  4);
+    v += __shfl_down_sync(0xffffffffu, v,  2);
+    v += __shfl_down_sync(0xffffffffu, v,  1);
+    return v;
+}
+
+// Block-level sum reduce. Uses warp-shuffle within each warp + a single
+// shared-memory pass across warp leaders. Block size must be a multiple of
+// 32 and <= 1024 (so warp count fits in a single warp). After this returns,
+// thread 0 holds the block-wide sum; other threads' return value is
+// undefined. Caller should broadcast via shared memory if needed.
+//
+//   smem must point at >= 32 floats (one per warp leader).
+__device__ __forceinline__ float block_sum(float v, float* smem) {
+    int lane    = threadIdx.x & 31;
+    int warpId  = threadIdx.x >> 5;
+    int nWarps  = (blockDim.x + 31) >> 5;
+    v = warp_sum(v);
+    if (lane == 0) smem[warpId] = v;
+    __syncthreads();
+    if (warpId == 0) {
+        float s = (threadIdx.x < nWarps) ? smem[threadIdx.x] : 0.0f;
+        s = warp_sum(s);
+        if (lane == 0) smem[0] = s;
+    }
+    __syncthreads();
+    return smem[0];
+}
+
 // ---------------------------------------------------------------------------
 // 2. k_scatter_S — atomicAdd phi^2 into global S
 // ---------------------------------------------------------------------------
@@ -206,37 +239,26 @@ __global__ void k_evolve_l1(
         while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
     }
 
-    // 7-channel block reduction (7 * 256 floats = 7 KB shared).
-    __shared__ float sred[256 * 7];
+    // 7-channel block reduction via warp-shuffle.
+    // Shared mem: one warp-leader slot per warp per channel (=> 7*32 floats max),
+    // plus one float per channel for broadcast = 7 floats. Total 7*32 + 7 = 231
+    // floats (~924 B). Independent of BS (so BS can change without reworking
+    // the shmem footprint).
+    __shared__ float ssmem[7 * 32];
     __shared__ float sbroad[7];
-    sred[tid          ] = sV;
-    sred[tid +   256  ] = sIx;
-    sred[tid + 2*256  ] = sIy;
-    sred[tid + 3*256  ] = sCx;
-    sred[tid + 4*256  ] = sCy;
-    sred[tid + 5*256  ] = sCxx;
-    sred[tid + 6*256  ] = sCyy;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) {
-            sred[tid          ] += sred[tid + s          ];
-            sred[tid +   256  ] += sred[tid + s +   256  ];
-            sred[tid + 2*256  ] += sred[tid + s + 2*256  ];
-            sred[tid + 3*256  ] += sred[tid + s + 3*256  ];
-            sred[tid + 4*256  ] += sred[tid + s + 4*256  ];
-            sred[tid + 5*256  ] += sred[tid + s + 5*256  ];
-            sred[tid + 6*256  ] += sred[tid + s + 6*256  ];
+    {
+        float v0 = block_sum(sV,   ssmem + 0*32);
+        float v1 = block_sum(sIx,  ssmem + 1*32);
+        float v2 = block_sum(sIy,  ssmem + 2*32);
+        float v3 = block_sum(sCx,  ssmem + 3*32);
+        float v4 = block_sum(sCy,  ssmem + 4*32);
+        float v5 = block_sum(sCxx, ssmem + 5*32);
+        float v6 = block_sum(sCyy, ssmem + 6*32);
+        if (tid == 0) {
+            sbroad[0] = v0; sbroad[1] = v1; sbroad[2] = v2;
+            sbroad[3] = v3; sbroad[4] = v4; sbroad[5] = v5;
+            sbroad[6] = v6;
         }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        sbroad[0] = sred[0];
-        sbroad[1] = sred[256];
-        sbroad[2] = sred[2*256];
-        sbroad[3] = sred[3*256];
-        sbroad[4] = sred[4*256];
-        sbroad[5] = sred[5*256];
-        sbroad[6] = sred[6*256];
     }
     __syncthreads();
     const float Vn  = sbroad[0];
@@ -304,15 +326,10 @@ __global__ void k_evolve_l1(
         while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
     }
 
-    // 1-channel perimeter reduction. Reuse sred[0..256].
+    // 1-channel perimeter reduction via warp-shuffle. Reuse ssmem (first 32).
     __syncthreads();
-    sred[tid] = sPeri;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) sred[tid] += sred[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) peri_out[n] = sred[0];
+    float pn = block_sum(sPeri, ssmem);
+    if (tid == 0) peri_out[n] = pn;
 }
 
 void launch_evolve(CellArrays& c, const SimParams& p) {
@@ -686,40 +703,26 @@ __global__ void k_initial_velocity(
         while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
     }
 
-    __shared__ float sred[256 * 8];
-    sred[tid          ] = sV;
-    sred[tid +   256  ] = sIx;
-    sred[tid + 2*256  ] = sIy;
-    sred[tid + 3*256  ] = sCx;
-    sred[tid + 4*256  ] = sCy;
-    sred[tid + 5*256  ] = sCxx;
-    sred[tid + 6*256  ] = sCyy;
-    sred[tid + 7*256  ] = sP;
-    __syncthreads();
-    for (int s = 128; s > 0; s >>= 1) {
-        if (tid < s) {
-            sred[tid          ] += sred[tid + s          ];
-            sred[tid +   256  ] += sred[tid + s +   256  ];
-            sred[tid + 2*256  ] += sred[tid + s + 2*256  ];
-            sred[tid + 3*256  ] += sred[tid + s + 3*256  ];
-            sred[tid + 4*256  ] += sred[tid + s + 4*256  ];
-            sred[tid + 5*256  ] += sred[tid + s + 5*256  ];
-            sred[tid + 6*256  ] += sred[tid + s + 6*256  ];
-            sred[tid + 7*256  ] += sred[tid + s + 7*256  ];
-        }
-        __syncthreads();
-    }
+    __shared__ float ssmem[8 * 32];
+    float v0 = block_sum(sV,   ssmem + 0*32);
+    float v1 = block_sum(sIx,  ssmem + 1*32);
+    float v2 = block_sum(sIy,  ssmem + 2*32);
+    float v3 = block_sum(sCx,  ssmem + 3*32);
+    float v4 = block_sum(sCy,  ssmem + 4*32);
+    float v5 = block_sum(sCxx, ssmem + 5*32);
+    float v6 = block_sum(sCyy, ssmem + 6*32);
+    float v7 = block_sum(sP,   ssmem + 7*32);
     if (tid == 0) {
-        float Vn  = sred[0];
-        float Ixn = sred[256];
-        float Iyn = sred[2*256];
+        float Vn  = v0;
+        float Ixn = v1;
+        float Iyn = v2;
         float coeffV = 60.0f * kappa / (xi * lambda_ * lambda_);
         V_out[n]    = Vn;
-        Cx_out[n]   = sred[3*256];
-        Cy_out[n]   = sred[4*256];
-        Cxx_out[n]  = sred[5*256];
-        Cyy_out[n]  = sred[6*256];
-        peri_out[n] = sred[7*256];
+        Cx_out[n]   = v3;
+        Cy_out[n]   = v4;
+        Cxx_out[n]  = v5;
+        Cyy_out[n]  = v6;
+        peri_out[n] = v7;
         vx_out[n]   = coeffV * Ixn + vA * dirx[n];
         vy_out[n]   = coeffV * Iyn + vA * diry[n];
     }

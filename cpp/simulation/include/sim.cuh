@@ -69,6 +69,7 @@ struct Simulation {
     void place_cells(int n, double R);
     void compute_origins();
     void alloc_gpu();
+    void configure_l2_persistence();
     void upload_initial_state();
     void apply_gamma_spec();
     void apply_v_A_disorder();

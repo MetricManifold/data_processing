@@ -135,6 +135,87 @@ void Simulation::alloc_gpu() {
     printf("[GPU] %d cells, T=%d, pool=%.1f MB, S=%.1f MB (%dx%d)\n",
            n, TILE_T, pool_bytes / 1e6, S_bytes / 1e6,
            params.Nx, params.Ny);
+
+    configure_l2_persistence();
+}
+
+// ---------------------------------------------------------------------------
+// configure_l2_persistence — pin the global S field in L2 cache via the
+// CUDA access-policy-window mechanism. S is read once per pixel by every
+// cell's tile (k_evolve_l1 pass-1 reads + pass-2 reads), so it gets reused
+// O(N_cells_overlapping) times per step. Pinning it as "persisting" tells
+// the L2 controller to prefer it over the streaming reads of phi tiles.
+//
+// On Ada (RTX 4090, sm_8.9):
+//   - Max persisting carveout ~ 32 MB (half of 64 MB total L2)
+// On Hopper (H100, sm_9.0):
+//   - Max persisting carveout ~ 44 MB
+//
+// Guard: if S exceeds the carveout, persistence will thrash the cache
+// (hitRatio drops, evictions overwhelm the gain). We skip in that case
+// and let the default LRU policy run.
+// ---------------------------------------------------------------------------
+void Simulation::configure_l2_persistence() {
+    if (cells.S == nullptr || cells.num_cells == 0) return;
+
+    int dev = 0;
+    cudaGetDevice(&dev);
+
+    int max_persist_bytes = 0;
+    cudaDeviceGetAttribute(&max_persist_bytes,
+                           cudaDevAttrMaxPersistingL2CacheSize, dev);
+    if (max_persist_bytes <= 0) {
+        printf("[L2] persistence not supported on this device; skipping.\n");
+        return;
+    }
+
+    const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
+
+    // Use up to 75% of the available carveout. If S exceeds that, skip:
+    // a window larger than the carveout thrashes (every miss evicts
+    // another persisting line, hitRatio collapses).
+    const size_t max_window = (size_t)(0.75 * (double)max_persist_bytes);
+    if (S_bytes > max_window) {
+        printf("[L2] S=%.1f MB exceeds 75%% of carveout (%.1f MB); skipping persistence.\n",
+               S_bytes / 1e6, max_persist_bytes / 1e6);
+        // Reset any prior carveout from earlier sim instances.
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+        return;
+    }
+
+    // Reserve the carveout sized to S exactly (rounded up to L2-line
+    // granularity by the driver). If the requested size is larger than
+    // currently configured, cudaDeviceSetLimit grows it.
+    cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                                         S_bytes);
+    if (err != cudaSuccess) {
+        printf("[L2] cudaDeviceSetLimit failed: %s; skipping persistence.\n",
+               cudaGetErrorString(err));
+        return;
+    }
+
+    // Attach the access policy window to the default (legacy) stream.
+    // hitRatio = 1.0 means the entire S range is preferred for persistence;
+    // hitProp = persisting (kept), missProp = streaming (don't pollute L2).
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr  = cells.S;
+    attr.accessPolicyWindow.num_bytes = S_bytes;
+    attr.accessPolicyWindow.hitRatio  = 1.0f;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+    err = cudaStreamSetAttribute(cudaStreamDefault,
+                                 cudaStreamAttributeAccessPolicyWindow,
+                                 &attr);
+    if (err != cudaSuccess) {
+        printf("[L2] cudaStreamSetAttribute failed: %s; skipping persistence.\n",
+               cudaGetErrorString(err));
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+        return;
+    }
+
+    printf("[L2] persisting S (%.1f MB) in carveout (max %.1f MB)\n",
+           S_bytes / 1e6, max_persist_bytes / 1e6);
 }
 
 // ---------------------------------------------------------------------------
