@@ -111,6 +111,8 @@ void Simulation::alloc_gpu() {
     ai(cells.rect,   4 * n);
 
     af(cells.volumes,      n);
+    af(cells.Ix,           n);
+    af(cells.Iy,           n);
     af(cells.Cx,           n);
     af(cells.Cy,           n);
     af(cells.Cxx,          n);
@@ -1205,7 +1207,8 @@ void Simulation::cleanup() {
     cf(cells.S);
     cf(cells.origin);
     cf(cells.rect);
-    cf(cells.volumes); cf(cells.Cx); cf(cells.Cy);
+    cf(cells.volumes); cf(cells.Ix); cf(cells.Iy);
+    cf(cells.Cx); cf(cells.Cy);
     cf(cells.Cxx); cf(cells.Cyy);
     cf(cells.perimeters);
     cf(cells.velocities_x); cf(cells.velocities_y);

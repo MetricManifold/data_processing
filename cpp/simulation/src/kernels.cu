@@ -103,9 +103,10 @@ __global__ void k_scatter_S(
     const int*   __restrict__ origin,
     const int*   __restrict__ rect,
     float* __restrict__ S,
-    int N, int L)
+    int N, int L, int CHUNK_PIXELS)
 {
-    const int n = blockIdx.x;
+    const int n  = blockIdx.y;
+    const int cb = blockIdx.x;       // chunk index within this cell
     if (n >= N) return;
     const float* tile = phi + (size_t)n * TILE_AREA;
     const int gx0 = origin[2*n + 0];
@@ -115,20 +116,27 @@ __global__ void k_scatter_S(
     const int rw  = rect[4*n + 2];
     const int rh  = rect[4*n + 3];
     const int total = rw * rh;
+    const int chunk_start = cb * CHUNK_PIXELS;
+    if (chunk_start >= total) return;
+    const int chunk_end = min(total, chunk_start + CHUNK_PIXELS);
     const int BS  = blockDim.x;
     const int tid = threadIdx.x;
 
-    int lx = rx0 + (tid % rw);
-    int ly = ry0 + (tid / rw);
-    for (int p = tid; p < total; p += BS) {
+    const int step_x = BS % rw;
+    const int step_y = BS / rw;
+    const int rx_end = rx0 + rw;
+    int p0 = chunk_start + tid;
+    int lx = rx0 + (p0 % rw);
+    int ly = ry0 + (p0 / rw);
+    for (int p = p0; p < chunk_end; p += BS) {
         float v = tile[ly * TILE_T + lx];
         if (v >= 1e-6f) {
             int gx = wrap_i(gx0 + lx, L);
             int gy = wrap_i(gy0 + ly, L);
             atomicAdd(&S[gy * L + gx], v * v);
         }
-        lx += BS;
-        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
+        lx += step_x; ly += step_y;
+        if (lx >= rx_end) { lx -= rw; ly += 1; }
     }
 }
 
@@ -137,7 +145,11 @@ void launch_scatter_S(CellArrays& c, const SimParams& p) {
     if (N == 0) return;
     const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes);
-    k_scatter_S<<<N, 256>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx);
+    constexpr int CHUNK_PIXELS = 2048;
+    constexpr int BS = 128;
+    constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+    dim3 grid(MAX_CHUNKS, N);
+    k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,17 +344,268 @@ __global__ void k_evolve_l1(
     if (tid == 0) peri_out[n] = pn;
 }
 
+// ---------------------------------------------------------------------------
+// 3b. Multi-block scatter/reduce/RHS pipeline.
+// ---------------------------------------------------------------------------
+// Grid shape (chunks_per_cell, N). Each block processes CHUNK_PIXELS pixels
+// of the active rect for one cell. Splitting the cell across many blocks
+// pumps occupancy when N is small. Per-cell accumulators are filled by
+// atomicAdd from one thread per block; the host pre-zeros them.
+// Background-skipping: pixels with phi < bgthr contribute negligibly to
+// reductions and have no RHS contribution; we early-out without touching
+// neighbors or S, saving most of the bandwidth in the periphery.
+// ---------------------------------------------------------------------------
+
+__global__ void k_zero_per_cell(
+    float* a, float* b, float* c, float* d,
+    float* e, float* f, float* g, float* h,
+    int N)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    a[n] = 0.0f; b[n] = 0.0f; c[n] = 0.0f; d[n] = 0.0f;
+    e[n] = 0.0f; f[n] = 0.0f; g[n] = 0.0f; h[n] = 0.0f;
+}
+
+__global__ void k_reduce_mb(
+    const float* __restrict__ phi,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    const float* __restrict__ S,
+    float* __restrict__ V_out,
+    float* __restrict__ Ix_out,
+    float* __restrict__ Iy_out,
+    float* __restrict__ peri_out,
+    float* __restrict__ Cx_out,
+    float* __restrict__ Cy_out,
+    float* __restrict__ Cxx_out,
+    float* __restrict__ Cyy_out,
+    int N, int L, int CHUNK_PIXELS)
+{
+    const int n  = blockIdx.y;
+    const int cb = blockIdx.x;
+    if (n >= N) return;
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    const int rect_total = rw * rh;
+    const int p_start = cb * CHUNK_PIXELS;
+    if (p_start >= rect_total) return;
+    const int p_end = min(p_start + CHUNK_PIXELS, rect_total);
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const float* tile = phi + (size_t)n * TILE_AREA;
+    const int tid = threadIdx.x;
+    const int BS  = blockDim.x;
+
+    float sV = 0.0f, sIx = 0.0f, sIy = 0.0f, sPeri = 0.0f;
+    float sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f;
+
+    const int step_x = BS % rw;
+    const int step_y = BS / rw;
+    const int rx_end = rx0 + rw;
+    int p0 = p_start + tid;
+    int lx = rx0 + (p0 % rw);
+    int ly = ry0 + (p0 / rw);
+    for (int p = p0; p < p_end; p += BS) {
+        int idx = ly * TILE_T + lx;
+        float c = __ldg(tile + idx);
+        // Background skip: pixel + immediate neighbors all near-zero ->
+        // zero gradient, zero c^2, no contribution to any accumulator.
+        if (c >= 1e-4f) {
+            float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
+            float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
+            float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
+            float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
+            float gx = 0.5f * (xp_ - xm_);
+            float gy = 0.5f * (yp_ - ym_);
+            int gxg = wrap_i(gx0 + lx, L);
+            int gyg = wrap_i(gy0 + ly, L);
+            float Sv   = __ldg(S + gyg * L + gxg);
+            float Soth = Sv - c * c;
+            if (Soth < 0.0f) Soth = 0.0f;
+            float c2 = c * c;
+            float fx = (float)lx, fy = (float)ly;
+            sV   += c2;
+            sIx  += c * gx * Soth;
+            sIy  += c * gy * Soth;
+            sPeri += sqrtf(gx * gx + gy * gy);
+            sCx  += c2 * fx;
+            sCy  += c2 * fy;
+            sCxx += c2 * fx * fx;
+            sCyy += c2 * fy * fy;
+        }
+        lx += step_x; ly += step_y;
+        if (lx >= rx_end) { lx -= rw; ly += 1; }
+    }
+
+    __shared__ float ws[32];
+    sV    = block_sum(sV,    ws);
+    sIx   = block_sum(sIx,   ws);
+    sIy   = block_sum(sIy,   ws);
+    sPeri = block_sum(sPeri, ws);
+    sCx   = block_sum(sCx,   ws);
+    sCy   = block_sum(sCy,   ws);
+    sCxx  = block_sum(sCxx,  ws);
+    sCyy  = block_sum(sCyy,  ws);
+    if (tid == 0) {
+        atomicAdd(&V_out[n],    sV);
+        atomicAdd(&Ix_out[n],   sIx);
+        atomicAdd(&Iy_out[n],   sIy);
+        atomicAdd(&peri_out[n], sPeri);
+        atomicAdd(&Cx_out[n],   sCx);
+        atomicAdd(&Cy_out[n],   sCy);
+        atomicAdd(&Cxx_out[n],  sCxx);
+        atomicAdd(&Cyy_out[n],  sCyy);
+    }
+}
+
+__global__ void k_rhs_mb(
+    const float* __restrict__ phi,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    const float* __restrict__ S,
+    const float* __restrict__ gamma_cell,
+    const float* __restrict__ v_A_cell,
+    const float* __restrict__ dirx,
+    const float* __restrict__ diry,
+    const float* __restrict__ V_in,
+    const float* __restrict__ Ix_in,
+    const float* __restrict__ Iy_in,
+    const float* __restrict__ tgt_radius,
+    float* __restrict__ vx_out,
+    float* __restrict__ vy_out,
+    float* __restrict__ phi_out,
+    int N, int L, int CHUNK_PIXELS,
+    float lambda_, float kappa, float mu,
+    float xi, float dt)
+{
+    const int n  = blockIdx.y;
+    const int cb = blockIdx.x;
+    if (n >= N) return;
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    const int rect_total = rw * rh;
+    const int p_start = cb * CHUNK_PIXELS;
+    if (p_start >= rect_total) return;
+    const int p_end = min(p_start + CHUNK_PIXELS, rect_total);
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const float* tile = phi     + (size_t)n * TILE_AREA;
+    float*       outp = phi_out + (size_t)n * TILE_AREA;
+    const int tid = threadIdx.x;
+    const int BS  = blockDim.x;
+
+    // Per-cell coefficients computed once per block, broadcast via shared.
+    __shared__ float vx_s, vy_s, volC_s, dwC_s, repC_s, gam_s;
+    if (tid == 0) {
+        const float gam    = gamma_cell[n];
+        const float vA     = v_A_cell[n];
+        const float R      = tgt_radius[n];
+        const float invXi  = 1.0f / xi;
+        const float coeffV = 60.0f * kappa * invXi / (lambda_ * lambda_);
+        const float piR2   = PI * R * R;
+        const float Vn     = V_in[n];
+        const float Ixn    = Ix_in[n];
+        const float Iyn    = Iy_in[n];
+        const float vx     = coeffV * Ixn + vA * dirx[n];
+        const float vy     = coeffV * Iyn + vA * diry[n];
+        vx_s   = vx;
+        vy_s   = vy;
+        volC_s = (2.0f * mu / piR2) * (piR2 - Vn);
+        dwC_s  = 30.0f * gam   / (lambda_ * lambda_);
+        repC_s = 30.0f * kappa / (lambda_ * lambda_);
+        gam_s  = gam;
+        // Only chunk 0 writes the per-cell velocity (avoids redundant writes).
+        if (cb == 0) {
+            vx_out[n] = vx;
+            vy_out[n] = vy;
+        }
+    }
+    __syncthreads();
+    const float vx = vx_s, vy = vy_s;
+    const float volC = volC_s, dwC = dwC_s, repC = repC_s;
+    const float gam  = gam_s;
+
+    const int step_x = BS % rw;
+    const int step_y = BS / rw;
+    const int rx_end = rx0 + rw;
+    int p0 = p_start + tid;
+    int lx = rx0 + (p0 % rw);
+    int ly = ry0 + (p0 / rw);
+    const float bgthr = 1e-5f;
+    for (int p = p0; p < p_end; p += BS) {
+        int idx = ly * TILE_T + lx;
+        float c   = __ldg(tile + idx);
+        float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
+        float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
+        float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
+        float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
+        // If the entire 5-stencil is background, the 9-pt stencil is also
+        // background; double-well, volume, repulsion, advection all zero.
+        // phi_out for that pixel is 0 (output buffer is pre-zeroed in
+        // k_rebind / alloc_gpu).
+        if (c >= bgthr || xp_ >= bgthr || xm_ >= bgthr || yp_ >= bgthr || ym_ >= bgthr) {
+            float xpyp = (lx + 1 < TILE_T && ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T + 1) : 0.0f;
+            float xpym = (lx + 1 < TILE_T && ly     > 0)      ? __ldg(tile + idx - TILE_T + 1) : 0.0f;
+            float xmyp = (lx     > 0      && ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T - 1) : 0.0f;
+            float xmym = (lx     > 0      && ly     > 0)      ? __ldg(tile + idx - TILE_T - 1) : 0.0f;
+            float lap = lap9(c, xm_, xp_, ym_, yp_, xmym, xpym, xmyp, xpyp);
+            float gx  = 0.5f * (xp_ - xm_);
+            float gy  = 0.5f * (yp_ - ym_);
+            int gxg = wrap_i(gx0 + lx, L);
+            int gyg = wrap_i(gy0 + ly, L);
+            float Sv   = __ldg(S + gyg * L + gxg);
+            float Soth = Sv - c * c;
+            if (Soth < 0.0f) Soth = 0.0f;
+            float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
+            float rhs = gam * lap - dwC * dw + volC * c - repC * c * Soth;
+            float adv = vx * gx + vy * gy;
+            outp[idx] = c + dt * (rhs - adv);
+        } else {
+            outp[idx] = 0.0f;
+        }
+        lx += step_x; ly += step_y;
+        if (lx >= rx_end) { lx -= rw; ly += 1; }
+    }
+}
+
 void launch_evolve(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
-    k_evolve_l1<<<N, 256>>>(
+    // Multi-block scatter+reduce+RHS pipeline. Three separate kernels:
+    // (a) k_zero_per_cell  zeros the 8 per-cell accumulators.
+    // (b) k_reduce_mb      grid=(chunks_per_cell, N), atomicAdds into
+    //     V/Ix/Iy/peri/Cx/Cy/Cxx/Cyy. Background-skipped per pixel.
+    // (c) k_rhs_mb         grid=(chunks_per_cell, N), reads finalized
+    //     V/Ix/Iy and writes phi_out + per-cell vx/vy. Background-skipped.
+    constexpr int CHUNK_PIXELS = 4096;
+    constexpr int BS = 256;
+    constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+    dim3 grid_mb(chunks_per_cell, N);
+
+    {
+        int bsz = 128, gsz = (N + bsz - 1) / bsz;
+        k_zero_per_cell<<<gsz, bsz>>>(
+            c.volumes, c.Ix, c.Iy, c.perimeters,
+            c.Cx, c.Cy, c.Cxx, c.Cyy, N);
+    }
+    k_reduce_mb<<<grid_mb, BS>>>(
         c.phi_in, c.origin, c.rect, c.S,
-        c.gamma_cell, c.v_A_cell, c.tgt_radius,
+        c.volumes, c.Ix, c.Iy, c.perimeters,
+        c.Cx, c.Cy, c.Cxx, c.Cyy,
+        N, p.Nx, CHUNK_PIXELS);
+    k_rhs_mb<<<grid_mb, BS>>>(
+        c.phi_in, c.origin, c.rect, c.S,
+        c.gamma_cell, c.v_A_cell,
         c.polar_x, c.polar_y,
-        c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy, c.perimeters,
+        c.volumes, c.Ix, c.Iy, c.tgt_radius,
         c.velocities_x, c.velocities_y,
         c.phi_out,
-        N, p.Nx,
+        N, p.Nx, CHUNK_PIXELS,
         (float)p.lambda, (float)p.kappa, (float)p.mu,
         (float)p.xi,     (float)p.dt);
 }
@@ -733,7 +996,13 @@ void launch_initial_velocity(CellArrays& c, const SimParams& p) {
     if (N == 0) return;
     const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes);
-    k_scatter_S<<<N, 256>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx);
+    {
+        constexpr int CHUNK_PIXELS = 2048;
+        constexpr int BS = 128;
+        constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+        dim3 grid(MAX_CHUNKS, N);
+        k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
+    }
     k_initial_velocity<<<N, 256>>>(
         c.phi_in, c.origin, c.rect, c.S,
         c.v_A_cell, c.polar_x, c.polar_y,

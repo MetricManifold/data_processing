@@ -123,6 +123,8 @@ struct CellArrays {
 
     // Per-cell observables produced by k_evolve_l1.
     float* volumes      = nullptr; // [N] : sum phi (tile-local; multiply by dA for area)
+    float* Ix           = nullptr; // [N] : tile-local sum(c * grad_x * S_other) (interaction integral, x)
+    float* Iy           = nullptr; // [N] : tile-local sum(c * grad_y * S_other) (interaction integral, y)
     float* Cx           = nullptr; // [N] : tile-local sum(phi^2 * lx)
     float* Cy           = nullptr; // [N] : tile-local sum(phi^2 * ly)
     float* Cxx          = nullptr; // [N] : tile-local sum(phi^2 * lx^2)
