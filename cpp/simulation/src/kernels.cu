@@ -140,16 +140,43 @@ __global__ void k_scatter_S(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch threshold between multi-block (small N) and single-block-per-cell
+// (large N) pipelines. Cached on first call; the threshold is 4 * SM count
+// (the device is fully saturated at ~4 blocks/SM, so chunking cells beyond
+// that point only adds launch + atomic overhead). RTX 4090 Laptop = 76 SMs
+// -> ~304; H100 = 132 SMs -> ~528.
+// ---------------------------------------------------------------------------
+static int evolve_dispatch_threshold() {
+    static int cached = 0;
+    if (cached == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int sm = 0;
+        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+        cached = (sm > 0) ? 4 * sm : 256;
+    }
+    return cached;
+}
+
 void launch_scatter_S(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
     const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes);
-    constexpr int CHUNK_PIXELS = 2048;
-    constexpr int BS = 128;
-    constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-    dim3 grid(MAX_CHUNKS, N);
-    k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
+    if (N >= evolve_dispatch_threshold()) {
+        // Large-N path: one block per cell, single chunk = whole rect.
+        // CHUNK_PIXELS large enough to cover any rect within TILE_T x TILE_T.
+        k_scatter_S<<<dim3(1, N), 256>>>(
+            c.phi_in, c.origin, c.rect, c.S, N, p.Nx, TILE_AREA);
+    } else {
+        // Small-N path: split each cell into chunks for occupancy.
+        constexpr int CHUNK_PIXELS = 2048;
+        constexpr int BS = 128;
+        constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+        k_scatter_S<<<dim3(MAX_CHUNKS, N), BS>>>(
+            c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +603,24 @@ __global__ void k_rhs_mb(
 void launch_evolve(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
-    // Multi-block scatter+reduce+RHS pipeline. Three separate kernels:
+    if (N >= evolve_dispatch_threshold()) {
+        // Large-N path: fused two-pass single-block-per-cell evolve.
+        // SMs are saturated by N blocks alone; chunking adds launch + atomic
+        // cost without throughput gain. The fused kernel keeps the velocity
+        // broadcast in shared mem (no extra global round-trip via Ix/Iy).
+        k_evolve_l1<<<N, 256>>>(
+            c.phi_in, c.origin, c.rect, c.S,
+            c.gamma_cell, c.v_A_cell, c.tgt_radius,
+            c.polar_x, c.polar_y,
+            c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy, c.perimeters,
+            c.velocities_x, c.velocities_y,
+            c.phi_out,
+            N, p.Nx,
+            (float)p.lambda, (float)p.kappa, (float)p.mu,
+            (float)p.xi,     (float)p.dt);
+        return;
+    }
+    // Small-N path: multi-block scatter+reduce+RHS pipeline.
     // (a) k_zero_per_cell  zeros the 8 per-cell accumulators.
     // (b) k_reduce_mb      grid=(chunks_per_cell, N), atomicAdds into
     //     V/Ix/Iy/peri/Cx/Cy/Cxx/Cyy. Background-skipped per pixel.
