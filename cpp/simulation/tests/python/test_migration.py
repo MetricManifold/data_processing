@@ -1663,7 +1663,7 @@ class TestCpuReference:
         parity, and we save before/after frames so a reviewer can see
         what the geometry actually does.
         """
-        Nx = Ny = 150
+        Nx = Ny = 200
         R = 20.0
         lambd = 7.0
         halo = 4

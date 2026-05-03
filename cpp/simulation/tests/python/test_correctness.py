@@ -801,7 +801,8 @@ class TestLargeN:
                       "-n", "32000", "-r", "49", "--confluence", "0.89",
                       "-t", "0.01", "--dt", "0.01",
                       "--v-A", "0", "--seed", "42",
-                      "--save-interval", "0", "--trajectory-samples", "0")
+                      "--save-interval", "0", "--trajectory-samples", "0",
+                      timeout=600)
         chk = read_checkpoint(out / "checkpoint.bin")
         assert chk["num_cells"] == 32000
         for c in chk["cells"]:
