@@ -58,6 +58,19 @@ struct Simulation {
     float* d_scripted_theta = nullptr;
     int    scripted_cursor  = 0;          // first unprocessed event idx
 
+    // ---- CUDA Graph capture for the hot step pipeline.
+    // step_stream is a non-default stream so launches can be captured.
+    // step_graph[parity] is the cached executable graph for the
+    // "regular fast" step (polar + scatter + fast-reduce + RHS) with the
+    // pool half-pointers baked in by parity. Output / rebind / scripted
+    // / first-step paths fall back to direct launches on the same stream.
+    cudaStream_t    step_stream            = nullptr;
+    cudaGraphExec_t step_graph[2]          = {nullptr, nullptr};
+    bool            step_graph_built[2]    = {false, false};
+    int             parity                 = 0;
+    float*          phi_A                  = nullptr;  // phi_pool half 0
+    float*          phi_B                  = nullptr;  // phi_pool half 1
+
     void init(const SimParams& p, int n_cells);
     bool init_from_checkpoint(const std::string& path,
                               const SimParams& cli_params,

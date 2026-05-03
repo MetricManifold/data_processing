@@ -99,6 +99,9 @@ void Simulation::alloc_gpu() {
     CK(cudaMemset(cells.phi_pool, 0, pool_bytes));
     cells.phi_in  = cells.phi_pool;
     cells.phi_out = cells.phi_pool + (size_t)n * TILE_AREA;
+    // Persistent half-pointers used by graph capture (parity-aware).
+    phi_A = cells.phi_pool;
+    phi_B = cells.phi_pool + (size_t)n * TILE_AREA;
 
     const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
     CK(cudaMalloc(&cells.S, S_bytes));
@@ -381,6 +384,23 @@ void Simulation::finalize_init() {
                                  : (params.seed ? params.seed : 1234u);
     launch_rng_init(cells, polar_seed);
     launch_initial_velocity(cells, params);
+    // Dedicated stream for the captured step pipeline. Non-blocking so it
+    // doesn't serialize against the default stream used by I/O paths.
+    if (!step_stream) {
+        CK(cudaStreamCreateWithFlags(&step_stream, cudaStreamNonBlocking));
+        // Mirror the L2 access-policy-window onto step_stream so the
+        // S-field benefits from persistence on the captured/replayed
+        // kernels too. Best-effort; ignore errors (we already logged
+        // any persistence-disabled state at alloc time).
+        cudaStreamAttrValue attr = {};
+        attr.accessPolicyWindow.base_ptr  = cells.S;
+        attr.accessPolicyWindow.num_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
+        attr.accessPolicyWindow.hitRatio  = 1.0f;
+        attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+        attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+        cudaStreamSetAttribute(step_stream,
+                               cudaStreamAttributeAccessPolicyWindow, &attr);
+    }
     CK(cudaDeviceSynchronize());
 }
 
@@ -795,56 +815,80 @@ bool Simulation::init_from_checkpoint(const std::string& path,
 // ---------------------------------------------------------------------------
 // step — one integration step.
 // ---------------------------------------------------------------------------
-// 1. polar update (skipped when v_A == 0)
-// 2. memset(S=0) + scatter phi^2 -> S
-// 3. fused evolve (writes phi_out + observables)
-// 4. host-side swap phi_in <-> phi_out
-// 5. every 10 steps: rebind (writes shifted tile to phi_out), then swap.
+// Hot path (the vast majority of steps): polar + scatter + fast-reduce + RHS,
+// captured into a CUDA Graph (one per pool-parity) and replayed each step.
+// Replay is a single host->driver call vs. ~5 launches, saving ~3-5 us/step
+// of API overhead. Slow path (rebind, output, scripted, first encounter):
+// direct launches on the same step_stream.
 // ---------------------------------------------------------------------------
 void Simulation::step() {
-    if (scripted_active) {
-        // Deterministic replay: apply all events whose step_count matches
-        // the current value (events are sorted ascending). We then SKIP
-        // launch_polar entirely (PRNG path is disabled).
-        int begin = scripted_cursor;
-        const int total = (int)h_scripted_step.size();
-        while (scripted_cursor < total
-               && h_scripted_step[scripted_cursor] == step_count) {
-            scripted_cursor++;
-        }
-        int count = scripted_cursor - begin;
-        if (count > 0) {
-            launch_apply_scripted(cells,
-                                  d_scripted_cid + begin,
-                                  d_scripted_theta + begin,
-                                  count);
-        }
-    } else {
-        launch_polar(cells, params);
-    }
-    launch_scatter_S(cells, params);
-    // Full reduce (Cx/Cy/Cxx/Cyy + perimeter) needed:
-    //  - on the step BEFORE rebind (rebind reads Cx/Cy/Cxx/Cyy)
-    //  - on output steps where host reads V/Cx/Cy/peri for traj/VTK/checkpoint
-    // Otherwise the cheap 3-channel reduce (V, Ix, Iy) is enough for RHS.
     int next_step = step_count + 1;
-    bool will_rebind   = (next_step % REBIND_EVERY) == 0;
-    bool will_traj     = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
-    bool will_save     = (params.save_interval > 0 && next_step % params.save_interval == 0);
-    bool will_ckpt     = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
-    bool will_vtk      = (vtk_interval > 0 && next_step % vtk_interval == 0);
-    bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
-    launch_evolve(cells, params, need_full_red);
-    std::swap(cells.phi_in, cells.phi_out);
+    const bool will_rebind = (next_step % REBIND_EVERY) == 0;
+    const bool will_traj   = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
+    const bool will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
+    const bool will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
+    const bool will_vtk    = (vtk_interval > 0 && next_step % vtk_interval == 0);
+    const bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
+    const bool fast_path = !scripted_active && !will_rebind && !need_full_red
+                           && (params.v_A != 0.0) && (params.tau > 0.0);
 
-    if (will_rebind) {
-        // gamma_ref = baseline params.gamma (typically 1.0). Cells with
-        // gamma_cell < gamma_ref get a larger K via per-cell scaling in
-        // k_rebind (see comment there). Stiffer cells get the unscaled K.
-        launch_rebind(cells,
-                      (float)params.subdomain_padding,
-                      (float)params.gamma);
-        std::swap(cells.phi_in, cells.phi_out);
+    // Keep cells.phi_in / phi_out in sync with parity, so any direct kernel
+    // launch (output, rebind path) reads the right buffer.
+    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+
+    if (fast_path) {
+        if (!step_graph_built[parity]) {
+            // Capture once per parity. cudaStreamCaptureModeThreadLocal so
+            // unrelated CUDA calls on the host (e.g. cudaMalloc) don't
+            // accidentally get pulled into the capture.
+            cudaGraph_t graph = nullptr;
+            CK(cudaStreamBeginCapture(step_stream,
+                                      cudaStreamCaptureModeThreadLocal));
+            launch_polar(cells, params, step_stream);
+            launch_scatter_S(cells, params, step_stream);
+            launch_evolve(cells, params, /*need_full_reduce=*/false, step_stream);
+            CK(cudaStreamEndCapture(step_stream, &graph));
+            CK(cudaGraphInstantiate(&step_graph[parity], graph, nullptr, nullptr, 0));
+            cudaGraphDestroy(graph);
+            step_graph_built[parity] = true;
+        }
+        CK(cudaGraphLaunch(step_graph[parity], step_stream));
+        parity ^= 1;
+    } else {
+        // Slow path: direct launches on step_stream so ordering matches the
+        // graph path (no cross-stream sync needed).
+        if (scripted_active) {
+            int begin = scripted_cursor;
+            const int total = (int)h_scripted_step.size();
+            while (scripted_cursor < total
+                   && h_scripted_step[scripted_cursor] == step_count) {
+                scripted_cursor++;
+            }
+            int count = scripted_cursor - begin;
+            if (count > 0) {
+                launch_apply_scripted(cells,
+                                      d_scripted_cid + begin,
+                                      d_scripted_theta + begin,
+                                      count, step_stream);
+            }
+        } else {
+            launch_polar(cells, params, step_stream);
+        }
+        launch_scatter_S(cells, params, step_stream);
+        launch_evolve(cells, params, need_full_red, step_stream);
+        parity ^= 1;
+        cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+        cells.phi_out = (parity == 0) ? phi_B : phi_A;
+
+        if (will_rebind) {
+            launch_rebind(cells,
+                          (float)params.subdomain_padding,
+                          (float)params.gamma, step_stream);
+            parity ^= 1;
+            cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+            cells.phi_out = (parity == 0) ? phi_B : phi_A;
+        }
     }
 
 #ifndef NDEBUG
@@ -980,6 +1024,7 @@ void Simulation::run() {
 // print_status — average volume vs target.
 // ---------------------------------------------------------------------------
 void Simulation::print_status() {
+    if (step_stream) CK(cudaStreamSynchronize(step_stream));
     int n = cells.num_cells;
     std::vector<float> vols(n);
     CK(cudaMemcpy(vols.data(), cells.volumes, n * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1010,6 +1055,7 @@ void Simulation::print_status() {
 // ---------------------------------------------------------------------------
 void Simulation::write_trajectory() {
     if (!traj_fp) return;
+    if (step_stream) CK(cudaStreamSynchronize(step_stream));
     int n = cells.num_cells;
     std::vector<int>   h_or(2 * n);
     std::vector<float> V(n), Cx(n), Cy(n), per(n);
@@ -1223,9 +1269,15 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
 // cleanup
 // ---------------------------------------------------------------------------
 void Simulation::cleanup() {
+    for (int i = 0; i < 2; ++i) {
+        if (step_graph[i]) { cudaGraphExecDestroy(step_graph[i]); step_graph[i] = nullptr; }
+        step_graph_built[i] = false;
+    }
+    if (step_stream) { cudaStreamDestroy(step_stream); step_stream = nullptr; }
     auto cf = [](auto& p) { if (p) { cudaFree(p); p = nullptr; } };
     cf(cells.phi_pool);
     cells.phi_in = cells.phi_out = nullptr;
+    phi_A = phi_B = nullptr;
     cf(cells.S);
     cf(cells.origin);
     cf(cells.rect);

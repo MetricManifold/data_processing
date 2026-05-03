@@ -12,7 +12,7 @@
 // ---------------------------------------------------------------------------
 
 // Polarity update (RTP or ABP, per p.abp). Cheap: one thread per cell.
-void launch_polar(CellArrays& c, const SimParams& p);
+void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
 
 // Apply a list of scripted tumble events: for each i in [0, count),
 // theta[d_cid[i]] = d_theta[i]; px = cos(theta); py = sin(theta).
@@ -20,10 +20,11 @@ void launch_polar(CellArrays& c, const SimParams& p);
 void launch_apply_scripted(CellArrays& c,
                            const int* d_cid,
                            const float* d_theta,
-                           int count);
+                           int count,
+                           cudaStream_t stream = 0);
 
 // Zero S then scatter phi^2 into it (one CTA per cell).
-void launch_scatter_S(CellArrays& c, const SimParams& p);
+void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
 
 // Fused two-pass evolve. Pass 1 reduces V/Cx/Cy/Ix/Iy, broadcasts vx/vy.
 // Pass 2 reads S again, computes laplacian/double-well/repulsion/advection,
@@ -35,13 +36,15 @@ void launch_scatter_S(CellArrays& c, const SimParams& p);
 // trajectory/VTK/checkpoint output steps (host reads V, Cx, Cy, perimeter).
 // On non-output, non-rebind steps it can be false; the mb path then skips
 // 5 atomicAdds per chunk and 4 block-reductions.
-void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce);
+void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
+                   cudaStream_t stream = 0);
 
 // COM-recentre: shift each cell's tile so its COM lands at (T/2, T/2).
 // Adjusts origin[n] and copies the (possibly shifted) tile into phi_out.
 // After this kernel, the *caller* must std::swap(phi_in, phi_out) so the
 // rebound tile becomes the current state.
-void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref);
+void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
+                   cudaStream_t stream = 0);
 
 // One-shot host helpers used only at init / resume.
 void launch_rng_init(CellArrays& c, unsigned long seed);

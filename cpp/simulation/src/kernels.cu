@@ -141,11 +141,11 @@ __global__ void k_scatter_S(
     }
 }
 
-void launch_scatter_S(CellArrays& c, const SimParams& p) {
+void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0) return;
     const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
-    cudaMemsetAsync(c.S, 0, Sbytes);
+    cudaMemsetAsync(c.S, 0, Sbytes, stream);
     // Always multi-block: chunking by ~4096 pixels keeps the SMs saturated
     // even at large N (1152 cells * 9 chunks/cell = 10368 blocks vs the
     // 1152-block "fused" alternative which left ~85% of warps idle on
@@ -153,7 +153,7 @@ void launch_scatter_S(CellArrays& c, const SimParams& p) {
     constexpr int CHUNK_PIXELS = 4096;
     constexpr int BS = 256;
     constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-    k_scatter_S<<<dim3(chunks_per_cell, N), BS>>>(
+    k_scatter_S<<<dim3(chunks_per_cell, N), BS, 0, stream>>>(
         c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
 }
 
@@ -650,7 +650,8 @@ __global__ void k_rhs_mb(
     }
 }
 
-void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce) {
+void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
+                   cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0) return;
     // Multi-block scatter+reduce+RHS pipeline (replaces fused k_evolve_l1).
@@ -665,27 +666,27 @@ void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce) {
     {
         int bsz = 128, gsz = (N + bsz - 1) / bsz;
         if (need_full_reduce) {
-            k_zero_per_cell<<<gsz, bsz>>>(
+            k_zero_per_cell<<<gsz, bsz, 0, stream>>>(
                 c.volumes, c.Ix, c.Iy, c.perimeters,
                 c.Cx, c.Cy, c.Cxx, c.Cyy, N);
         } else {
-            k_zero_per_cell3<<<gsz, bsz>>>(
+            k_zero_per_cell3<<<gsz, bsz, 0, stream>>>(
                 c.volumes, c.Ix, c.Iy, N);
         }
     }
     if (need_full_reduce) {
-        k_reduce_mb_full<<<grid_mb, BS>>>(
+        k_reduce_mb_full<<<grid_mb, BS, 0, stream>>>(
             c.phi_in, c.origin, c.rect, c.S,
             c.volumes, c.Ix, c.Iy, c.perimeters,
             c.Cx, c.Cy, c.Cxx, c.Cyy,
             N, p.Nx, CHUNK_PIXELS);
     } else {
-        k_reduce_mb_fast<<<grid_mb, BS>>>(
+        k_reduce_mb_fast<<<grid_mb, BS, 0, stream>>>(
             c.phi_in, c.origin, c.rect, c.S,
             c.volumes, c.Ix, c.Iy,
             N, p.Nx, CHUNK_PIXELS);
     }
-    k_rhs_mb<<<grid_mb, BS>>>(
+    k_rhs_mb<<<grid_mb, BS, 0, stream>>>(
         c.phi_in, c.origin, c.rect, c.S,
         c.gamma_cell, c.v_A_cell,
         c.polar_x, c.polar_y,
@@ -840,10 +841,11 @@ __global__ void k_rebind(
     }
 }
 
-void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref) {
+void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
+                   cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0) return;
-    k_rebind<<<N, 256>>>(c.phi_in, c.phi_out, c.origin, c.rect,
+    k_rebind<<<N, 256, 0, stream>>>(c.phi_in, c.phi_out, c.origin, c.rect,
                          c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy,
                          c.tgt_radius, c.gamma_cell, N,
                          bbox_k, gamma_ref, TILE_BBOX_ALIGN, TILE_BBOX_MIN);
@@ -887,10 +889,10 @@ __global__ void k_polar(
     st[i] = s;
 }
 
-void launch_polar(CellArrays& c, const SimParams& p) {
+void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0 || p.v_A == 0.0 || p.tau <= 0.0) return;
-    k_polar<<<(N + 255) / 256, 256>>>(
+    k_polar<<<(N + 255) / 256, 256, 0, stream>>>(
         (curandState*)c.rng_states,
         c.polar_theta, c.polar_x, c.polar_y,
         (float)p.dt, (float)p.tau, p.abp, N);
@@ -920,10 +922,11 @@ __global__ void k_apply_scripted(
 void launch_apply_scripted(CellArrays& c,
                            const int* d_cid,
                            const float* d_theta,
-                           int count)
+                           int count,
+                           cudaStream_t stream)
 {
     if (count <= 0) return;
-    k_apply_scripted<<<(count + 31) / 32, 32>>>(
+    k_apply_scripted<<<(count + 31) / 32, 32, 0, stream>>>(
         c.polar_theta, c.polar_x, c.polar_y,
         d_cid, d_theta, count);
 }
