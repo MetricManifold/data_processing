@@ -822,23 +822,7 @@ void Simulation::step() {
     } else {
         launch_polar(cells, params);
     }
-    {
-        cudaError_t e = cudaPeekAtLastError();
-        if (e != cudaSuccess) {
-            fprintf(stderr, "[CUDA] step %d (after polar): %s\n", step_count, cudaGetErrorString(e));
-            fflush(stderr);
-            exit(1);
-        }
-    }
     launch_scatter_S(cells, params);
-    {
-        cudaError_t e = cudaPeekAtLastError();
-        if (e != cudaSuccess) {
-            fprintf(stderr, "[CUDA] step %d (after scatter_S): %s\n", step_count, cudaGetErrorString(e));
-            fflush(stderr);
-            exit(1);
-        }
-    }
     // Full reduce (Cx/Cy/Cxx/Cyy + perimeter) needed:
     //  - on the step BEFORE rebind (rebind reads Cx/Cy/Cxx/Cyy)
     //  - on output steps where host reads V/Cx/Cy/peri for traj/VTK/checkpoint
@@ -851,34 +835,22 @@ void Simulation::step() {
     bool will_vtk      = (vtk_interval > 0 && next_step % vtk_interval == 0);
     bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
     launch_evolve(cells, params, need_full_red);
-    {
-        cudaError_t e = cudaPeekAtLastError();
-        if (e != cudaSuccess) {
-            fprintf(stderr, "[CUDA] step %d (after evolve): %s\n", step_count, cudaGetErrorString(e));
-            fflush(stderr);
-            exit(1);
-        }
-    }
     std::swap(cells.phi_in, cells.phi_out);
 
-    if ((step_count + 1) % REBIND_EVERY == 0) {
+    if (will_rebind) {
         // gamma_ref = baseline params.gamma (typically 1.0). Cells with
         // gamma_cell < gamma_ref get a larger K via per-cell scaling in
         // k_rebind (see comment there). Stiffer cells get the unscaled K.
         launch_rebind(cells,
                       (float)params.subdomain_padding,
                       (float)params.gamma);
-        {
-            cudaError_t e = cudaPeekAtLastError();
-            if (e != cudaSuccess) {
-                fprintf(stderr, "[CUDA] step %d (after rebind): %s\n", step_count, cudaGetErrorString(e));
-                fflush(stderr);
-                exit(1);
-            }
-        }
         std::swap(cells.phi_in, cells.phi_out);
     }
 
+#ifndef NDEBUG
+    // Per-step launch error check: useful in Debug builds, off in Release
+    // (NDEBUG is set automatically by CMake for Release). Saves one host
+    // API call per step on the hot path.
     {
         cudaError_t err = cudaPeekAtLastError();
         if (err != cudaSuccess) {
@@ -892,6 +864,7 @@ void Simulation::step() {
             exit(1);
         }
     }
+#endif
     step_count++;
     cur_time += params.dt;
 }

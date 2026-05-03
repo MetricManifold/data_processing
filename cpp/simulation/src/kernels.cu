@@ -141,25 +141,6 @@ __global__ void k_scatter_S(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch threshold between multi-block (small N) and single-block-per-cell
-// (large N) pipelines. Cached on first call; the threshold is 4 * SM count
-// (the device is fully saturated at ~4 blocks/SM, so chunking cells beyond
-// that point only adds launch + atomic overhead). RTX 4090 Laptop = 76 SMs
-// -> ~304; H100 = 132 SMs -> ~528.
-// ---------------------------------------------------------------------------
-static int evolve_dispatch_threshold() {
-    static int cached = 0;
-    if (cached == 0) {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        int sm = 0;
-        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
-        cached = (sm > 0) ? 4 * sm : 256;
-    }
-    return cached;
-}
-
 void launch_scatter_S(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
