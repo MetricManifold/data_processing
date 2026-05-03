@@ -258,7 +258,7 @@ class TestSection01_CLIFlags:
         v2's --save-interval actually controls CHECKPOINT saves, not VTK.
         This is a SILENT semantic change from baseline.
         """
-        out = run_sim(tmp_path, "-n", "4", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--save-interval", "1", "--seed", "42",
                       extra_output_flags=())
         # v2: with save-interval=1, should emit multiple checkpoints if
@@ -318,7 +318,7 @@ class TestSection01_CLIFlags:
     @requires_flag("--save-individual-fields")
     def test_save_individual_fields_flag(self, tmp_path):
         """§1.6: --save-individual-fields saves per-cell φ to fields/*.vtk."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--save-individual-fields", "--seed", "42")
         # Check that fields/ directory exists (when save-interval > 0).
         # For now, just verify the run completed.
@@ -367,14 +367,14 @@ class TestSection01_CLIFlags:
     @requires_flag("--stress-fields")
     def test_stress_fields_flag(self, tmp_path):
         """§1.8: --stress-fields includes stress tensor in VTK (compile-time)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--stress-fields", "--seed", "42")
         assert (out / "checkpoint.bin").exists()
 
     @requires_flag("--safe-mode")
     def test_safe_mode_flag_gpu_memory_limit(self, tmp_path):
         """§1.8 + §9: --safe-mode limits GPU mem to 1 GB."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--safe-mode", "--seed", "42")
         assert (out / "checkpoint.bin").exists()
 
@@ -399,7 +399,7 @@ class TestSection02_OutputArtefacts:
         out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--seed", "42")
         chk = read_checkpoint(out / "checkpoint.bin")
-        assert chk["version"] in (4, 5, 6), f"unexpected version {chk['version']}"
+        assert chk["version"] in (4, 5, 6, 7), f"unexpected version {chk['version']}"
         assert chk["num_cells"] == 4
         assert chk["params"]["Nx"] == 200
 
@@ -436,7 +436,7 @@ class TestSection02_OutputArtefacts:
     @requires_flag("--save-individual-fields")
     def test_per_cell_vtk_files_when_save_individual_fields(self, tmp_path):
         """§2: output_NNNNNN_cell_MM.vtk files (per-cell φ)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--save-individual-fields", "--seed", "42")
         # Fields may be saved to fields/ dir. Just verify checkpoint exists.
         assert (out / "checkpoint.bin").exists()
@@ -668,7 +668,7 @@ class TestSection06_DomainModes:
         """§6: Periodic BC (always-on torus topology)."""
         # Run a cell that starts near domain edge; confirm it wraps.
         # This is a post-sim analysis: load checkpoint and inspect centroid.
-        out = run_sim(tmp_path, "-n", "1", "-N", "100", "-r", "10",
+        out = run_sim(tmp_path, "-n", "1", "-N", "200", "-r", "10",
                       "-t", "5.0", "--v-A", "0.05", "--tau", "100",
                       "--seed", "42", "--trajectory-samples", "50")
         traj, _ = read_trajectory(out / "trajectory.txt")
@@ -692,11 +692,11 @@ class TestSection07_CheckpointFormat:
     """Test checkpoint I/O: write v6, read v3/v4/v6."""
 
     def test_sim_v2_writes_v6_checkpoints(self, tmp_path):
-        """§7: v2 WRITE: format v6 (current)."""
+        """§7: v2 WRITE: format v7 (current)."""
         out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--seed", "42")
         chk = read_checkpoint(out / "checkpoint.bin")
-        assert chk["version"] == 6, f"v2 should write v6, got {chk['version']}"
+        assert chk["version"] == 7, f"v2 should write v7, got {chk['version']}"
 
     @requires_baseline()
     def test_sim_v2_reads_baseline_v4_checkpoints(self, baseline_sim, tmp_path):
@@ -722,7 +722,7 @@ class TestSection07_CheckpointFormat:
         ckpt1 = out1 / "checkpoint.bin"
         out2 = run_sim(tmp_path / "run2", "-c", str(ckpt1), "-t", "1.0", "--seed", "42")
         chk2 = read_checkpoint(out2 / "checkpoint.bin")
-        assert chk2["version"] == 6
+        assert chk2["version"] == 7
         assert chk2["time"] >= 0.99
 
 
@@ -797,7 +797,7 @@ class TestSection09_ComputeKnobs:
     @requires_flag("--safe-mode")
     def test_safe_mode_gpu_memory_limit(self, tmp_path):
         """§9: --safe-mode (1 GB GPU memory cap)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--safe-mode", "--seed", "42")
         assert (out / "checkpoint.bin").exists()
 
@@ -834,7 +834,7 @@ class TestSection09_ComputeKnobs:
     @requires_flag("--safe-mode")
     def test_safe_mode_explicit_cover(self, tmp_path):
         """§9: --safe-mode (only testable compute knob)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "100", "-r", "20",
+        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--safe-mode", "--seed", "42")
         assert (out / "checkpoint.bin").exists()
 
@@ -981,7 +981,7 @@ class TestSection11_Miscellaneous:
 
     def test_trajectory_time_precision_monotonic(self, tmp_path):
         """§11: Trajectory timestamps monotonic (float32 precision limits)."""
-        out = run_sim(tmp_path, "-n", "2", "-N", "128", "-r", "20",
+        out = run_sim(tmp_path, "-n", "2", "-N", "200", "-r", "20",
                       "-t", "10.0", "--dt", "0.01", "--seed", "42",
                       "--trajectory-samples", "100")
         traj, _ = read_trajectory(out / "trajectory.txt")

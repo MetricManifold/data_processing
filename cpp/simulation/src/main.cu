@@ -180,9 +180,24 @@ int main(int argc, char** argv) {
                 "Pick one.\n");
         return 1;
     }
+    // If neither -N nor --confluence is given, fall back to baseline's
+    // historical default (confluence = 0.85). This keeps single-line
+    // invocations like `cell_sim -n 8 -r 20` runnable without forcing
+    // the user to pick a domain size every time.
+    if (confluence <= 0 && !nx_set) {
+        confluence = 0.85f;
+        fprintf(stderr,
+                "[warn] No -N or --confluence specified; "
+                "auto-setting --confluence=0.85.\n");
+    }
     if (confluence > 0) {
         int L = Simulation::domain_for(ncells_set ? ncells : 8,
                                        p.target_radius, confluence);
+        // Domain must be >= TILE_T to avoid tile self-wrap. For tiny
+        // (n*r²) inputs the confluence formula gives L < TILE_T; bump it
+        // up so the sim still runs (the actual confluence will be lower
+        // than requested in that case, which is the right trade-off).
+        if (L < TILE_T) L = TILE_T;
         p.Nx = L; p.Ny = L;
     }
     // Translate --trajectory-interval into --trajectory-samples now that

@@ -2111,7 +2111,7 @@ class TestDefaultOutputFootprint:
         metrics. This is the baseline disk footprint every production
         submission inherits unless it passes flags to opt in.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "0.2", "--dt", "0.01", "--seed", "1")
         files = sorted(p.name for p in out.iterdir() if p.is_file())
         assert files == ["checkpoint.bin", "trajectory.txt"], (
@@ -2126,7 +2126,7 @@ class TestDefaultOutputFootprint:
         when samples=0 (~200 bytes × N_runs = surprise tens of MB on big
         studies). Disabled runs must leave no trace.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "0.2", "--dt", "0.01", "--seed", "1",
                   "--trajectory-samples", "0")
         assert not (out / "trajectory.txt").exists(), (
@@ -2139,7 +2139,7 @@ class TestDefaultOutputFootprint:
         This is the cheapest possible run mode, used by benchmarks and by
         test-correctness harnesses that only inspect live state.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "0.2", "--dt", "0.01", "--seed", "1",
                   "--trajectory-samples", "0",
                   "--no-save-final-checkpoint")
@@ -2161,7 +2161,7 @@ class TestDefaultOutputFootprint:
         timescales). It is now opt-in via `--vtk-interval`. This test
         locks in that default.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "0.2", "--dt", "0.01", "--seed", "1")
         vtks = sorted(p.name for p in out.glob("*.vtk"))
         assert vtks == [], f"unexpected VTK output under defaults: {vtks}"
@@ -2174,7 +2174,7 @@ class TestDefaultOutputFootprint:
         these flags as no-ops but we want to guarantee the default, with
         no flags, is silent.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "0.2", "--dt", "0.01", "--seed", "1")
         unwanted = ["observables.csv", "energy_metrics.txt",
                     "diagnostics.json"]
@@ -2194,7 +2194,7 @@ class TestDefaultOutputFootprint:
         If someone bumps default trajectory_samples to 10000 this catches
         it immediately. Loose upper bound: 10× expected size.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "1.0", "--dt", "0.01", "--seed", "1")
         traj = out / "trajectory.txt"
         assert traj.exists()
@@ -2212,7 +2212,7 @@ class TestDefaultOutputFootprint:
         1000) would quietly multiply cluster disk usage by 10×. Any change
         here must be intentional and deliberate.
         """
-        out = sim("-n", "4", "-N", "150", "-r", "20",
+        out = sim("-n", "4", "-N", "200", "-r", "20",
                   "-t", "0.1", "--dt", "0.01", "--seed", "1")
         data = read_checkpoint(out / "checkpoint.bin")
         p = data["params"]
@@ -2394,7 +2394,7 @@ class Test3DDeferred:
     @pytest.mark.xfail(strict=True,
                        reason="3D solver not implemented in sim_v2")
     def test_3d_flag_accepted(self, sim):
-        sim("-n", "2", "-N", "80", "-r", "15", "-t", "0.05",
+        sim("-n", "2", "-N", "200", "-r", "15", "-t", "0.05",
             "--dt", "0.01", "--3d", "-Nz", "80", "--seed", "1",
             "--trajectory-samples", "0")
 
@@ -2403,7 +2403,7 @@ class Test3DDeferred:
     def test_Nz_flag_accepted(self, sim):
         """`-Nz` alone should be accepted even without `--3d`
         (baseline rejects this — we want parity or explicit error)."""
-        sim("-n", "2", "-N", "80", "-r", "15", "-t", "0.05",
+        sim("-n", "2", "-N", "200", "-r", "15", "-t", "0.05",
             "--dt", "0.01", "-Nz", "80", "--seed", "1",
             "--trajectory-samples", "0")
 

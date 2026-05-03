@@ -240,9 +240,9 @@ class TestPeriodicBoundaryCrossing:
 
     def test_volume_continuous_across_wrap(self, tmp_path):
         R = 15
-        L = 150           # >= TILE_T (128); still ~5R so cell wraps cleanly
+        L = 200           # >= TILE_T (192); still ~13R so cell wraps cleanly
         v_A = 0.1
-        t_end = 2000
+        t_end = 2500      # at v_A=0.1 -> ideal disp 250 px > L (need >=1 wrap)
         out = run_sim(tmp_path / "run",
                       "-n", "1", "-N", str(L), "-r", str(R),
                       "-t", str(t_end), "--dt", "0.01",

@@ -27,6 +27,7 @@ from report import (record_metric, record_timeseries,
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "cpu_ref_2tau"
+FIXTURE_DIR_SOFT = Path(__file__).parent / "fixtures" / "cpu_ref_2tau_soft"
 DOMAIN_L = 376.0   # IC has L = 376
 TAU = 10000.0
 RADIUS = 49.0
@@ -273,5 +274,126 @@ class TestCutoverParity:
             # max|err| ~ 0.14 concentrated at cell-cell interfaces (steep
             # gradients amplify sub-pixel position drift). Thresholds
             # ~5x observed to catch regressions without flapping.
+            assert phi_rms < 5e-2, f"final phi RMS = {phi_rms:.3e} > 5e-2"
+            assert phi_max < 0.7, f"final phi max|err| = {phi_max:.3f} > 0.7"
+
+
+@pytest.mark.slow
+class TestCutoverParitySoft:
+    """Soft-cell variant: GPU sim_v3 vs f64 Rust cpu_ref over 2tau, IC has
+    cell 0 with gamma=0.35 (Palmieri-extension soft cell) and 15 stiff
+    cells at gamma=1.0; v_A=0.014.
+
+    Mirrors :class:`TestCutoverParity` but with the soft fixture in
+    ``fixtures/cpu_ref_2tau_soft/``. Reference data was produced on
+    Compute Canada Nibi against the same f64 Rust cpu_ref binary
+    (commit d9447a7 = per-cell gamma via the GAMA sidecar). See the
+    fixture README for the regen protocol.
+
+    The same trajectory and final-phi tolerances are applied: the soft
+    cell is a pertubation of the per-cell gamma, not a change to the
+    integration scheme, so f32-vs-f64 drift envelopes should be the
+    same order as the hard-cell case.
+    """
+
+    def test_2tau_soft_scripted_events(self, sim, request, tmp_path):
+        ic = FIXTURE_DIR_SOFT / "ic_checkpoint.bin"
+        events = FIXTURE_DIR_SOFT / "events.txt"
+        ref_traj_path = FIXTURE_DIR_SOFT / "ref_trajectory.txt"
+        ref_phi_path = FIXTURE_DIR_SOFT / "ref_final_phi.npz"
+        for p in (ic, events, ref_traj_path):
+            assert p.exists(), f"missing fixture: {p}"
+
+        out = sim(
+            "-c", str(ic),
+            "--scripted-events", str(events),
+            "--v-A", "0.014",
+            "--tau", "10000",
+            "-t", "20000",
+            "--trajectory-samples", "400",
+            "--checkpoint-interval", "0",
+            "--save-interval", "0",
+            "--print-interval", "0",
+            "--save-final-checkpoint",
+            timeout=900,
+        )
+
+        gpu_data = _read_positions(out / "trajectory.txt")
+        cpu_data = _read_positions(ref_traj_path)
+        assert len(cpu_data) >= 100 and len(gpu_data) >= 100, \
+            f"frame counts: cpu={len(cpu_data)} gpu={len(gpu_data)}"
+        ts, rms, mx, dr_pc = _per_frame_drift(gpu_data, cpu_data)
+        assert len(ts) >= 100, f"only {len(ts)} aligned frames"
+        assert ts[-1] >= 19000, f"GPU run ended at t={ts[-1]:.0f}"
+
+        rms_max = float(rms.max())
+        max_p95 = float(np.percentile(mx, 95))
+        max_final = float(mx[-1])
+        max_any = float(mx.max())
+
+        gpu_ckpt = out / "checkpoint.bin"
+        assert gpu_ckpt.exists(), f"no GPU final checkpoint at {gpu_ckpt}"
+        phi_gpu = _final_phi_full(gpu_ckpt)
+        if ref_phi_path.exists():
+            ref = np.load(ref_phi_path)
+            phi_cpu = np.asarray(ref["phi"]).sum(axis=0).astype(np.float64)
+            assert phi_cpu.shape == phi_gpu.shape, \
+                f"phi shape mismatch gpu={phi_gpu.shape} cpu={phi_cpu.shape}"
+            phi_err_2d = phi_gpu - phi_cpu
+            phi_rms = float(np.sqrt((phi_err_2d ** 2).mean()))
+            phi_max = float(np.abs(phi_err_2d).max())
+        else:
+            phi_err_2d = np.zeros_like(phi_gpu)
+            phi_rms = float("nan"); phi_max = float("nan")
+
+        summary = dict(
+            rms_max=rms_max, max_p95=max_p95, max_final=max_final, max_any=max_any,
+            phi_rms=phi_rms, phi_max=phi_max,
+            n_frames=int(len(ts)), t_final=float(ts[-1]),
+        )
+
+        art = tmp_path / "parity_artifacts_soft"
+        _save_artifacts(art, ts, rms, mx, dr_pc, phi_err_2d, summary)
+        persist = request.config.getoption("--parity-artifacts")
+        if persist:
+            dst = Path(persist) / "soft"
+            dst.mkdir(parents=True, exist_ok=True)
+            for f in art.iterdir():
+                shutil.copy(f, dst / f.name)
+            print(f"\n[parity-soft] artifacts copied to {dst}")
+        print("\n[parity-soft] " + "  ".join(f"{k}={v:.4g}"
+              if isinstance(v, float) else f"{k}={v}" for k, v in summary.items()))
+
+        nodeid = request.node.nodeid
+        record_description(nodeid,
+            "GPU sim_v3 vs f64 Rust cpu_ref over 2tau, soft cell (gamma=0.35) "
+            "+ 15 stiff cells, v_A=0.014. Trajectory drift |Dr|(t) plus final "
+            "phase-field error (sum_i phi_i on full domain).")
+        record_metric(nodeid, "rms|Dr| envelope", rms_max, expected=0.0,
+                      tolerance=0.5, unit="px")
+        record_metric(nodeid, "max|Dr| p95", max_p95, expected=0.0,
+                      tolerance=0.5, unit="px")
+        record_metric(nodeid, "max|Dr| final", max_final, expected=0.0,
+                      tolerance=1.0, unit="px")
+        record_metric(nodeid, "max|Dr| any-frame", max_any, expected=0.0,
+                      tolerance=RADIUS / 5, unit="px")
+        if not np.isnan(phi_rms):
+            record_metric(nodeid, "phi RMS (final)", phi_rms, expected=0.0,
+                          tolerance=5e-2, unit="")
+            record_metric(nodeid, "phi max|err| (final)", phi_max,
+                          expected=0.0, tolerance=0.7, unit="")
+        record_timeseries(nodeid, ts, {"rms|Dr|": rms, "max|Dr|": mx},
+                          xlabel="t", ylabel="|Dr| (px)",
+                          title="GPU vs cpu_ref drift (soft)", ylog=True)
+        if not np.isnan(phi_rms):
+            record_comparison_panel(nodeid, phi_gpu, phi_gpu - phi_err_2d,
+                                    title="Final sum phi_i (soft): GPU | cpu_ref | |err|")
+
+        assert rms_max < 0.5, f"rms|Dr| envelope = {rms_max:.3f} > 0.5"
+        assert max_p95 < 0.5, f"max|Dr| p95 = {max_p95:.3f} > 0.5"
+        assert max_final < 1.0, f"final max|Dr| = {max_final:.3f} > 1.0"
+        assert max_any < RADIUS / 5, \
+            f"any-frame max|Dr| = {max_any:.3f} > R/5={RADIUS/5:.1f}"
+        if not np.isnan(phi_rms):
             assert phi_rms < 5e-2, f"final phi RMS = {phi_rms:.3e} > 5e-2"
             assert phi_max < 0.7, f"final phi max|err| = {phi_max:.3f} > 0.7"

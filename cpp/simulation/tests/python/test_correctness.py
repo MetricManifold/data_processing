@@ -60,7 +60,7 @@ class TestTrajectoryIntegrity:
 
     def test_timestamps_strictly_increasing(self, sim):
         """Every unique timestamp must be strictly greater than the previous."""
-        out = sim("-n", "2", "-N", "128", "-r", "20", "-t", "1", "--dt", "0.01",
+        out = sim("-n", "2", "-N", "200", "-r", "20", "-t", "1", "--dt", "0.01",
                   "--v-A", "0", "--seed", "42", "--trajectory-samples", "50")
         data, _ = read_trajectory(out / "trajectory.txt")
         times = sorted(data.keys())
@@ -83,7 +83,7 @@ class TestTrajectoryIntegrity:
         Binary layout v5: magic(4), ver(4), step(4), time(8), N(4), ...
         """
         import struct
-        out = sim("-n", "1", "-N", "128", "-r", "20", "-t", "0.5", "--dt", "0.01",
+        out = sim("-n", "1", "-N", "200", "-r", "20", "-t", "0.5", "--dt", "0.01",
                   "--v-A", "0", "--seed", "42", "--trajectory-samples", "0")
         ckpt = (out / "checkpoint.bin").read_bytes()
         magic, version = struct.unpack_from("<II", ckpt, 0)
@@ -108,7 +108,7 @@ class TestTrajectoryIntegrity:
         import struct, subprocess
         from conftest import CELL_SIM
         # 1. Short initial run to generate a v5 checkpoint
-        out1 = sim("-n", "1", "-N", "64", "-r", "15", "-t", "0.5",
+        out1 = sim("-n", "1", "-N", "200", "-r", "15", "-t", "0.5",
                    "--dt", "0.001", "--v-A", "0", "--seed", "42",
                    "--trajectory-samples", "0")
         ckpt_src = out1 / "checkpoint.bin"
@@ -716,7 +716,7 @@ class TestConfluence:
 
     def test_confluence_independent_of_N(self, tmp_path):
         """Different N values with same confluence should give same packing fraction."""
-        R = 20.0  # smaller R for faster test
+        R = 49.0  # cell radius large enough that auto-L stays >= TILE_T
         target_phi = 0.85
         phis = []
         for N in [12, 24]:
