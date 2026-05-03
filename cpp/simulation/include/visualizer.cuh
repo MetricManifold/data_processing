@@ -15,6 +15,8 @@
 // Overlays (drawn from device data, no host roundtrip):
 //   * Red tint on soft cells (gamma_cell < soft_gamma_threshold).
 //   * Cyan dashed bbox on soft cells (active rect).
+//   * Magenta dashed TILE_T outline (outer scratch container).
+//   * Orange dashed sigma box (live shape extent from second moments).
 //   * White velocity arrows at every cell centroid.
 // ---------------------------------------------------------------------------
 
@@ -75,6 +77,13 @@ private:
     cudaGraphicsResource_t cuda_resource = nullptr;
     bool initialized = false;
     int tex_width = 0, tex_height = 0;
+    // Dedicated non-blocking CUDA stream so viz kernels never serialize
+    // against the sim's default-stream work; gated by sim_done / viz_done
+    // events so frames are skipped if the previous one is still in flight.
+    cudaStream_t viz_stream = 0;
+    cudaEvent_t  sim_done = nullptr;  // recorded on default stream pre-update
+    cudaEvent_t  viz_done = nullptr;  // recorded on viz_stream post-update
+    bool         viz_in_flight = false;
 };
 
 } // namespace cellsim

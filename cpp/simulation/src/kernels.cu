@@ -129,12 +129,13 @@ __global__ void k_scatter_S(
     int lx = rx0 + (p0 % rw);
     int ly = ry0 + (p0 / rw);
     for (int p = p0; p < chunk_end; p += BS) {
-        float v = tile[ly * TILE_T + lx];
-        if (v >= 1e-6f) {
-            int gx = wrap_i(gx0 + lx, L);
-            int gy = wrap_i(gy0 + ly, L);
-            atomicAdd(&S[gy * L + gx], v * v);
-        }
+        float v = __ldg(tile + ly * TILE_T + lx);
+        // Every pixel inside the rect contributes to S (no background-skip):
+        // skipping changes the global S field by ~rect_area * 1e-12 which is
+        // below f32 epsilon but not bit-exact.
+        int gx = wrap_i(gx0 + lx, L);
+        int gy = wrap_i(gy0 + ly, L);
+        atomicAdd(&S[gy * L + gx], v * v);
         lx += step_x; ly += step_y;
         if (lx >= rx_end) { lx -= rw; ly += 1; }
     }
@@ -164,19 +165,15 @@ void launch_scatter_S(CellArrays& c, const SimParams& p) {
     if (N == 0) return;
     const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes);
-    if (N >= evolve_dispatch_threshold()) {
-        // Large-N path: one block per cell, single chunk = whole rect.
-        // CHUNK_PIXELS large enough to cover any rect within TILE_T x TILE_T.
-        k_scatter_S<<<dim3(1, N), 256>>>(
-            c.phi_in, c.origin, c.rect, c.S, N, p.Nx, TILE_AREA);
-    } else {
-        // Small-N path: split each cell into chunks for occupancy.
-        constexpr int CHUNK_PIXELS = 2048;
-        constexpr int BS = 128;
-        constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-        k_scatter_S<<<dim3(MAX_CHUNKS, N), BS>>>(
-            c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
-    }
+    // Always multi-block: chunking by ~4096 pixels keeps the SMs saturated
+    // even at large N (1152 cells * 9 chunks/cell = 10368 blocks vs the
+    // 1152-block "fused" alternative which left ~85% of warps idle on
+    // a 76-SM device).
+    constexpr int CHUNK_PIXELS = 4096;
+    constexpr int BS = 256;
+    constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+    k_scatter_S<<<dim3(chunks_per_cell, N), BS>>>(
+        c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,9 +375,10 @@ __global__ void k_evolve_l1(
 // of the active rect for one cell. Splitting the cell across many blocks
 // pumps occupancy when N is small. Per-cell accumulators are filled by
 // atomicAdd from one thread per block; the host pre-zeros them.
-// Background-skipping: pixels with phi < bgthr contribute negligibly to
-// reductions and have no RHS contribution; we early-out without touching
-// neighbors or S, saving most of the bandwidth in the periphery.
+// All pixels inside the active rect are evaluated unconditionally; we do
+// NOT background-skip on phi < threshold. The rect itself is the locality
+// optimisation; further skipping would change reductions / RHS by amounts
+// below f32 epsilon but not bit-exact, which is unacceptable here.
 // ---------------------------------------------------------------------------
 
 __global__ void k_zero_per_cell(
@@ -394,7 +392,89 @@ __global__ void k_zero_per_cell(
     e[n] = 0.0f; f[n] = 0.0f; g[n] = 0.0f; h[n] = 0.0f;
 }
 
-__global__ void k_reduce_mb(
+__global__ void k_zero_per_cell3(
+    float* a, float* b, float* c, int N)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    a[n] = 0.0f; b[n] = 0.0f; c[n] = 0.0f;
+}
+
+// Fast reduce: only V, Ix, Iy. Used on non-rebind, non-output steps.
+// Saves 5 atomicAdds per chunk and 5 block-reductions vs the full variant.
+__global__ void k_reduce_mb_fast(
+    const float* __restrict__ phi,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    const float* __restrict__ S,
+    float* __restrict__ V_out,
+    float* __restrict__ Ix_out,
+    float* __restrict__ Iy_out,
+    int N, int L, int CHUNK_PIXELS)
+{
+    const int n  = blockIdx.y;
+    const int cb = blockIdx.x;
+    if (n >= N) return;
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    const int rect_total = rw * rh;
+    const int p_start = cb * CHUNK_PIXELS;
+    if (p_start >= rect_total) return;
+    const int p_end = min(p_start + CHUNK_PIXELS, rect_total);
+    const int gx0 = origin[2*n + 0];
+    const int gy0 = origin[2*n + 1];
+    const float* tile = phi + (size_t)n * TILE_AREA;
+    const int tid = threadIdx.x;
+    const int BS  = blockDim.x;
+
+    float sV = 0.0f, sIx = 0.0f, sIy = 0.0f;
+
+    const int step_x = BS % rw;
+    const int step_y = BS / rw;
+    const int rx_end = rx0 + rw;
+    int p0 = p_start + tid;
+    int lx = rx0 + (p0 % rw);
+    int ly = ry0 + (p0 / rw);
+    for (int p = p0; p < p_end; p += BS) {
+        int idx = ly * TILE_T + lx;
+        // rect invariant: rx0 >= 1 && rx0+rw <= TILE_T-1, same for y.
+        // All 5-pt stencil neighbors are in-tile, no boundary guards.
+        float c   = __ldg(tile + idx);
+        float xp_ = __ldg(tile + idx + 1);
+        float xm_ = __ldg(tile + idx - 1);
+        float yp_ = __ldg(tile + idx + TILE_T);
+        float ym_ = __ldg(tile + idx - TILE_T);
+        float gx = 0.5f * (xp_ - xm_);
+        float gy = 0.5f * (yp_ - ym_);
+        int gxg = wrap_i(gx0 + lx, L);
+        int gyg = wrap_i(gy0 + ly, L);
+        float Sv   = __ldg(S + gyg * L + gxg);
+        float Soth = Sv - c * c;
+        if (Soth < 0.0f) Soth = 0.0f;
+        sV  += c * c;
+        sIx += c * gx * Soth;
+        sIy += c * gy * Soth;
+        lx += step_x; ly += step_y;
+        if (lx >= rx_end) { lx -= rw; ly += 1; }
+    }
+
+    __shared__ float ws[32];
+    sV  = block_sum(sV,  ws);
+    sIx = block_sum(sIx, ws);
+    sIy = block_sum(sIy, ws);
+    if (tid == 0) {
+        atomicAdd(&V_out[n],  sV);
+        atomicAdd(&Ix_out[n], sIx);
+        atomicAdd(&Iy_out[n], sIy);
+    }
+}
+
+// Full reduce: V, Ix, Iy, perimeter, Cx, Cy, Cxx, Cyy.
+// Used on rebind steps (rebind needs Cx/Cy/Cxx/Cyy) and on output steps
+// (host reads V, Cx, Cy, perimeter for trajectory/VTK/checkpoint).
+__global__ void k_reduce_mb_full(
     const float* __restrict__ phi,
     const int*   __restrict__ origin,
     const int*   __restrict__ rect,
@@ -437,32 +517,29 @@ __global__ void k_reduce_mb(
     int ly = ry0 + (p0 / rw);
     for (int p = p0; p < p_end; p += BS) {
         int idx = ly * TILE_T + lx;
-        float c = __ldg(tile + idx);
-        // Background skip: pixel + immediate neighbors all near-zero ->
-        // zero gradient, zero c^2, no contribution to any accumulator.
-        if (c >= 1e-4f) {
-            float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
-            float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
-            float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
-            float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
-            float gx = 0.5f * (xp_ - xm_);
-            float gy = 0.5f * (yp_ - ym_);
-            int gxg = wrap_i(gx0 + lx, L);
-            int gyg = wrap_i(gy0 + ly, L);
-            float Sv   = __ldg(S + gyg * L + gxg);
-            float Soth = Sv - c * c;
-            if (Soth < 0.0f) Soth = 0.0f;
-            float c2 = c * c;
-            float fx = (float)lx, fy = (float)ly;
-            sV   += c2;
-            sIx  += c * gx * Soth;
-            sIy  += c * gy * Soth;
-            sPeri += sqrtf(gx * gx + gy * gy);
-            sCx  += c2 * fx;
-            sCy  += c2 * fy;
-            sCxx += c2 * fx * fx;
-            sCyy += c2 * fy * fy;
-        }
+        // rect invariant: stencil neighbors in-tile, no boundary guards.
+        float c   = __ldg(tile + idx);
+        float xp_ = __ldg(tile + idx + 1);
+        float xm_ = __ldg(tile + idx - 1);
+        float yp_ = __ldg(tile + idx + TILE_T);
+        float ym_ = __ldg(tile + idx - TILE_T);
+        float gx = 0.5f * (xp_ - xm_);
+        float gy = 0.5f * (yp_ - ym_);
+        int gxg = wrap_i(gx0 + lx, L);
+        int gyg = wrap_i(gy0 + ly, L);
+        float Sv   = __ldg(S + gyg * L + gxg);
+        float Soth = Sv - c * c;
+        if (Soth < 0.0f) Soth = 0.0f;
+        float c2 = c * c;
+        float fx = (float)lx, fy = (float)ly;
+        sV    += c2;
+        sIx   += c * gx * Soth;
+        sIy   += c * gy * Soth;
+        sPeri += sqrtf(gx * gx + gy * gy);
+        sCx   += c2 * fx;
+        sCy   += c2 * fy;
+        sCxx  += c2 * fx * fx;
+        sCyy  += c2 * fy * fy;
         lx += step_x; ly += step_y;
         if (lx >= rx_end) { lx -= rw; ly += 1; }
     }
@@ -563,69 +640,42 @@ __global__ void k_rhs_mb(
     int p0 = p_start + tid;
     int lx = rx0 + (p0 % rw);
     int ly = ry0 + (p0 / rw);
-    const float bgthr = 1e-5f;
     for (int p = p0; p < p_end; p += BS) {
         int idx = ly * TILE_T + lx;
-        float c   = __ldg(tile + idx);
-        float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
-        float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
-        float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
-        float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
-        // If the entire 5-stencil is background, the 9-pt stencil is also
-        // background; double-well, volume, repulsion, advection all zero.
-        // phi_out for that pixel is 0 (output buffer is pre-zeroed in
-        // k_rebind / alloc_gpu).
-        if (c >= bgthr || xp_ >= bgthr || xm_ >= bgthr || yp_ >= bgthr || ym_ >= bgthr) {
-            float xpyp = (lx + 1 < TILE_T && ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T + 1) : 0.0f;
-            float xpym = (lx + 1 < TILE_T && ly     > 0)      ? __ldg(tile + idx - TILE_T + 1) : 0.0f;
-            float xmyp = (lx     > 0      && ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T - 1) : 0.0f;
-            float xmym = (lx     > 0      && ly     > 0)      ? __ldg(tile + idx - TILE_T - 1) : 0.0f;
-            float lap = lap9(c, xm_, xp_, ym_, yp_, xmym, xpym, xmyp, xpyp);
-            float gx  = 0.5f * (xp_ - xm_);
-            float gy  = 0.5f * (yp_ - ym_);
-            int gxg = wrap_i(gx0 + lx, L);
-            int gyg = wrap_i(gy0 + ly, L);
-            float Sv   = __ldg(S + gyg * L + gxg);
-            float Soth = Sv - c * c;
-            if (Soth < 0.0f) Soth = 0.0f;
-            float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
-            float rhs = gam * lap - dwC * dw + volC * c - repC * c * Soth;
-            float adv = vx * gx + vy * gy;
-            outp[idx] = c + dt * (rhs - adv);
-        } else {
-            outp[idx] = 0.0f;
-        }
+        // rect invariant: stencil neighbors in-tile, no boundary guards.
+        float c    = __ldg(tile + idx);
+        float xp_  = __ldg(tile + idx + 1);
+        float xm_  = __ldg(tile + idx - 1);
+        float yp_  = __ldg(tile + idx + TILE_T);
+        float ym_  = __ldg(tile + idx - TILE_T);
+        float xpyp = __ldg(tile + idx + TILE_T + 1);
+        float xpym = __ldg(tile + idx - TILE_T + 1);
+        float xmyp = __ldg(tile + idx + TILE_T - 1);
+        float xmym = __ldg(tile + idx - TILE_T - 1);
+        float lap = lap9(c, xm_, xp_, ym_, yp_, xmym, xpym, xmyp, xpyp);
+        float gx  = 0.5f * (xp_ - xm_);
+        float gy  = 0.5f * (yp_ - ym_);
+        int gxg = wrap_i(gx0 + lx, L);
+        int gyg = wrap_i(gy0 + ly, L);
+        float Sv   = __ldg(S + gyg * L + gxg);
+        float Soth = Sv - c * c;
+        if (Soth < 0.0f) Soth = 0.0f;
+        float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
+        float rhs = gam * lap - dwC * dw + volC * c - repC * c * Soth;
+        float adv = vx * gx + vy * gy;
+        outp[idx] = c + dt * (rhs - adv);
         lx += step_x; ly += step_y;
         if (lx >= rx_end) { lx -= rw; ly += 1; }
     }
 }
 
-void launch_evolve(CellArrays& c, const SimParams& p) {
+void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce) {
     const int N = c.num_cells;
     if (N == 0) return;
-    if (N >= evolve_dispatch_threshold()) {
-        // Large-N path: fused two-pass single-block-per-cell evolve.
-        // SMs are saturated by N blocks alone; chunking adds launch + atomic
-        // cost without throughput gain. The fused kernel keeps the velocity
-        // broadcast in shared mem (no extra global round-trip via Ix/Iy).
-        k_evolve_l1<<<N, 256>>>(
-            c.phi_in, c.origin, c.rect, c.S,
-            c.gamma_cell, c.v_A_cell, c.tgt_radius,
-            c.polar_x, c.polar_y,
-            c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy, c.perimeters,
-            c.velocities_x, c.velocities_y,
-            c.phi_out,
-            N, p.Nx,
-            (float)p.lambda, (float)p.kappa, (float)p.mu,
-            (float)p.xi,     (float)p.dt);
-        return;
-    }
-    // Small-N path: multi-block scatter+reduce+RHS pipeline.
-    // (a) k_zero_per_cell  zeros the 8 per-cell accumulators.
-    // (b) k_reduce_mb      grid=(chunks_per_cell, N), atomicAdds into
-    //     V/Ix/Iy/peri/Cx/Cy/Cxx/Cyy. Background-skipped per pixel.
-    // (c) k_rhs_mb         grid=(chunks_per_cell, N), reads finalized
-    //     V/Ix/Iy and writes phi_out + per-cell vx/vy. Background-skipped.
+    // Multi-block scatter+reduce+RHS pipeline (replaces fused k_evolve_l1).
+    // Splitting reduce/RHS across many blocks pumps SM occupancy at all N,
+    // including the large-N regime where a single block per cell would
+    // bottleneck on the heavy fused kernel's register footprint.
     constexpr int CHUNK_PIXELS = 4096;
     constexpr int BS = 256;
     constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
@@ -633,15 +683,27 @@ void launch_evolve(CellArrays& c, const SimParams& p) {
 
     {
         int bsz = 128, gsz = (N + bsz - 1) / bsz;
-        k_zero_per_cell<<<gsz, bsz>>>(
-            c.volumes, c.Ix, c.Iy, c.perimeters,
-            c.Cx, c.Cy, c.Cxx, c.Cyy, N);
+        if (need_full_reduce) {
+            k_zero_per_cell<<<gsz, bsz>>>(
+                c.volumes, c.Ix, c.Iy, c.perimeters,
+                c.Cx, c.Cy, c.Cxx, c.Cyy, N);
+        } else {
+            k_zero_per_cell3<<<gsz, bsz>>>(
+                c.volumes, c.Ix, c.Iy, N);
+        }
     }
-    k_reduce_mb<<<grid_mb, BS>>>(
-        c.phi_in, c.origin, c.rect, c.S,
-        c.volumes, c.Ix, c.Iy, c.perimeters,
-        c.Cx, c.Cy, c.Cxx, c.Cyy,
-        N, p.Nx, CHUNK_PIXELS);
+    if (need_full_reduce) {
+        k_reduce_mb_full<<<grid_mb, BS>>>(
+            c.phi_in, c.origin, c.rect, c.S,
+            c.volumes, c.Ix, c.Iy, c.perimeters,
+            c.Cx, c.Cy, c.Cxx, c.Cyy,
+            N, p.Nx, CHUNK_PIXELS);
+    } else {
+        k_reduce_mb_fast<<<grid_mb, BS>>>(
+            c.phi_in, c.origin, c.rect, c.S,
+            c.volumes, c.Ix, c.Iy,
+            N, p.Nx, CHUNK_PIXELS);
+    }
     k_rhs_mb<<<grid_mb, BS>>>(
         c.phi_in, c.origin, c.rect, c.S,
         c.gamma_cell, c.v_A_cell,

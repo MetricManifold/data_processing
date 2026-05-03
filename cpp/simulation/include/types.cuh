@@ -78,7 +78,7 @@ struct SimParams {
 // ---------------------------------------------------------------------------
 static constexpr int TILE_T        = 192;
 static constexpr int TILE_AREA     = TILE_T * TILE_T;
-static constexpr int REBIND_EVERY  = 10;
+static constexpr int REBIND_EVERY  = 8;
 
 // Adaptive rect parameters (host constants used in init / k_rebind).
 //   bbox_k       half-width = ceil(k * sigma + margin) per axis

@@ -50,7 +50,8 @@ static void usage(const char* prog) {
     printf("  --trajectory-interval <n> Steps between trajectory saves (alt. to --trajectory-samples)\n");
     printf("  --vtk-interval <n>    Write binary VTK composite field every N steps (0=off, default)\n");
     printf("  --live-view           Open live CUDA-OpenGL viewer (requires ENABLE_VISUALIZER build)\n");
-    printf("  --live-view-interval <n>  Steps between viewer updates (default: 1)\n");
+    printf("  --live-view-tu <f>        Frame interval in time units (default: 5.0)\n");
+    printf("  --live-view-interval <n>  Steps between viewer updates (overrides --live-view-tu)\n");
     printf("  --save-individual-fields  Write per-cell phi (accepted, no-op stub in v2)\n");
     printf("  --use-diagnostics         Enable diagnostic outputs (accepted, no-op stub in v2)\n");
     printf("  --observable-interval <n> Diagnostic cadence (accepted, no-op stub in v2)\n");
@@ -66,6 +67,8 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
     SimParams p;
     SimOverrides ov;
     int ncells = 8;
@@ -82,7 +85,10 @@ int main(int argc, char** argv) {
     int vtk_interval = 0;         // Steps between binary VTK dumps; 0 = off.
     bool live_view = false;       // Open CUDA-GL live window. Requires
                                   // ENABLE_VISUALIZER build; otherwise warned + ignored.
-    int  live_view_interval = 1;  // Step cadence for viewer updates.
+    int  live_view_interval = 0;  // Step cadence for viewer updates. 0 = derive
+                                  // from --live-view-tu after dt is known.
+    bool live_view_interval_set = false;
+    double live_view_tu = 5.0;    // Default frame interval in time units.
     std::string scripted_events_path;
 
     for (int i = 1; i < argc; i++) {
@@ -141,6 +147,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--live-view")) { live_view = true; }
         else if (!strcmp(argv[i], "--live-view-interval") && i+1<argc) {
             live_view_interval = atoi(argv[++i]);
+            live_view_interval_set = true;
+        }
+        else if (!strcmp(argv[i], "--live-view-tu") && i+1<argc) {
+            live_view_tu = atof(argv[++i]);
         }
         // Accept-and-ignore stubs: baseline-compatible flags whose payloads
         // (per-cell VTK, GPU diagnostics, stress tensor, mem cap) are not yet
@@ -197,6 +207,11 @@ int main(int argc, char** argv) {
     sim.v_A_sigma = v_A_sigma;
     sim.vtk_interval = vtk_interval;
     sim.live_view = live_view;
+    if (!live_view_interval_set) {
+        // Derive from --live-view-tu (default 5 tau): one frame per 5 tu.
+        live_view_interval = (int)(live_view_tu / p.dt + 0.5);
+        if (live_view_interval < 1) live_view_interval = 1;
+    }
     sim.live_view_interval = (live_view_interval > 0) ? live_view_interval : 1;
 #ifndef ENABLE_VISUALIZER
     if (live_view) {

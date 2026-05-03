@@ -29,7 +29,13 @@ void launch_scatter_S(CellArrays& c, const SimParams& p);
 // Pass 2 reads S again, computes laplacian/double-well/repulsion/advection,
 // and writes phi_out plus reduces perimeter. Also writes velocities,
 // volumes, Cx, Cy, perimeters into the per-cell observable arrays.
-void launch_evolve(CellArrays& c, const SimParams& p);
+//
+// `need_full_reduce` controls whether Cx/Cy/Cxx/Cyy and perimeter are also
+// computed. Set true on rebind steps (rebind reads Cx/Cy/Cxx/Cyy) and on
+// trajectory/VTK/checkpoint output steps (host reads V, Cx, Cy, perimeter).
+// On non-output, non-rebind steps it can be false; the mb path then skips
+// 5 atomicAdds per chunk and 4 block-reductions.
+void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce);
 
 // COM-recentre: shift each cell's tile so its COM lands at (T/2, T/2).
 // Adjusts origin[n] and copies the (possibly shifted) tile into phi_out.

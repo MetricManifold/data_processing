@@ -822,8 +822,43 @@ void Simulation::step() {
     } else {
         launch_polar(cells, params);
     }
+    {
+        cudaError_t e = cudaPeekAtLastError();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[CUDA] step %d (after polar): %s\n", step_count, cudaGetErrorString(e));
+            fflush(stderr);
+            exit(1);
+        }
+    }
     launch_scatter_S(cells, params);
-    launch_evolve(cells, params);
+    {
+        cudaError_t e = cudaPeekAtLastError();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[CUDA] step %d (after scatter_S): %s\n", step_count, cudaGetErrorString(e));
+            fflush(stderr);
+            exit(1);
+        }
+    }
+    // Full reduce (Cx/Cy/Cxx/Cyy + perimeter) needed:
+    //  - on the step BEFORE rebind (rebind reads Cx/Cy/Cxx/Cyy)
+    //  - on output steps where host reads V/Cx/Cy/peri for traj/VTK/checkpoint
+    // Otherwise the cheap 3-channel reduce (V, Ix, Iy) is enough for RHS.
+    int next_step = step_count + 1;
+    bool will_rebind   = (next_step % REBIND_EVERY) == 0;
+    bool will_traj     = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
+    bool will_save     = (params.save_interval > 0 && next_step % params.save_interval == 0);
+    bool will_ckpt     = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
+    bool will_vtk      = (vtk_interval > 0 && next_step % vtk_interval == 0);
+    bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
+    launch_evolve(cells, params, need_full_red);
+    {
+        cudaError_t e = cudaPeekAtLastError();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[CUDA] step %d (after evolve): %s\n", step_count, cudaGetErrorString(e));
+            fflush(stderr);
+            exit(1);
+        }
+    }
     std::swap(cells.phi_in, cells.phi_out);
 
     if ((step_count + 1) % REBIND_EVERY == 0) {
@@ -833,16 +868,30 @@ void Simulation::step() {
         launch_rebind(cells,
                       (float)params.subdomain_padding,
                       (float)params.gamma);
+        {
+            cudaError_t e = cudaPeekAtLastError();
+            if (e != cudaSuccess) {
+                fprintf(stderr, "[CUDA] step %d (after rebind): %s\n", step_count, cudaGetErrorString(e));
+                fflush(stderr);
+                exit(1);
+            }
+        }
         std::swap(cells.phi_in, cells.phi_out);
     }
 
-#ifdef DEBUG_CUDA
-    cudaError_t err = cudaPeekAtLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA] step %d: %s\n", step_count, cudaGetErrorString(err));
-        exit(1);
+    {
+        cudaError_t err = cudaPeekAtLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[CUDA] step %d (peek): %s\n", step_count, cudaGetErrorString(err));
+            fflush(stderr);
+            cudaError_t serr = cudaDeviceSynchronize();
+            if (serr != cudaSuccess) {
+                fprintf(stderr, "[CUDA] step %d (sync): %s\n", step_count, cudaGetErrorString(serr));
+                fflush(stderr);
+            }
+            exit(1);
+        }
     }
-#endif
     step_count++;
     cur_time += params.dt;
 }

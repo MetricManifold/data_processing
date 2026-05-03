@@ -7,25 +7,36 @@ cmake_minimum_required(VERSION 3.18)
 # baseline is preserved under git tag `baseline-v1-final`.
 # ============================================================================
 
-# Windows: point at CUDA 13.0 explicitly (must precede project()).
+# Windows: point at CUDA 13.2 explicitly (must precede project()).
 if(WIN32 AND NOT DEFINED CMAKE_CUDA_COMPILER)
-    set(CMAKE_CUDA_COMPILER "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/bin/nvcc.exe")
-    set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0")
+    set(CMAKE_CUDA_COMPILER "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2/bin/nvcc.exe")
+    set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2")
     # VS2026 is unsupported by nvcc but works in practice.
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
+endif()
+
+# Architecture selection. Cluster builds set this explicitly via their build
+# scripts (Fir/Narval=sm_80, Nibi/Rorqual=sm_90, etc). On the local Windows
+# laptop we build only for the GPU we actually have (sm_89, RTX 4090 Laptop)
+# to keep fatbins lean and codegen tuned for that arch.
+# Override with `-DCMAKE_CUDA_ARCHITECTURES=<x>` for one-off builds.
+# MUST be set before project() — otherwise the CUDA language detection in
+# project() picks a native default and the value below is silently ignored
+# (CMake only respects pre-project() settings here).
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    if(WIN32)
+        set(CMAKE_CUDA_ARCHITECTURES "89")
+    else()
+        # Cover Ampere (A100 sm_80, RTX 30xx sm_86), Ada (RTX 40xx sm_89),
+        # Hopper (H100 sm_90) for portable Linux builds when not specified.
+        set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
+    endif()
 endif()
 
 project(cell_sim LANGUAGES CXX CUDA)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
-
-# Covers Ampere (A100 sm_80, RTX 30xx sm_86), Ada (RTX 40xx sm_89), Hopper
-# (H100 sm_90). Single list works on Windows laptop + Fir + Nibi + Narval +
-# Rorqual. Override with `-DCMAKE_CUDA_ARCHITECTURES=<x>` for one-off builds.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
-endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -51,6 +62,8 @@ add_executable(cell_sim ${CELL_SIM_SOURCES})
 target_include_directories(cell_sim PRIVATE include)
 target_compile_options(cell_sim PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math --expt-relaxed-constexpr>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xptxas=-O3,--allow-expensive-optimizations=true>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:--extra-device-vectorization>
 )
 
 if(ENABLE_VISUALIZER)
