@@ -176,23 +176,18 @@ void Simulation::configure_l2_persistence() {
 
     const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
 
-    // Use up to 75% of the available carveout. If S exceeds that, skip:
-    // a window larger than the carveout thrashes (every miss evicts
-    // another persisting line, hitRatio collapses).
-    const size_t max_window = (size_t)(0.75 * (double)max_persist_bytes);
-    if (S_bytes > max_window) {
-        printf("[L2] S=%.1f MB exceeds 75%% of carveout (%.1f MB); skipping persistence.\n",
-               S_bytes / 1e6, max_persist_bytes / 1e6);
-        // Reset any prior carveout from earlier sim instances.
-        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
-        return;
-    }
+    // Use the full available carveout. When S fits, pin all of it; when
+    // S exceeds the carveout, pin the leading carveout-worth of bytes
+    // (testsim approach). Even partial pinning gives a measurable win
+    // because the hot rebind / reduce / RHS reads of S are spatially
+    // localized to whichever cells happen to be in flight.
+    const size_t persist_size = std::min((size_t)max_persist_bytes, S_bytes);
+    const size_t window_bytes = persist_size;
 
-    // Reserve the carveout sized to S exactly (rounded up to L2-line
-    // granularity by the driver). If the requested size is larger than
-    // currently configured, cudaDeviceSetLimit grows it.
+    // Reserve the carveout. cudaDeviceSetLimit grows the carveout to the
+    // requested size if larger than current.
     cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
-                                         S_bytes);
+                                         persist_size);
     if (err != cudaSuccess) {
         printf("[L2] cudaDeviceSetLimit failed: %s; skipping persistence.\n",
                cudaGetErrorString(err));
@@ -200,11 +195,12 @@ void Simulation::configure_l2_persistence() {
     }
 
     // Attach the access policy window to the default (legacy) stream.
-    // hitRatio = 1.0 means the entire S range is preferred for persistence;
-    // hitProp = persisting (kept), missProp = streaming (don't pollute L2).
+    // hitRatio = 1.0 means every access in the window is a candidate for
+    // persistence; hitProp = persisting (kept), missProp = streaming
+    // (don't pollute L2).
     cudaStreamAttrValue attr = {};
     attr.accessPolicyWindow.base_ptr  = cells.S;
-    attr.accessPolicyWindow.num_bytes = S_bytes;
+    attr.accessPolicyWindow.num_bytes = window_bytes;
     attr.accessPolicyWindow.hitRatio  = 1.0f;
     attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
     attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
@@ -219,8 +215,13 @@ void Simulation::configure_l2_persistence() {
         return;
     }
 
-    printf("[L2] persisting S (%.1f MB) in carveout (max %.1f MB)\n",
-           S_bytes / 1e6, max_persist_bytes / 1e6);
+    if (S_bytes <= (size_t)max_persist_bytes) {
+        printf("[L2] persisting full S (%.1f MB) in carveout (max %.1f MB)\n",
+               S_bytes / 1e6, max_persist_bytes / 1e6);
+    } else {
+        printf("[L2] persisting first %.1f MB of S=%.1f MB (carveout max %.1f MB)\n",
+               window_bytes / 1e6, S_bytes / 1e6, max_persist_bytes / 1e6);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,16 +391,23 @@ void Simulation::finalize_init() {
         CK(cudaStreamCreateWithFlags(&step_stream, cudaStreamNonBlocking));
         // Mirror the L2 access-policy-window onto step_stream so the
         // S-field benefits from persistence on the captured/replayed
-        // kernels too. Best-effort; ignore errors (we already logged
-        // any persistence-disabled state at alloc time).
-        cudaStreamAttrValue attr = {};
-        attr.accessPolicyWindow.base_ptr  = cells.S;
-        attr.accessPolicyWindow.num_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
-        attr.accessPolicyWindow.hitRatio  = 1.0f;
-        attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-        attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(step_stream,
-                               cudaStreamAttributeAccessPolicyWindow, &attr);
+        // kernels too. We size the window at min(S_bytes, carveout) so
+        // even oversize S gets the leading slice pinned.
+        int max_persist_bytes = 0;
+        cudaDeviceGetAttribute(&max_persist_bytes,
+                               cudaDevAttrMaxPersistingL2CacheSize, 0);
+        if (max_persist_bytes > 0) {
+            const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
+            const size_t window_bytes = std::min((size_t)max_persist_bytes, S_bytes);
+            cudaStreamAttrValue attr = {};
+            attr.accessPolicyWindow.base_ptr  = cells.S;
+            attr.accessPolicyWindow.num_bytes = window_bytes;
+            attr.accessPolicyWindow.hitRatio  = 1.0f;
+            attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+            cudaStreamSetAttribute(step_stream,
+                                   cudaStreamAttributeAccessPolicyWindow, &attr);
+        }
     }
     CK(cudaDeviceSynchronize());
 }
