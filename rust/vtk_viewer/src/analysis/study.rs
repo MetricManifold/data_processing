@@ -1736,7 +1736,10 @@ fn generate_comparison_with_config(
     let n_panels = active_panels.len();
 
     // Dynamic grid: prefer 4 columns, compute rows needed
-    let n_cols = if n_panels <= 2 { n_panels as u32 } else if n_panels <= 4 { (n_panels as u32).min(4) } else { 4 };
+    let n_cols = if n_panels <= 2 { n_panels as u32 }
+                 else if n_panels == 3 || n_panels == 6 || n_panels == 9 { 3 }
+                 else if n_panels <= 4 { n_panels as u32 }
+                 else { 4 };
     let n_rows = ((n_panels as u32) + n_cols - 1) / n_cols;
     let pw = 340u32;
     let ph = 280u32;

@@ -76,7 +76,11 @@ struct SimParams {
 // All kernels iterate p = 0..rw*rh and decode (lx, ly) by /, %; T does
 // NOT need to be a power of two.
 // ---------------------------------------------------------------------------
-static constexpr int TILE_T        = 192;
+#ifndef CELL_SIM_TILE_T
+#define CELL_SIM_TILE_T 192
+#endif
+static constexpr int TILE_T        = CELL_SIM_TILE_T;
+static_assert(TILE_T % 2 == 0, "TILE_T must be even");
 static constexpr int TILE_AREA     = TILE_T * TILE_T;
 static constexpr int REBIND_EVERY  = 8;
 

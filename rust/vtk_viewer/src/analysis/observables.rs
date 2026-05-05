@@ -1506,6 +1506,17 @@ pub struct VelocityDistributionResult {
     /// Gaussian std dev (for reference curve)
     pub pop_sigma_vx: f64,
     pub cell0_sigma_vx: f64,
+    /// Raw velocity samples (kept in-memory for downstream panels such as
+    /// `panels::draw_gvi_panel`; skipped during JSON serialization to avoid
+    /// bloating run_result.json).
+    #[serde(skip, default)]
+    pub pop_vx: Vec<f64>,
+    #[serde(skip, default)]
+    pub pop_vy: Vec<f64>,
+    #[serde(skip, default)]
+    pub cell0_vx: Vec<f64>,
+    #[serde(skip, default)]
+    pub cell0_vy: Vec<f64>,
 }
 
 /// Compute velocity distribution P(v_x) for cell 0 and population.
@@ -1520,13 +1531,16 @@ pub fn velocity_distribution(pos: &UnwrappedPositions, n_bins: usize) -> Velocit
         cell0_mean_speed: 0.0, cell0_kurtosis: 0.0,
         pop_mean_speed: 0.0, pop_kurtosis: 0.0,
         pop_sigma_vx: 0.0, cell0_sigma_vx: 0.0,
+        pop_vx: vec![], pop_vy: vec![], cell0_vx: vec![], cell0_vy: vec![],
     };
     if n < 3 || nc == 0 { return empty; }
 
     // Compute v_x for all cells at all times
     let n_vel = n - 1;
     let mut cell0_vx: Vec<f64> = Vec::with_capacity(n_vel);
+    let mut cell0_vy: Vec<f64> = Vec::with_capacity(n_vel);
     let mut pop_vx: Vec<f64> = Vec::with_capacity(n_vel * nc);
+    let mut pop_vy: Vec<f64> = Vec::with_capacity(n_vel * nc);
     let mut cell0_speeds: Vec<f64> = Vec::with_capacity(n_vel);
     let mut pop_speeds: Vec<f64> = Vec::with_capacity(n_vel * nc);
 
@@ -1539,10 +1553,12 @@ pub fn velocity_distribution(pos: &UnwrappedPositions, n_bins: usize) -> Velocit
             let speed = (vx * vx + vy * vy).sqrt();
 
             pop_vx.push(vx);
+            pop_vy.push(vy);
             pop_speeds.push(speed);
 
             if pos.cell_ids[i] == 0 {
                 cell0_vx.push(vx);
+                cell0_vy.push(vy);
                 cell0_speeds.push(speed);
             }
         }
@@ -1597,6 +1613,10 @@ pub fn velocity_distribution(pos: &UnwrappedPositions, n_bins: usize) -> Velocit
         pop_kurtosis: pop_kurt,
         pop_sigma_vx: pop_vx_std,
         cell0_sigma_vx: c0_vx_std,
+        pop_vx,
+        pop_vy,
+        cell0_vx,
+        cell0_vy,
     }
 }
 

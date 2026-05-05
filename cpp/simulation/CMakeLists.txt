@@ -48,6 +48,11 @@ endif()
 # CLUSTER BUILDS (headless nodes, no display).
 option(ENABLE_VISUALIZER "Build the live CUDA-OpenGL viewer (--live-view)" OFF)
 
+# TILE_T compile-time tile edge (px). 320 covers aspect-ratio ~5 cells
+# (clearance T/2-1 = 159 px); 192 was tight for soft cells. Memory cost
+# scales as 2*T^2*4 B/cell (320 -> 819 KB/cell vs 192 -> 295 KB/cell).
+set(CELL_SIM_TILE_T "320" CACHE STRING "Tile edge in pixels (TILE_T). Must be even.")
+
 set(CELL_SIM_SOURCES
     src/main.cu
     src/kernels.cu
@@ -60,6 +65,8 @@ endif()
 add_executable(cell_sim ${CELL_SIM_SOURCES})
 
 target_include_directories(cell_sim PRIVATE include)
+target_compile_definitions(cell_sim PRIVATE CELL_SIM_TILE_T=${CELL_SIM_TILE_T})
+message(STATUS "cell_sim: TILE_T=${CELL_SIM_TILE_T}")
 target_compile_options(cell_sim PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math --expt-relaxed-constexpr>
     $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-Xptxas=-O3,--allow-expensive-optimizations=true>

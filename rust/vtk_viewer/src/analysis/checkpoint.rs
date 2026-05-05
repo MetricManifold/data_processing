@@ -41,6 +41,10 @@ pub struct SimParams {
     pub tau: f32,
     pub halo_width: i32,
     pub lambda: f32,
+    /// Placement RNG seed. Only present in sim_v3 v7 / sim_v2 v6 (sp_size=144).
+    pub seed: Option<u32>,
+    /// Polarity RNG seed. Only present in sim_v3 v7 / sim_v2 v6 (sp_size=144).
+    pub polarity_seed: Option<u32>,
 }
 
 /// Bounding box (inner, without halo).
@@ -143,8 +147,8 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     // Version
     f.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if version < 2 || version > 6 {
-        anyhow::bail!("Unsupported checkpoint version {} (expected 2-6)", version);
+    if version < 2 || version > 7 {
+        anyhow::bail!("Unsupported checkpoint version {} (expected 2-7)", version);
     }
 
     // Step
@@ -225,6 +229,8 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     f.read_exact(&mut sp_buf)?;
 
     let (nx, ny, dx, dy, dt, lambda, target_radius, v_a, tau, halo_width);
+    let mut seed: Option<u32> = None;
+    let mut polarity_seed: Option<u32> = None;
     if sim_params_size == 144 {
         // sim_v2 v6 layout (f64 scalars)
         nx = i32::from_le_bytes(sp_buf[0..4].try_into()?);
@@ -239,6 +245,13 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         v_a = f64::from_le_bytes(sp_buf[80..88].try_into()?) as f32;
         tau = f64::from_le_bytes(sp_buf[96..104].try_into()?) as f32;
         halo_width = i32::from_le_bytes(sp_buf[112..116].try_into()?);
+        // sim_v3 v7 / sim_v2 v6: seed @128, polarity_seed @132 (u32 each).
+        if sp_buf.len() >= 136 {
+            seed = Some(u32::from_le_bytes(sp_buf[128..132].try_into()?));
+        }
+        if sp_buf.len() >= 140 {
+            polarity_seed = Some(u32::from_le_bytes(sp_buf[132..136].try_into()?));
+        }
     } else if sim_params_size == 88 {
         // sim_v2 v5 layout (f32 scalars, sim_v2's own field order)
         nx = i32::from_le_bytes(sp_buf[0..4].try_into()?);
@@ -270,7 +283,17 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         halo_width = if sp_buf.len() > 64 { i32::from_le_bytes(sp_buf[60..64].try_into()?) } else { 4 };
     }
 
-    let params = SimParams { nx, ny, dx, dy, dt, target_radius, v_a, tau, halo_width, lambda };
+    // v7 (sim_v3): uniform TILE_T tiles, no halo. Tile edge follows SimParams.
+    let tile_t: i32 = if version == 7 {
+        f.read_exact(&mut buf4)?;
+        i32::from_le_bytes(buf4)
+    } else {
+        0
+    };
+    // For v7, halo is implicit in the tile (0 padding). Force halo=0 so
+    // composite_phi() places tiles at their raw origins.
+    let halo_width = if version == 7 { 0 } else { halo_width };
+    let params = SimParams { nx, ny, dx, dy, dt, target_radius, v_a, tau, halo_width, lambda, seed, polarity_seed };
 
     eprintln!("Checkpoint: v={}, step={}, t={:.0} ({:.1}τ), cells={}, domain={}×{}",
               version, step, time, time / 10000.0, num_cells, nx, ny);
@@ -283,14 +306,25 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         f.read_exact(&mut buf4)?;
         let id = i32::from_le_bytes(buf4);
 
-        // BoundingBox: x0, y0, x1, y1 (inner, no halo)
-        let mut bb = [0u8; 16];
-        f.read_exact(&mut bb)?;
-        let x0 = i32::from_le_bytes(bb[0..4].try_into()?);
-        let y0 = i32::from_le_bytes(bb[4..8].try_into()?);
-        let x1 = i32::from_le_bytes(bb[8..12].try_into()?);
-        let y1 = i32::from_le_bytes(bb[12..16].try_into()?);
-        let bbox = BBox { x0, y0, x1, y1 };
+        let bbox;
+        if version == 7 {
+            // origin (ox, oy) — 2 i32 — defines the world-coord position of the
+            // tile's (0,0) corner. Tile spans (ox..ox+T, oy..oy+T).
+            let mut og = [0u8; 8];
+            f.read_exact(&mut og)?;
+            let ox = i32::from_le_bytes(og[0..4].try_into()?);
+            let oy = i32::from_le_bytes(og[4..8].try_into()?);
+            bbox = BBox { x0: ox, y0: oy, x1: ox + tile_t, y1: oy + tile_t };
+        } else {
+            // BoundingBox: x0, y0, x1, y1 (inner, no halo)
+            let mut bb = [0u8; 16];
+            f.read_exact(&mut bb)?;
+            let x0 = i32::from_le_bytes(bb[0..4].try_into()?);
+            let y0 = i32::from_le_bytes(bb[4..8].try_into()?);
+            let x1 = i32::from_le_bytes(bb[8..12].try_into()?);
+            let y1 = i32::from_le_bytes(bb[12..16].try_into()?);
+            bbox = BBox { x0, y0, x1, y1 };
+        }
 
         // centroid (Vec2: f32, f32)
         f.read_exact(&mut buf8)?;
@@ -306,8 +340,7 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         f.read_exact(&mut buf4)?;
         let volume = f32::from_le_bytes(buf4);
 
-        // phi field: (bbox_w + 2*halo) * (bbox_h + 2*halo) floats
-        // This is cell->field_size = bbox_with_halo.size()
+        // phi field. v7: T*T uniform tile (halo=0). v<=6: (w+2*halo)*(h+2*halo).
         let phi_w = bbox.width() + 2 * halo;
         let phi_h = bbox.height() + 2 * halo;
         let field_size = (phi_w * phi_h) as usize;
@@ -332,47 +365,31 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     }
 
     // Read optional per-cell v_A
+    // Read optional per-cell sidecar arrays. sim_v2 writes them in order
+    // GAMA → RADI → VA_A → POLR, baseline writes VA_A → GAMA → RADI. We
+    // accept any order by dispatching on the magic tag.
     let mut per_cell_v_a = Vec::new();
-    if let Ok(()) = f.read_exact(&mut buf4) {
-        let m = u32::from_le_bytes(buf4);
-        if m == 0x56415F41 { // "VA_A"
-            f.read_exact(&mut buf4)?;
-            let count = i32::from_le_bytes(buf4) as usize;
-            let mut data = vec![0u8; count * 4];
-            f.read_exact(&mut data)?;
-            per_cell_v_a = data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-        }
-    }
-
-    // Read optional per-cell gamma
     let mut per_cell_gamma = Vec::new();
-    if let Ok(()) = f.read_exact(&mut buf4) {
-        let m = u32::from_le_bytes(buf4);
-        if m == 0x47414D41 { // "GAMA"
-            f.read_exact(&mut buf4)?;
-            let count = i32::from_le_bytes(buf4) as usize;
-            let mut data = vec![0u8; count * 4];
-            f.read_exact(&mut data)?;
-            per_cell_gamma = data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-        }
-    }
-
-    // Read optional per-cell radius
     let mut per_cell_radius = Vec::new();
-    if let Ok(()) = f.read_exact(&mut buf4) {
+    while let Ok(()) = f.read_exact(&mut buf4) {
         let m = u32::from_le_bytes(buf4);
-        if m == 0x52414449 { // "RADI"
-            f.read_exact(&mut buf4)?;
-            let count = i32::from_le_bytes(buf4) as usize;
-            let mut data = vec![0u8; count * 4];
-            f.read_exact(&mut data)?;
-            per_cell_radius = data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
+        // Stop on unknown magic (or POLR which we don't surface yet)
+        if m != 0x56415F41 && m != 0x47414D41 && m != 0x52414449 && m != 0x504F4C52 {
+            break;
+        }
+        f.read_exact(&mut buf4)?;
+        let count = i32::from_le_bytes(buf4) as usize;
+        let mut data = vec![0u8; count * 4];
+        f.read_exact(&mut data)?;
+        let parsed: Vec<f32> = data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        match m {
+            0x56415F41 => per_cell_v_a = parsed,    // VA_A
+            0x47414D41 => per_cell_gamma = parsed,  // GAMA
+            0x52414449 => per_cell_radius = parsed, // RADI
+            0x504F4C52 => {}                        // POLR (skip)
+            _ => unreachable!(),
         }
     }
 

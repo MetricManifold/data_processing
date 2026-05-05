@@ -492,7 +492,8 @@ bool Visualizer::init(int field_width, int field_height, const char* title) {
         return false;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0);  // no vsync — don't throttle the sim.
+    glfwSwapInterval(1);  // vsync on — prevents tearing. Sim isn't throttled
+                          // because update() only blocks on swap when called.
     glfwShowWindow(window);
     glfwFocusWindow(window);
 

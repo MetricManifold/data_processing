@@ -6,6 +6,8 @@
 pub mod batch;
 pub mod checkpoint;
 pub mod io;
+pub mod metadata;
 pub mod observables;
 pub mod output;
+pub mod panels;
 pub mod study;

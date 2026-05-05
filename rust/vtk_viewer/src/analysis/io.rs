@@ -458,31 +458,22 @@ pub fn unwrap_trajectory(traj: &Trajectory) -> UnwrappedPositions {
             }
         }
 
-        // Unwrap periodic boundaries relative to previous frame
+        // Unwrap periodic boundaries relative to previous frame.
+        // Note: `prev` holds *unwrapped* coordinates that may be many box-
+        // lengths away from the raw read-from-file value, so we need
+        // multi-wrap minimum-image (round-based), not a single ±L correction.
         if let Some(prev) = positions.last() {
             for i in 0..n_cells {
                 let mut dx = frame[i][0] - prev[i][0];
                 let mut dy = frame[i][1] - prev[i][1];
-                if dx > lx / 2.0 {
-                    dx -= lx;
-                } else if dx < -lx / 2.0 {
-                    dx += lx;
-                }
-                if dy > ly / 2.0 {
-                    dy -= ly;
-                } else if dy < -ly / 2.0 {
-                    dy += ly;
-                }
+                if lx > 0.0 { dx -= lx * (dx / lx).round(); }
+                if ly > 0.0 { dy -= ly * (dy / ly).round(); }
                 frame[i][0] = prev[i][0] + dx;
                 frame[i][1] = prev[i][1] + dy;
 
                 if dim == 3 && lz > 0.0 {
                     let mut dz = frame[i][2] - prev[i][2];
-                    if dz > lz / 2.0 {
-                        dz -= lz;
-                    } else if dz < -lz / 2.0 {
-                        dz += lz;
-                    }
+                    dz -= lz * (dz / lz).round();
                     frame[i][2] = prev[i][2] + dz;
                 }
             }
