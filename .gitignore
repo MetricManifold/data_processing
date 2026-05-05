@@ -64,3 +64,6 @@ cpp/simulation/study/
 # MPI is dead
 cpp/simulation_mpi/
 
+
+cpu_ref_validate/
+
