@@ -129,6 +129,9 @@ enum Commands {
         /// Overlay per-cell energy (½v²) as a heat colormap on cell interiors
         #[arg(long)]
         show_energy: bool,
+        /// Emit a JSON sidecar with all banner metadata next to the PNG.
+        #[arg(long)]
+        emit_metadata: bool,
     },
     /// List available observables
     List,
@@ -260,7 +263,7 @@ fn main() -> Result<()> {
 
             write_json(&result, &output)?;
         }
-        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy } => {
+        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata } => {
             let is_dir = input.is_dir();
             let is_vtk = input.extension().map_or(false, |e| e == "vtk");
             // Activate per-cell rendering when user wants colored contours or speed shading
@@ -393,6 +396,10 @@ fn main() -> Result<()> {
 
                 // Centroids for cell labeling: (cell_id, x, y, is_soft)
                 let mut centroids: Vec<(u32, f64, f64, bool)> = Vec::new();
+                // Per-cell text rendered ABOVE the ID label (e.g. "γ=0.35"
+                // for cells whose stiffness differs from the population mode).
+                let mut gamma_labels: std::collections::HashMap<u32, String> =
+                    std::collections::HashMap::new();
 
                 let (phi, nx, ny, title) = if is_vtk {
                     // VTK file: parse structured points, extract "phi" field
@@ -462,6 +469,14 @@ fn main() -> Result<()> {
                                 (gammas[i] - mode_gamma).abs() > tol_check && gammas[i] < mode_gamma
                             } else { false };
                             centroids.push((cell.id as u32, cell.centroid.0 as f64, cell.centroid.1 as f64, is_soft));
+                            // Annotate cells whose gamma deviates from the mode
+                            // (in either direction) with their numeric value.
+                            if i < gammas.len() && (gammas[i] - mode_gamma).abs() > tol_check {
+                                gamma_labels.insert(
+                                    cell.id as u32,
+                                    format!("{:.2}", gammas[i]),
+                                );
+                            }
                         }
                         let n_soft = centroids.iter().filter(|c| c.3).count();
                         eprintln!("  Loaded {} cell centroids from checkpoint ({} soft)", centroids.len(), n_soft);
@@ -499,15 +514,89 @@ fn main() -> Result<()> {
                 let energy_data = overlays.as_ref().map(|(_, e)| e.as_slice()).unwrap_or(&[]);
 
                 let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells, &centroids,
-                    polarity_data, energy_data);
+                    polarity_data, energy_data, &gamma_labels);
+
+                // Build metadata banner for checkpoint snapshots
+                let (final_img, final_w, final_h) = if !is_vtk {
+                    use analysis::checkpoint::load_checkpoint;
+                    let ckpt = load_checkpoint(&input)?;
+                    let marker = analysis::metadata::load_marker_for(&input);
+                    let lines = build_metadata_lines(&ckpt, marker.as_ref(), &input);
+                    for l in &lines { eprintln!("  {}", l); }
+
+                    // Optional sidecar JSON with all metadata fields
+                    if emit_metadata {
+                        let p = &ckpt.params;
+                        let h = &ckpt.header;
+                        let lx = (p.nx as f32) * p.dx;
+                        let ly = (p.ny as f32) * p.dy;
+                        let phi_computed = analysis::metadata::compute_confluence(
+                            h.num_cells, p.target_radius, lx, ly);
+                        let phi_original = marker.as_ref()
+                            .and_then(|m| analysis::metadata::marker_param_f64(m, "confluence"));
+                        let stats = |xs: &[f32]| -> Option<serde_json::Value> {
+                            if xs.is_empty() { return None; }
+                            let mn = xs.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let mx = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let mean = xs.iter().map(|&x| x as f64).sum::<f64>() / xs.len() as f64;
+                            Some(serde_json::json!({"min": mn, "mean": mean, "max": mx}))
+                        };
+                        let meta = serde_json::json!({
+                            "source": input.to_string_lossy(),
+                            "checkpoint": {
+                                "version": h.version,
+                                "step": h.step,
+                                "time": h.time,
+                                "time_tau": h.time / 10000.0,
+                                "num_cells": h.num_cells,
+                            },
+                            "domain": {
+                                "nx": p.nx, "ny": p.ny,
+                                "lx": lx, "ly": ly,
+                                "dx": p.dx, "dy": p.dy,
+                            },
+                            "physics": {
+                                "target_radius": p.target_radius,
+                                "v_a_param": p.v_a,
+                                "tau": p.tau,
+                                "dt": p.dt,
+                                "lambda": p.lambda,
+                                "halo_width": p.halo_width,
+                            },
+                            "rng": {
+                                "seed": p.seed.map(|s| serde_json::Value::Number(s.into())).unwrap_or(serde_json::Value::String("n/a".to_string())),
+                                "polarity_seed": p.polarity_seed.map(|s| serde_json::Value::Number(s.into())).unwrap_or(serde_json::Value::String("n/a".to_string())),
+                            },
+                            "per_cell": {
+                                "v_a": stats(&ckpt.per_cell_v_a),
+                                "gamma": stats(&ckpt.per_cell_gamma),
+                                "radius": stats(&ckpt.per_cell_radius),
+                            },
+                            "confluence": {
+                                "computed": phi_computed,
+                                "original": phi_original,
+                                "delta": phi_original.map(|o| phi_computed - o),
+                            },
+                            "marker": marker,
+                        });
+                        let json_path = output.with_extension("meta.json");
+                        std::fs::write(&json_path, serde_json::to_string_pretty(&meta)?)?;
+                        eprintln!("Metadata saved: {}", json_path.display());
+                    }
+
+                    let (banner_img, bw, bh) = compose_with_banner(&img_data, nx, ny, &lines);
+                    (banner_img, bw, bh)
+                } else {
+                    (img_data, nx, ny)
+                };
 
                 let out_path = if output.extension().map_or(true, |e| e != "png") {
                     output.with_extension("png")
                 } else {
                     output.clone()
                 };
-                write_png(&out_path, &img_data, nx, ny)?;
-                eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), nx, ny);
+                write_png(&out_path, &final_img, final_w, final_h)?;
+                eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), final_w, final_h);
             }
         }
         Commands::Check { dir, n_cells, expected_frames, t_start, t_end, json } => {
@@ -1139,34 +1228,38 @@ fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Res
         }
     }
 
-    // --- MSD plot ---
+    // --- MSD/Δt plot (Palmieri Fig 5 convention: linear axes, Δt up to 8τ) ---
     if let Some(ref msd) = result.msd {
         if !msd.lag_times.is_empty() {
             let out_path = plot_dir.join("msd.svg");
             let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
             root.fill(&WHITE)?;
 
-            let t: Vec<f64> = msd.lag_times.iter().filter(|&&t| t > 0.0).copied().collect();
-            let m: Vec<f64> = msd.lag_times.iter().zip(msd.values.iter())
-                .filter(|(&t, _)| t > 0.0).map(|(_, &v)| v).collect();
-            if !t.is_empty() {
-                let t_log: Vec<f64> = t.iter().map(|v| v.log10()).collect();
-                let m_log: Vec<f64> = m.iter().map(|v| v.log10()).collect();
-                let x_min = t_log.first().copied().unwrap_or(0.0) - 0.1;
-                let x_max = t_log.last().copied().unwrap_or(5.0) + 0.1;
-                let y_min = m_log.iter().copied().fold(f64::INFINITY, f64::min) - 0.2;
-                let y_max = m_log.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 0.2;
+            // Palmieri Fig 5 caps the x-axis at Δt = 8τ.
+            let tau = result.params.extra.get("tau")
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(10000.0);
+            let x_cap = 8.0 * tau;
+
+            let pts: Vec<(f64, f64)> = msd.lag_times.iter().zip(msd.values.iter())
+                .filter(|(&t, _)| t > 0.0 && t <= x_cap)
+                .map(|(&t, &v)| (t / tau, v / t))
+                .collect();
+            if !pts.is_empty() {
+                let x_min = 0.0;
+                let x_max = 8.0;
+                let y_max = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) * 1.1 + 1e-12;
 
                 let mut chart = ChartBuilder::on(&root)
-                    .caption(format!("MSD — {}", label), ("sans-serif", 22).into_font())
+                    .caption(format!("MSD/Δt → 4D_eff — {}", label), ("sans-serif", 22).into_font())
                     .margin(15)
                     .x_label_area_size(45)
                     .y_label_area_size(65)
-                    .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+                    .build_cartesian_2d(x_min..x_max, 0.0..y_max)?;
 
                 chart.configure_mesh()
-                    .x_desc("log₁₀(Δt)")
-                    .y_desc("log₁₀(MSD)")
+                    .x_desc("Δt / τ")
+                    .y_desc("MSD/Δt")
                     .x_label_style(("sans-serif", 16))
                     .y_label_style(("sans-serif", 16))
                     .axis_desc_style(("sans-serif", 18))
@@ -1174,13 +1267,83 @@ fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Res
                     .draw()?;
 
                 chart.draw_series(LineSeries::new(
-                    t_log.iter().zip(m_log.iter()).map(|(&x, &y)| (x, y)),
+                    pts.iter().copied(),
                     ShapeStyle::from(&BLUE).stroke_width(2),
                 ))?;
 
                 root.present()?;
                 eprintln!("  Plot: {}", out_path.display());
             }
+        }
+    }
+
+    // --- Cell-0 perimeter L_n(t) plot ---
+    // Tagged-cell elasticity: raw normalized perimeter L_n vs time, overlaid
+    // with population mean. shape_index stores p_eff = L_n × 2√π, so divide
+    // back by the same factor to recover L_n.
+    if let Some(ref si) = result.shape_index {
+        if !si.times.is_empty() && !si.cell0_p_vs_time.is_empty() {
+            let factor = 2.0 * std::f64::consts::PI.sqrt();
+            let l_n_cell0: Vec<f64> = si.cell0_p_vs_time.iter().map(|&p| p / factor).collect();
+            let l_n_pop: Vec<f64>   = si.p_vs_time.iter().map(|&p| p / factor).collect();
+
+            let out_path = plot_dir.join("cell0_perimeter.svg");
+            let root = SVGBackend::new(&out_path, (900, 500)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            let x_min = *si.times.first().unwrap();
+            let x_max = *si.times.last().unwrap();
+            let mut y_min = l_n_cell0.iter().chain(l_n_pop.iter())
+                .copied().fold(f64::INFINITY, f64::min);
+            let mut y_max = l_n_cell0.iter().chain(l_n_pop.iter())
+                .copied().fold(f64::NEG_INFINITY, f64::max);
+            let pad = ((y_max - y_min) * 0.05).max(1e-3);
+            y_min -= pad; y_max += pad;
+
+            let cell0_mean = l_n_cell0.iter().sum::<f64>() / l_n_cell0.len() as f64;
+            let cell0_var  = l_n_cell0.iter().map(|v| (v - cell0_mean).powi(2)).sum::<f64>()
+                / l_n_cell0.len() as f64;
+            let cell0_std  = cell0_var.sqrt();
+
+            let mut chart = ChartBuilder::on(&root)
+                .caption(
+                    format!("Cell-0 perimeter L_n(t) — {} (⟨L_n⟩={:.3}, σ={:.3})",
+                            label, cell0_mean, cell0_std),
+                    ("sans-serif", 20).into_font())
+                .margin(15).x_label_area_size(45).y_label_area_size(65)
+                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+            chart.configure_mesh()
+                .x_desc("t").y_desc("L_n  (normalized perimeter)")
+                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
+
+            // Population mean (background, grey)
+            chart.draw_series(LineSeries::new(
+                si.times.iter().zip(l_n_pop.iter()).map(|(&x, &y)| (x, y)),
+                ShapeStyle::from(&RGBAColor(120, 120, 120, 0.7)).stroke_width(1)))?
+                .label("⟨L_n⟩ population")
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 18, y)],
+                    ShapeStyle::from(&RGBAColor(120, 120, 120, 0.9)).stroke_width(2)));
+
+            // Cell-0 trace (foreground, red)
+            chart.draw_series(LineSeries::new(
+                si.times.iter().zip(l_n_cell0.iter()).map(|(&x, &y)| (x, y)),
+                ShapeStyle::from(&RED).stroke_width(2)))?
+                .label("L_n cell 0 (tagged)")
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 18, y)],
+                    ShapeStyle::from(&RED).stroke_width(2)));
+
+            chart.configure_series_labels()
+                .background_style(WHITE.mix(0.85))
+                .border_style(BLACK)
+                .label_font(("sans-serif", 14))
+                .position(plotters::chart::SeriesLabelPosition::UpperRight)
+                .draw()?;
+
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
         }
     }
 
@@ -1207,6 +1370,202 @@ fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Res
                 ShapeStyle::from(&BLUE).stroke_width(2)))?;
             root.present()?;
             eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- Velocity autocorrelation C_v(τ) ---
+    if let Some(ref va) = result.velocity_autocorrelation {
+        if !va.lag_times.is_empty() {
+            let out_path = plot_dir.join("velocity_autocorrelation.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+            let x_min = *va.lag_times.first().unwrap();
+            let x_max = *va.lag_times.last().unwrap();
+            let y_min = va.cv.iter().copied().fold(f64::INFINITY, f64::min).min(-0.05);
+            let y_max = va.cv.iter().copied().fold(f64::NEG_INFINITY, f64::max).max(0.05);
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("Velocity autocorrelation — {} (τ_c={:.3e}, β={:.2})", label, va.tau_c, va.beta), ("sans-serif", 20).into_font())
+                .margin(15).x_label_area_size(45).y_label_area_size(65)
+                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+            chart.configure_mesh()
+                .x_desc("τ").y_desc("C_v(τ)")
+                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
+            chart.draw_series(LineSeries::new(vec![(x_min, 0.0), (x_max, 0.0)],
+                ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1)))?;
+            chart.draw_series(LineSeries::new(
+                va.lag_times.iter().zip(va.cv.iter()).map(|(&x, &y)| (x, y)),
+                ShapeStyle::from(&BLUE).stroke_width(2)))?;
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- Velocity distribution P(v_x): cell 0 vs population ---
+    if let Some(ref vd) = result.velocity_distribution {
+        if vd.bin_edges.len() >= 2 && !vd.pop_hist.is_empty() {
+            let out_path = plot_dir.join("velocity_distribution.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+            let centers: Vec<f64> = vd.bin_edges.windows(2).map(|w| 0.5 * (w[0] + w[1])).collect();
+            let x_min = *vd.bin_edges.first().unwrap();
+            let x_max = *vd.bin_edges.last().unwrap();
+            let y_max = vd.pop_hist.iter().chain(vd.cell0_hist.iter())
+                .copied().fold(0.0_f64, f64::max) * 1.1 + 1e-12;
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("P(v_x) — {} (κ_pop={:.2}, κ_cell0={:.2})", label, vd.pop_kurtosis, vd.cell0_kurtosis), ("sans-serif", 20).into_font())
+                .margin(15).x_label_area_size(45).y_label_area_size(65)
+                .build_cartesian_2d(x_min..x_max, 0.0..y_max)?;
+            chart.configure_mesh()
+                .x_desc("v_x").y_desc("P(v_x)")
+                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
+            chart.draw_series(LineSeries::new(
+                centers.iter().zip(vd.pop_hist.iter()).map(|(&x, &y)| (x, y)),
+                ShapeStyle::from(&RGBAColor(120, 120, 120, 0.9)).stroke_width(2)))?
+                .label("population")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 18, y)],
+                    ShapeStyle::from(&RGBAColor(120, 120, 120, 0.9)).stroke_width(2)));
+            if !vd.cell0_hist.is_empty() {
+                chart.draw_series(LineSeries::new(
+                    centers.iter().zip(vd.cell0_hist.iter()).map(|(&x, &y)| (x, y)),
+                    ShapeStyle::from(&RED).stroke_width(2)))?
+                    .label("cell 0")
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 18, y)],
+                        ShapeStyle::from(&RED).stroke_width(2)));
+            }
+            chart.configure_series_labels()
+                .background_style(WHITE.mix(0.85)).border_style(BLACK)
+                .label_font(("sans-serif", 14))
+                .position(plotters::chart::SeriesLabelPosition::UpperRight).draw()?;
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- G(v_i) = -sqrt(|ln CCDF(|v_i|)|) (Palmieri Fig 4 convention) ---
+    // Reuses analysis::panels::draw_gvi_panel so single-run and study/compare
+    // share exactly one renderer. Pass any number of (label, vx, vy) series.
+    if let Some(ref vd) = result.velocity_distribution {
+        if !vd.cell0_vx.is_empty() {
+            use analysis::panels::{draw_gvi_panel, GviSeries, GviPanelOpts, GviMarker};
+            let out_path = plot_dir.join("velocity_gvi.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+
+            // Single-run G(v_i): cell 0 only (the soft cell). Population
+            // is omitted -- in homogeneous-v_A configs it tracks cell 0
+            // anyway; the relevant comparison is data vs Gaussian + Eq.5.
+            let series = vec![GviSeries {
+                label: "cell 0".to_string(),
+                vx: &vd.cell0_vx, vy: &vd.cell0_vy,
+                color: RGBAColor(220, 50, 50, 0.95),
+                marker: GviMarker::Triangle,
+            }];
+
+            let opts = GviPanelOpts {
+                title: format!("G(v_i) — {}", label),
+                // Naive moment-based σ from cell 0 (matches second
+                // moment of the data). This is the *correct* Gaussian
+                // reference: any visible deviation is the non-Gaussian
+                // (active / burst) signal — fitting σ to the curve shape
+                // is misleading because the data is genuinely non-Gaussian.
+                gaussian_ref_sigma: None,
+                // Fit Palmieri Eq. 5 (Gaussian noise + arcsine bursts)
+                // to the cell 0 series.
+                palmieri_fit_index: Some(0),
+                v_a: 0.01,
+                ..Default::default()
+            };
+            draw_gvi_panel(&root, &series, &opts)?;
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- Per-cell diffusion histogram ---
+    if let Some(ref pcd) = result.per_cell_diffusion {
+        if !pcd.d_values.is_empty() {
+            let out_path = plot_dir.join("per_cell_diffusion.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+            let d_min = pcd.d_values.iter().copied().fold(f64::INFINITY, f64::min);
+            let d_max = pcd.d_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let pad = (d_max - d_min).max(1e-12) * 0.1;
+            let x_lo = (d_min - pad).max(0.0);
+            let x_hi = d_max + pad;
+            let n_bins = 20usize;
+            let bw = (x_hi - x_lo) / n_bins as f64;
+            let mut counts = vec![0u32; n_bins];
+            for &d in &pcd.d_values {
+                if bw > 0.0 {
+                    let b = (((d - x_lo) / bw) as usize).min(n_bins - 1);
+                    counts[b] += 1;
+                }
+            }
+            let max_count = *counts.iter().max().unwrap_or(&1);
+            let mut chart = ChartBuilder::on(&root)
+                .caption(format!("Per-cell D — {} (⟨D⟩={:.3e}, CV={:.2})", label, pcd.d_mean, pcd.cv), ("sans-serif", 20).into_font())
+                .margin(15).x_label_area_size(45).y_label_area_size(55)
+                .build_cartesian_2d(x_lo..x_hi, 0u32..(max_count + 1))?;
+            chart.configure_mesh()
+                .x_desc("D (per cell)").y_desc("Count")
+                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
+                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
+            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
+                let x0 = x_lo + i as f64 * bw;
+                Rectangle::new([(x0, 0), (x0 + bw * 0.9, c)], BLUE.mix(0.7).filled())
+            }))?;
+            // Mark cell 0's D value with a red vertical line
+            if let Some(idx) = pcd.cell_ids.iter().position(|&id| id == 0) {
+                let d0 = pcd.d_values[idx];
+                chart.draw_series(LineSeries::new(
+                    vec![(d0, 0u32), (d0, max_count + 1)],
+                    ShapeStyle::from(&RED).stroke_width(2)))?
+                    .label(format!("cell 0: D={:.3e}", d0))
+                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 18, y)],
+                        ShapeStyle::from(&RED).stroke_width(2)));
+                chart.configure_series_labels()
+                    .background_style(WHITE.mix(0.85)).border_style(BLACK)
+                    .label_font(("sans-serif", 14))
+                    .position(plotters::chart::SeriesLabelPosition::UpperRight).draw()?;
+            }
+            root.present()?;
+            eprintln!("  Plot: {}", out_path.display());
+        }
+    }
+
+    // --- Non-Gaussian parameter α₂(t) ---
+    if let Some(ref a2) = result.alpha2 {
+        if !a2.lag_times.is_empty() {
+            let out_path = plot_dir.join("alpha2.svg");
+            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
+            root.fill(&WHITE)?;
+            let t_pos: Vec<f64> = a2.lag_times.iter().filter(|&&t| t > 0.0).copied().collect();
+            let v_pos: Vec<f64> = a2.lag_times.iter().zip(a2.values.iter())
+                .filter(|(&t, _)| t > 0.0).map(|(_, &v)| v).collect();
+            if !t_pos.is_empty() {
+                let t_log: Vec<f64> = t_pos.iter().map(|v| v.log10()).collect();
+                let x_min = t_log.first().copied().unwrap();
+                let x_max = t_log.last().copied().unwrap();
+                let y_min = v_pos.iter().copied().fold(f64::INFINITY, f64::min).min(-0.05);
+                let y_max = v_pos.iter().copied().fold(f64::NEG_INFINITY, f64::max).max(0.05);
+                let mut chart = ChartBuilder::on(&root)
+                    .caption(format!("Non-Gaussian α₂(Δt) — {}", label), ("sans-serif", 20).into_font())
+                    .margin(15).x_label_area_size(45).y_label_area_size(65)
+                    .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+                chart.configure_mesh()
+                    .x_desc("log₁₀(Δt)").y_desc("α₂")
+                    .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
+                    .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
+                chart.draw_series(LineSeries::new(vec![(x_min, 0.0), (x_max, 0.0)],
+                    ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1)))?;
+                chart.draw_series(LineSeries::new(
+                    t_log.iter().zip(v_pos.iter()).map(|(&x, &y)| (x, y)),
+                    ShapeStyle::from(&BLUE).stroke_width(2)))?;
+                root.present()?;
+                eprintln!("  Plot: {}", out_path.display());
+            }
         }
     }
 
@@ -1238,12 +1597,15 @@ fn digit_bitmap(d: u8) -> [u8; 6] {
 /// Draw a cell ID label at pixel position (cx, cy) on an RGB image buffer.
 /// `highlight` = true for cell 0 (green label), false = white label.
 fn draw_label(img: &mut [u8], w: usize, h: usize, cx: i32, cy: i32, text: &str, highlight: bool) {
-    draw_label_with_spatial(img, w, h, cx, cy, text, "", highlight);
+    draw_label_with_spatial(img, w, h, cx, cy, text, "", "", highlight);
 }
 
 /// Draw cell ID + spatial index label. Spatial index drawn smaller below the ID.
+/// `above_text` is drawn in the 5x7 font above the ID (used for "γ=0.35"
+/// annotations on cells whose stiffness deviates from the population mode).
 fn draw_label_with_spatial(img: &mut [u8], w: usize, h: usize, cx: i32, cy: i32,
-                            id_text: &str, spatial_text: &str, highlight: bool) {
+                            id_text: &str, spatial_text: &str, above_text: &str,
+                            highlight: bool) {
     let scale = 2i32;
     let small_scale = 1i32;
     let char_w = 4 * scale + scale;
@@ -1258,9 +1620,20 @@ fn draw_label_with_spatial(img: &mut [u8], w: usize, h: usize, cx: i32, cy: i32,
     let small_total_w = if has_spatial { small_n * small_char_w - small_scale } else { 0 };
     let gap = if has_spatial { 2 } else { 0 };
 
+    // 5x7-font sizing for the above-text band (e.g. "γ=0.35"). Glyph width is
+    // 5*scale, kerning is 1*scale; chars().count() avoids byte-counting bugs
+    // for multibyte γ.
+    let has_above = !above_text.is_empty();
+    let above_scale = 1i32;
+    let above_char_total = 6 * above_scale; // 5 px glyph + 1 px kern
+    let above_n = above_text.chars().count() as i32;
+    let above_total_w = if has_above { (above_n * above_char_total).saturating_sub(above_scale) } else { 0 };
+    let above_h = if has_above { 7 * above_scale } else { 0 };
+    let above_gap = if has_above { 2 } else { 0 };
+
     let pad = scale;
-    let label_w = total_w.max(small_total_w);
-    let label_h = char_h + if has_spatial { gap + small_char_h } else { 0 };
+    let label_w = total_w.max(small_total_w).max(above_total_w);
+    let label_h = above_h + above_gap + char_h + if has_spatial { gap + small_char_h } else { 0 };
 
     // Clamp label position so it stays fully inside the image
     let half_w = label_w / 2 + pad;
@@ -1290,10 +1663,20 @@ fn draw_label_with_spatial(img: &mut [u8], w: usize, h: usize, cx: i32, cy: i32,
         }
     }
 
+    let label_top = cy - label_h / 2;
+
+    // Draw above-text (γ value) using 5x7 font. Use a warm yellow tint so it
+    // visually distinguishes from the ID (white/green).
+    if has_above {
+        let above_x = cx - above_total_w / 2;
+        let above_rgb = if highlight { [255, 230, 120] } else { [255, 200, 80] };
+        draw_text_5x7(img, w, h, above_x, label_top, above_text, above_scale, above_rgb);
+    }
+
     // Draw cell ID (main text, scale 2)
     let (fg_r, fg_g, fg_b) = if highlight { (100, 255, 100) } else { (255, 255, 255) };
     let start_x = cx - total_w / 2;
-    let start_y = cy - label_h / 2;
+    let start_y = label_top + above_h + above_gap;
 
     draw_text_bitmap(img, w, h, start_x, start_y, id_text, scale, fg_r, fg_g, fg_b);
 
@@ -1461,11 +1844,11 @@ fn render_single_vtk(
             owned_centroids = load_centroids_for_vtk(vtk_path, time);
             &owned_centroids
         };
-        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents, &[], &[]);
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents, &[], &[], &std::collections::HashMap::new());
         Ok((img_data, nx, ny, title))
     } else {
         let empty_centroids = Vec::new();
-        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids, &[], &[]);
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids, &[], &[], &std::collections::HashMap::new());
         Ok((img_data, nx, ny, title))
     }
 }
@@ -1476,6 +1859,7 @@ fn render_phi_to_rgb(
     label_cells: bool, centroids: &[(u32, f64, f64, bool)],
     polarity: &[(f64, f64, f64, f64)],   // (cx, cy, px, py)
     energy: &[(f64, f64, f64)],           // (cx, cy, ke)
+    cell_above_text: &std::collections::HashMap<u32, String>,
 ) -> (Vec<u8>, usize, usize) {
     let mut img_data = vec![0u8; nx * ny * 3];
 
@@ -1609,12 +1993,287 @@ fn render_phi_to_rgb(
             let iy = (ny as i32 - 1) - wy as i32;
             let spatial_idx = spatial_map[&cid];
             let highlight = soft_map.get(&cid).copied().unwrap_or(false);
+            let above = cell_above_text.get(&cid).map(|s| s.as_str()).unwrap_or("");
             draw_label_with_spatial(&mut img_data, nx, ny, ix, iy,
-                &format!("{}", cid), &format!("{}", spatial_idx), highlight);
+                &format!("{}", cid), &format!("{}", spatial_idx), above, highlight);
         }
     }
 
     (img_data, nx, ny)
+}
+
+/// 5×7 bitmap font for plot banner text. Each glyph is 7 rows; bits are 5 wide
+/// (lowest 5 bits, MSB = leftmost pixel). Returns all-zero for unsupported chars.
+fn glyph_5x7(c: char) -> [u8; 7] {
+    match c {
+        ' ' => [0,0,0,0,0,0,0],
+        '0' => [0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110],
+        '1' => [0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110],
+        '2' => [0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111],
+        '3' => [0b11110,0b00001,0b00001,0b01110,0b00001,0b00001,0b11110],
+        '4' => [0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010],
+        '5' => [0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110],
+        '6' => [0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110],
+        '7' => [0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000],
+        '8' => [0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110],
+        '9' => [0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100],
+        'A' => [0b01110,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001],
+        'B' => [0b11110,0b10001,0b10001,0b11110,0b10001,0b10001,0b11110],
+        'C' => [0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110],
+        'D' => [0b11100,0b10010,0b10001,0b10001,0b10001,0b10010,0b11100],
+        'E' => [0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111],
+        'F' => [0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000],
+        'G' => [0b01110,0b10001,0b10000,0b10111,0b10001,0b10001,0b01111],
+        'H' => [0b10001,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001],
+        'I' => [0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110],
+        'J' => [0b00111,0b00010,0b00010,0b00010,0b00010,0b10010,0b01100],
+        'K' => [0b10001,0b10010,0b10100,0b11000,0b10100,0b10010,0b10001],
+        'L' => [0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111],
+        'M' => [0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001],
+        'N' => [0b10001,0b10001,0b11001,0b10101,0b10011,0b10001,0b10001],
+        'O' => [0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+        'P' => [0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000],
+        'Q' => [0b01110,0b10001,0b10001,0b10001,0b10101,0b10010,0b01101],
+        'R' => [0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001],
+        'S' => [0b01110,0b10001,0b10000,0b01110,0b00001,0b10001,0b01110],
+        'T' => [0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100],
+        'U' => [0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+        'V' => [0b10001,0b10001,0b10001,0b10001,0b10001,0b01010,0b00100],
+        'W' => [0b10001,0b10001,0b10001,0b10101,0b10101,0b10101,0b01010],
+        'X' => [0b10001,0b10001,0b01010,0b00100,0b01010,0b10001,0b10001],
+        'Y' => [0b10001,0b10001,0b10001,0b01010,0b00100,0b00100,0b00100],
+        'Z' => [0b11111,0b00001,0b00010,0b00100,0b01000,0b10000,0b11111],
+        'a' => [0,0,0b01110,0b00001,0b01111,0b10001,0b01111],
+        'b' => [0b10000,0b10000,0b11110,0b10001,0b10001,0b10001,0b11110],
+        'c' => [0,0,0b01110,0b10001,0b10000,0b10001,0b01110],
+        'd' => [0b00001,0b00001,0b01111,0b10001,0b10001,0b10001,0b01111],
+        'e' => [0,0,0b01110,0b10001,0b11111,0b10000,0b01110],
+        'f' => [0b00110,0b01001,0b01000,0b11110,0b01000,0b01000,0b01000],
+        'g' => [0,0,0b01111,0b10001,0b01111,0b00001,0b01110],
+        'h' => [0b10000,0b10000,0b11110,0b10001,0b10001,0b10001,0b10001],
+        'i' => [0b00100,0,0b01100,0b00100,0b00100,0b00100,0b01110],
+        'j' => [0b00010,0,0b00110,0b00010,0b00010,0b10010,0b01100],
+        'k' => [0b10000,0b10000,0b10010,0b10100,0b11000,0b10100,0b10010],
+        'l' => [0b01100,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110],
+        'm' => [0,0,0b11010,0b10101,0b10101,0b10101,0b10101],
+        'n' => [0,0,0b11110,0b10001,0b10001,0b10001,0b10001],
+        'o' => [0,0,0b01110,0b10001,0b10001,0b10001,0b01110],
+        'p' => [0,0,0b11110,0b10001,0b11110,0b10000,0b10000],
+        'q' => [0,0,0b01111,0b10001,0b01111,0b00001,0b00001],
+        'r' => [0,0,0b10110,0b11001,0b10000,0b10000,0b10000],
+        's' => [0,0,0b01110,0b10000,0b01110,0b00001,0b11110],
+        't' => [0b01000,0b01000,0b11110,0b01000,0b01000,0b01001,0b00110],
+        'u' => [0,0,0b10001,0b10001,0b10001,0b10001,0b01110],
+        'v' => [0,0,0b10001,0b10001,0b10001,0b01010,0b00100],
+        'w' => [0,0,0b10001,0b10001,0b10101,0b10101,0b01010],
+        'x' => [0,0,0b10001,0b01010,0b00100,0b01010,0b10001],
+        'y' => [0,0,0b10001,0b10001,0b01111,0b00001,0b01110],
+        'z' => [0,0,0b11111,0b00010,0b00100,0b01000,0b11111],
+        '.' => [0,0,0,0,0,0b01100,0b01100],
+        ',' => [0,0,0,0,0b01100,0b00100,0b01000],
+        ':' => [0,0b01100,0b01100,0,0b01100,0b01100,0],
+        '-' => [0,0,0,0b11111,0,0,0],
+        '_' => [0,0,0,0,0,0,0b11111],
+        '=' => [0,0,0b11111,0,0b11111,0,0],
+        '/' => [0b00001,0b00010,0b00010,0b00100,0b01000,0b01000,0b10000],
+        '+' => [0,0b00100,0b00100,0b11111,0b00100,0b00100,0],
+        '%' => [0b11001,0b11010,0b00100,0b00100,0b01000,0b01011,0b10011],
+        '(' => [0b00010,0b00100,0b01000,0b01000,0b01000,0b00100,0b00010],
+        ')' => [0b01000,0b00100,0b00010,0b00010,0b00010,0b00100,0b01000],
+        '#' => [0b01010,0b01010,0b11111,0b01010,0b11111,0b01010,0b01010],
+        'τ' => [0b11111,0b00100,0b00100,0b00100,0b00100,0b00101,0b00010],
+        'φ' => [0b00100,0b01110,0b10101,0b10101,0b10101,0b01110,0b00100],
+        'ρ' => [0,0,0b01110,0b10001,0b10001,0b11110,0b10000],
+        'γ' => [0,0b10001,0b10010,0b01010,0b00100,0b00100,0b01000],
+        '×' => [0,0b00100,0b01010,0b11111,0b01010,0b00100,0],
+        _ => [0,0,0,0,0,0,0],
+    }
+}
+
+/// Draw a string at (x, y) using 5×7 bitmap font, scaled by `scale`.
+fn draw_text_5x7(img: &mut [u8], w: usize, h: usize,
+                 x: i32, y: i32, text: &str, scale: i32, rgb: [u8; 3]) -> i32 {
+    let glyph_w = 5 * scale;
+    let kern = scale; // 1px gap between glyphs (scaled)
+    let mut cur_x = x;
+    for ch in text.chars() {
+        let bm = glyph_5x7(ch);
+        for row in 0..7 {
+            for col in 0..5 {
+                if bm[row] & (1u8 << (4 - col)) != 0 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let px = cur_x + (col as i32) * scale + sx;
+                            let py = y + (row as i32) * scale + sy;
+                            if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                                let idx = (py as usize * w + px as usize) * 3;
+                                img[idx] = rgb[0];
+                                img[idx + 1] = rgb[1];
+                                img[idx + 2] = rgb[2];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cur_x += glyph_w + kern;
+    }
+    cur_x
+}
+
+/// Compose a metadata banner at the top of an RGB image. Returns the new
+/// (image_data, width, height) with the banner stacked above the original.
+fn compose_with_banner(
+    img: &[u8], nx: usize, ny: usize,
+    lines: &[String],
+) -> (Vec<u8>, usize, usize) {
+    if lines.is_empty() {
+        return (img.to_vec(), nx, ny);
+    }
+    // Auto-scale font: prefer larger, but shrink if widest line wouldn't fit.
+    let max_chars = lines.iter().map(|s| s.chars().count()).max().unwrap_or(1);
+    let pad_x_per_scale = 4i32;
+    // Glyph cell width = 5 * scale + scale (kerning) = 6 * scale per char
+    // Total width for a scale s = 6 * s * max_chars + 2 * pad_x_per_scale * s
+    // Solve for largest s such that total <= nx
+    let max_scale: i32 = (1..=4).rev()
+        .find(|&s| (6 * s * max_chars as i32 + 2 * pad_x_per_scale * s) <= nx as i32)
+        .unwrap_or(1);
+    let scale: i32 = max_scale.min(if nx >= 1200 { 3 } else if nx >= 600 { 2 } else { 1 });
+    let scale = scale.max(1);
+    let glyph_h = 7 * scale;
+    let line_gap = 2 * scale;
+    let pad_y = 4 * scale;
+    let banner_h = (pad_y * 2) + (glyph_h * lines.len() as i32) + (line_gap * (lines.len() as i32 - 1).max(0));
+    let banner_h = banner_h.max(0) as usize;
+    let new_h = ny + banner_h;
+    let mut out = vec![0u8; new_h * nx * 3];
+
+    // Banner background: dark grey-blue
+    for y in 0..banner_h {
+        for x in 0..nx {
+            let idx = (y * nx + x) * 3;
+            out[idx] = 18; out[idx + 1] = 22; out[idx + 2] = 32;
+        }
+    }
+    // Draw text lines
+    let pad_x: i32 = pad_x_per_scale * scale;
+    let mut cur_y: i32 = pad_y;
+    for line in lines {
+        draw_text_5x7(&mut out, nx, banner_h, pad_x, cur_y, line, scale, [230, 230, 235]);
+        cur_y += glyph_h + line_gap;
+    }
+    // Copy original image below banner
+    let dst_off = banner_h * nx * 3;
+    out[dst_off..dst_off + img.len()].copy_from_slice(img);
+    (out, nx, new_h)
+}
+
+/// Build human-readable metadata lines for a checkpoint snapshot.
+fn build_metadata_lines(
+    ckpt: &analysis::checkpoint::Checkpoint,
+    marker: Option<&analysis::metadata::SimMarker>,
+    ckpt_path: &std::path::Path,
+) -> Vec<String> {
+    use analysis::metadata::{compute_confluence, marker_param_f64};
+    let p = &ckpt.params;
+    let h = &ckpt.header;
+    let lx = (p.nx as f32) * p.dx;
+    let ly = (p.ny as f32) * p.dy;
+    let phi_computed = compute_confluence(h.num_cells, p.target_radius, lx, ly);
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // Line 1: filename / source
+    if let Some(stem) = ckpt_path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
+        lines.push(format!("Source: {}", stem));
+    }
+
+    // Line 2: timestamp + study
+    let ts = marker.and_then(|m| m.provenance.as_ref()).and_then(|p| p.timestamp.clone());
+    let study = marker.and_then(|m| m.study.as_ref()).and_then(|s| s.name.clone());
+    match (ts, study) {
+        (Some(t), Some(s)) => lines.push(format!("Submitted: {}  study: {}", t, s)),
+        (Some(t), None)    => lines.push(format!("Submitted: {}", t)),
+        (None, Some(s))    => lines.push(format!("Study: {}", s)),
+        _ => {}
+    }
+
+    // Line 3: physics: N, R, dt, t (sim time)
+    lines.push(format!(
+        "N={}  R={:.1}  dt={:.3}  t={:.0} ({:.2}tau)  step={}",
+        h.num_cells, p.target_radius, p.dt, h.time, h.time / 10000.0, h.step
+    ));
+
+    // Line 4: domain + confluence (computed vs original)
+    let phi_orig = marker.and_then(|m| marker_param_f64(m, "confluence"));
+    let phi_str = match phi_orig {
+        Some(o) => format!(
+            "phi_computed={:.4}  phi_original={:.4}  delta={:+.4}",
+            phi_computed, o, phi_computed - o
+        ),
+        None => format!("phi_computed={:.4}  phi_original=N/A", phi_computed),
+    };
+    lines.push(format!("Domain: {}x{} ({:.0}x{:.0})  {}",
+        p.nx, p.ny, lx, ly, phi_str));
+
+    // Line 5: motility scalars; Line 6: per-cell stats
+    let g = &ckpt.per_cell_gamma;
+    let v = &ckpt.per_cell_v_a;
+    let r = &ckpt.per_cell_radius;
+    let stats = |xs: &[f32]| -> Option<(f32, f32, f32)> {
+        if xs.is_empty() { return None; }
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
+        let mut s = 0.0f64;
+        for &x in xs { mn = mn.min(x); mx = mx.max(x); s += x as f64; }
+        Some((mn, (s / xs.len() as f64) as f32, mx))
+    };
+    lines.push(format!("v_A_param={:.4}  tau={:.0}  lambda={:.2}  halo={}",
+        p.v_a, p.tau, p.lambda, p.halo_width));
+    let seed_str = match p.seed {
+        Some(s) => format!("{}", s),
+        None => "n/a".to_string(),
+    };
+    let pol_seed_str = match p.polarity_seed {
+        Some(s) => format!("{}", s),
+        None => "n/a".to_string(),
+    };
+    lines.push(format!("seed={}  polarity_seed={}", seed_str, pol_seed_str));
+    let mut cell_parts: Vec<String> = Vec::new();
+    if let Some((mn, mean, mx)) = stats(v) {
+        cell_parts.push(format!("v_A_cell[min/avg/max]={:.4}/{:.4}/{:.4}", mn, mean, mx));
+    }
+    if let Some((mn, mean, mx)) = stats(g) {
+        cell_parts.push(format!("gamma=[{:.3}/{:.3}/{:.3}]", mn, mean, mx));
+    }
+    if let Some((mn, mean, mx)) = stats(r) {
+        cell_parts.push(format!("R=[{:.2}/{:.2}/{:.2}]", mn, mean, mx));
+    }
+    if !cell_parts.is_empty() {
+        lines.push(cell_parts.join("  "));
+    }
+
+    // Line 6: provenance jobs / source checkpoint (if resume)
+    if let Some(prov) = marker.and_then(|m| m.provenance.as_ref()) {
+        let mut prov_parts: Vec<String> = Vec::new();
+        if !prov.job_ids.is_empty() {
+            prov_parts.push(format!("jobs={}", prov.job_ids.join(",")));
+        }
+        if let Some(src) = &prov.source_checkpoint {
+            // Show only last two path components for brevity
+            let short = std::path::Path::new(src);
+            let trail: Vec<&str> = short.iter().rev().take(3)
+                .filter_map(|s| s.to_str()).collect();
+            let mut joined = trail.into_iter().rev().collect::<Vec<_>>().join("/");
+            if joined.is_empty() { joined = src.clone(); }
+            prov_parts.push(format!("resumed_from=.../{}", joined));
+        }
+        if !prov_parts.is_empty() {
+            lines.push(prov_parts.join("  "));
+        }
+    }
+    lines
 }
 
 /// Write RGB image data to a PNG file.
@@ -2059,7 +2718,7 @@ impl MovieContext {
             for &(cid, wx, wy, soft) in &wrapped {
                 let sp = spatial_map.get(&cid).copied().unwrap_or(0);
                 draw_label_with_spatial(&mut rgb, nx, ny, wx, wy,
-                    &cid.to_string(), &sp.to_string(), soft);
+                    &cid.to_string(), &sp.to_string(), "", soft);
             }
         }
 
