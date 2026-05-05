@@ -980,10 +980,12 @@ void Simulation::run() {
             write_vtk();
             wrote_output = true;
         }
-        // Status line: only when an output was written this step (and only
-        // if the user opted in via --print-interval > 0). Avoids spamming
-        // stdout on benchmark runs that disable I/O entirely.
-        if (wrote_output && params.print_interval > 0
+        // Status line: print on cadence regardless of whether trajectory/VTK
+        // was written this step. The previous `wrote_output &&` gate caused
+        // long compute phases (e.g. equilibration with --trajectory-samples 0)
+        // to appear silent, which trips agent-terminal idle-kill (Ctrl+C
+        // after ~30-60 s of no stdout). --print-interval 0 still disables.
+        if (params.print_interval > 0
             && step_count % params.print_interval == 0)
             print_status();
 
@@ -992,8 +994,17 @@ void Simulation::run() {
             if (viz.should_close()) {
                 viz.shutdown();
                 viz_active = false;
-                printf("[viz] window closed; sim continues headless\n");
+                // When the window is closed, exit the sim instead of
+                // silently continuing headless. Live-view runs are
+                // exploratory; the user closing the window means "stop".
+                printf("[viz] window closed; stopping sim\n");
+                break;
             } else {
+                // Viz reads sim buffers; sim runs on step_stream so we must
+                // wait for the current step to finish before sampling. Without
+                // this the colormap shows half-applied scatter/evolve state
+                // and looks like flashing/tearing.
+                cudaStreamSynchronize(step_stream);
                 viz.update(cells.S, cells.phi_in, cells.origin, cells.rect,
                            cells.Cx, cells.Cy, cells.Cxx, cells.Cyy,
                            cells.volumes,

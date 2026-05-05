@@ -37,7 +37,7 @@ static void usage(const char* prog) {
     printf("  --xi <f>              Friction (default: 1500)\n");
     printf("  --lambda <f>          Interface width (default: 7.0)\n");
     printf("  -l <f>                Interface width (alias for --lambda)\n");
-    printf("  --subdomain-padding <f>  Adaptive-rect K: half-width = ceil(K*sigma + R/2) (default: 2.0)\n");
+    printf("  --subdomain-padding <f>  Adaptive-rect K: hw = ceil(2*sigma + K*R/4*sqrt(gamma_ref/gamma)) (default: 2.0)\n");
     printf("  --abp                 Use ABP instead of run-and-tumble\n");
     printf("  -o <dir>              Output directory (default: ./output)\n");
     printf("  -c <path>             Resume from checkpoint\n");

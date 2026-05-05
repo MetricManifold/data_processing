@@ -740,7 +740,19 @@ __global__ void k_rebind(
 
     __shared__ int sshift[2];
     __shared__ int srect[4];
+    __shared__ int sold[4];   // rect_k (the rect before this rebind). Both
+                              // buffers are zero outside this rect, so all
+                              // work in this kernel lives in old ∪ new.
+    __shared__ int sunion[4]; // [ux0, uy0, uw, uh]
     if (tid == 0) {
+        // Snapshot the previous rect before we overwrite it. The kernel
+        // invariant (maintained by every rebind) is: both phi_in and
+        // phi_out are zero outside `sold` at kernel entry.
+        sold[0] = rect[4*n + 0];
+        sold[1] = rect[4*n + 1];
+        sold[2] = rect[4*n + 2];
+        sold[3] = rect[4*n + 3];
+
         float Vn = V[n];
         float invV = (Vn > 1e-6f) ? 1.0f / Vn : 0.0f;
         float mx = Cx[n] * invV;
@@ -758,28 +770,28 @@ __global__ void k_rebind(
         if (vary < 0.0f) vary = 0.0f;
         float sigx = sqrtf(varx);
         float sigy = sqrtf(vary);
-        // Per-axis half-widths: hw = ceil(K_eff*sigma + R/2). Margin scales
-        // with cell radius so the rect tracks shape change between rebinds.
-        // K (subdomain_padding) controls how aggressively the rect tracks
-        // the second moments; the only hard floor is bbox_min and the only
-        // ceiling is Th-1 (preserves stencil halo).
+        // Per-axis half-widths: hw = ceil(2*sigma + margin). The 2*sigma
+        // term tracks the cell's actual per-axis extent (for a uniform
+        // ellipse, semi-axis ~= 2*sigma), so a horizontally-stretched
+        // cell gets a wide hw_x and a short hw_y, accurately reflecting
+        // the cell wall.
         //
-        // Per-cell K scaling: softer cells (lower gamma) deform more between
-        // rebinds and squeeze through gaps with high transient aspect ratio,
-        // so they need extra padding. K_eff = K * sqrt(max(1, gamma_ref/gamma)).
-        // At gamma == gamma_ref this is a no-op; at gamma = gamma_ref/4
-        // (e.g. 0.25 vs 1.0) it doubles K. Stiffer-than-reference cells get
-        // the unscaled K -- they don't need the extra room.
+        // The additive margin is the safety buffer past the cell wall:
+        //   margin = K * (R/4) * sqrt(gamma_ref / gamma)
+        // K (subdomain_padding, default 2) controls the buffer size.
+        // K=2 reproduces the historical R/2 padding for stiff cells.
+        // Soft cells (gamma < gamma_ref) move/deform faster between
+        // rebinds, so they get a sqrt(gamma_ref/gamma) larger cushion.
+        // The cushion is bounded by the hmax = Th-1 clamp below.
         float R = tgt_radius[n];
         float gn = gamma_cell[n];
-        float k_scale = 1.0f;
+        float soft_scale = 1.0f;
         if (gn > 0.0f && gn < gamma_ref) {
-            k_scale = sqrtf(gamma_ref / gn);
+            soft_scale = sqrtf(gamma_ref / gn);
         }
-        float k_eff = bbox_k * k_scale;
-        float margin = 0.5f * R;
-        int hwx = (int)ceilf(k_eff * sigx + margin);
-        int hwy = (int)ceilf(k_eff * sigy + margin);
+        float margin = bbox_k * 0.25f * R * soft_scale;
+        int hwx = (int)ceilf(2.0f * sigx + margin);
+        int hwy = (int)ceilf(2.0f * sigy + margin);
         hwx = ((hwx + bbox_align - 1) / bbox_align) * bbox_align;
         hwy = ((hwy + bbox_align - 1) / bbox_align) * bbox_align;
         const int hmax = Th - 1;     // keep 1px stencil halo
@@ -802,42 +814,71 @@ __global__ void k_rebind(
         rect[4*n + 1] = srect[1];
         rect[4*n + 2] = srect[2];
         rect[4*n + 3] = srect[3];
+
+        // Union of old and new rects. We only need to touch pixels in
+        // this region: outside the union both buffers are already zero
+        // (invariant from the previous rebind + evolve writing only
+        // inside the rect).
+        int ox0 = sold[0], oy0 = sold[1];
+        int ox1 = ox0 + sold[2], oy1 = oy0 + sold[3];
+        int nx0 = srect[0], ny0 = srect[1];
+        int nx1 = nx0 + srect[2], ny1 = ny0 + srect[3];
+        int ux0 = ox0 < nx0 ? ox0 : nx0;
+        int uy0 = oy0 < ny0 ? oy0 : ny0;
+        int ux1 = ox1 > nx1 ? ox1 : nx1;
+        int uy1 = oy1 > ny1 ? oy1 : ny1;
+        sunion[0] = ux0;
+        sunion[1] = uy0;
+        sunion[2] = ux1 - ux0;
+        sunion[3] = uy1 - uy0;
     }
     __syncthreads();
     const int sx = sshift[0];
     const int sy = sshift[1];
     const int rx0 = srect[0], ry0 = srect[1];
     const int rx1 = rx0 + srect[2], ry1 = ry0 + srect[3];
+    const int ox0_old = sold[0], oy0_old = sold[1];
+    const int ox1_old = ox0_old + sold[2], oy1_old = oy0_old + sold[3];
+    const int ux0 = sunion[0], uy0 = sunion[1];
+    const int uw  = sunion[2], uh  = sunion[3];
+    const int u_total = uw * uh;
 
-    // Phase 1: write shifted source data into phi_out (destination).
-    // Pixels in new rect get shifted source; outside = 0.
-    for (int p = tid; p < TILE_AREA; p += BS) {
-        int ox = p % TILE_T;
-        int oy = p / TILE_T;
+    // Phase 1: write shifted source into phi_out, but only inside the
+    // union bbox. Outside the union, phi_out is already 0 (invariant).
+    //   - pixel in new rect:        write shifted phi_in lookup
+    //   - pixel in old rect only:   write 0 (clears stale evolve data)
+    //   - pixel in neither (rare):  already 0; skip
+    for (int p = tid; p < u_total; p += BS) {
+        int ox = ux0 + (p % uw);
+        int oy = uy0 + (p / uw);
+        bool in_new = (ox >= rx0 && ox < rx1 && oy >= ry0 && oy < ry1);
+        bool in_old = (ox >= ox0_old && ox < ox1_old && oy >= oy0_old && oy < oy1_old);
         float v = 0.0f;
-        if (ox >= rx0 && ox < rx1 && oy >= ry0 && oy < ry1) {
+        if (in_new) {
             int sxi = ox + sx;
             int syi = oy + sy;
             if (sxi >= 0 && sxi < TILE_T && syi >= 0 && syi < TILE_T) {
                 v = tin[syi * TILE_T + sxi];
             }
         }
-        tout[p] = v;
+        if (in_new || in_old) {
+            tout[oy * TILE_T + ox] = v;
+        }
     }
     __syncthreads();
 
-    // Phase 2: scrub source-buffer halo. After the caller swaps, this
-    // buffer becomes phi_out for the next evolve. Evolve only writes
-    // INSIDE the new rect, so any pixels outside-new-rect carry stale
-    // cell data from before this rebind (when the rect shrinks). On the
-    // following swap those stale pixels become phi_in and the boundary
-    // stencil reads them. Zeroing now is the cheapest fix; no race
-    // because Phase 1 above already finished reading from tin.
-    for (int p = tid; p < TILE_AREA; p += BS) {
-        int ox = p % TILE_T;
-        int oy = p / TILE_T;
-        bool inside = (ox >= rx0 && ox < rx1 && oy >= ry0 && oy < ry1);
-        if (!inside) tin[p] = 0.0f;
+    // Phase 2: scrub stale data in tin (the source buffer). After the
+    // caller swaps, this becomes phi_out for the next evolve, which only
+    // writes INSIDE the new rect; we must zero everything in old\new now.
+    // No race: Phase 1 finished reading tin (sync above).
+    for (int p = tid; p < u_total; p += BS) {
+        int ox = ux0 + (p % uw);
+        int oy = uy0 + (p / uw);
+        bool in_new = (ox >= rx0 && ox < rx1 && oy >= ry0 && oy < ry1);
+        bool in_old = (ox >= ox0_old && ox < ox1_old && oy >= oy0_old && oy < oy1_old);
+        if (in_old && !in_new) {
+            tin[oy * TILE_T + ox] = 0.0f;
+        }
     }
 }
 
