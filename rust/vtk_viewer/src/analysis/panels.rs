@@ -264,13 +264,12 @@ pub fn draw_gvi_panel(
             ));
     }
 
-    // Optional Palmieri Eq. 5 fit. If `palmieri_fit_index` is set, fit
-    // Eq.5 to that series' G(v) curve and to *every* later series too,
-    // so that e.g. cell 0 gets its own fit overlay with its own ζ
-    // (cell 0 has its own intrinsic burst statistics that differ from
-    // the population). Each fit is drawn in the matching series colour.
+    // Optional Palmieri Eq. 5 fit. Fits Eq. 5 to the single series
+    // identified by `palmieri_fit_index` only. The control / Gaussian
+    // baseline does not get its own Eq. 5 overlay because the burst
+    // mixture only describes the active (soft) population.
     if let Some(idx) = opts.palmieri_fit_index {
-        for (s_i, ((xs, gs, _), s)) in computed.iter().zip(series.iter()).enumerate().skip(idx) {
+        if let (Some((xs, gs, _)), Some(s)) = (computed.get(idx), series.get(idx)) {
             // Trapezoidal weighting (≈ ∫ dv) so dense bulk samples near
             // v=0 don't swamp the sparse tail.
             let v_min = opts.palmieri_fit_min_v.unwrap_or(0.0);
@@ -302,13 +301,7 @@ pub fn draw_gvi_panel(
                 let ccdf = palmieri_ccdf(v, ref_sigma, best_zeta, opts.v_a);
                 if ccdf > 1e-15 { Some((v, g_from_ccdf(ccdf))) } else { None }
             }).collect();
-            // First fit (population) gets the standard pinky-red colour;
-            // additional fits inherit their series colour.
-            let eq5_color = if s_i == idx {
-                RGBAColor(200, 100, 100, 0.8)
-            } else {
-                s.color
-            };
+            let eq5_color = RGBAColor(200, 100, 100, 0.8);
             chart.draw_series(LineSeries::new(palmieri_curve, eq5_color.stroke_width(2)))?
                 .label(format!("Eq.5 [{}] ζ={:.1}%", s.label, best_zeta * 100.0))
                 .legend(move |(x, y)| PathElement::new(
