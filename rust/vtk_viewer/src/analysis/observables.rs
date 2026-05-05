@@ -4,7 +4,6 @@
 //! structured results suitable for JSON serialization.
 
 use super::io::UnwrappedPositions;
-use rayon::prelude::*;
 use serde::Serialize;
 use std::f64::consts::PI;
 
@@ -1381,7 +1380,7 @@ pub struct BurstDetectionResult {
 /// `k` defaults to 3.0 (3-sigma), `min_frames` defaults to 1.
 pub fn detect_bursts(
     pos: &UnwrappedPositions,
-    traj: &super::io::Trajectory,
+    _traj: &super::io::Trajectory,
     k_sigma: f64,
     min_frames: usize,
 ) -> BurstDetectionResult {
@@ -1587,7 +1586,7 @@ pub fn velocity_distribution(pos: &UnwrappedPositions, n_bins: usize) -> Velocit
     // Histogram
     let v_max = pop_vx.iter().map(|x| x.abs()).fold(0.0f64, f64::max);
     let bin_width = 2.0 * v_max / n_bins as f64;
-    let mut bin_edges: Vec<f64> = (0..=n_bins).map(|i| -v_max + i as f64 * bin_width).collect();
+    let bin_edges: Vec<f64> = (0..=n_bins).map(|i| -v_max + i as f64 * bin_width).collect();
 
     let histogramize = |data: &[f64]| -> Vec<f64> {
         let mut counts = vec![0u64; n_bins];

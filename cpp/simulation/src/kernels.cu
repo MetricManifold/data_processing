@@ -1,4 +1,4 @@
-// sim_v3 kernels — fixed-tile unified-pool architecture.
+// CUDA kernels — fixed-tile unified-pool architecture.
 //
 // Layout:
 //   1. Device helpers

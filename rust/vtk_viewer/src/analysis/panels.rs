@@ -103,7 +103,7 @@ pub fn compute_gvi(vx: &[f64], vy: &[f64]) -> (Vec<f64>, Vec<f64>, f64) {
     let mut centers = Vec::new();
     let mut gvi = Vec::new();
     let mut last_idx: Option<usize> = None;
-    let mut push_idx = |i: usize, centers: &mut Vec<f64>, gvi: &mut Vec<f64>, last_idx: &mut Option<usize>| {
+    let push_idx = |i: usize, centers: &mut Vec<f64>, gvi: &mut Vec<f64>, last_idx: &mut Option<usize>| {
         if last_idx.map_or(false, |li| li == i) { return; }
         let v = v_abs[i];
         let ccdf = (n - i) as f64 / n as f64;

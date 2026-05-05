@@ -11,7 +11,6 @@ mod analysis;
 mod colormap;
 mod vtk;
 
-use analysis::batch::{discover_runs, group_by_key};
 use analysis::io::{load_trajectory, load_trajectory_subsample, unwrap_trajectory};
 use analysis::observables::*;
 use analysis::output::*;
@@ -265,7 +264,7 @@ fn main() -> Result<()> {
         }
         Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata } => {
             let is_dir = input.is_dir();
-            let is_vtk = input.extension().map_or(false, |e| e == "vtk");
+            let _is_vtk = input.extension().map_or(false, |e| e == "vtk");
             // Activate per-cell rendering when user wants colored contours or speed shading
             let use_cell_render = color_by != "none" || shade_speed;
 
@@ -401,7 +400,7 @@ fn main() -> Result<()> {
                 let mut gamma_labels: std::collections::HashMap<u32, String> =
                     std::collections::HashMap::new();
 
-                let (phi, nx, ny, title) = if is_vtk {
+                let (phi, nx, ny, _title) = if is_vtk {
                     // VTK file: parse structured points, extract "phi" field
                     let vtk_data = vtk::parse_vtk(&input)?;
                     let phi_field = vtk_data.scalars.get("phi")
@@ -1935,7 +1934,7 @@ fn render_phi_to_rgb(
                 let lx = ((lx % nx as i32) + nx as i32) as usize % nx;
                 let ly = ((ly % ny as i32) + ny as i32) as usize % ny;
                 let iy = ny - 1 - ly;
-                let idx = (iy * nx + lx) * 3;
+                let _idx = (iy * nx + lx) * 3;
                 // Thicker line: draw 3×3
                 for dy in -1i32..=1 {
                     for dx in -1i32..=1 {
@@ -2476,34 +2475,36 @@ impl MovieContext {
             eprintln!("  Trajectory: {} time samples", traj.len());
         }
 
-        // Compute displacement intervals (only if shade_speed is on)
-        let mut intervals = Vec::new();
+        // Compute displacement intervals (only if shade_speed is on).
+        // intervals is consumed downstream by path_avg_speed_static; it must
+        // outlive the `if` so don't shadow with an inner let-binding.
+        let mut intervals: Vec<DisplacementInterval> = Vec::new();
         let mut speed_max_val = 1e-6f32;
         if shade_speed && traj.len() > 1 {
             let hlx = nx as f32 / 2.0;
-        let hly = ny as f32 / 2.0;
-        let lx = nx as f32;
-        let ly = ny as f32;
-        let mut intervals = Vec::with_capacity(traj.len());
-        for i in 1..traj.len() {
-            let (t_now, cells_now) = &traj[i];
-            let (t_prev, cells_prev) = &traj[i - 1];
-            let dt = t_now - t_prev;
-            if dt <= 0.0 { continue; }
-            let mut dr_map = std::collections::HashMap::new();
-            for (&cid, pos) in cells_now {
-                if let Some(prev) = cells_prev.get(&cid) {
-                    let mut dx = pos[0] - prev[0];
-                    let mut dy = pos[1] - prev[1];
-                    if dx > hlx { dx -= lx; } if dx < -hlx { dx += lx; }
-                    if dy > hly { dy -= ly; } if dy < -hly { dy += ly; }
-                    dr_map.insert(cid, (dx * dx + dy * dy).sqrt());
+            let hly = ny as f32 / 2.0;
+            let lx = nx as f32;
+            let ly = ny as f32;
+            intervals.reserve(traj.len());
+            for i in 1..traj.len() {
+                let (t_now, cells_now) = &traj[i];
+                let (t_prev, cells_prev) = &traj[i - 1];
+                let dt = t_now - t_prev;
+                if dt <= 0.0 { continue; }
+                let mut dr_map = std::collections::HashMap::new();
+                for (&cid, pos) in cells_now {
+                    if let Some(prev) = cells_prev.get(&cid) {
+                        let mut dx = pos[0] - prev[0];
+                        let mut dy = pos[1] - prev[1];
+                        if dx > hlx { dx -= lx; } if dx < -hlx { dx += lx; }
+                        if dy > hly { dy -= ly; } if dy < -hly { dy += ly; }
+                        dr_map.insert(cid, (dx * dx + dy * dy).sqrt());
+                    }
                 }
+                intervals.push(DisplacementInterval { time: *t_now, displacements: dr_map });
             }
-            intervals.push(DisplacementInterval { time: *t_now, displacements: dr_map });
-        }
 
-        // Fixed global speed normalization: scan trajectory for P95
+            // Fixed global speed normalization: scan trajectory for P95
             speed_max_val = {
                 let mut all_speeds: Vec<f32> = Vec::new();
                 let n_samples = 50.min(intervals.len());

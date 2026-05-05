@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::io::{load_trajectory, load_trajectory_subsample, unwrap_trajectory};
+use super::io::{load_trajectory_subsample, unwrap_trajectory};
 use super::observables::*;
 use super::output::RunResult;
 
@@ -1346,8 +1346,6 @@ fn generate_figure(
     let [n_rows, n_cols] = cfg.layout;
     let out_path = output_dir.join(&cfg.output);
 
-    let panel_w = cfg.width / n_cols as u32;
-    let panel_h = (cfg.height - 40) / n_rows as u32; // 40px for title
     let total_w = cfg.width;
     let total_h = cfg.height;
 
@@ -2562,9 +2560,6 @@ pub fn generate_fss_plot(
     title_area.titled("Finite-Size Scaling — Cell 0 Observables", ("sans-serif", 20))?;
     let panels = chart_area.split_evenly((n_rows as usize, n_cols as usize));
 
-    let soft_color = RGBAColor(220, 60, 60, 1.0);
-    let ctrl_color = RGBAColor(52, 152, 219, 1.0);
-
     fn cond_color(cond: &str) -> RGBAColor {
         if cond.contains("soft") { RGBAColor(220, 60, 60, 1.0) }
         else { RGBAColor(52, 152, 219, 1.0) }
@@ -2612,7 +2607,6 @@ pub fn generate_fss_plot(
             .build_cartesian_2d((x_min.ln())..(x_max.ln()), y_min..y_max)?;
 
         // Force tick marks only at the actual N values
-        let ns_ln: Vec<f64> = ns.iter().map(|&n| (n as f64).ln()).collect();
         let ns_owned: Vec<usize> = ns.to_vec();
         chart.configure_mesh()
             .x_desc("N")

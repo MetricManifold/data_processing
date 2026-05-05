@@ -1,8 +1,8 @@
-// sim_v3 host-side glue — allocation, init, step loop, checkpoint I/O.
+// Host-side glue — allocation, init, step loop, checkpoint I/O.
 //
-// Internal architecture is the fixed-tile unified-pool design. The external
-// API matches sim_v2 so main.cu, the test harness, the trajectory writer
-// and the cluster MCP tools all keep working.
+// Architecture: fixed-tile unified-pool. Each cell owns a TILE_T x TILE_T
+// phi buffer in a contiguous device array; an active rect inside the tile
+// tracks the cell's current extent.
 //
 // Checkpoint compatibility:
 //   * Reads:  v3, v4, v5, v6 (legacy variable-W/H tiles) AND v7 (TILE_T
@@ -31,7 +31,6 @@
 
 // ---------------------------------------------------------------------------
 // place_cells — rejection sampling with periodic distance.
-// Bit-for-bit identical to sim_v2 so the same seed produces the same layout.
 // ---------------------------------------------------------------------------
 void Simulation::place_cells(int n, double R) {
     unsigned s = params.seed ? params.seed : 42;
@@ -60,7 +59,7 @@ void Simulation::place_cells(int n, double R) {
             }
             if (good) {
                 h_cells[placed] = {cx, cy, R, params.gamma, params.v_A, 0, 0};
-                rand(); // consume one to match baseline Cell ctor RNG draw
+                rand(); // consume one to match historical Cell ctor RNG draw
                 ok = true;
                 placed++;
             }
@@ -466,8 +465,8 @@ void Simulation::init(const SimParams& p, int n_cells) {
 
 // ---------------------------------------------------------------------------
 // init_from_checkpoint — versions 3..7. v3-v6 use variable W/H tiles
-// (legacy sim_v2 format); we re-tile them into TILE_T uniform buffers on
-// load. v7 is the native format produced by save_checkpoint() below.
+// (legacy format); we re-tile them into TILE_T uniform buffers on load.
+// v7 is the native format produced by save_checkpoint() below.
 // ---------------------------------------------------------------------------
 bool Simulation::init_from_checkpoint(const std::string& path,
                                       const SimParams& cli,
@@ -540,7 +539,7 @@ bool Simulation::init_from_checkpoint(const std::string& path,
         params.xi            = u_f32(48);
         params.tau           = u_f32(52);
         params.halo          = u_i32(60);
-        // Older formats stored subdomain_padding at offset 68; sim_v3 ignores it.
+        // Older formats stored subdomain_padding at offset 68; ignored on load.
         if (sp_sz >= 76) params.abp = (u_i32(72) == 1);
         params.print_interval     = 100;
         params.trajectory_samples = 0;
@@ -690,7 +689,7 @@ bool Simulation::init_from_checkpoint(const std::string& path,
                           params.target_radius, params.gamma, params.v_A,
                           ox_new, oy_new};
         }
-        // sim_v3 has no halo concept; record 0 for any future round-trip.
+        // No halo concept in the current format; record 0 for round-trip.
         params.halo = 0;
     }
 
@@ -1069,8 +1068,8 @@ void Simulation::print_status() {
 }
 
 // ---------------------------------------------------------------------------
-// write_trajectory — same CSV format as sim_v2 so analysis tooling is
-// untouched. Centroids are computed on the host from (Cx, Cy, V, origin).
+// write_trajectory — stable CSV format consumed by the Rust analyzer
+// and Python tooling. Centroids are computed on the host from (Cx, Cy, V, origin).
 // ---------------------------------------------------------------------------
 void Simulation::write_trajectory() {
     if (!traj_fp) return;

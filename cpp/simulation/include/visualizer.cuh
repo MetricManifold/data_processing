@@ -10,7 +10,7 @@
 // Renders the global S(x,y) = sum_n phi_n(x,y)^2 field directly from device
 // memory each call (no host copies). Single-window viridis colormap; user
 // closes the window or presses ESC to terminate the viewer (the simulation
-// keeps running). Designed for sim_v3 tile-pool layout.
+// keeps running). Designed for the tile-pool layout.
 //
 // Overlays (drawn from device data, no host roundtrip):
 //   * Red tint on soft cells (gamma_cell < soft_gamma_threshold).

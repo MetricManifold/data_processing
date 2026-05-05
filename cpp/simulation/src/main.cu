@@ -52,11 +52,6 @@ static void usage(const char* prog) {
     printf("  --live-view           Open live CUDA-OpenGL viewer (requires ENABLE_VISUALIZER build)\n");
     printf("  --live-view-tu <f>        Frame interval in time units (default: 5.0)\n");
     printf("  --live-view-interval <n>  Steps between viewer updates (overrides --live-view-tu)\n");
-    printf("  --save-individual-fields  Write per-cell phi (accepted, no-op stub in v2)\n");
-    printf("  --use-diagnostics         Enable diagnostic outputs (accepted, no-op stub in v2)\n");
-    printf("  --observable-interval <n> Diagnostic cadence (accepted, no-op stub in v2)\n");
-    printf("  --stress-fields           Include stress tensor in VTK (accepted, no-op stub in v2)\n");
-    printf("  --safe-mode               Cap GPU memory at 1 GB (accepted, no-op stub in v2)\n");
     printf("  --seed <n>            Placement RNG seed\n");
     printf("  --polarity-seed <n>   Polarity RNG seed\n");
     printf("  --scripted-events <f> Pre-determined tumble events for deterministic replay\n");
@@ -152,15 +147,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--live-view-tu") && i+1<argc) {
             live_view_tu = atof(argv[++i]);
         }
-        // Accept-and-ignore stubs: baseline-compatible flags whose payloads
-        // (per-cell VTK, GPU diagnostics, stress tensor, mem cap) are not yet
-        // implemented in v2. Keeping the CLI surface intact prevents script
-        // breakage and lets test_features.py exercise the migration path.
-        else if (!strcmp(argv[i], "--save-individual-fields")) { /* stub */ }
-        else if (!strcmp(argv[i], "--use-diagnostics"))        { /* stub */ }
-        else if (!strcmp(argv[i], "--observable-interval") && i+1<argc) { ++i; /* stub */ }
-        else if (!strcmp(argv[i], "--stress-fields"))          { /* stub */ }
-        else if (!strcmp(argv[i], "--safe-mode"))              { /* stub */ }
+        // TODO(observables): re-introduce a `--observables [interval=<n>]` CLI
+        // surface that drives an on-GPU per-cell measurement pass (volume,
+        // perimeter, shape index, stress/strain tensors, neighbor contacts)
+        // and writes observables.csv. Historic flags `--use-diagnostics` and
+        // `--observable-interval` are removed here; restore as a single,
+        // properly-implemented `--observables` flag once the kernel is ready.
         else if (!strcmp(argv[i], "--seed") && i+1<argc) { p.seed = atoi(argv[++i]); ov.seed = true; }
         else if (!strcmp(argv[i], "--polarity-seed") && i+1<argc) {
             p.polarity_seed = atoi(argv[++i]); ov.polarity_seed = true;
@@ -173,17 +165,15 @@ int main(int argc, char** argv) {
     }
 
     // Mutually-exclusive domain specification: -N OR --confluence, not both.
-    // Baseline cell_sim rejects this combination; v2 must match.
     if (confluence > 0 && nx_set) {
         fprintf(stderr,
                 "Error: -N and --confluence are mutually exclusive. "
                 "Pick one.\n");
         return 1;
     }
-    // If neither -N nor --confluence is given, fall back to baseline's
-    // historical default (confluence = 0.85). This keeps single-line
-    // invocations like `cell_sim -n 8 -r 20` runnable without forcing
-    // the user to pick a domain size every time.
+    // If neither -N nor --confluence is given, fall back to confluence=0.85.
+    // This keeps single-line invocations like `cell_sim -n 8 -r 20` runnable
+    // without forcing the user to pick a domain size every time.
     if (confluence <= 0 && !nx_set) {
         confluence = 0.85f;
         fprintf(stderr,

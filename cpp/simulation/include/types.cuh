@@ -7,7 +7,7 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// sim_v3 simulation parameters
+// Simulation parameters
 // ---------------------------------------------------------------------------
 // Scalar physics/numerical knobs in double precision so time accumulation,
 // step-count math, and derived coefficients never lose precision. Per-pixel
@@ -94,7 +94,7 @@ static constexpr int TILE_BBOX_ALIGN = 16;
 static constexpr int TILE_BBOX_MIN   = 32;
 
 // ---------------------------------------------------------------------------
-// All GPU arrays — SoA layout. Vastly simplified from sim_v2:
+// All GPU arrays — SoA layout:
 //   * no per-cell variable W/H, no halo, no shifts, no neighbour list,
 //     no spatial hash, no resize tracking, no second-moment scratch.
 //   * single contiguous phi pool of 2*N*TILE_AREA floats (double-buffered).

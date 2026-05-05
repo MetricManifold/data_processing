@@ -315,15 +315,6 @@ class TestSection01_CLIFlags:
         # Just confirm checkpoint exists.
         assert (out / "checkpoint.bin").exists()
 
-    @requires_flag("--save-individual-fields")
-    def test_save_individual_fields_flag(self, tmp_path):
-        """§1.6: --save-individual-fields saves per-cell φ to fields/*.vtk."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--save-individual-fields", "--seed", "42")
-        # Check that fields/ directory exists (when save-interval > 0).
-        # For now, just verify the run completed.
-        assert (out / "checkpoint.bin").exists()
-
     # 1.7 Random Number Generation (2 flags)
 
     def test_seed_flag_determinism(self, tmp_path):
@@ -346,37 +337,14 @@ class TestSection01_CLIFlags:
         # Just verify the run completed.
         assert chk["num_cells"] == 4
 
-    # 1.8 Diagnostics & Advanced (4 flags)
-
-    @requires_flag("--use-diagnostics")
-    def test_use_diagnostics_flag(self, tmp_path):
-        """§1.8: --use-diagnostics enables GPU diagnostics (compile-time dep)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--use-diagnostics", "--seed", "42")
-        # Just verify the run completed.
-        assert (out / "checkpoint.bin").exists()
-
-    @requires_flag("--observable-interval")
-    def test_observable_interval_flag(self, tmp_path):
-        """§1.8: --observable-interval <int> (compile-time: -DENABLE_DIAGNOSTICS)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--observable-interval", "100", "--seed", "42")
-        # observables.csv may exist if diagnostics enabled at compile-time.
-        assert (out / "checkpoint.bin").exists()
-
-    @requires_flag("--stress-fields")
-    def test_stress_fields_flag(self, tmp_path):
-        """§1.8: --stress-fields includes stress tensor in VTK (compile-time)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--stress-fields", "--seed", "42")
-        assert (out / "checkpoint.bin").exists()
-
-    @requires_flag("--safe-mode")
-    def test_safe_mode_flag_gpu_memory_limit(self, tmp_path):
-        """§1.8 + §9: --safe-mode limits GPU mem to 1 GB."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--safe-mode", "--seed", "42")
-        assert (out / "checkpoint.bin").exists()
+    # 1.8 Diagnostics & Advanced — removed
+    #
+    # `--use-diagnostics`, `--observable-interval`, `--stress-fields`,
+    # `--safe-mode` and `--save-individual-fields` were CLI stubs in v2 that
+    # the cutover sim never implemented. They are removed; a single
+    # `--observables` flag is planned to cover GPU-side measurement
+    # (volume/perimeter/stress/strain/contacts) once the kernel lands.
+    # See the TODO(observables) note in main.cu.
 
     # 1.9 Help (1 flag)
 
@@ -432,26 +400,6 @@ class TestSection02_OutputArtefacts:
         are clarified.
         """
         pass
-
-    @requires_flag("--save-individual-fields")
-    def test_per_cell_vtk_files_when_save_individual_fields(self, tmp_path):
-        """§2: output_NNNNNN_cell_MM.vtk files (per-cell φ)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--save-individual-fields", "--seed", "42")
-        # Fields may be saved to fields/ dir. Just verify checkpoint exists.
-        assert (out / "checkpoint.bin").exists()
-
-    @requires_flag("--observable-interval")
-    def test_observables_csv_when_diagnostics_enabled(self, tmp_path):
-        """§2: observables.csv (per-step diagnostic measurements).
-
-        Requires compile-time -DENABLE_DIAGNOSTICS=ON.
-        """
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--use-diagnostics", "--observable-interval", "100",
-                      "--seed", "42")
-        # observables.csv may exist depending on compile flags.
-        assert (out / "checkpoint.bin").exists()
 
     @pytest.mark.skip(reason="summary.json not implemented in v2")
     def test_summary_json_end_of_simulation_metadata(self, tmp_path):
@@ -794,13 +742,6 @@ class TestSection09_ComputeKnobs:
         """§9: GPU device 0 (hard-coded, single-GPU only)."""
         pass
 
-    @requires_flag("--safe-mode")
-    def test_safe_mode_gpu_memory_limit(self, tmp_path):
-        """§9: --safe-mode (1 GB GPU memory cap)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--safe-mode", "--seed", "42")
-        assert (out / "checkpoint.bin").exists()
-
     @pytest.mark.skip(reason="CUDA streams are internal, non-testable")
     def test_cuda_streams_internal(self, tmp_path):
         """§9: CUDA streams (internal optimization)."""
@@ -831,13 +772,6 @@ class TestSection09_ComputeKnobs:
         """§9: Inline subdomain remapping (internal, every ~10 steps)."""
         pass
 
-    @requires_flag("--safe-mode")
-    def test_safe_mode_explicit_cover(self, tmp_path):
-        """§9: --safe-mode (only testable compute knob)."""
-        out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
-                      "-t", "0.5", "--safe-mode", "--seed", "42")
-        assert (out / "checkpoint.bin").exists()
-
 
 # ============================================================================
 # § 10. Compile-Time Build Options (9 tests, all skipped)
@@ -849,21 +783,6 @@ class TestSection10_CompileTimeOptions:
     @pytest.mark.skip(reason="Compile-time flag: -DBACKEND=CUDA/SERIAL/MPI")
     def test_backend_selection(self, tmp_path):
         """§10: -DBACKEND (compile-time, not runtime testable)."""
-        pass
-
-    @pytest.mark.skip(reason="Compile-time flag: -DSAFE_MODE=ON/OFF")
-    def test_compile_time_safe_mode(self, tmp_path):
-        """§10: -DSAFE_MODE (note: --safe-mode is runtime equivalent)."""
-        pass
-
-    @pytest.mark.skip(reason="Compile-time feature flag")
-    def test_enable_diagnostics_compile_flag(self, tmp_path):
-        """§10: -DENABLE_DIAGNOSTICS=ON/OFF."""
-        pass
-
-    @pytest.mark.skip(reason="Compile-time feature flag")
-    def test_enable_stress_fields_compile_flag(self, tmp_path):
-        """§10: -DENABLE_STRESS_FIELDS=ON/OFF."""
         pass
 
     @pytest.mark.skip(reason="Compile-time feature flag")

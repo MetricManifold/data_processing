@@ -237,7 +237,7 @@ pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajec
 
     if !backward_jumps.is_empty() {
         // Split into segments at each backward jump
-        let n_cells_est = if params.n_cells > 0 { params.n_cells } else {
+        let _n_cells_est = if params.n_cells > 0 { params.n_cells } else {
             // Estimate from first frame
             rows.iter().take_while(|r| r.time == rows[0].time).count()
         };
@@ -268,8 +268,8 @@ pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajec
         let mut keep_ranges: Vec<(usize, usize)> = Vec::new();
 
         if segments.len() == 2 {
-            let (s0_start, s0_end, s0_t0, s0_t1, s0_x, s0_y) = segments[0];
-            let (s1_start, s1_end, s1_t0, s1_t1, s1_x, s1_y) = segments[1];
+            let (s0_start, s0_end, _s0_t0, s0_t1, s0_x, s0_y) = segments[0];
+            let (s1_start, s1_end, s1_t0, _s1_t1, s1_x, s1_y) = segments[1];
             let time_jump = s0_t1 - s1_t0;
             let pos_dist = ((s0_x - s1_x).powi(2) + (s0_y - s1_y).powi(2)).sqrt();
 
