@@ -1660,12 +1660,21 @@ fn generate_comparison_with_config(
         // MSD/Δt for cell tc and population
         let max_lag = n_times / 2;
         let lag_8tau = ((8.0 * tau / dt).round() as usize).min(max_lag);
-        let n_lags = 100usize;
-        let lags: Vec<usize> = (1..=max_lag.min(lag_8tau + 10))
-            .filter(|&l| l <= 10 || l == lag_8tau ||
-                    (l as f64 / max_lag as f64 * n_lags as f64) as usize !=
-                    ((l as f64 - 1.0) / max_lag as f64 * n_lags as f64) as usize)
-            .collect();
+        // Sample lags densely in the visible 0..8τ window (200 points there)
+        // and ensure lag_8tau itself is included for D_eff readout. The
+        // earlier scheme spread 100 lags over the full max_lag (~100τ),
+        // leaving only ~8 points inside the plotted 0..8τ range.
+        let n_lags_visible = 200usize;
+        let stride = (lag_8tau / n_lags_visible).max(1);
+        let mut lag_set: std::collections::BTreeSet<usize> =
+            (1..=10.min(lag_8tau)).collect();
+        let mut l = stride;
+        while l <= lag_8tau {
+            lag_set.insert(l);
+            l += stride;
+        }
+        lag_set.insert(lag_8tau);
+        let lags: Vec<usize> = lag_set.into_iter().collect();
 
         let mut msd_t = Vec::new();
         let mut msd_pop = Vec::new();
@@ -2075,152 +2084,36 @@ fn generate_comparison_with_config(
 
     // ===== gvi: velocity distribution G(v_i) =====
     "gvi" => {
+        use super::panels::{draw_gvi_panel, GviSeries, GviPanelOpts, GviMarker};
 
-        fn compute_gvi(vx: &[f64], vy: &[f64], _n_bins: usize) -> (Vec<f64>, Vec<f64>, f64) {
-            // Palmieri G(v_i): empirical CCDF-based, no bins.
-            // G(v) = -sqrt(|ln(P(|v|)/P(0))|) where P is the complementary CDF.
-            // For a Gaussian, G(v) = -v/(σ√2), a straight line.
-            let mut v_abs: Vec<f64> = vx.iter().chain(vy.iter()).map(|v| v.abs()).filter(|v| v.is_finite()).collect();
-            if v_abs.is_empty() { return (vec![], vec![], 0.0); }
-            let sigma = {
-                let all: Vec<f64> = vx.iter().chain(vy.iter()).copied().filter(|v| v.is_finite()).collect();
-                let n = all.len() as f64;
-                let mean = all.iter().sum::<f64>() / n;
-                (all.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt()
-            };
-            v_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let n = v_abs.len();
+        // σ for the Gaussian reference: use ctrl (so soft tails show as deviations).
+        let (_, _, c_sigma) = super::panels::compute_gvi(&cd.vx, &cd.vy);
 
-            // Empirical CCDF: P(|v| > v_i) = (n - rank) / n
-            // G(v_i) = -sqrt(|ln(CCDF(v_i))|)
-            // Subsample to ~200 points for clean plotting
-            let step = (n / 200).max(1);
-            let mut centers = Vec::new();
-            let mut gvi = Vec::new();
-            for i in (0..n).step_by(step) {
-                let v = v_abs[i];
-                let ccdf = (n - i) as f64 / n as f64;
-                if ccdf > 0.0 && ccdf < 1.0 {
-                    let g = -((-ccdf.ln()).sqrt());
-                    centers.push(v);
-                    gvi.push(g);
-                }
-            }
-            (centers, gvi, sigma)
-        }
+        let series = vec![
+            GviSeries {
+                label: soft_label.to_string(),
+                vx: &sd.vx, vy: &sd.vy,
+                color: soft_color, marker: GviMarker::Triangle,
+            },
+            GviSeries {
+                label: ctrl_label.to_string(),
+                vx: &cd.vx, vy: &cd.vy,
+                color: ctrl_color, marker: GviMarker::Circle,
+            },
+        ];
 
-        let (sv, sg, s_sigma) = compute_gvi(&sd.vx, &sd.vy, 80);
-        let (cv, cg, c_sigma) = compute_gvi(&cd.vx, &cd.vy, 80);
-
-        let x_max = panel_cfg.x_range.map(|r| r[1]).unwrap_or(0.022);
-        // Auto-scale Y to actual data range, or use panel config
-        let y_min_data = sg.iter().chain(cg.iter()).copied().fold(0.0f64, f64::min);
-        let y_min = panel_cfg.y_range.map(|r| r[0]).unwrap_or((y_min_data - 0.3).min(-3.5));
-        let y_max = panel_cfg.y_range.map(|r| r[1]).unwrap_or(0.5);
-
-        let mut chart = ChartBuilder::on(area)
-            .caption(&format!("({}) {}", panel_label, panel_cfg.title.as_deref().unwrap_or("G(v_i)")), ("sans-serif", 16))
-            .margin(8).x_label_area_size(30).y_label_area_size(50)
-            .build_cartesian_2d(0.0..x_max, y_min..y_max)?;
-        chart.configure_mesh().x_desc("|v_i|").y_desc("G(v_i)")
-            .x_label_style(("sans-serif", 14)).y_label_style(("sans-serif", 14)).light_line_style(TRANSPARENT).bold_line_style(RGBAColor(200, 200, 200, 0.3)).draw()?;
-
-        // Soft scatter
-        chart.draw_series(sv.iter().zip(sg.iter()).map(|(&x, &y)| {
-            TriangleMarker::new((x, y), 4, soft_color.filled())
-        }))?.label(&format!("{} (σ={:.4})", soft_label, s_sigma))
-            .legend(move |(x,y)| TriangleMarker::new((x+6, y), 4, soft_color.filled()));
-        // Ctrl scatter
-        chart.draw_series(cv.iter().zip(cg.iter()).map(|(&x, &y)| {
-            Circle::new((x, y), 3, ctrl_color.filled())
-        }))?.label(&format!("{} (σ={:.4})", ctrl_label, c_sigma))
-            .legend(move |(x,y)| Circle::new((x+6, y), 3, ctrl_color.filled()));
-        // erfc approximation (Abramowitz & Stegun 7.1.26), valid for z >= 0
-        fn erfc_approx(z: f64) -> f64 {
-            let z = z.abs(); // symmetric for our use
-            let t = 1.0 / (1.0 + 0.3275911 * z);
-            let val = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                + t * (-1.453152027 + t * 1.061405429))))
-                * (-z * z).exp();
-            val.max(1e-15)
-        }
-
-        // G(v) from CCDF for a given distribution
-        fn g_from_ccdf(ccdf: f64) -> f64 {
-            let ccdf = ccdf.max(1e-15);
-            -((-ccdf.ln()).sqrt())
-        }
-
-        // Palmieri Eq. 5 CCDF: mixture of Gaussian + burst (convolution of arcsine and Gaussian)
-        fn palmieri_ccdf(v: f64, sigma: f64, zeta: f64, v_a: f64) -> f64 {
-            let sqrt2 = std::f64::consts::SQRT_2;
-            let ccdf_gauss = erfc_approx(v / (sigma * sqrt2));
-            // Burst CCDF: average erfc shifted by ±v_A (approximates conv(P_iso, P_G))
-            let ccdf_burst_plus = erfc_approx((v - v_a) / (sigma * sqrt2));
-            let ccdf_burst_minus = erfc_approx((v + v_a) / (sigma * sqrt2));
-            let ccdf_burst = (ccdf_burst_plus + ccdf_burst_minus) / 2.0;
-            (1.0 - zeta) * ccdf_gauss + zeta * ccdf_burst
-        }
-
-        // Gaussian reference
-        let ref_sigma = c_sigma.max(1e-6);
-        chart.draw_series(LineSeries::new(
-            (1..100).map(|i| {
-                let v = i as f64 * x_max / 100.0;
-                let ccdf = erfc_approx(v / (ref_sigma * std::f64::consts::SQRT_2));
-                (v, g_from_ccdf(ccdf))
-            }),
-            BLACK.mix(0.5).stroke_width(2),
-        ))?.label("Gaussian");
-
-        // Fit ζ to soft data via grid search (minimize sum of squared residuals)
-        let v_a = 0.01_f64;
-        let sigma_fit = c_sigma.max(1e-6);
-        let mut best_zeta = 0.05_f64;
-        let mut best_sse = f64::INFINITY;
-        for zi in 1..200 {
-            let zeta_try = zi as f64 * 0.0025; // 0.25% to 50% in 0.25% steps
-            let mut sse = 0.0;
-            let mut count = 0;
-            for (&v, &g_data) in sv.iter().zip(sg.iter()) {
-                if v > 0.001 && v < x_max {
-                    let ccdf = palmieri_ccdf(v, sigma_fit, zeta_try, v_a);
-                    let g_model = g_from_ccdf(ccdf);
-                    sse += (g_data - g_model).powi(2);
-                    count += 1;
-                }
-            }
-            if count > 0 && sse < best_sse {
-                best_sse = sse;
-                best_zeta = zeta_try;
-            }
-        }
-
-        // Draw Palmieri Eq. 5 fit
-        let palmieri_ref: Vec<(f64, f64)> = (1..200).filter_map(|i| {
-            let v = i as f64 * x_max / 200.0;
-            let ccdf = palmieri_ccdf(v, sigma_fit, best_zeta, v_a);
-            if ccdf > 1e-15 {
-                Some((v, g_from_ccdf(ccdf)))
-            } else {
-                None
-            }
-        }).collect();
-        let eq5_color = RGBAColor(200, 100, 100, 0.8);
-        chart.draw_series(LineSeries::new(
-            palmieri_ref.into_iter(),
-            eq5_color.stroke_width(2),
-        ))?.label(&format!("Eq.5 ζ={:.1}%", best_zeta * 100.0))
-            .legend(move |(x, y)| PathElement::new(
-                vec![(x, y), (x + 15, y)],
-                eq5_color.stroke_width(2),
-            ));
-
-        chart.configure_series_labels().position(SeriesLabelPosition::UpperRight)
-            .background_style(WHITE.mix(0.8)).border_style(BLACK.mix(0.3))
-            .label_font(("sans-serif", 9)).draw()?;
-        chart.plotting_area().draw(&PathElement::new(
-            vec![(0.0, y_max), (x_max, y_max), (x_max, y_min)], BLACK.mix(0.5).stroke_width(1)))?;
+        let opts = GviPanelOpts {
+            title: panel_cfg.title.clone().unwrap_or_else(|| "G(v_i)".to_string()),
+            panel_label: Some(panel_label),
+            x_max: panel_cfg.x_range.map(|r| r[1]).unwrap_or(0.022),
+            y_range: panel_cfg.y_range.map(|r| (r[0], r[1])),
+            gaussian_ref_sigma: Some(c_sigma),
+            palmieri_fit_index: Some(0), // fit Eq. 5 to soft
+            v_a: 0.01,
+            palmieri_fit_min_v: None,
+            gaussian_sigma_sweep: Vec::new(),
+        };
+        draw_gvi_panel(area, &series, &opts)?;
     }
 
     // ===== deff_bar: D_eff bar chart =====
