@@ -134,6 +134,18 @@ enum Commands {
     },
     /// List available observables
     List,
+    /// Run a study using the v2 declarative pipeline (ARCHITECTURE.md).
+    /// Discovery + observables + aggregate + figures, all driven by TOML.
+    Study2 {
+        /// Path to the v2 study TOML config file.
+        config: PathBuf,
+        /// Base directory containing simulation data.
+        #[arg(long, short = 'd')]
+        data_dir: PathBuf,
+        /// Number of parallel threads (default: all available).
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// Validate trajectory/checkpoint integrity. Exits 0 on pass, 1 on any failure.
     Check {
         /// Simulation output directory (must contain trajectory.txt; checkpoint.bin optional)
@@ -632,6 +644,12 @@ fn main() -> Result<()> {
                 };
                 println!("  {:<22} {}", name, desc);
             }
+        }
+        Commands::Study2 { config, data_dir, threads } => {
+            if let Some(t) = threads {
+                rayon::ThreadPoolBuilder::new().num_threads(t).build_global().ok();
+            }
+            analysis::v2::studies::run_study(&config, &data_dir)?;
         }
     }
 

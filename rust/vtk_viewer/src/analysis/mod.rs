@@ -11,3 +11,7 @@ pub mod observables;
 pub mod output;
 pub mod panels;
 pub mod study;
+
+/// v2 architecture (in-progress migration).
+/// See [crate-root ARCHITECTURE.md](../../ARCHITECTURE.md).
+pub mod v2;

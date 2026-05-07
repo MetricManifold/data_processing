@@ -19,6 +19,7 @@ serde_json = "1.0"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
+bitflags = "2"
 plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
 png = "0.17"
 
