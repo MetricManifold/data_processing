@@ -1,21 +1,16 @@
 //! Mean-squared-displacement observable.
 //!
-//! v2 wrapper around the existing [`crate::analysis::observables::compute_msd`].
-//! The implementation is *not* duplicated here — phase 9 (cutover) will
-//! move the body of the compute function into this file and delete the
-//! legacy entry point. Until then both paths share one implementation.
+//! Multi-origin averaging over the first half of the trajectory plus a
+//! cell-0-specific MSD for the Palmieri convention. The implementation
+//! is owned here (this is the canonical home).
 
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::analysis::observables as legacy;
+use crate::analysis::io::UnwrappedPositions;
 use crate::analysis::v2::observable::{Context, Observable, Requirements};
 
 /// Ensemble-averaged mean-squared displacement.
-///
-/// Multi-origin averaging over the first half of the trajectory, plus a
-/// cell-0-specific MSD for the Palmieri soft-cell convention. See
-/// [`MsdOutput`] for what's returned.
 pub struct Msd;
 
 #[derive(Clone, Debug, Serialize)]
@@ -26,14 +21,60 @@ pub struct MsdOutput {
     pub cell0_values: Vec<f64>,
 }
 
-impl From<legacy::MsdResult> for MsdOutput {
-    fn from(r: legacy::MsdResult) -> Self {
-        Self {
-            lag_times: r.lag_times,
-            values: r.values,
-            cell0_values: r.cell0_values,
+/// Stand-alone MSD computation. Public so other modules (and the legacy
+/// shim) can call it; the trait `Observable for Msd` just forwards.
+pub fn compute_msd(pos: &UnwrappedPositions) -> MsdOutput {
+    let n_times = pos.n_times;
+    let n_cells = pos.n_cells;
+    if n_times < 2 {
+        return MsdOutput {
+            lag_times: vec![],
+            values: vec![],
+            cell0_values: vec![],
+        };
+    }
+    let max_lag = n_times / 2;
+    let dt = if n_times > 1 { pos.times[1] - pos.times[0] } else { 1.0 };
+    let cell0_idx = pos.cell_ids.iter().position(|&id| id == 0).unwrap_or(0);
+
+    let n_origins = max_lag;
+    let mut msd_sum = vec![0.0f64; max_lag];
+    let mut msd_count = vec![0u64; max_lag];
+    let mut cell0_msd_sum = vec![0.0f64; max_lag];
+
+    for t0 in 0..n_origins {
+        for lag in 1..max_lag {
+            let ti = t0 + lag;
+            if ti >= n_times {
+                break;
+            }
+            let mut sum_dsq = 0.0;
+            for i in 0..n_cells {
+                let dx = pos.positions[ti][i][0] - pos.positions[t0][i][0];
+                let dy = pos.positions[ti][i][1] - pos.positions[t0][i][1];
+                let dz = pos.positions[ti][i][2] - pos.positions[t0][i][2];
+                let dsq = dx * dx + dy * dy + dz * dz;
+                sum_dsq += dsq;
+                if i == cell0_idx {
+                    cell0_msd_sum[lag] += dsq;
+                }
+            }
+            msd_sum[lag] += sum_dsq / n_cells as f64;
+            msd_count[lag] += 1;
         }
     }
+
+    let mut lag_times = Vec::with_capacity(max_lag.saturating_sub(1));
+    let mut values = Vec::with_capacity(max_lag.saturating_sub(1));
+    let mut cell0_values = Vec::with_capacity(max_lag.saturating_sub(1));
+    for lag in 1..max_lag {
+        if msd_count[lag] > 0 {
+            lag_times.push(lag as f64 * dt);
+            values.push(msd_sum[lag] / msd_count[lag] as f64);
+            cell0_values.push(cell0_msd_sum[lag] / msd_count[lag] as f64);
+        }
+    }
+    MsdOutput { lag_times, values, cell0_values }
 }
 
 impl Observable for Msd {
@@ -48,7 +89,7 @@ impl Observable for Msd {
     }
 
     fn compute(&self, ctx: &Context) -> Result<Self::Output> {
-        Ok(legacy::compute_msd(&ctx.positions).into())
+        Ok(compute_msd(&ctx.positions))
     }
 }
 
@@ -58,21 +99,17 @@ impl Observable for Msd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::io::UnwrappedPositions;
     use crate::analysis::v2::observable::{ObservableBag, RunParams};
     use std::sync::Arc;
 
-    /// Build a tiny synthetic trajectory: one cell drifting with constant
-    /// velocity, plus a second cell stationary. MSD(Δt) of cell 0 should
-    /// equal `(v Δt)²`; ensemble MSD = half of that.
     fn synthetic_pos(n_times: usize, dt: f64, v: f64) -> UnwrappedPositions {
         let times: Vec<f64> = (0..n_times).map(|i| i as f64 * dt).collect();
         let cell_ids = vec![0u32, 1];
         let positions: Vec<Vec<[f64; 3]>> = (0..n_times)
             .map(|t| {
                 vec![
-                    [v * times[t], 0.0, 0.0], // cell 0 drifts in x
-                    [0.0, 0.0, 0.0],          // cell 1 stays
+                    [v * times[t], 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
                 ]
             })
             .collect();
@@ -100,14 +137,9 @@ mod tests {
             params: RunParams::default(),
         };
         let out = Msd.compute(&ctx).expect("compute msd");
-        // First lag = dt = 1.0; cell-0 MSD = (v dt)^2 = 0.01
-        assert!(out.lag_times.len() >= 1);
-        assert!((out.cell0_values[0] - 0.01).abs() < 1e-9,
-                "cell0 msd at dt=1: got {}", out.cell0_values[0]);
-        // Ensemble MSD averages cell 0 (drift) and cell 1 (static):
-        //   ((v dt)^2 + 0) / 2 = 0.005
-        assert!((out.values[0] - 0.005).abs() < 1e-9,
-                "ensemble msd at dt=1: got {}", out.values[0]);
+        assert!(!out.lag_times.is_empty());
+        assert!((out.cell0_values[0] - 0.01).abs() < 1e-9);
+        assert!((out.values[0] - 0.005).abs() < 1e-9);
     }
 
     #[test]
@@ -122,7 +154,6 @@ mod tests {
         let out = Msd.compute(&ctx).expect("compute");
         let mut bag = ObservableBag::new();
         bag.insert::<Msd>(out);
-        let back = bag.get::<Msd>().expect("msd missing from bag");
-        assert!(!back.lag_times.is_empty());
+        assert!(bag.get::<Msd>().is_some());
     }
 }

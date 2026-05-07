@@ -1,16 +1,17 @@
 //! G(v_i) Palmieri velocity-distribution panel for a pair of runs.
 //!
-//! Delegates to the legacy [`crate::analysis::panels::draw_gvi_panel`]
-//! since that function already implements the Palmieri Eq. 5 fit logic
-//! (see commit `f432190`). Phase 9 will inline / port the body.
+//! Thin orchestration: builds two `GviSeries` from the run bags and
+//! delegates to [`crate::analysis::v2::panels::gvi_core::draw_gvi_panel`].
 
 use anyhow::{anyhow, Result};
 use plotters::backend::SVGBackend;
 use plotters::coord::Shift;
 use plotters::drawing::DrawingArea;
 
-use crate::analysis::panels::{compute_gvi, draw_gvi_panel, GviMarker, GviPanelOpts, GviSeries};
 use crate::analysis::v2::observables::velocity_distribution::VelocityDistribution;
+use crate::analysis::v2::panels::gvi_core::{
+    compute_gvi, draw_gvi_panel, GviMarker, GviPanelOpts, GviSeries,
+};
 use crate::analysis::v2::panels::{Panel, PanelOpts};
 
 use super::{PairPanelData, CTRL_COLOR, SOFT_COLOR};
@@ -53,8 +54,9 @@ impl<'a, 'b> Panel<'a, 'b> for GviPair {
             .get::<VelocityDistribution>()
             .ok_or_else(|| anyhow!("gvi_pair: denominator missing velocity_distribution"))?;
 
-        // Use ctrl σ as the Gaussian reference so soft tails show as
-        // deviations from the matched-second-moment Gaussian.
+        // Gaussian reference σ from the denominator (control) so soft
+        // tails appear as deviations from a matched-second-moment
+        // baseline.
         let (_, _, ctrl_sigma) = compute_gvi(&den.cell0_vx, &den.cell0_vy);
 
         let series = vec![
@@ -86,7 +88,6 @@ impl<'a, 'b> Panel<'a, 'b> for GviPair {
             palmieri_fit_min_v: None,
             gaussian_sigma_sweep: Vec::new(),
         };
-        draw_gvi_panel(area, &series, &gvi_opts).map_err(|e| anyhow!("gvi panel: {}", e))?;
-        Ok(())
+        draw_gvi_panel(area, &series, &gvi_opts)
     }
 }

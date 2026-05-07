@@ -6,6 +6,7 @@
 //! Layout helpers (multi-panel composition, color palette, default
 //! styles) live in [`layout`].
 
+pub mod gvi_core;
 pub mod layout;
 pub mod pair;
 pub mod sweep;
