@@ -7,6 +7,7 @@
 //! styles) live in [`layout`].
 
 pub mod layout;
+pub mod pair;
 pub mod sweep;
 
 use anyhow::Result;
@@ -31,10 +32,11 @@ pub struct PanelOpts {
 /// A panel that knows how to render itself into a drawing area given
 /// its typed input data.
 ///
-/// Generic over the backend so panels can be unit-tested with the
-/// bitmap or SVG backend interchangeably; the production paths use
-/// [`SVGBackend`].
-pub trait Panel<'b> {
+/// Two lifetimes:
+/// - `'a` flows into the associated `Data` type (so panels can borrow
+///   from outer state, e.g. a slice of `RunAnalysis`).
+/// - `'b` is the SVG backend lifetime.
+pub trait Panel<'a, 'b> {
     type Data;
     fn id(&self) -> &'static str;
     fn render(

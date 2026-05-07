@@ -168,6 +168,27 @@ pub enum AggregateToml {
         input: String,
         into: String,
     },
+    /// Pair *individual runs* (not aggregated summaries) by the value
+    /// of `pair_var`. Runs that agree on every variable except
+    /// `pair_var` form one [`RunPair`]. Used by diagnostic/comparison
+    /// figures that need direct access to each run's observables.
+    PairRuns {
+        pair_var: String,
+        numerator: String,
+        denominator: String,
+        /// Optional filter: only emit pairs whose `pair_var` residual
+        /// (e.g. seed) is in this list. Empty = emit all.
+        #[serde(default)]
+        seeds: Vec<String>,
+        /// Variable name used for the seed filter (default: "seed").
+        #[serde(default = "default_seed_var")]
+        seed_var: String,
+        into: String,
+    },
+}
+
+fn default_seed_var() -> String {
+    "seed".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +235,36 @@ pub enum PanelToml {
         #[serde(default)]
         h_line: Option<f64>,
     },
+    /// Common shape for all pair panels (speed_bursts, gvi, ln_*, msd_t,
+    /// deff_bar, summary). The `subtype` discriminates the actual
+    /// panel; common knobs (title, ranges) are shared.
+    Pair {
+        /// `speed_bursts | gvi | ln_timeseries | ln_histogram | msd_t |
+        /// deff_bar | summary`.
+        subtype: String,
+        input: String,
+        /// Which RunPair index inside the slot to render (default: 0).
+        #[serde(default)]
+        pair_index: usize,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        x_range: Option<[f64; 2]>,
+        #[serde(default)]
+        y_range: Option<[f64; 2]>,
+        /// Speed-bursts panel: max speed for the y axis (default 0.02).
+        #[serde(default)]
+        speed_max: Option<f64>,
+        /// MSD/Δt panel: max lag in τ (default 8).
+        #[serde(default)]
+        msd_lag_max: Option<f64>,
+        /// G(v_i) panel: x_max for |v| (default 0.022).
+        #[serde(default)]
+        gvi_x_max: Option<f64>,
+        /// L_n histogram panel: number of bins (default 40).
+        #[serde(default)]
+        bins: Option<usize>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +284,24 @@ pub enum Slot {
     Summaries(Vec<GroupSummary>),
     Curve(SweepCurve),
     Pairs(Vec<PairResult>),
+    /// Run pairs identified by a pair variable (e.g. soft vs ctrl at
+    /// the same seed). Stored as indices into the runs slice; the
+    /// figure renderer resolves them via the runs vector.
+    RunPairs(Vec<RunPair>),
+}
+
+/// One paired comparison: numerator and denominator runs identified by
+/// indices into the `runs: &[RunAnalysis]` passed to the figure
+/// renderer. `key` and `variables` describe the residual variables
+/// (everything except the pair variable).
+#[derive(Clone, Debug)]
+pub struct RunPair {
+    pub key: String,
+    pub variables: BTreeMap<String, super::discovery::ScalarValue>,
+    pub numerator_idx: usize,
+    pub denominator_idx: usize,
+    pub numerator_label: String,
+    pub denominator_label: String,
 }
 
 /// Owned variant of [`super::aggregate::Group`] (the borrowed form
@@ -361,7 +430,7 @@ pub fn run_study(toml_path: &Path, base_dir: &Path) -> Result<()> {
     };
     std::fs::create_dir_all(&out_dir).ok();
     for fig in &cfg.figures {
-        render_figure(fig, &ws, &out_dir)?;
+        render_figure(fig, &ws, &runs, &out_dir)?;
     }
 
     Ok(())
@@ -463,7 +532,95 @@ fn execute_op(
             ws.insert(into, Slot::Pairs(pairs));
             Ok(())
         }
+        AggregateToml::PairRuns {
+            pair_var,
+            numerator,
+            denominator,
+            seeds,
+            seed_var,
+            into,
+        } => {
+            let pairs = pair_runs(runs, pair_var, numerator, denominator, seeds, seed_var);
+            ws.insert(into, Slot::RunPairs(pairs));
+            Ok(())
+        }
     }
+}
+
+/// For each unique residual (every variable except `pair_var`), find
+/// the run with `pair_var = numerator` and the run with `pair_var =
+/// denominator`. Emit one [`RunPair`] per match.
+fn pair_runs(
+    runs: &[RunAnalysis],
+    pair_var: &str,
+    numerator: &str,
+    denominator: &str,
+    seeds: &[String],
+    seed_var: &str,
+) -> Vec<RunPair> {
+    let mut by_residual: BTreeMap<
+        String,
+        (
+            BTreeMap<String, BTreeMap<String, usize>>,
+            BTreeMap<String, super::discovery::ScalarValue>,
+        ),
+    > = BTreeMap::new();
+    for (i, r) in runs.iter().enumerate() {
+        let cond = r
+            .variables
+            .get(pair_var)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let residual_key: String = r
+            .variables
+            .iter()
+            .filter(|(k, _)| k.as_str() != pair_var)
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",");
+        let entry = by_residual.entry(residual_key).or_insert_with(|| {
+            let residual_vars: BTreeMap<_, _> = r
+                .variables
+                .iter()
+                .filter(|(k, _)| k.as_str() != pair_var)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            (BTreeMap::new(), residual_vars)
+        });
+        entry
+            .0
+            .entry(cond)
+            .or_default()
+            .insert(format!("{}", i), i);
+    }
+
+    let mut out = Vec::new();
+    for (residual, (cond_map, residual_vars)) in by_residual {
+        let num_run = cond_map.get(numerator).and_then(|m| m.values().next());
+        let den_run = cond_map.get(denominator).and_then(|m| m.values().next());
+        let (Some(&num_idx), Some(&den_idx)) = (num_run, den_run) else {
+            continue;
+        };
+        // Filter by seed if requested.
+        if !seeds.is_empty() {
+            let seed_value = residual_vars
+                .get(seed_var)
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if !seeds.iter().any(|s| s == &seed_value) {
+                continue;
+            }
+        }
+        out.push(RunPair {
+            key: residual,
+            variables: residual_vars,
+            numerator_idx: num_idx,
+            denominator_idx: den_idx,
+            numerator_label: numerator.to_string(),
+            denominator_label: denominator.to_string(),
+        });
+    }
+    out
 }
 
 /// Re-wrap a borrowed `MetricExtractor` reference back into a Box for
@@ -482,7 +639,12 @@ fn reborrow(ex: &MetricExtractor) -> MetricExtractor {
 // ---------------------------------------------------------------------------
 // render_figure
 // ---------------------------------------------------------------------------
-fn render_figure(fig: &FigureToml, ws: &Workspace, out_dir: &Path) -> Result<()> {
+fn render_figure(
+    fig: &FigureToml,
+    ws: &Workspace,
+    runs: &[RunAnalysis],
+    out_dir: &Path,
+) -> Result<()> {
     let path: PathBuf = out_dir.join(&fig.output);
     let backend = SVGBackend::new(&path, (fig.width, fig.height));
     let area = backend.into_drawing_area();
@@ -535,6 +697,68 @@ fn render_figure(fig: &FigureToml, ws: &Workspace, out_dir: &Path) -> Result<()>
                     log_y: false,
                 };
                 panel.render(cell, curve, &opts)?;
+            }
+            PanelToml::Pair {
+                subtype,
+                input,
+                pair_index,
+                title,
+                x_range,
+                y_range,
+                speed_max,
+                msd_lag_max,
+                gvi_x_max,
+                bins,
+            } => {
+                let pairs = match ws.get(input)? {
+                    Slot::RunPairs(p) => p,
+                    _ => return Err(anyhow!("pair panel expects RunPairs slot `{}`", input)),
+                };
+                let p = pairs.get(*pair_index).ok_or_else(|| {
+                    anyhow!("pair_index {} out of bounds for slot `{}`", pair_index, input)
+                })?;
+                let data = crate::analysis::v2::panels::pair::PairPanelData {
+                    numerator: &runs[p.numerator_idx],
+                    denominator: &runs[p.denominator_idx],
+                    numerator_label: &p.numerator_label,
+                    denominator_label: &p.denominator_label,
+                };
+                let opts = PanelOpts {
+                    title: title.clone(),
+                    x_label: None,
+                    y_label: None,
+                    x_range: x_range.map(|r| (r[0], r[1])),
+                    y_range: y_range.map(|r| (r[0], r[1])),
+                    log_x: false,
+                    log_y: false,
+                };
+                use crate::analysis::v2::panels::pair as pp;
+                use crate::analysis::v2::panels::Panel as _Panel;
+                match subtype.as_str() {
+                    "speed_bursts" => pp::speed_bursts::SpeedBurstsPair {
+                        speed_max: speed_max.unwrap_or(0.02),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "ln_timeseries" => pp::ln_timeseries::LnTimeseriesPair.render(cell, &data, &opts)?,
+                    "ln_histogram" => pp::ln_histogram::LnHistogramPair {
+                        n_bins: bins.unwrap_or(40),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "msd_t" => pp::msd_t::MsdTPair {
+                        msd_lag_max: msd_lag_max.unwrap_or(8.0),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "deff_bar" => pp::deff_bar::DeffBarPair.render(cell, &data, &opts)?,
+                    "gvi" => pp::gvi::GviPair {
+                        x_max: gvi_x_max.unwrap_or(0.022),
+                        v_a: data.numerator.params.v_a,
+                    }
+                    .render(cell, &data, &opts)?,
+                    "summary" => pp::summary::SummaryPair.render(cell, &data, &opts)?,
+                    other => {
+                        return Err(anyhow!("unknown pair subtype `{}`", other));
+                    }
+                }
             }
         }
     }

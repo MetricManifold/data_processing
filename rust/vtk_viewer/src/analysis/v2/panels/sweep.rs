@@ -19,7 +19,7 @@ pub struct MetricVsX<'a> {
     pub h_line: Option<f64>,
 }
 
-impl<'a, 'b> Panel<'b> for MetricVsX<'a> {
+impl<'a, 'b, 's> Panel<'a, 'b> for MetricVsX<'s> {
     type Data = SweepCurve;
 
     fn id(&self) -> &'static str {

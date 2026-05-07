@@ -11,17 +11,26 @@
 //!   2. adding a `pub mod foo;` line below,
 //!   3. adding the observable to `register_builtin()` in this file.
 
+pub mod bursts;
+pub mod displacement_velocities;
+pub mod ln_perimeter;
 pub mod msd;
+pub mod msd_palmieri;
+pub mod velocity_distribution;
 
 use super::observable::{Observable, ObservableBag};
 
 /// All built-in observables we may want to compute. Used by future
 /// `analyze_run` to dispatch from the TOML's `compute = [...]` list.
-///
-/// During phase 1 only [`msd::Msd`] is wired; further observables are
-/// added one phase at a time.
 pub fn register_builtin() -> Vec<Box<dyn ErasedObservable>> {
-    vec![Box::new(EraseAdaptor(msd::Msd))]
+    vec![
+        Box::new(EraseAdaptor(msd::Msd)),
+        Box::new(EraseAdaptor(msd_palmieri::MsdPalmieri)),
+        Box::new(EraseAdaptor(ln_perimeter::LnPerimeter)),
+        Box::new(EraseAdaptor(displacement_velocities::DisplacementVelocities)),
+        Box::new(EraseAdaptor(velocity_distribution::VelocityDistribution::default())),
+        Box::new(EraseAdaptor(bursts::Bursts::default())),
+    ]
 }
 
 // ---------------------------------------------------------------------------
