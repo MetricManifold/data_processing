@@ -229,5 +229,5 @@ Migration phases 2–6 can land in any order once 1 is done; phase 7 needs
 | 5     | ✅ done | `analysis/v2/panels/{mod, layout, sweep}.rs` |
 | 6     | ✅ done | `analysis/v2/studies.rs` |
 | 7     | ✅ done | `cell_analyze study2` subcommand |
-| 8     | ✅ done | observables {ln_perimeter, displacement_velocities, msd_palmieri, velocity_distribution, bursts}, pair panels, `pair_runs` aggregator. v2 reproduces `soft_vs_hard_3349027070.svg` end-to-end. |
-| 9     | not started | (cutover: delete legacy, promote v2 to top level) |
+| 8     | ✅ done | observables {ln_perimeter, displacement_velocities, msd_palmieri, velocity_distribution, bursts}, pair panels, `pair_runs` aggregator |
+| 9     | ✅ done | inlined gvi/msd/bursts/velocity_distribution; added single + overlay aggregators and panels; rewrote CLI; deleted legacy `analysis/{study,observables,panels,output,batch}.rs` (~5300 LOC); shipped 5 reference TOMLs in `cpp/simulation/study/templates/` |

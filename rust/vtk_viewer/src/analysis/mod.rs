@@ -1,17 +1,14 @@
 //! Shared analysis library for cell simulation trajectory data.
 //!
-//! Provides trajectory I/O, observable computation, batch processing,
-//! and structured JSON output. Used by the `cell_analyze` binary.
+//! Trajectory I/O, checkpoint parsing, sim-marker metadata, and the v2
+//! pipeline (observables / aggregators / panels / studies). The v2
+//! pipeline is the only public surface; the foundation modules
+//! ([`io`], [`checkpoint`], [`metadata`]) are reused directly by the
+//! `snapshot` and `check` subcommands of `cell_analyze`.
 
-pub mod batch;
 pub mod checkpoint;
 pub mod io;
 pub mod metadata;
-pub mod observables;
-pub mod output;
-pub mod panels;
-pub mod study;
 
-/// v2 architecture (in-progress migration).
-/// See [crate-root ARCHITECTURE.md](../../ARCHITECTURE.md).
+/// Declarative analysis pipeline. See `ARCHITECTURE.md`.
 pub mod v2;

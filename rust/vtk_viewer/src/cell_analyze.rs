@@ -1,32 +1,30 @@
 //! Unified analysis CLI for cell simulation trajectory data.
 //!
-//! Usage:
-//!   cell_analyze run    <dir> [-o output.json] [--observables msd,overlap,...]
-//!   cell_analyze study  <config.toml> -d <data_dir> [-o output.json]
-//!   cell_analyze snapshot <file_or_dir> [-o output.png] [--movie] [--skip N] [--fps N]
-//!   cell_analyze list
+//! Subcommands:
+//!   `study`    — TOML-driven analysis pipeline (the only data path).
+//!                Combines run discovery, observable computation,
+//!                aggregation and rendering. See ARCHITECTURE.md.
+//!   `snapshot` — render phase-field PNGs from checkpoints / VTK frames.
+//!   `check`    — validate trajectory/checkpoint integrity.
+//!   `list`     — list available observables, panels, aggregators.
 #![allow(dead_code)]
 
 mod analysis;
 mod colormap;
 mod vtk;
 
-use analysis::io::{load_trajectory, load_trajectory_subsample, unwrap_trajectory};
-use analysis::observables::*;
-use analysis::output::*;
-use analysis::study;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+
+use analysis::io::load_trajectory;
 
 #[derive(Parser)]
 #[command(name = "cell_analyze")]
-#[command(about = "High-performance analysis for cell simulation trajectories")]
+#[command(about = "TOML-driven analysis for cell-simulation trajectories.\n\
+                   Reference TOMLs live in cpp/simulation/study/templates/.")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -35,62 +33,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Analyze a single simulation run
-    Run {
-        /// Simulation output directory (must contain trajectory.txt)
-        dir: PathBuf,
-        /// Output JSON file (default: stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Directory for SVG plots (default: no plots)
-        #[arg(long)]
-        plot_dir: Option<PathBuf>,
-        /// Comma-separated list of observables (default: all)
-        #[arg(long, value_delimiter = ',')]
-        observables: Option<Vec<String>>,
-        /// Persistence time τ (default: 10000)
-        #[arg(long, default_value_t = 10000.0)]
-        tau: f64,
-        /// Cell radius R for displacement normalization (default: 49)
-        #[arg(long, default_value_t = 49.0)]
-        cell_radius: f64,
-        /// Fraction of MSD used for D_eff fit (default: 0.3)
-        #[arg(long, default_value_t = 0.3)]
-        fit_frac: f64,
-        /// Number of S(q) bins (default: 200)
-        #[arg(long, default_value_t = 200)]
-        sq_bins: usize,
-        /// Number of S(q) frames to average (default: 20)
-        #[arg(long, default_value_t = 20)]
-        sq_frames: usize,
-        /// Keep every Nth frame (default: 1 = all frames)
-        #[arg(long, default_value_t = 1)]
-        subsample: usize,
-    },
-    /// Run a TOML-defined study: discover, analyze, pair, aggregate, plot
+    /// Run a TOML-defined study: discover runs, compute observables,
+    /// aggregate, render figures. The TOML wires everything together.
     Study {
-        /// Path to the study TOML config file
+        /// Path to the study TOML config file.
         config: PathBuf,
-        /// Base directory containing simulation data
+        /// Base directory containing simulation data.
         #[arg(long, short = 'd')]
         data_dir: PathBuf,
-        /// Output JSON file
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Directory for plots (default: same as output JSON)
-        #[arg(long)]
-        plot_dir: Option<PathBuf>,
-        /// Dry run: show discovery results without analyzing
-        #[arg(long)]
-        dry_run: bool,
-        /// Number of parallel threads (default: all available)
+        /// Number of parallel threads (default: all available).
         #[arg(long)]
         threads: Option<usize>,
-        /// Keep every Nth frame (default: 1 = all frames)
-        #[arg(long, default_value_t = 1)]
-        subsample: usize,
     },
-    /// Render phase field snapshot(s) from checkpoint, VTK file, or directory of VTK frames
+    /// Render phase field snapshot(s) from checkpoint, VTK file, or directory of VTK frames.
     Snapshot {
         /// Path to checkpoint.bin, frame_NNNNNN.vtk, or directory containing VTK frames
         input: PathBuf,
@@ -132,19 +87,11 @@ enum Commands {
         #[arg(long)]
         emit_metadata: bool,
     },
-    /// List available observables
-    List,
-    /// Run a study using the v2 declarative pipeline (ARCHITECTURE.md).
-    /// Discovery + observables + aggregate + figures, all driven by TOML.
-    Study2 {
-        /// Path to the v2 study TOML config file.
-        config: PathBuf,
-        /// Base directory containing simulation data.
-        #[arg(long, short = 'd')]
-        data_dir: PathBuf,
-        /// Number of parallel threads (default: all available).
-        #[arg(long)]
-        threads: Option<usize>,
+    /// List available observables, panels and aggregators (with descriptions).
+    List {
+        /// What to list. Default: all categories.
+        #[arg(long, default_value = "all")]
+        what: String,
     },
     /// Validate trajectory/checkpoint integrity. Exits 0 on pass, 1 on any failure.
     Check {
@@ -172,107 +119,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run {
-            dir,
-            output,
-            plot_dir,
-            observables,
-            tau,
-            cell_radius,
-            fit_frac,
-            sq_bins,
-            sq_frames,
-            subsample,
-        } => {
-            let obs = parse_observables(observables)?;
-            let result = analyze_single_run(
-                &dir,
-                &obs,
-                tau,
-                cell_radius,
-                fit_frac,
-                sq_bins,
-                sq_frames,
-                subsample,
-            )?;
-            if let Some(ref pd) = plot_dir {
-                std::fs::create_dir_all(pd)?;
-                plot_run_result(&result, pd, cell_radius)?;
-            }
-            write_json(&result, &output)?;
-        }
         Commands::Study {
             config,
             data_dir,
-            output,
-            plot_dir,
-            dry_run,
             threads,
-            subsample,
         } => {
             if let Some(n) = threads {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build_global()
-                    .ok();
+                rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
             }
-
-            let toml_str = std::fs::read_to_string(&config)
-                .with_context(|| format!("Reading study config: {}", config.display()))?;
-            let study_config: study::StudyConfig = toml::from_str(&toml_str)
-                .with_context(|| format!("Parsing study config: {}", config.display()))?;
-
-            eprintln!("Study: {}", study_config.study.name);
-            if !study_config.study.description.is_empty() {
-                eprintln!("  {}", study_config.study.description);
-            }
-
-            if dry_run {
-                let discovered = study::discover_study_runs(&data_dir, &study_config.discovery)?;
-                eprintln!("\nDry run: found {} runs", discovered.len());
-                for run in &discovered {
-                    let vars: Vec<String> = run.variables.iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect();
-                    eprintln!("  {} [{}]", run.trajectory.display(), vars.join(", "));
-                }
-                return Ok(());
-            }
-
-            let plot_out = plot_dir
-                .or_else(|| output.as_ref().and_then(|p| p.parent().map(|pp| pp.to_path_buf())))
-                .unwrap_or_else(|| PathBuf::from("."));
-
-            let result = study::run_study(&data_dir, &study_config, &plot_out, subsample)?;
-
-            // Print summary to stderr
-            eprintln!("\n{}", "=".repeat(70));
-            eprintln!("STUDY RESULTS: {}", result.study_name);
-            eprintln!("{}", "=".repeat(70));
-            eprintln!("Runs analyzed: {}", result.n_runs_total);
-            eprintln!("Groups: {}", result.n_groups);
-
-            if !result.paired.is_empty() {
-                eprintln!("\nPaired comparisons:");
-                for pg in &result.paired {
-                    eprintln!("  {} ({}n/{}d):", pg.group_key, pg.numerator.n_seeds, pg.denominator.n_seeds);
-                    for (name, val) in &pg.paired_metrics {
-                        eprintln!("    {}: {:.4} ± {:.4}", name, val.mean, val.stderr);
-                    }
-                }
-            }
-
-            if !result.groups.is_empty() {
-                eprintln!("\nGroups:");
-                for g in &result.groups {
-                    eprintln!("  {} ({} seeds):", g.group_key, g.n_seeds);
-                    for (name, val) in &g.metrics {
-                        eprintln!("    {}: {:.4} ± {:.4}", name, val.mean, val.stderr);
-                    }
-                }
-            }
-
-            write_json(&result, &output)?;
+            analysis::v2::studies::run_study(&config, &data_dir)?;
         }
         Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata } => {
             let is_dir = input.is_dir();
@@ -614,64 +469,60 @@ fn main() -> Result<()> {
             let exit_code = run_check(&dir, n_cells, expected_frames, t_start, t_end, json.as_deref())?;
             std::process::exit(exit_code);
         }
-        Commands::List => {
-            println!("Available observables:");
-            println!();
-            for name in ALL_OBSERVABLES {
-                let desc = match *name {
-                    "msd" => "Mean squared displacement MSD(Δt)",
-                    "diffusion" => "Effective diffusion coefficient D_eff from MSD slope",
-                    "log_slope" => "MSD log-slope Δ(t) — diffusion exponent",
-                    "cage" => "Cage length l_c from MSD plateau",
-                    "alpha2" => "Non-Gaussian parameter α₂(t)",
-                    "overlap" => "Self-overlap Q(t), four-point susceptibility χ₄(t), τ_α, β",
-                    "structure" => "Static structure factor S(q) + peak q*",
-                    "scattering" => "Self-intermediate scattering function F_s(q*, t)",
-                    "van_hove" => "van Hove self-correlation G_s(Δx, t)",
-                    "per_cell_diffusion" => "Per-cell diffusion coefficient D_i",
-                    "displacement" => "Displacement statistics (Phase 0 quench analysis)",
-                    "va_mobility_correlation" => "Pearson r between inherent v_A and time-averaged speed (σ>0 runs)",
-                    "spatial_correlation" => "Spatial autocorrelation C(r) of mobility + correlation length ξ",
-                    "shape_index" => "Shape index p_eff = L_n × 2√π from trajectory perimeter (vertex model)",
-                    "velocity_autocorrelation" => "Velocity autocorrelation C_v(τ) and correlation time τ_c",
-                    "burst_detection" => "Speed burst events (|v| > μ+3σ), frequency, duration, amplitude",
-                    "velocity_distribution" => "Velocity distribution P(v_x), kurtosis for cell 0 and population",
-                    "polarity_tau" => "Persistence time τ from polarity autocorrelation ⟨p̂(t+Δt)·p̂(t)⟩ = exp(-Δt/τ)",
-                    "hexatic_order" => "Hexatic order ψ₆ per cell + g₆(r) orientational correlation",
-                    "voronoi_shape" => "Voronoi shape index q = P/√A from Delaunay dual",
-                    "kinetic_energy" => "Kinetic energy time series KE(t) = ½Σ(v²)",
-                    _ => "",
-                };
-                println!("  {:<22} {}", name, desc);
-            }
-        }
-        Commands::Study2 { config, data_dir, threads } => {
-            if let Some(t) = threads {
-                rayon::ThreadPoolBuilder::new().num_threads(t).build_global().ok();
-            }
-            analysis::v2::studies::run_study(&config, &data_dir)?;
+        Commands::List { what } => {
+            list_what(&what);
         }
     }
 
     Ok(())
 }
 
-fn parse_observables(input: Option<Vec<String>>) -> Result<Vec<String>> {
-    match input {
-        None => Ok(ALL_OBSERVABLES.iter().map(|s| s.to_string()).collect()),
-        Some(names) => {
-            for name in &names {
-                if !is_valid_observable(name) {
-                    anyhow::bail!(
-                        "Unknown observable '{}'. Run 'cell_analyze list' to see options.",
-                        name
-                    );
-                }
-            }
-            Ok(names)
-        }
+/// Print available observables / panels / aggregators / templates.
+fn list_what(what: &str) {
+    let want = what.to_ascii_lowercase();
+    let all = want == "all";
+    if all || want == "observables" {
+        println!("Observables:");
+        println!("  msd                       Ensemble MSD(Δt) + cell-0 MSD");
+        println!("  msd_palmieri              Dense 0..8τ MSD/Δt + D_eff(8τ)");
+        println!("  ln_perimeter              L_n(t) for the tagged cell");
+        println!("  displacement_velocities   (vx, vy) + speeds for tagged cell");
+        println!("  velocity_distribution     P(v_x), σ, kurtosis (cell 0 + population)");
+        println!("  bursts                    Speed-burst events |v| > μ + k·σ");
+        println!();
+    }
+    if all || want == "aggregators" {
+        println!("Aggregators (study TOML `[[aggregate]]` op):");
+        println!("  groupby      group runs sharing variable values");
+        println!("  mean_stderr  mean±stderr of metrics across replicates");
+        println!("  sweep        order group summaries along a numeric axis");
+        println!("  pair_ratio   ratio + propagated error between two groups");
+        println!("  pair_runs    pair raw runs (e.g. soft vs ctrl) for diagnostic figures");
+        println!("  single_run   pick exactly one run via filter");
+        println!("  overlay      bundle N runs for layered plots");
+        println!();
+    }
+    if all || want == "panels" {
+        println!("Panels (figure TOML `[[figure]].panels.type/subtype`):");
+        println!("  metric_vs_x                       sweep panel: y vs x with stderr bars");
+        println!("  pair / speed_bursts | gvi |        soft-vs-ctrl style 6/8-panel grid");
+        println!("       ln_timeseries | ln_histogram |");
+        println!("       msd_t | deff_bar | summary");
+        println!("  single / msd | gvi |               one-run plots");
+        println!("         ln_timeseries | speed_bursts");
+        println!("  overlay / msd | gvi | ln_timeseries  N-run colored overlay");
+        println!();
+    }
+    if all || want == "templates" {
+        println!("Reference TOMLs in cpp/simulation/study/templates/:");
+        println!("  single_run.toml          one run → 4-panel single-run grid");
+        println!("  pair_compare.toml        soft vs ctrl → 8-panel diagnostic");
+        println!("  overlay_gamma_sweep.toml N runs at different γ overlaid");
+        println!("  fss.toml                 sweep over N → metric_vs_x");
+        println!("  phase3a_pairwise.toml    sweep over separation → metric_vs_x");
     }
 }
+
 
 /// Trajectory/checkpoint integrity checker. Returns process exit code.
 fn run_check(
@@ -902,694 +753,6 @@ fn run_check(
     Ok(if all_pass { 0 } else { 1 })
 }
 
-fn analyze_single_run(
-    dir: &PathBuf,
-    observables: &[String],
-    tau: f64,
-    cell_radius: f64,
-    fit_frac: f64,
-    sq_bins: usize,
-    sq_frames: usize,
-    subsample: usize,
-) -> Result<RunResult> {
-    let t0 = Instant::now();
-    let traj_path = dir.join("trajectory.txt");
-    if !traj_path.exists() {
-        anyhow::bail!("No trajectory.txt found in {}", dir.display());
-    }
-
-    let traj = load_trajectory_subsample(&traj_path, subsample)?;
-    let pos = unwrap_trajectory(&traj);
-
-    let has = |name: &str| observables.iter().any(|s| s == name);
-
-    let cell_spacing = (pos.lx * pos.ly / pos.n_cells as f64).sqrt();
-    let cage_radius = cell_spacing * 0.3;
-
-    // Compute requested observables
-    let msd = if has("msd") || has("diffusion") || has("log_slope") || has("cage") {
-        eprintln!("  Computing MSD...");
-        Some(compute_msd(&pos))
-    } else {
-        None
-    };
-
-    let diffusion = if has("diffusion") {
-        msd.as_ref().map(|m| compute_diffusion(m, fit_frac))
-    } else {
-        None
-    };
-
-    let log_slope = if has("log_slope") {
-        msd.as_ref().map(|m| msd_log_slope(m))
-    } else {
-        None
-    };
-
-    let cage = if has("cage") {
-        msd.as_ref().map(|m| cage_length(m, tau))
-    } else {
-        None
-    };
-
-    let alpha2 = if has("alpha2") {
-        eprintln!("  Computing α₂...");
-        Some(non_gaussian_parameter(&pos))
-    } else {
-        None
-    };
-
-    let overlap = if has("overlap") {
-        eprintln!("  Computing Q(t), χ₄...");
-        Some(overlap_and_chi4(&pos, cage_radius))
-    } else {
-        None
-    };
-
-    let structure = if has("structure") || has("scattering") {
-        eprintln!("  Computing S(q)...");
-        Some(structure_factor(&pos, sq_bins, sq_frames))
-    } else {
-        None
-    };
-
-    let scattering = if has("scattering") {
-        let q_star = structure
-            .as_ref()
-            .map_or(0.1, |s| s.q_star);
-        eprintln!("  Computing F_s(q*={:.4}, t)...", q_star);
-        Some(self_intermediate_scattering(&pos, q_star))
-    } else {
-        None
-    };
-
-    let van_hove_result = if has("van_hove") {
-        eprintln!("  Computing van Hove G_s...");
-        Some(van_hove(&pos, tau, 200))
-    } else {
-        None
-    };
-
-    let pcd = if has("per_cell_diffusion") {
-        eprintln!("  Computing per-cell D...");
-        Some(per_cell_diffusion(&pos, fit_frac, tau))
-    } else {
-        None
-    };
-
-    let displacement = if has("displacement") {
-        Some(compute_displacement(&pos, cell_radius))
-    } else {
-        None
-    };
-
-    let va_corr = if has("va_mobility_correlation") {
-        eprintln!("  Computing v_A-mobility correlation...");
-        Some(va_mobility_correlation(&pos))
-    } else {
-        None
-    };
-
-    let spatial_corr = if has("spatial_correlation") {
-        eprintln!("  Computing spatial correlation C(r)...");
-        Some(spatial_correlation(&pos, 40))
-    } else {
-        None
-    };
-
-    let shape_idx = if has("shape_index") {
-        eprintln!("  Computing shape index p_eff from L_n...");
-        Some(shape_index(&traj))
-    } else {
-        None
-    };
-    let vel_autocorr = if has("velocity_autocorrelation") {
-        eprintln!("  Computing velocity autocorrelation C_v(τ)...");
-        Some(velocity_autocorrelation(&pos))
-    } else {
-        None
-    };
-
-    let bursts = if has("burst_detection") {
-        eprintln!("  Detecting speed bursts (3σ threshold)...");
-        Some(detect_bursts(&pos, &traj, 3.0, 1))
-    } else {
-        None
-    };
-
-    let vel_dist = if has("velocity_distribution") {
-        eprintln!("  Computing velocity distribution P(v_x)...");
-        Some(velocity_distribution(&pos, 100))
-    } else {
-        None
-    };
-
-    let pol_tau = if has("polarity_tau") {
-        eprintln!("  Estimating τ from polarity autocorrelation...");
-        Some(polarity_tau(&traj))
-    } else {
-        None
-    };
-
-    let hex_order = if has("hexatic_order") {
-        eprintln!("  Computing hexatic order ψ₆ and g₆(r)...");
-        Some(compute_hexatic_order(&pos, cell_radius))
-    } else {
-        None
-    };
-
-    let vor_shape = if has("voronoi_shape") {
-        eprintln!("  Computing Voronoi shape index q = P/√A...");
-        Some(compute_voronoi_shape(&pos, cell_radius))
-    } else {
-        None
-    };
-
-    let kin_energy = if has("kinetic_energy") {
-        eprintln!("  Computing kinetic energy time series...");
-        Some(compute_kinetic_energy(&pos))
-    } else {
-        None
-    };
-
-    let se = match (&diffusion, &overlap) {
-        (Some(d), Some(o)) => {
-            let val = stokes_einstein(d.d_eff, o.tau_alpha);
-            if val.is_finite() {
-                Some(val)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    let extra: BTreeMap<String, String> = traj
-        .params
-        .extra
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    let elapsed = t0.elapsed();
-    eprintln!(
-        "  Done: {} frames, {} cells, {:.1}s",
-        pos.n_times,
-        pos.n_cells,
-        elapsed.as_secs_f64()
-    );
-
-    Ok(RunResult {
-        path: dir.display().to_string(),
-        params: RunParams {
-            v_a: traj.params.v_a,
-            n_cells: traj.params.n_cells,
-            lx: traj.params.lx,
-            ly: traj.params.ly,
-            confluence: traj.params.n_cells as f64 * std::f64::consts::PI * cell_radius * cell_radius / (traj.params.lx * traj.params.ly),
-            subdomain_padding: None,
-            bbox_mean: None,
-            extra,
-        },
-        msd: if has("msd") { msd } else { None },
-        diffusion,
-        log_slope,
-        cage,
-        alpha2,
-        overlap,
-        structure: if has("structure") { structure } else { None },
-        scattering,
-        van_hove: van_hove_result,
-        per_cell_diffusion: pcd,
-        displacement,
-        stokes_einstein: se,
-        va_mobility_correlation: va_corr,
-        spatial_correlation: spatial_corr,
-        shape_index: shape_idx,
-        velocity_autocorrelation: vel_autocorr,
-        burst_detection: bursts,
-        velocity_distribution: vel_dist,
-        polarity_tau: pol_tau,
-        hexatic_order: hex_order,
-        voronoi_shape: vor_shape,
-        kinetic_energy: kin_energy,
-    })
-}
-
-// ============================================================================
-// SVG plot generation for single-run observables
-// ============================================================================
-
-fn plot_run_result(result: &RunResult, plot_dir: &Path, cell_radius: f64) -> Result<()> {
-    use plotters::prelude::*;
-
-    let n_cells = result.params.n_cells;
-    let label = format!("N={}", n_cells);
-
-    // --- Hexatic order plots ---
-    if let Some(ref h) = result.hexatic_order {
-        // 1. g₆(r) line plot
-        if !h.g6_r.is_empty() {
-            let r_norm: Vec<f64> = h.g6_r.iter().map(|r| r / (2.0 * cell_radius)).collect();
-            let out_path = plot_dir.join("g6_r.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            let x_max = r_norm.last().copied().unwrap_or(5.0) + 0.1;
-            let y_min = h.g6_values.iter().copied().fold(f64::INFINITY, f64::min).min(-0.05) - 0.02;
-            let y_max = h.g6_values.iter().copied().fold(f64::NEG_INFINITY, f64::max).max(0.05) + 0.02;
-
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("g₆(r) — {} (⟨ψ₆⟩={:.3})", label, h.psi6_mean), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(65)
-                .build_cartesian_2d(0.0..x_max, y_min..y_max)?;
-            chart.configure_mesh()
-                .x_desc("r / (2R)").y_desc("g₆(r)")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            chart.draw_series(LineSeries::new(vec![(0.0, 0.0), (x_max, 0.0)],
-                ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1)))?;
-            chart.draw_series(LineSeries::new(
-                r_norm.iter().zip(h.g6_values.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&BLUE).stroke_width(2)))?.label(&label);
-            chart.draw_series(r_norm.iter().zip(h.g6_values.iter()).map(|(&x, &y)| Circle::new((x, y), 3, BLUE.filled())))?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-
-        // 2. ψ₆ histogram
-        if !h.psi6_per_cell.is_empty() {
-            let out_path = plot_dir.join("psi6_histogram.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let n_bins = 20usize;
-            let mut counts = vec![0u32; n_bins];
-            for &v in &h.psi6_per_cell {
-                let b = ((v * n_bins as f64) as usize).min(n_bins - 1);
-                counts[b] += 1;
-            }
-            let max_count = *counts.iter().max().unwrap_or(&1);
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("|ψ₆| distribution — {} (⟨ψ₆⟩={:.3})", label, h.psi6_mean), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(55)
-                .build_cartesian_2d(0.0..1.0f64, 0u32..(max_count + 1))?;
-            chart.configure_mesh()
-                .x_desc("|ψ₆|").y_desc("Count")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            let bin_w = 1.0 / n_bins as f64;
-            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
-                let x0 = i as f64 * bin_w;
-                Rectangle::new([(x0, 0), (x0 + bin_w * 0.9, c)], BLUE.mix(0.7).filled())
-            }))?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Voronoi shape index plot ---
-    if let Some(ref v) = result.voronoi_shape {
-        if !v.q_per_cell.is_empty() {
-            let out_path = plot_dir.join("voronoi_q_histogram.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let q_min = v.q_per_cell.iter().copied().fold(f64::INFINITY, f64::min);
-            let q_max = v.q_per_cell.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let range_pad = (q_max - q_min).max(0.1) * 0.15;
-            let hist_min = (q_min - range_pad).max(3.0);
-            let hist_max = q_max + range_pad;
-            let n_bins = 20usize;
-            let bw = (hist_max - hist_min) / n_bins as f64;
-            let mut counts = vec![0u32; n_bins];
-            for &q in &v.q_per_cell {
-                if q > 0.0 {
-                    let b = ((q - hist_min) / bw) as usize;
-                    if b < n_bins { counts[b] += 1; }
-                }
-            }
-            let max_count = *counts.iter().max().unwrap_or(&1);
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("Voronoi q = P/√A — {} (⟨q⟩={:.2})", label, v.q_mean), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(55)
-                .build_cartesian_2d(hist_min..hist_max, 0u32..(max_count + 1))?;
-            chart.configure_mesh()
-                .x_desc("q = P/√A").y_desc("Count")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
-                let x0 = hist_min + i as f64 * bw;
-                Rectangle::new([(x0, 0), (x0 + bw * 0.9, c)], BLUE.mix(0.7).filled())
-            }))?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- MSD/Δt plot (Palmieri Fig 5 convention: linear axes, Δt up to 8τ) ---
-    if let Some(ref msd) = result.msd {
-        if !msd.lag_times.is_empty() {
-            let out_path = plot_dir.join("msd.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            // Palmieri Fig 5 caps the x-axis at Δt = 8τ.
-            let tau = result.params.extra.get("tau")
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(10000.0);
-            let x_cap = 8.0 * tau;
-
-            let pts: Vec<(f64, f64)> = msd.lag_times.iter().zip(msd.values.iter())
-                .filter(|(&t, _)| t > 0.0 && t <= x_cap)
-                .map(|(&t, &v)| (t / tau, v / t))
-                .collect();
-            if !pts.is_empty() {
-                let x_min = 0.0;
-                let x_max = 8.0;
-                let y_max = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) * 1.1 + 1e-12;
-
-                let mut chart = ChartBuilder::on(&root)
-                    .caption(format!("MSD/Δt → 4D_eff — {}", label), ("sans-serif", 22).into_font())
-                    .margin(15)
-                    .x_label_area_size(45)
-                    .y_label_area_size(65)
-                    .build_cartesian_2d(x_min..x_max, 0.0..y_max)?;
-
-                chart.configure_mesh()
-                    .x_desc("Δt / τ")
-                    .y_desc("MSD/Δt")
-                    .x_label_style(("sans-serif", 16))
-                    .y_label_style(("sans-serif", 16))
-                    .axis_desc_style(("sans-serif", 18))
-                    .light_line_style(TRANSPARENT)
-                    .draw()?;
-
-                chart.draw_series(LineSeries::new(
-                    pts.iter().copied(),
-                    ShapeStyle::from(&BLUE).stroke_width(2),
-                ))?;
-
-                root.present()?;
-                eprintln!("  Plot: {}", out_path.display());
-            }
-        }
-    }
-
-    // --- Cell-0 perimeter L_n(t) plot ---
-    // Tagged-cell elasticity: raw normalized perimeter L_n vs time, overlaid
-    // with population mean. shape_index stores p_eff = L_n × 2√π, so divide
-    // back by the same factor to recover L_n.
-    if let Some(ref si) = result.shape_index {
-        if !si.times.is_empty() && !si.cell0_p_vs_time.is_empty() {
-            let factor = 2.0 * std::f64::consts::PI.sqrt();
-            let l_n_cell0: Vec<f64> = si.cell0_p_vs_time.iter().map(|&p| p / factor).collect();
-            let l_n_pop: Vec<f64>   = si.p_vs_time.iter().map(|&p| p / factor).collect();
-
-            let out_path = plot_dir.join("cell0_perimeter.svg");
-            let root = SVGBackend::new(&out_path, (900, 500)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            let x_min = *si.times.first().unwrap();
-            let x_max = *si.times.last().unwrap();
-            let mut y_min = l_n_cell0.iter().chain(l_n_pop.iter())
-                .copied().fold(f64::INFINITY, f64::min);
-            let mut y_max = l_n_cell0.iter().chain(l_n_pop.iter())
-                .copied().fold(f64::NEG_INFINITY, f64::max);
-            let pad = ((y_max - y_min) * 0.05).max(1e-3);
-            y_min -= pad; y_max += pad;
-
-            let cell0_mean = l_n_cell0.iter().sum::<f64>() / l_n_cell0.len() as f64;
-            let cell0_var  = l_n_cell0.iter().map(|v| (v - cell0_mean).powi(2)).sum::<f64>()
-                / l_n_cell0.len() as f64;
-            let cell0_std  = cell0_var.sqrt();
-
-            let mut chart = ChartBuilder::on(&root)
-                .caption(
-                    format!("Cell-0 perimeter L_n(t) — {} (⟨L_n⟩={:.3}, σ={:.3})",
-                            label, cell0_mean, cell0_std),
-                    ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(65)
-                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
-            chart.configure_mesh()
-                .x_desc("t").y_desc("L_n  (normalized perimeter)")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-
-            // Population mean (background, grey)
-            chart.draw_series(LineSeries::new(
-                si.times.iter().zip(l_n_pop.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&RGBAColor(120, 120, 120, 0.7)).stroke_width(1)))?
-                .label("⟨L_n⟩ population")
-                .legend(|(x, y)| PathElement::new(
-                    vec![(x, y), (x + 18, y)],
-                    ShapeStyle::from(&RGBAColor(120, 120, 120, 0.9)).stroke_width(2)));
-
-            // Cell-0 trace (foreground, red)
-            chart.draw_series(LineSeries::new(
-                si.times.iter().zip(l_n_cell0.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&RED).stroke_width(2)))?
-                .label("L_n cell 0 (tagged)")
-                .legend(|(x, y)| PathElement::new(
-                    vec![(x, y), (x + 18, y)],
-                    ShapeStyle::from(&RED).stroke_width(2)));
-
-            chart.configure_series_labels()
-                .background_style(WHITE.mix(0.85))
-                .border_style(BLACK)
-                .label_font(("sans-serif", 14))
-                .position(plotters::chart::SeriesLabelPosition::UpperRight)
-                .draw()?;
-
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Kinetic energy plot ---
-    if let Some(ref ke) = result.kinetic_energy {
-        if !ke.times.is_empty() {
-            let out_path = plot_dir.join("kinetic_energy.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let x_min = *ke.times.first().unwrap();
-            let x_max = *ke.times.last().unwrap();
-            let y_min = ke.ke_per_cell.iter().copied().fold(f64::INFINITY, f64::min) * 0.9;
-            let y_max = ke.ke_per_cell.iter().copied().fold(f64::NEG_INFINITY, f64::max) * 1.1;
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("KE per cell — {} (⟨KE⟩={:.2e})", label, ke.ke_mean), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(65)
-                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
-            chart.configure_mesh()
-                .x_desc("t").y_desc("½⟨v²⟩")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            chart.draw_series(LineSeries::new(
-                ke.times.iter().zip(ke.ke_per_cell.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&BLUE).stroke_width(2)))?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Velocity autocorrelation C_v(τ) ---
-    if let Some(ref va) = result.velocity_autocorrelation {
-        if !va.lag_times.is_empty() {
-            let out_path = plot_dir.join("velocity_autocorrelation.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let x_min = *va.lag_times.first().unwrap();
-            let x_max = *va.lag_times.last().unwrap();
-            let y_min = va.cv.iter().copied().fold(f64::INFINITY, f64::min).min(-0.05);
-            let y_max = va.cv.iter().copied().fold(f64::NEG_INFINITY, f64::max).max(0.05);
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("Velocity autocorrelation — {} (τ_c={:.3e}, β={:.2})", label, va.tau_c, va.beta), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(65)
-                .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
-            chart.configure_mesh()
-                .x_desc("τ").y_desc("C_v(τ)")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            chart.draw_series(LineSeries::new(vec![(x_min, 0.0), (x_max, 0.0)],
-                ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1)))?;
-            chart.draw_series(LineSeries::new(
-                va.lag_times.iter().zip(va.cv.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&BLUE).stroke_width(2)))?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Velocity distribution P(v_x): cell 0 vs population ---
-    if let Some(ref vd) = result.velocity_distribution {
-        if vd.bin_edges.len() >= 2 && !vd.pop_hist.is_empty() {
-            let out_path = plot_dir.join("velocity_distribution.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let centers: Vec<f64> = vd.bin_edges.windows(2).map(|w| 0.5 * (w[0] + w[1])).collect();
-            let x_min = *vd.bin_edges.first().unwrap();
-            let x_max = *vd.bin_edges.last().unwrap();
-            let y_max = vd.pop_hist.iter().chain(vd.cell0_hist.iter())
-                .copied().fold(0.0_f64, f64::max) * 1.1 + 1e-12;
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("P(v_x) — {} (κ_pop={:.2}, κ_cell0={:.2})", label, vd.pop_kurtosis, vd.cell0_kurtosis), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(65)
-                .build_cartesian_2d(x_min..x_max, 0.0..y_max)?;
-            chart.configure_mesh()
-                .x_desc("v_x").y_desc("P(v_x)")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            chart.draw_series(LineSeries::new(
-                centers.iter().zip(vd.pop_hist.iter()).map(|(&x, &y)| (x, y)),
-                ShapeStyle::from(&RGBAColor(120, 120, 120, 0.9)).stroke_width(2)))?
-                .label("population")
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 18, y)],
-                    ShapeStyle::from(&RGBAColor(120, 120, 120, 0.9)).stroke_width(2)));
-            if !vd.cell0_hist.is_empty() {
-                chart.draw_series(LineSeries::new(
-                    centers.iter().zip(vd.cell0_hist.iter()).map(|(&x, &y)| (x, y)),
-                    ShapeStyle::from(&RED).stroke_width(2)))?
-                    .label("cell 0")
-                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 18, y)],
-                        ShapeStyle::from(&RED).stroke_width(2)));
-            }
-            chart.configure_series_labels()
-                .background_style(WHITE.mix(0.85)).border_style(BLACK)
-                .label_font(("sans-serif", 14))
-                .position(plotters::chart::SeriesLabelPosition::UpperRight).draw()?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- G(v_i) = -sqrt(|ln CCDF(|v_i|)|) (Palmieri Fig 4 convention) ---
-    // Reuses analysis::panels::draw_gvi_panel so single-run and study/compare
-    // share exactly one renderer. Pass any number of (label, vx, vy) series.
-    if let Some(ref vd) = result.velocity_distribution {
-        if !vd.cell0_vx.is_empty() {
-            use analysis::panels::{draw_gvi_panel, GviSeries, GviPanelOpts, GviMarker};
-            let out_path = plot_dir.join("velocity_gvi.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-
-            // Single-run G(v_i): cell 0 only (the soft cell). Population
-            // is omitted -- in homogeneous-v_A configs it tracks cell 0
-            // anyway; the relevant comparison is data vs Gaussian + Eq.5.
-            let series = vec![GviSeries {
-                label: "cell 0".to_string(),
-                vx: &vd.cell0_vx, vy: &vd.cell0_vy,
-                color: RGBAColor(220, 50, 50, 0.95),
-                marker: GviMarker::Triangle,
-            }];
-
-            let opts = GviPanelOpts {
-                title: format!("G(v_i) — {}", label),
-                // Naive moment-based σ from cell 0 (matches second
-                // moment of the data). This is the *correct* Gaussian
-                // reference: any visible deviation is the non-Gaussian
-                // (active / burst) signal — fitting σ to the curve shape
-                // is misleading because the data is genuinely non-Gaussian.
-                gaussian_ref_sigma: None,
-                // Fit Palmieri Eq. 5 (Gaussian noise + arcsine bursts)
-                // to the cell 0 series.
-                palmieri_fit_index: Some(0),
-                v_a: 0.01,
-                ..Default::default()
-            };
-            draw_gvi_panel(&root, &series, &opts)?;
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Per-cell diffusion histogram ---
-    if let Some(ref pcd) = result.per_cell_diffusion {
-        if !pcd.d_values.is_empty() {
-            let out_path = plot_dir.join("per_cell_diffusion.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let d_min = pcd.d_values.iter().copied().fold(f64::INFINITY, f64::min);
-            let d_max = pcd.d_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let pad = (d_max - d_min).max(1e-12) * 0.1;
-            let x_lo = (d_min - pad).max(0.0);
-            let x_hi = d_max + pad;
-            let n_bins = 20usize;
-            let bw = (x_hi - x_lo) / n_bins as f64;
-            let mut counts = vec![0u32; n_bins];
-            for &d in &pcd.d_values {
-                if bw > 0.0 {
-                    let b = (((d - x_lo) / bw) as usize).min(n_bins - 1);
-                    counts[b] += 1;
-                }
-            }
-            let max_count = *counts.iter().max().unwrap_or(&1);
-            let mut chart = ChartBuilder::on(&root)
-                .caption(format!("Per-cell D — {} (⟨D⟩={:.3e}, CV={:.2})", label, pcd.d_mean, pcd.cv), ("sans-serif", 20).into_font())
-                .margin(15).x_label_area_size(45).y_label_area_size(55)
-                .build_cartesian_2d(x_lo..x_hi, 0u32..(max_count + 1))?;
-            chart.configure_mesh()
-                .x_desc("D (per cell)").y_desc("Count")
-                .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-            chart.draw_series(counts.iter().enumerate().map(|(i, &c)| {
-                let x0 = x_lo + i as f64 * bw;
-                Rectangle::new([(x0, 0), (x0 + bw * 0.9, c)], BLUE.mix(0.7).filled())
-            }))?;
-            // Mark cell 0's D value with a red vertical line
-            if let Some(idx) = pcd.cell_ids.iter().position(|&id| id == 0) {
-                let d0 = pcd.d_values[idx];
-                chart.draw_series(LineSeries::new(
-                    vec![(d0, 0u32), (d0, max_count + 1)],
-                    ShapeStyle::from(&RED).stroke_width(2)))?
-                    .label(format!("cell 0: D={:.3e}", d0))
-                    .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 18, y)],
-                        ShapeStyle::from(&RED).stroke_width(2)));
-                chart.configure_series_labels()
-                    .background_style(WHITE.mix(0.85)).border_style(BLACK)
-                    .label_font(("sans-serif", 14))
-                    .position(plotters::chart::SeriesLabelPosition::UpperRight).draw()?;
-            }
-            root.present()?;
-            eprintln!("  Plot: {}", out_path.display());
-        }
-    }
-
-    // --- Non-Gaussian parameter α₂(t) ---
-    if let Some(ref a2) = result.alpha2 {
-        if !a2.lag_times.is_empty() {
-            let out_path = plot_dir.join("alpha2.svg");
-            let root = SVGBackend::new(&out_path, (720, 480)).into_drawing_area();
-            root.fill(&WHITE)?;
-            let t_pos: Vec<f64> = a2.lag_times.iter().filter(|&&t| t > 0.0).copied().collect();
-            let v_pos: Vec<f64> = a2.lag_times.iter().zip(a2.values.iter())
-                .filter(|(&t, _)| t > 0.0).map(|(_, &v)| v).collect();
-            if !t_pos.is_empty() {
-                let t_log: Vec<f64> = t_pos.iter().map(|v| v.log10()).collect();
-                let x_min = t_log.first().copied().unwrap();
-                let x_max = t_log.last().copied().unwrap();
-                let y_min = v_pos.iter().copied().fold(f64::INFINITY, f64::min).min(-0.05);
-                let y_max = v_pos.iter().copied().fold(f64::NEG_INFINITY, f64::max).max(0.05);
-                let mut chart = ChartBuilder::on(&root)
-                    .caption(format!("Non-Gaussian α₂(Δt) — {}", label), ("sans-serif", 20).into_font())
-                    .margin(15).x_label_area_size(45).y_label_area_size(65)
-                    .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
-                chart.configure_mesh()
-                    .x_desc("log₁₀(Δt)").y_desc("α₂")
-                    .x_label_style(("sans-serif", 16)).y_label_style(("sans-serif", 16))
-                    .axis_desc_style(("sans-serif", 18)).light_line_style(TRANSPARENT).draw()?;
-                chart.draw_series(LineSeries::new(vec![(x_min, 0.0), (x_max, 0.0)],
-                    ShapeStyle::from(&RGBAColor(150, 150, 150, 0.5)).stroke_width(1)))?;
-                chart.draw_series(LineSeries::new(
-                    t_log.iter().zip(v_pos.iter()).map(|(&x, &y)| (x, y)),
-                    ShapeStyle::from(&BLUE).stroke_width(2)))?;
-                root.present()?;
-                eprintln!("  Plot: {}", out_path.display());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// RdYlBu_r colormap approximation: 0=blue, 0.5=yellow, 1=dark red.
 // ============================================================================
 // Cell label rendering for snapshot --label-cells
 // ============================================================================
@@ -2344,26 +1507,6 @@ fn rdylbu_colormap(frac: f64) -> (u8, u8, u8) {
         let b = (255.0 * (1.0 - f)) as u8;
         (r, g, b)
     }
-}
-
-fn write_json<T: serde::Serialize>(data: &T, output: &Option<PathBuf>) -> Result<()> {
-    let json = serde_json::to_string_pretty(data)?;
-    match output {
-        Some(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, &json).context("Writing output file")?;
-            eprintln!("Output written to {}", path.display());
-        }
-        None => {
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            handle.write_all(json.as_bytes())?;
-            handle.write_all(b"\n")?;
-        }
-    }
-    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
