@@ -185,6 +185,30 @@ pub enum AggregateToml {
         seed_var: String,
         into: String,
     },
+    /// Pick a single run that matches a set of variable filters.
+    /// Filters are `var = value` equality checks. Errors if zero or
+    /// multiple runs match.
+    SingleRun {
+        /// Map of variable name → required value. Stringly-typed for
+        /// TOML simplicity; values are matched against the
+        /// `ScalarValue::to_string()` of each run's variables.
+        #[serde(default)]
+        filter: BTreeMap<String, String>,
+        /// Optional display label. Default: stringified filter.
+        #[serde(default)]
+        label: Option<String>,
+        into: String,
+    },
+    /// Bundle N runs into an Overlay slot for N-way layered plots.
+    /// `vary` names the variable whose distinct values become the
+    /// series labels (e.g. `vary = "gamma_c"`). `filter` further
+    /// constrains which runs are eligible.
+    Overlay {
+        vary: String,
+        #[serde(default)]
+        filter: BTreeMap<String, String>,
+        into: String,
+    },
 }
 
 fn default_seed_var() -> String {
@@ -265,6 +289,47 @@ pub enum PanelToml {
         #[serde(default)]
         bins: Option<usize>,
     },
+    /// Single-run panel. `input` references a `single_run` slot.
+    Single {
+        /// `msd | gvi | ln_timeseries | speed_bursts`.
+        subtype: String,
+        input: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        x_range: Option<[f64; 2]>,
+        #[serde(default)]
+        y_range: Option<[f64; 2]>,
+        #[serde(default)]
+        speed_max: Option<f64>,
+        #[serde(default)]
+        msd_lag_max: Option<f64>,
+        #[serde(default)]
+        gvi_x_max: Option<f64>,
+        /// G(v_i) panel: enable Eq.5 fit (default true).
+        #[serde(default)]
+        fit_eq5: Option<bool>,
+        /// MSD panel: also draw the population MSD (default true).
+        #[serde(default)]
+        show_population: Option<bool>,
+    },
+    /// Overlay panel: N runs colored by series. `input` references an
+    /// `overlay` slot.
+    Overlay {
+        /// `msd | gvi | ln_timeseries`.
+        subtype: String,
+        input: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        x_range: Option<[f64; 2]>,
+        #[serde(default)]
+        y_range: Option<[f64; 2]>,
+        #[serde(default)]
+        msd_lag_max: Option<f64>,
+        #[serde(default)]
+        gvi_x_max: Option<f64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +353,33 @@ pub enum Slot {
     /// the same seed). Stored as indices into the runs slice; the
     /// figure renderer resolves them via the runs vector.
     RunPairs(Vec<RunPair>),
+    /// A single run, identified by index. Used by single_run panels
+    /// (one trajectory at a time).
+    SingleRun(SingleRunRef),
+    /// N-way overlay: a list of runs to render on shared axes with one
+    /// colored series per run (e.g. γ_c sweep).
+    Overlay(OverlayRef),
+}
+
+/// Reference to one selected run.
+#[derive(Clone, Debug)]
+pub struct SingleRunRef {
+    pub index: usize,
+    pub label: String,
+}
+
+/// A bundle of N runs to be plotted overlay-style.
+#[derive(Clone, Debug)]
+pub struct OverlayRef {
+    pub series: Vec<OverlaySeriesRef>,
+}
+
+/// One series in an overlay: index into runs + display label + the
+/// variable value that distinguishes it (used for the legend).
+#[derive(Clone, Debug)]
+pub struct OverlaySeriesRef {
+    pub run_index: usize,
+    pub label: String,
 }
 
 /// One paired comparison: numerator and denominator runs identified by
@@ -544,7 +636,104 @@ fn execute_op(
             ws.insert(into, Slot::RunPairs(pairs));
             Ok(())
         }
+        AggregateToml::SingleRun { filter, label, into } => {
+            let matches: Vec<usize> = runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| filter_matches(r, filter))
+                .map(|(i, _)| i)
+                .collect();
+            if matches.is_empty() {
+                return Err(anyhow!(
+                    "single_run: no runs match filter {:?}",
+                    filter
+                ));
+            }
+            if matches.len() > 1 {
+                return Err(anyhow!(
+                    "single_run: filter {:?} matched {} runs (need exactly 1)",
+                    filter,
+                    matches.len()
+                ));
+            }
+            let idx = matches[0];
+            let display_label = label.clone().unwrap_or_else(|| {
+                if filter.is_empty() {
+                    "run".to_string()
+                } else {
+                    filter
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            });
+            ws.insert(
+                into,
+                Slot::SingleRun(SingleRunRef {
+                    index: idx,
+                    label: display_label,
+                }),
+            );
+            Ok(())
+        }
+        AggregateToml::Overlay { vary, filter, into } => {
+            let mut series: Vec<OverlaySeriesRef> = runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| filter_matches(r, filter))
+                .map(|(i, r)| {
+                    let val = r
+                        .variables
+                        .get(vary)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| format!("run{}", i));
+                    OverlaySeriesRef {
+                        run_index: i,
+                        label: format!("{}={}", vary, val),
+                    }
+                })
+                .collect();
+            if series.is_empty() {
+                return Err(anyhow!(
+                    "overlay: no runs match filter {:?}",
+                    filter
+                ));
+            }
+            // Sort by the vary variable value (numeric if possible).
+            series.sort_by(|a, b| {
+                let ax = runs[a.run_index]
+                    .variables
+                    .get(vary)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(f64::INFINITY);
+                let bx = runs[b.run_index]
+                    .variables
+                    .get(vary)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(f64::INFINITY);
+                ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ws.insert(into, Slot::Overlay(OverlayRef { series }));
+            Ok(())
+        }
     }
+}
+
+/// `var = value` equality check on a `RunAnalysis`. Used by both
+/// `single_run` and `overlay` filter blocks.
+fn filter_matches(run: &RunAnalysis, filter: &BTreeMap<String, String>) -> bool {
+    for (k, v) in filter {
+        let actual = run
+            .variables
+            .get(k)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if &actual != v {
+            return false;
+        }
+    }
+    true
 }
 
 /// For each unique residual (every variable except `pair_var`), find
@@ -757,6 +946,106 @@ fn render_figure(
                     "summary" => pp::summary::SummaryPair.render(cell, &data, &opts)?,
                     other => {
                         return Err(anyhow!("unknown pair subtype `{}`", other));
+                    }
+                }
+            }
+            PanelToml::Single {
+                subtype,
+                input,
+                title,
+                x_range,
+                y_range,
+                speed_max,
+                msd_lag_max,
+                gvi_x_max,
+                fit_eq5,
+                show_population,
+            } => {
+                let single = match ws.get(input)? {
+                    Slot::SingleRun(r) => r,
+                    _ => return Err(anyhow!("single panel expects SingleRun slot `{}`", input)),
+                };
+                let data = crate::analysis::v2::panels::single::SingleRunData {
+                    run: &runs[single.index],
+                    label: &single.label,
+                };
+                let opts = PanelOpts {
+                    title: title.clone(),
+                    x_label: None,
+                    y_label: None,
+                    x_range: x_range.map(|r| (r[0], r[1])),
+                    y_range: y_range.map(|r| (r[0], r[1])),
+                    log_x: false,
+                    log_y: false,
+                };
+                use crate::analysis::v2::panels::single as sp;
+                use crate::analysis::v2::panels::Panel as _Panel;
+                match subtype.as_str() {
+                    "msd" => sp::msd::MsdSingle {
+                        msd_lag_max: msd_lag_max.unwrap_or(8.0),
+                        show_population: show_population.unwrap_or(true),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "gvi" => sp::gvi::GviSingle {
+                        x_max: gvi_x_max.unwrap_or(0.022),
+                        fit_eq5: fit_eq5.unwrap_or(true),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "ln_timeseries" => sp::ln_timeseries::LnTimeseriesSingle.render(cell, &data, &opts)?,
+                    "speed_bursts" => sp::speed_bursts::SpeedBurstsSingle {
+                        speed_max: speed_max.unwrap_or(0.02),
+                    }
+                    .render(cell, &data, &opts)?,
+                    other => {
+                        return Err(anyhow!("unknown single subtype `{}`", other));
+                    }
+                }
+            }
+            PanelToml::Overlay {
+                subtype,
+                input,
+                title,
+                x_range,
+                y_range,
+                msd_lag_max,
+                gvi_x_max,
+            } => {
+                let overlay = match ws.get(input)? {
+                    Slot::Overlay(o) => o,
+                    _ => return Err(anyhow!("overlay panel expects Overlay slot `{}`", input)),
+                };
+                let series: Vec<crate::analysis::v2::panels::overlay::OverlaySeries<'_>> = overlay
+                    .series
+                    .iter()
+                    .map(|s| crate::analysis::v2::panels::overlay::OverlaySeries {
+                        run: &runs[s.run_index],
+                        label: &s.label,
+                    })
+                    .collect();
+                let data = crate::analysis::v2::panels::overlay::OverlayData { series };
+                let opts = PanelOpts {
+                    title: title.clone(),
+                    x_label: None,
+                    y_label: None,
+                    x_range: x_range.map(|r| (r[0], r[1])),
+                    y_range: y_range.map(|r| (r[0], r[1])),
+                    log_x: false,
+                    log_y: false,
+                };
+                use crate::analysis::v2::panels::overlay as op;
+                use crate::analysis::v2::panels::Panel as _Panel;
+                match subtype.as_str() {
+                    "msd" => op::msd::MsdOverlay {
+                        msd_lag_max: msd_lag_max.unwrap_or(8.0),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "gvi" => op::gvi::GviOverlay {
+                        x_max: gvi_x_max.unwrap_or(0.022),
+                    }
+                    .render(cell, &data, &opts)?,
+                    "ln_timeseries" => op::ln_timeseries::LnTimeseriesOverlay.render(cell, &data, &opts)?,
+                    other => {
+                        return Err(anyhow!("unknown overlay subtype `{}`", other));
                     }
                 }
             }

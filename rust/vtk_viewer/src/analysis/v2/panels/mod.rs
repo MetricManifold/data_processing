@@ -8,7 +8,9 @@
 
 pub mod gvi_core;
 pub mod layout;
+pub mod overlay;
 pub mod pair;
+pub mod single;
 pub mod sweep;
 
 use anyhow::Result;
