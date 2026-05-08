@@ -59,3 +59,10 @@ void launch_init_phi(CellArrays& c, const SimParams& p,
 // without advancing phi. Used after both fresh init and resume so that the
 // first trajectory write has a meaningful velocity.
 void launch_initial_velocity(CellArrays& c, const SimParams& p);
+
+// Halo support: in-place add. dst[i] += src[i] for i in [0, n_floats).
+// Used by the multi-GPU halo exchange to fold neighbour-rank contributions
+// into the local S band after ncclSend/ncclRecv has placed the neighbour's
+// data in a staging buffer.
+void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
+                     cudaStream_t stream);

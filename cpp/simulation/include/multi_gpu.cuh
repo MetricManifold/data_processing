@@ -72,6 +72,19 @@ void mg_finalize_world(MgWorld& w);
 void mg_allreduce_sum_f32(MgComm* comm, float* buf, std::size_t n_floats,
                           cudaStream_t stream);
 
+// Send `n_floats` from `src` (this rank, device memory) to `peer_rank`,
+// and receive `n_floats` from `peer_rank` into `dst` (this rank, device
+// memory). Both must be issued inside an mg_group_start/mg_group_end
+// pair. NCCL pairs sends and recvs by appearance order within a group,
+// so callers on both ends must match the order. Used by the slab
+// halo exchange: rank g sends its top band to rank prev and rank g
+// recvs prev's bottom band into a temp staging buffer.
+void mg_send_recv_f32(MgComm* comm,
+                      const float* src, int peer_send,
+                      float* dst, int peer_recv,
+                      std::size_t n_floats,
+                      cudaStream_t stream);
+
 // NCCL group brackets. Required around per-rank issuing in single-process
 // multi-device mode: every rank's ncclAllReduce call between Start/End is
 // coalesced into one collective. No-op when ENABLE_MULTI_GPU=OFF.

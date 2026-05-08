@@ -27,6 +27,7 @@
 
 #include "kernels.cuh"
 #include <curand_kernel.h>
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -1179,4 +1180,31 @@ void launch_rng_init(CellArrays& c, unsigned long seed) {
     if (N == 0) return;
     k_rng_init<<<(N + 255) / 256, 256>>>(
         (curandState*)c.rng_states, seed, N);
+}
+
+// ---------------------------------------------------------------------------
+// 9. k_halo_add — in-place dst[i] += src[i].
+// ---------------------------------------------------------------------------
+// Used by multi-GPU halo exchange. The halo band is at most
+// 2 * HALO_H * Nx floats; e.g. for Nx=10412, HALO_H=159 that is ~13 MB
+// or ~3.3 M floats per band. A simple grid-stride loop saturates global
+// memory bandwidth, which dominates over any arithmetic here.
+// ---------------------------------------------------------------------------
+__global__ void k_halo_add(float* dst, const float* src, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        dst[i] += src[i];
+    }
+}
+
+void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
+                     cudaStream_t stream) {
+    if (n_floats == 0) return;
+    constexpr int BS = 256;
+    // Cap grid at a sensible size; the loop handles the rest.
+    int blocks = (int)std::min<std::size_t>(
+        (n_floats + BS - 1) / BS, (std::size_t)1024);
+    if (blocks <= 0) blocks = 1;
+    k_halo_add<<<blocks, BS, 0, stream>>>(dst, src, n_floats);
 }

@@ -119,6 +119,32 @@ void mg_allreduce_sum_f32(MgComm* comm, float* buf, std::size_t n_floats,
     }
 }
 
+void mg_send_recv_f32(MgComm* comm,
+                      const float* src, int peer_send,
+                      float* dst, int peer_recv,
+                      std::size_t n_floats,
+                      cudaStream_t stream)
+{
+    if (!comm || n_floats == 0) return;
+    // Issue both the send and the recv. Caller is responsible for being
+    // inside an mg_group_start/mg_group_end pair so NCCL can match this
+    // with the symmetric calls on the peer rank.
+    ncclResult_t rs = ncclSend((const void*)src, n_floats, ncclFloat32,
+                               peer_send, comm->c, stream);
+    if (rs != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclSend: %s\n",
+                ncclGetErrorString(rs));
+        std::exit(1);
+    }
+    ncclResult_t rr = ncclRecv((void*)dst, n_floats, ncclFloat32,
+                               peer_recv, comm->c, stream);
+    if (rr != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclRecv: %s\n",
+                ncclGetErrorString(rr));
+        std::exit(1);
+    }
+}
+
 void mg_group_start() { ncclGroupStart(); }
 void mg_group_end()   { ncclGroupEnd(); }
 
@@ -146,6 +172,14 @@ void mg_finalize_world(MgWorld& /*w*/) {}
 void mg_allreduce_sum_f32(MgComm* /*c*/, float* /*buf*/,
                           std::size_t /*n*/, cudaStream_t /*s*/) {
     fprintf(stderr, "[multi_gpu] mg_allreduce_sum_f32 called in stub build\n");
+    std::exit(1);
+}
+
+void mg_send_recv_f32(MgComm* /*c*/,
+                      const float* /*src*/, int /*peer_send*/,
+                      float* /*dst*/, int /*peer_recv*/,
+                      std::size_t /*n*/, cudaStream_t /*s*/) {
+    fprintf(stderr, "[multi_gpu] mg_send_recv_f32 called in stub build\n");
     std::exit(1);
 }
 

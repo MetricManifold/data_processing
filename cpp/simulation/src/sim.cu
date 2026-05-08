@@ -116,23 +116,32 @@ void Simulation::alloc_gpu() {
     phi_B = cells.phi_pool + (size_t)n * TILE_AREA;
 
     // ----- Slab partition for S -----
-    // PHASE B0: regardless of `gpus`, every rank still allocates the full
-    // grid. The slab indexing helper (slab_local_y) is wired through every
-    // S kernel access, but with y_lo=0, halo_h=0, ext_height=Ny it is the
-    // identity. Both the single-GPU path and the existing replicated-S
-    // multi-GPU orchestrator (NCCL allreduce on full S) keep working.
-    //
-    // PHASE B1+ will flip this to a true slab partition (per-rank y_lo,
-    // halo_h=HALO_H, ext_height < Ny) and replace the orchestrator's
-    // allreduce with halo exchange. Bounds-check guard left in for the
-    // future flip.
-    cells.S_y_lo       = 0;
-    cells.S_halo_h     = 0;
-    cells.S_ext_height = params.Ny;
+    // For G == 1: slab covers the whole grid (y_lo=0, halo=0, ext_height=Ny).
+    // For G  > 1: slab_y_lo / slab_y_hi were set by slice_cells_to_local.
+    //             Each rank's S buffer is (slab_height + 2*HALO_H) x Nx
+    //             floats. Pixels outside [y_lo - HALO_H, y_hi + HALO_H)
+    //             (with periodic wrap) are NOT addressable on this rank;
+    //             cells whose tiles extend beyond that window violate the
+    //             slab contract and require migration to a neighbour rank.
+    if (gpus <= 1) {
+        cells.S_y_lo       = 0;
+        cells.S_halo_h     = 0;
+        cells.S_ext_height = params.Ny;
+    } else {
+        cells.S_y_lo       = slab_y_lo;
+        cells.S_halo_h     = HALO_H;
+        cells.S_ext_height = (slab_y_hi - slab_y_lo) + 2 * HALO_H;
+    }
+    // Halos must not overlap themselves around the periodic wrap. This
+    // requires slab_height + 2*HALO_H <= Ny, i.e. ext_height <= Ny.
+    // Hits when (Ny / G) is too small relative to HALO_H — for our target
+    // (Ny=10412, G=4, HALO_H=159) ext_height = 2603+318 = 2921 << 10412.
     if (cells.S_ext_height > params.Ny) {
         fprintf(stderr,
-            "[FATAL] alloc_gpu: slab ext_height (%d) > Ny (%d)\n",
-            cells.S_ext_height, params.Ny);
+            "[FATAL] alloc_gpu: slab ext_height (%d) > Ny (%d). "
+            "G=%d may be too high for Ny=%d (slab_h=%d, HALO_H=%d).\n",
+            cells.S_ext_height, params.Ny, gpus, params.Ny,
+            slab_y_hi - slab_y_lo, HALO_H);
         std::exit(1);
     }
     const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
@@ -878,31 +887,49 @@ bool Simulation::init_from_checkpoint(const std::string& path,
 // slice_cells_to_local — multi-GPU helper.
 //
 // After place_cells + apply_gamma_spec + apply_v_A_disorder have produced
-// the GLOBAL cell vector (h_cells.size() == cells_global), trim h_cells
-// down to this rank's slice. cell_offset is set; subsequent compute_origins,
-// alloc_gpu, upload_initial_state operate only on local cells.
+// the GLOBAL cell vector (h_cells.size() == cells_global), partition the
+// vector by spatial Y position: rank g keeps cells whose COM cy lies in
+// [slab_y_lo[g], slab_y_hi[g]). Slab bounds are stored on the Simulation
+// for later use (alloc_gpu, halo exchange, migration). h_global_id is
+// populated so we can recover the original cell ids for trajectory I/O.
+// For gpus == 1 this is a no-op (slab covers the full grid).
 // ---------------------------------------------------------------------------
 void Simulation::slice_cells_to_local() {
     const int n_global = (int)h_cells.size();
     cells_global = n_global;
     if (gpus <= 1) {
         cell_offset = 0;
+        slab_y_lo = 0;
+        slab_y_hi = params.Ny;
+        h_global_id.resize(n_global);
+        for (int i = 0; i < n_global; ++i) h_global_id[i] = i;
         return;
     }
-    int base = n_global / gpus;
-    int rem  = n_global % gpus;
-    int off  = rank * base + (rank < rem ? rank : rem);
-    int n_local = base + (rank < rem ? 1 : 0);
-    cell_offset = off;
-    if (off + n_local > n_global) {
-        fprintf(stderr,
-                "[FATAL] slice_cells_to_local: rank=%d off=%d n_local=%d "
-                "exceeds n_global=%d\n", rank, off, n_local, n_global);
-        std::exit(1);
+    // Compute this rank's slab bounds. Boundaries are placed at the
+    // floor of g*Ny/G so the partition is exact and reproducible.
+    slab_y_lo = (int)((long long)rank       * params.Ny / gpus);
+    slab_y_hi = (int)((long long)(rank + 1) * params.Ny / gpus);
+
+    std::vector<CellHost> kept;
+    kept.reserve(n_global / gpus + 16);
+    h_global_id.clear();
+    h_global_id.reserve(n_global / gpus + 16);
+    for (int i = 0; i < n_global; ++i) {
+        // Wrap cy into [0, Ny) for partition decision.
+        double cy = h_cells[i].cy;
+        cy = std::fmod(cy, (double)params.Ny);
+        if (cy < 0) cy += params.Ny;
+        int cy_int = (int)std::floor(cy);
+        if (cy_int >= slab_y_lo && cy_int < slab_y_hi) {
+            kept.push_back(h_cells[i]);
+            h_global_id.push_back(i);
+        }
     }
-    std::vector<CellHost> local(h_cells.begin() + off,
-                                h_cells.begin() + off + n_local);
-    h_cells.swap(local);
+    cell_offset = -1;  // not meaningful for spatial partition
+    h_cells.swap(kept);
+    fprintf(stderr,
+        "[multi-gpu] rank %d/%d: spatial slab y in [%d,%d), %d/%d cells\n",
+        rank, gpus, slab_y_lo, slab_y_hi, (int)h_cells.size(), n_global);
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,6 +1654,30 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
     const size_t S_floats = (size_t)s0.params.Nx * s0.params.Ny;
 
     // ---------------------------------------------------------------------
+    // Halo exchange staging buffers. Each rank's S buffer holds rows
+    // [y_lo - HALO_H, y_hi + HALO_H), with two boundary "bands" of size
+    // 2*HALO_H rows each: one at the top (local rows [0, 2*HALO_H)) and
+    // one at the bottom (local rows [slab_h, slab_h + 2*HALO_H)). Each
+    // exchange step: send my band to neighbour, recv neighbour's band
+    // into staging, kernel-add staging into my band. After: both ranks'
+    // bands hold the sum (the correct global S contribution from both).
+    //
+    // For G == 1 these stay at size 0 / nullptr; halo exchange is a no-op.
+    // ---------------------------------------------------------------------
+    const size_t halo_band_floats = (args.gpus > 1)
+        ? (size_t)(2 * HALO_H) * s0.params.Nx
+        : 0;
+    std::vector<float*> halo_top_recv(args.gpus, nullptr);
+    std::vector<float*> halo_bot_recv(args.gpus, nullptr);
+    if (args.gpus > 1) {
+        for (int g = 0; g < args.gpus; ++g) {
+            CK(cudaSetDevice(world.devices[g]));
+            CK(cudaMalloc(&halo_top_recv[g], halo_band_floats * sizeof(float)));
+            CK(cudaMalloc(&halo_bot_recv[g], halo_band_floats * sizeof(float)));
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Persistent worker threads, one per rank. Each thread:
     //   1. cudaSetDevice(g) once at startup (thread-local context).
     //   2. Loops:
@@ -1657,20 +1708,54 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
             cudaSetDevice(world.devices[g]);
             // Stick this thread to its device for its entire lifetime.
             // No further cudaSetDevice calls in the hot loop.
+            const int prev_rank = (g - 1 + args.gpus) % args.gpus;
+            const int next_rank = (g + 1) % args.gpus;
+            const int slab_h    = sims[g]->cells.S_ext_height
+                                  - 2 * sims[g]->cells.S_halo_h;
+            float* const S          = sims[g]->cells.S;
+            float* const my_top_band = S;                                  // rows [0, 2H)
+            float* const my_bot_band = S + (size_t)slab_h * s0.params.Nx;  // rows [slab_h, slab_h + 2H)
+
             while (true) {
                 start_barrier.wait();
                 if (shutdown.load(std::memory_order_acquire)) break;
 
                 sims[g]->step_pre_reduce();
 
-                // NCCL multi-thread mode: each thread issues its rank's
-                // collective inside its own group bracket. ncclGroupEnd
-                // synchronizes across all threads with matching brackets.
-                mg_group_start();
-                mg_allreduce_sum_f32(world.comms[g],
-                                     sims[g]->cells.S, S_floats,
+                if (args.gpus == 1) {
+                    // No allreduce, no halo: single-rank slab is the whole
+                    // grid. step_pre_reduce + step_post_reduce drives the
+                    // sim like the single-GPU path.
+                } else {
+                    // Halo exchange.
+                    //   For each boundary, neighbour's contribution must be
+                    //   summed into ours. NCCL pairs sends and recvs in
+                    //   group order: each rank sends top_band to prev,
+                    //   sends bot_band to next, recvs prev's bot_band into
+                    //   halo_top_recv, recvs next's top_band into
+                    //   halo_bot_recv. The send/recv ordering is identical
+                    //   on every rank so NCCL pairs them deterministically.
+                    mg_group_start();
+                    mg_send_recv_f32(world.comms[g],
+                                     my_top_band, prev_rank,
+                                     halo_top_recv[g], prev_rank,
+                                     halo_band_floats,
                                      sims[g]->step_stream);
-                mg_group_end();
+                    mg_send_recv_f32(world.comms[g],
+                                     my_bot_band, next_rank,
+                                     halo_bot_recv[g], next_rank,
+                                     halo_band_floats,
+                                     sims[g]->step_stream);
+                    mg_group_end();
+
+                    // Fold neighbour contributions into our local bands.
+                    // After: both bands contain (my contributions +
+                    // neighbour contributions) for the matching global rows.
+                    launch_halo_add(my_top_band, halo_top_recv[g],
+                                    halo_band_floats, sims[g]->step_stream);
+                    launch_halo_add(my_bot_band, halo_bot_recv[g],
+                                    halo_band_floats, sims[g]->step_stream);
+                }
 
                 sims[g]->step_post_reduce();
 
@@ -1757,6 +1842,13 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
     for (int g = 0; g < args.gpus; ++g) {
         CK(cudaSetDevice(world.devices[g]));
         sims[g]->cleanup();
+    }
+    if (args.gpus > 1) {
+        for (int g = 0; g < args.gpus; ++g) {
+            cudaSetDevice(world.devices[g]);
+            if (halo_top_recv[g]) cudaFree(halo_top_recv[g]);
+            if (halo_bot_recv[g]) cudaFree(halo_bot_recv[g]);
+        }
     }
     mg_finalize_world(world);
     return 0;

@@ -88,7 +88,17 @@ struct Simulation {
     int rank           = 0;
     int device         = 0;
     int cells_global   = 0;   // total cells across the world
-    int cell_offset    = 0;   // global index of this rank's first cell
+    int cell_offset    = 0;   // first global cell id (B0 only — kept for
+                              // single-GPU and contiguous-id slicing)
+    // Spatial partition along y. For G==1 these stay 0..Ny / no halo.
+    // For G>1 they are set by slice_cells_to_local() before alloc_gpu().
+    int slab_y_lo      = 0;
+    int slab_y_hi      = 0;
+    // Global cell id of each local cell, length == h_cells.size(). For
+    // G=1 this is just [0, n_cells). For G>1 it is the spatial-partition
+    // permutation of [0, n_global) and is NOT contiguous. Used for
+    // trajectory/checkpoint output and for cell migration tracking.
+    std::vector<int> h_global_id;
 
     void init(const SimParams& p, int n_cells);
     bool init_from_checkpoint(const std::string& path,
