@@ -1,5 +1,6 @@
 // main.cu — CLI entry point
 #include "sim.cuh"
+#include "multi_gpu.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +59,11 @@ static void usage(const char* prog) {
     printf("                        (file format: lines `t cid [old_theta] new_theta`,\n");
     printf("                         3- or 4-col; '#' header lines ignored). Disables\n");
     printf("                         the per-step PRNG tumble path entirely.\n");
+    printf("  --gpus <n>            Run on N GPUs (default: 1). N>1 requires a build with\n");
+    printf("                        -DENABLE_MULTI_GPU=ON (NCCL). Single-process,\n");
+    printf("                        one-thread, multi-device. Cells are partitioned\n");
+    printf("                        across GPUs; the global S(x,y) field is replicated\n");
+    printf("                        and kept in sync via NCCL all-reduce per step.\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -85,6 +91,7 @@ int main(int argc, char** argv) {
     bool live_view_interval_set = false;
     double live_view_tu = 5.0;    // Default frame interval in time units.
     std::string scripted_events_path;
+    int gpus = 1;                 // --gpus N. >1 requires ENABLE_MULTI_GPU.
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-n") && i+1<argc) { ncells = atoi(argv[++i]); ncells_set = true; }
@@ -160,6 +167,13 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--scripted-events") && i+1<argc) {
             scripted_events_path = argv[++i];
         }
+        else if (!strcmp(argv[i], "--gpus") && i+1<argc) {
+            gpus = atoi(argv[++i]);
+            if (gpus < 1) {
+                fprintf(stderr, "Error: --gpus must be >= 1 (got %d)\n", gpus);
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }
     }
@@ -203,6 +217,44 @@ int main(int argc, char** argv) {
     }
 
     MKDIR(outdir.c_str());
+
+    // ---- Multi-GPU dispatch ----
+    // --gpus 1 always falls through to the single-GPU path below
+    // (preserves the captured-graph fast path and is bit-identical to a
+    // no-NCCL build). --gpus > 1 routes to the orchestrator in sim.cu;
+    // requires ENABLE_MULTI_GPU=ON at build time.
+    if (gpus > 1) {
+        if (!mg_available()) {
+            fprintf(stderr,
+                "Error: --gpus %d requested but this binary was built "
+                "without ENABLE_MULTI_GPU. Rebuild with cmake "
+                "-DENABLE_MULTI_GPU=ON to enable multi-GPU.\n", gpus);
+            return 1;
+        }
+        if (!scripted_events_path.empty()) {
+            fprintf(stderr,
+                "Error: --scripted-events is not yet supported on --gpus>1.\n");
+            return 1;
+        }
+        if (live_view) {
+            fprintf(stderr,
+                "Error: --live-view is incompatible with --gpus>1.\n");
+            return 1;
+        }
+        MultiGpuRunArgs args;
+        args.params              = p;
+        args.ov                  = ov;
+        args.ncells_global       = ncells;
+        args.gpus                = gpus;
+        args.outdir              = outdir;
+        args.ckpt_path           = ckpt_path;
+        args.gamma_spec          = gamma_spec;
+        args.v_A_sigma           = v_A_sigma;
+        args.checkpoint_interval = checkpoint_interval;
+        args.vtk_interval        = vtk_interval;
+        args.save_final          = save_final;
+        return run_multi_gpu(args);
+    }
 
     Simulation sim;
     sim.out_dir = outdir;

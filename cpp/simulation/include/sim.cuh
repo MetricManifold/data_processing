@@ -71,6 +71,25 @@ struct Simulation {
     float*          phi_A                  = nullptr;  // phi_pool half 0
     float*          phi_B                  = nullptr;  // phi_pool half 1
 
+    // ---- Multi-GPU partitioning (single-GPU defaults are: gpus=1, rank=0,
+    // device=0, cells_global = cells.num_cells, cell_offset = 0).
+    //
+    // In a multi-GPU run (--gpus G), one Simulation instance is created
+    // per rank by the orchestrator in src/multi_gpu.cu. Each instance
+    // performs the full deterministic GLOBAL cell placement (using
+    // params.seed) so per-cell scalars and origins are bit-identical
+    // across ranks before slicing, then keeps only its local slice
+    // [cell_offset, cell_offset + cells.num_cells) inside h_cells and
+    // GPU buffers. The global S(x,y) is REPLICATED on every rank and
+    // kept consistent by an NCCL all-reduce sandwiched between the
+    // pre-reduce and post-reduce step phases (see step_pre_reduce /
+    // step_post_reduce below).
+    int gpus           = 1;
+    int rank           = 0;
+    int device         = 0;
+    int cells_global   = 0;   // total cells across the world
+    int cell_offset    = 0;   // global index of this rank's first cell
+
     void init(const SimParams& p, int n_cells);
     bool init_from_checkpoint(const std::string& path,
                               const SimParams& cli_params,
@@ -80,6 +99,10 @@ struct Simulation {
 
     // internal
     void place_cells(int n, double R);
+    // After place_cells + apply_gamma_spec + apply_v_A_disorder have run
+    // on the GLOBAL cell vector (h_cells), trim h_cells to this rank's
+    // slice [cell_offset, cell_offset + count). No-op when gpus <= 1.
+    void slice_cells_to_local();
     void compute_origins();
     void alloc_gpu();
     void configure_l2_persistence();
@@ -88,6 +111,14 @@ struct Simulation {
     void apply_v_A_disorder();
     void finalize_init();
     void step();
+    // Multi-GPU step decomposition. The orchestrator drives:
+    //   for each rank g: sim[g].step_pre_reduce()
+    //   ncclGroupStart(); for each g: ncclAllReduce(S); ncclGroupEnd()
+    //   for each rank g: sim[g].step_post_reduce()
+    // step() (single-GPU monolithic, with graph fast path) calls neither
+    // of these — it remains the hot path for --gpus 1.
+    void step_pre_reduce();
+    void step_post_reduce();
     void print_status();
     void write_trajectory();
     void write_vtk();
@@ -97,3 +128,28 @@ struct Simulation {
         return (int)std::ceil(std::sqrt((double)n * M_PI * R * R / rho));
     }
 };
+
+// ---------------------------------------------------------------------------
+// Multi-GPU orchestrator. Defined in src/multi_gpu.cu when ENABLE_MULTI_GPU
+// is ON. Returns 0 on success. Handles cudaSetDevice, NCCL world setup,
+// per-rank Simulation init (fresh or from checkpoint), the lockstep step
+// loop with NCCL all-reduce on S, and rank-0-driven I/O. Caller owns
+// nothing — full lifecycle is managed inside.
+//
+// When ENABLE_MULTI_GPU is OFF this function is not defined; main.cu
+// guards the call with mg_available() and never reaches it.
+// ---------------------------------------------------------------------------
+struct MultiGpuRunArgs {
+    SimParams     params;
+    SimOverrides  ov;
+    int           ncells_global  = 0;
+    int           gpus           = 1;
+    std::string   outdir         = "./output";
+    std::string   ckpt_path;          // empty -> fresh init
+    std::string   gamma_spec;
+    double        v_A_sigma      = 0.0;
+    int           checkpoint_interval = 0;
+    int           vtk_interval        = 0;
+    bool          save_final          = true;
+};
+int run_multi_gpu(const MultiGpuRunArgs& args);

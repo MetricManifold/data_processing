@@ -31,10 +31,21 @@
 
 // ---------------------------------------------------------------------------
 // place_cells — rejection sampling with periodic distance.
+//
+// Multi-GPU semantics: `n` is always the GLOBAL cell count. Every rank
+// runs the identical RNG-driven placement (same params.seed) so the
+// generated cells are bit-identical across ranks. h_cells is left
+// containing the full GLOBAL vector after this call; slice_cells_to_local
+// (called after apply_gamma_spec / apply_v_A_disorder) trims it to this
+// rank's slice. apply_gamma_spec / apply_v_A_disorder need the global
+// vector because spec selectors like `cluster(p%, x, y)` and `nearest(x, y)`
+// depend on the global population layout.
 // ---------------------------------------------------------------------------
 void Simulation::place_cells(int n, double R) {
     unsigned s = params.seed ? params.seed : 42;
     srand(s);
+    cells_global = n;
+    if (gpus <= 1) cell_offset = 0;
     h_cells.resize(n);
     if (n == 1) {
         h_cells[0] = {(double)(params.Nx / 2), (double)(params.Ny / 2),
@@ -68,6 +79,8 @@ void Simulation::place_cells(int n, double R) {
             spacing *= 0.95;
             if (spacing < R) {
                 fprintf(stderr, "Warning: placed %d/%d\n", placed, n);
+                h_cells.resize(placed);
+                cells_global = placed;
                 break;
             }
         }
@@ -455,12 +468,20 @@ void Simulation::init(const SimParams& p, int n_cells) {
     place_cells(n_cells, params.target_radius);
     apply_gamma_spec();
     apply_v_A_disorder();
+    slice_cells_to_local();
     compute_origins();
     alloc_gpu();
     upload_initial_state();
     finalize_init();
-    printf("[SIM] init: %d cells, t_end=%.1f, dt=%.4f, traj_every=%d\n",
-           n_cells, params.t_end, params.dt, traj_every);
+    if (gpus > 1) {
+        printf("[SIM] init rank=%d/%d: %d/%d cells (offset=%d), "
+               "t_end=%.1f, dt=%.4f, traj_every=%d\n",
+               rank, gpus, (int)h_cells.size(), cells_global, cell_offset,
+               params.t_end, params.dt, traj_every);
+    } else {
+        printf("[SIM] init: %d cells, t_end=%.1f, dt=%.4f, traj_every=%d\n",
+               n_cells, params.t_end, params.dt, traj_every);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -813,10 +834,54 @@ bool Simulation::init_from_checkpoint(const std::string& path,
 
     finalize_init();
 
+    if (gpus > 1) {
+        cells_global = nc;
+        // TODO(multi-gpu phase B): partition checkpoint load across ranks.
+        // Currently all ranks load the entire checkpoint and only one
+        // rank's worth is on-device. Acceptable for first multi-GPU
+        // bring-up; revisit when N_global * (TILE_AREA*4 + ~8 floats)
+        // becomes large enough that loading time matters.
+        fprintf(stderr,
+                "[multi-gpu] WARNING: checkpoint resume on --gpus>1 currently "
+                "loads the full checkpoint on every rank without slicing. "
+                "First-pass support; correctness for resumed multi-GPU runs "
+                "is not yet validated.\n");
+    }
     printf("[SIM] resumed from %s: step=%d, t=%.4f, %d cells, %dx%d, t_end=%.1f\n",
            path.c_str(), step_count, cur_time, n,
            params.Nx, params.Ny, params.t_end);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// slice_cells_to_local — multi-GPU helper.
+//
+// After place_cells + apply_gamma_spec + apply_v_A_disorder have produced
+// the GLOBAL cell vector (h_cells.size() == cells_global), trim h_cells
+// down to this rank's slice. cell_offset is set; subsequent compute_origins,
+// alloc_gpu, upload_initial_state operate only on local cells.
+// ---------------------------------------------------------------------------
+void Simulation::slice_cells_to_local() {
+    const int n_global = (int)h_cells.size();
+    cells_global = n_global;
+    if (gpus <= 1) {
+        cell_offset = 0;
+        return;
+    }
+    int base = n_global / gpus;
+    int rem  = n_global % gpus;
+    int off  = rank * base + (rank < rem ? rank : rem);
+    int n_local = base + (rank < rem ? 1 : 0);
+    cell_offset = off;
+    if (off + n_local > n_global) {
+        fprintf(stderr,
+                "[FATAL] slice_cells_to_local: rank=%d off=%d n_local=%d "
+                "exceeds n_global=%d\n", rank, off, n_local, n_global);
+        std::exit(1);
+    }
+    std::vector<CellHost> local(h_cells.begin() + off,
+                                h_cells.begin() + off + n_local);
+    h_cells.swap(local);
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +979,92 @@ void Simulation::step() {
             }
             exit(1);
         }
+    }
+#endif
+    step_count++;
+    cur_time += params.dt;
+}
+
+// ---------------------------------------------------------------------------
+// step_pre_reduce / step_post_reduce — multi-GPU step decomposition.
+// ---------------------------------------------------------------------------
+// The orchestrator drives one step like this, for each rank g in lockstep:
+//
+//   for g: sim[g].step_pre_reduce();          // polar + scatter to LOCAL S
+//   ncclGroupStart();
+//   for g: ncclAllReduce(S, sum, comm[g], stream[g]);
+//   ncclGroupEnd();
+//   for g: sim[g].step_post_reduce();         // evolve + maybe rebind
+//
+// Graph capture is NOT used on this path — capturing across an external
+// NCCL collective is fragile, and the per-step graph savings (~3-5us) are
+// dwarfed by the all-reduce. The graph fast path remains in step() above
+// and is what --gpus 1 always uses.
+//
+// step_pre_reduce / step_post_reduce together advance step_count and
+// cur_time by exactly one step (post_reduce does the increment). It is
+// the orchestrator's responsibility to issue them in pairs.
+// ---------------------------------------------------------------------------
+void Simulation::step_pre_reduce() {
+    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+
+    if (scripted_active) {
+        int begin = scripted_cursor;
+        const int total = (int)h_scripted_step.size();
+        while (scripted_cursor < total
+               && h_scripted_step[scripted_cursor] == step_count) {
+            scripted_cursor++;
+        }
+        int count = scripted_cursor - begin;
+        if (count > 0) {
+            launch_apply_scripted(cells,
+                                  d_scripted_cid + begin,
+                                  d_scripted_theta + begin,
+                                  count, step_stream);
+        }
+    } else {
+        launch_polar(cells, params, step_stream);
+    }
+    launch_scatter_S(cells, params, step_stream);
+}
+
+void Simulation::step_post_reduce() {
+    int next_step = step_count + 1;
+    const bool will_rebind = (next_step % REBIND_EVERY) == 0;
+    const bool will_traj   = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
+    const bool will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
+    const bool will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
+    const bool will_vtk    = (vtk_interval > 0 && next_step % vtk_interval == 0);
+    const bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
+
+    launch_evolve(cells, params, need_full_red, step_stream);
+    parity ^= 1;
+    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+
+    if (will_rebind) {
+        launch_rebind(cells,
+                      (float)params.subdomain_padding,
+                      (float)params.gamma, step_stream);
+        parity ^= 1;
+        cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+        cells.phi_out = (parity == 0) ? phi_B : phi_A;
+    }
+
+#ifndef NDEBUG
+    cudaError_t err = cudaPeekAtLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA] step %d (peek): %s\n", step_count,
+                cudaGetErrorString(err));
+        fflush(stderr);
+        cudaError_t serr = cudaDeviceSynchronize();
+        if (serr != cudaSuccess) {
+            fprintf(stderr, "[CUDA] step %d (sync): %s\n", step_count,
+                    cudaGetErrorString(serr));
+            fflush(stderr);
+        }
+        exit(1);
     }
 #endif
     step_count++;
@@ -1310,3 +1461,284 @@ void Simulation::cleanup() {
     cf(d_scripted_cid);
     cf(d_scripted_theta);
 }
+
+// ===========================================================================
+// Multi-GPU orchestrator (single process, one host thread, NCCL).
+// Compiled only when ENABLE_MULTI_GPU is ON. main.cu always sees the
+// declaration (in sim.cuh) but only invokes it under mg_available().
+// ===========================================================================
+
+#include "multi_gpu.cuh"
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+
+#ifdef ENABLE_MULTI_GPU
+
+#ifdef _WIN32
+  #include <direct.h>
+  #define MG_MKDIR(d) _mkdir(d)
+#else
+  #include <sys/stat.h>
+  #define MG_MKDIR(d) mkdir(d, 0755)
+#endif
+
+// ---------------------------------------------------------------------------
+// MgBarrier — reusable cyclic barrier. Required because we drive the multi-
+// GPU step pipeline from one persistent host thread per rank: each step has
+// distinct phases (kernel-launch vs I/O) that must not overlap. A barrier
+// here lets all G workers finish a phase before the main thread observes the
+// per-rank state for I/O / termination.
+// ---------------------------------------------------------------------------
+struct MgBarrier {
+    std::mutex              m;
+    std::condition_variable cv;
+    int                     n;            // total participants (workers + main)
+    int                     arrived = 0;
+    uint64_t                gen     = 0;
+
+    explicit MgBarrier(int participants) : n(participants) {}
+
+    void wait() {
+        std::unique_lock<std::mutex> lk(m);
+        uint64_t my_gen = gen;
+        if (++arrived == n) {
+            arrived = 0;
+            ++gen;
+            cv.notify_all();
+        } else {
+            cv.wait(lk, [&]{ return gen != my_gen; });
+        }
+    }
+};
+
+int run_multi_gpu(const MultiGpuRunArgs& args) {
+    MgWorld world;
+    if (!mg_init_world(args.gpus, world)) return 1;
+
+    // ---- Per-rank Simulation construction & init ----
+    std::vector<std::unique_ptr<Simulation>> sims;
+    sims.reserve(args.gpus);
+    for (int g = 0; g < args.gpus; ++g) {
+        CK(cudaSetDevice(world.devices[g]));
+        auto sim = std::make_unique<Simulation>();
+        sim->gpus    = args.gpus;
+        sim->rank    = g;
+        sim->device  = world.devices[g];
+        // Per-rank output dir. Rank 0 writes to the user-supplied --output
+        // path (so the canonical files land where users expect); other
+        // ranks write to {outdir}/rank{g}/ to keep their slice
+        // checkpoints / trajectories segregated.
+        sim->out_dir = (g == 0) ? args.outdir
+                                : args.outdir + "/rank" + std::to_string(g);
+        MG_MKDIR(sim->out_dir.c_str());
+
+        sim->save_final_checkpoint = args.save_final;
+        sim->checkpoint_interval   = args.checkpoint_interval;
+        sim->gamma_spec            = args.gamma_spec;
+        sim->v_A_sigma             = args.v_A_sigma;
+        sim->vtk_interval          = args.vtk_interval;
+
+        if (!args.ckpt_path.empty()) {
+            if (!sim->init_from_checkpoint(args.ckpt_path,
+                                           args.params, args.ov)) {
+                mg_finalize_world(world);
+                return 1;
+            }
+        } else {
+            if (g == 0) {
+                printf("=== Phase-Field Cell Simulation (v2, multi-GPU --gpus %d) ===\n",
+                       args.gpus);
+                printf("Cells (global): %d, R=%.1f, Domain: %dx%d\n",
+                       args.ncells_global, args.params.target_radius,
+                       args.params.Nx, args.params.Ny);
+                printf("gamma=%.2f, kappa=%.2f, mu=%.2f, lambda=%.2f\n",
+                       args.params.gamma, args.params.kappa,
+                       args.params.mu, args.params.lambda);
+                printf("v_A=%.4f, xi=%.1f, tau=%.1f, dt=%.4f, t_end=%.1f\n",
+                       args.params.v_A, args.params.xi, args.params.tau,
+                       args.params.dt, args.params.t_end);
+            }
+            sim->init(args.params, args.ncells_global);
+        }
+        sims.push_back(std::move(sim));
+    }
+
+    // After init, every rank has its own step_stream, its own NCCL comm,
+    // and its own (replicated) cells.S of size Nx*Ny floats. The S values
+    // are stale until the first step's pre-reduce fills them; the initial
+    // velocity is computed inside finalize_init using each rank's LOCAL
+    // S (sum of its own cells only). For motility-driven runs that is a
+    // small first-step transient that washes out within ~tau / dt steps,
+    // so we accept it for first bring-up. (Phase B: do an initial NCCL
+    // all-reduce on S right after finalize_init and re-run
+    // launch_initial_velocity to seed the first trajectory write.)
+
+    Simulation& s0 = *sims[0];
+    int target_step = std::max(s0.step_count, (int)(s0.params.t_end / s0.params.dt));
+    int total       = target_step - s0.step_count;
+    auto t0         = std::chrono::high_resolution_clock::now();
+
+    // Open per-rank trajectory files.
+    for (int g = 0; g < args.gpus; ++g) {
+        Simulation& s = *sims[g];
+        if (s.traj_every <= 0) continue;
+        std::string tp = s.out_dir + "/trajectory.txt";
+        s.traj_fp = fopen(tp.c_str(), "a");
+        if (!s.traj_fp) continue;
+        fseek(s.traj_fp, 0, SEEK_END);
+        if (ftell(s.traj_fp) == 0) {
+            fprintf(s.traj_fp,
+                "# Trajectory data (rank %d, cells [%d, %d) of %d global)\n",
+                g, s.cell_offset,
+                s.cell_offset + (int)s.h_cells.size(), s.cells_global);
+            fprintf(s.traj_fp,
+                "# Format: time cell_id x y vx vy px py theta v_A_i L_n volume\n");
+            fprintf(s.traj_fp,
+                "# v_A=%.6f N_global=%d N_local=%d Lx=%d Ly=%d dim=2 dt=%.6f tau=%.4f\n",
+                s.params.v_A, s.cells_global, (int)s.h_cells.size(),
+                s.params.Nx, s.params.Ny, s.params.dt, s.params.tau);
+        }
+    }
+
+    const size_t S_floats = (size_t)s0.params.Nx * s0.params.Ny;
+
+    // ---------------------------------------------------------------------
+    // Persistent worker threads, one per rank. Each thread:
+    //   1. cudaSetDevice(g) once at startup (thread-local context).
+    //   2. Loops:
+    //        wait at start_barrier (woken by main thread once per step)
+    //        if shutdown: break
+    //        step_pre_reduce(); ncclGroupStart/AllReduce/GroupEnd;
+    //        step_post_reduce();
+    //        wait at end_barrier (releases main thread for I/O)
+    //
+    // Why threads (vs the previous single-host-thread loop):
+    //   The previous orchestrator issued every kernel launch sequentially
+    //   on one host thread, with cudaSetDevice() context flips between
+    //   ranks. With G ranks each issuing ~7 launches/step, the host-side
+    //   serialization added ~G * 7 * ~10us = ~280us/step at G=4 — enough
+    //   to dominate the ~1ms/step compute at N=1152 and turn 4-GPU into
+    //   a 3.15x slowdown vs single-GPU. Per-rank threads parallelize the
+    //   launches, the GPUs run concurrently, and ncclGroupEnd
+    //   synchronizes the all-reduce across threads at the right moment.
+    // ---------------------------------------------------------------------
+    MgBarrier start_barrier(args.gpus + 1);  // workers + main
+    MgBarrier end_barrier(args.gpus + 1);
+    std::atomic<bool> shutdown{false};
+
+    std::vector<std::thread> workers;
+    workers.reserve(args.gpus);
+    for (int g = 0; g < args.gpus; ++g) {
+        workers.emplace_back([&, g] {
+            cudaSetDevice(world.devices[g]);
+            // Stick this thread to its device for its entire lifetime.
+            // No further cudaSetDevice calls in the hot loop.
+            while (true) {
+                start_barrier.wait();
+                if (shutdown.load(std::memory_order_acquire)) break;
+
+                sims[g]->step_pre_reduce();
+
+                // NCCL multi-thread mode: each thread issues its rank's
+                // collective inside its own group bracket. ncclGroupEnd
+                // synchronizes across all threads with matching brackets.
+                mg_group_start();
+                mg_allreduce_sum_f32(world.comms[g],
+                                     sims[g]->cells.S, S_floats,
+                                     sims[g]->step_stream);
+                mg_group_end();
+
+                sims[g]->step_post_reduce();
+
+                end_barrier.wait();
+            }
+        });
+    }
+
+    while (sims[0]->step_count < target_step) {
+        // Wake all workers; they advance the step count atomically.
+        start_barrier.wait();
+        // Block until every worker has finished post_reduce.
+        end_barrier.wait();
+
+        // ---- I/O on cadence (per-rank, segregated dirs) ----
+        int sc = sims[0]->step_count;
+        bool wrote_any = false;
+        if (s0.params.save_interval > 0 && sc % s0.params.save_interval == 0) {
+            char tag[32]; snprintf(tag, sizeof(tag), "%08d", sc);
+            for (int g = 0; g < args.gpus; ++g) {
+                CK(cudaSetDevice(world.devices[g]));
+                sims[g]->save_checkpoint(sims[g]->out_dir, tag);
+            }
+            wrote_any = true;
+        }
+        if (s0.checkpoint_interval > 0 && sc % s0.checkpoint_interval == 0) {
+            for (int g = 0; g < args.gpus; ++g) {
+                CK(cudaSetDevice(world.devices[g]));
+                sims[g]->save_checkpoint(sims[g]->out_dir);
+            }
+            wrote_any = true;
+        }
+        if (sims[0]->traj_every > 0 && sc % sims[0]->traj_every == 0) {
+            for (int g = 0; g < args.gpus; ++g) {
+                CK(cudaSetDevice(world.devices[g]));
+                sims[g]->write_trajectory();
+            }
+            wrote_any = true;
+        }
+        if (s0.vtk_interval > 0 && sc % s0.vtk_interval == 0) {
+            CK(cudaSetDevice(world.devices[0]));
+            sims[0]->write_vtk();
+            wrote_any = true;
+        }
+        (void)wrote_any;
+        if (s0.params.print_interval > 0 && sc % s0.params.print_interval == 0) {
+            for (int g = 0; g < args.gpus; ++g) {
+                CK(cudaSetDevice(world.devices[g]));
+                printf("[rank %d] ", g);
+                sims[g]->print_status();
+            }
+        }
+    }
+
+    // Tell workers to exit, then wake them so they observe the flag.
+    shutdown.store(true, std::memory_order_release);
+    start_barrier.wait();
+    for (auto& t : workers) t.join();
+
+    for (int g = 0; g < args.gpus; ++g) {
+        if (sims[g]->traj_fp) {
+            fclose(sims[g]->traj_fp);
+            sims[g]->traj_fp = nullptr;
+        }
+    }
+
+    if (s0.save_final_checkpoint) {
+        for (int g = 0; g < args.gpus; ++g) {
+            CK(cudaSetDevice(world.devices[g]));
+            sims[g]->save_checkpoint(sims[g]->out_dir);
+        }
+    }
+
+    for (int g = 0; g < args.gpus; ++g) {
+        CK(cudaSetDevice(world.devices[g]));
+        CK(cudaDeviceSynchronize());
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double wall = std::chrono::duration<double>(t1 - t0).count();
+    int denom = std::max(1, total);
+    printf("[SIM] Done (multi-GPU --gpus %d): %d steps, t=%.2f, wall=%.3fs (%.3f ms/step)\n",
+           args.gpus, total, sims[0]->cur_time, wall, wall * 1000.0 / denom);
+
+    for (int g = 0; g < args.gpus; ++g) {
+        CK(cudaSetDevice(world.devices[g]));
+        sims[g]->cleanup();
+    }
+    mg_finalize_world(world);
+    return 0;
+}
+
+#endif  // ENABLE_MULTI_GPU

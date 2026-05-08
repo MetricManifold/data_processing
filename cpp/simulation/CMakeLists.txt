@@ -48,6 +48,13 @@ endif()
 # CLUSTER BUILDS (headless nodes, no display).
 option(ENABLE_VISUALIZER "Build the live CUDA-OpenGL viewer (--live-view)" OFF)
 
+# Optional multi-GPU support via NCCL. OFF by default so Windows local
+# builds (no NCCL) still compile. Cluster builds (Nibi/Fir H100 nodes)
+# turn this ON to enable --gpus N for N>1. The single-GPU path is
+# unaffected either way (--gpus 1 is bit-identical regardless of this
+# option).
+option(ENABLE_MULTI_GPU "Build with NCCL multi-GPU support (--gpus >1)" OFF)
+
 # TILE_T compile-time tile edge (px). 320 covers aspect-ratio ~5 cells
 # (clearance T/2-1 = 159 px); 192 was tight for soft cells. Memory cost
 # scales as 2*T^2*4 B/cell (320 -> 819 KB/cell vs 192 -> 295 KB/cell).
@@ -57,6 +64,7 @@ set(CELL_SIM_SOURCES
     src/main.cu
     src/kernels.cu
     src/sim.cu
+    src/multi_gpu.cu
 )
 if(ENABLE_VISUALIZER)
     list(APPEND CELL_SIM_SOURCES src/visualizer.cu)
@@ -79,6 +87,40 @@ if(ENABLE_VISUALIZER)
     target_compile_definitions(cell_sim PRIVATE ENABLE_VISUALIZER)
     target_link_libraries(cell_sim PRIVATE glfw OpenGL::GL)
     message(STATUS "cell_sim: live viewer ENABLED (--live-view available)")
+endif()
+
+if(ENABLE_MULTI_GPU)
+    # NCCL is shipped under the CUDA toolkit on cluster H100 nodes (e.g.
+    # nibi: $CUDA_HOME/include/nccl.h, $CUDA_HOME/lib/libnccl.so) and
+    # also as a standalone tarball. Try CUDA_HOME first, then NCCL_ROOT.
+    find_path(NCCL_INCLUDE_DIR nccl.h
+        HINTS
+            $ENV{NCCL_ROOT}/include
+            $ENV{CUDA_HOME}/include
+            $ENV{CUDA_PATH}/include
+            ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    find_library(NCCL_LIBRARY nccl
+        HINTS
+            $ENV{NCCL_ROOT}/lib
+            $ENV{NCCL_ROOT}/lib64
+            $ENV{CUDA_HOME}/lib
+            $ENV{CUDA_HOME}/lib64
+            $ENV{CUDA_PATH}/lib
+            $ENV{CUDA_PATH}/lib64
+    )
+    if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+        message(FATAL_ERROR
+            "ENABLE_MULTI_GPU=ON but NCCL not found. "
+            "Set NCCL_ROOT or load the cluster module that provides nccl.h "
+            "(on nibi: `module load nccl`).")
+    endif()
+    target_compile_definitions(cell_sim PRIVATE ENABLE_MULTI_GPU)
+    target_include_directories(cell_sim PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(cell_sim PRIVATE ${NCCL_LIBRARY})
+    message(STATUS "cell_sim: multi-GPU ENABLED (NCCL=${NCCL_LIBRARY})")
+else()
+    message(STATUS "cell_sim: multi-GPU DISABLED (--gpus must be 1)")
 endif()
 set_target_properties(cell_sim PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
