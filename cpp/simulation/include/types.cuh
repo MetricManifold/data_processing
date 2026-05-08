@@ -84,6 +84,25 @@ static_assert(TILE_T % 2 == 0, "TILE_T must be even");
 static constexpr int TILE_AREA     = TILE_T * TILE_T;
 static constexpr int REBIND_EVERY  = 8;
 
+// ---------------------------------------------------------------------------
+// Multi-GPU slab decomposition (1D along y).
+//
+// HALO_H is the maximum number of pixels a cell's nonzero phi can extend
+// past its COM along either axis. It is hard-fixed by the rect clamp in
+// k_rebind: hmax = TILE_T/2 - 1, after which the cell's phi is identically
+// zero. So if a cell's rebind-time COM is at row cy_r, all its nonzero
+// pixels lie in rows [cy_r - HALO_H, cy_r + HALO_H]. Owning rank g for
+// rows [slab_lo[g], slab_hi[g]) therefore needs S allocated for rows
+// [slab_lo[g] - HALO_H, slab_hi[g] + HALO_H) — the "extended slab".
+// No alignment slack needed; the contract is tight by construction.
+//
+// Cell migration (transfer of ownership when COM crosses slab boundary) is
+// done at rebind, before scatter, so the contract is re-established every
+// REBIND_EVERY steps using the up-to-date COM. Between rebinds, COM drift
+// is bounded by velocity * REBIND_EVERY * dt and is at most a few pixels.
+// ---------------------------------------------------------------------------
+static constexpr int HALO_H        = TILE_T / 2 - 1;
+
 // Adaptive rect parameters (host constants used in init / k_rebind).
 //   bbox_k       half-width = ceil(k * sigma + margin) per axis
 //   bbox_margin  px added on each side; sized to R/2 in k_rebind so rect
@@ -92,6 +111,50 @@ static constexpr int REBIND_EVERY  = 8;
 //   bbox_min     minimum half-width (avoids degenerate small rects)
 static constexpr int TILE_BBOX_ALIGN = 16;
 static constexpr int TILE_BBOX_MIN   = 32;
+
+// ---------------------------------------------------------------------------
+// SlabInfo — per-rank y-axis partition.
+//
+// Holds enough state for a kernel to translate a global pixel y in
+// [0, Ny) to a local row index in [0, ext_height). The slab covers global
+// rows [y_lo, y_hi) and stores HALO_H rows on each side, giving an
+// extended height ext_height = (y_hi - y_lo) + 2 * HALO_H. The buffer
+// for S is allocated with that height; row 0 of the buffer corresponds
+// to global row (y_lo - HALO_H) mod Ny.
+//
+// For the single-GPU build path (gpus == 1) we set y_lo = 0, y_hi = Ny,
+// halo_h = 0, ext_height = Ny — i.e. the slab is the whole grid and the
+// translation is the identity. This keeps the kernel code uniform
+// regardless of gpus.
+// ---------------------------------------------------------------------------
+struct SlabInfo {
+    int y_lo      = 0;   // first global row this rank owns
+    int y_hi      = 0;   // one past last global row this rank owns
+    int halo_h    = 0;   // HALO_H for multi-rank, 0 for single-rank
+    int ext_height = 0;  // (y_hi - y_lo) + 2 * halo_h, == Ny for single-rank
+    int Ny        = 0;   // global Ny (needed for periodic wrap)
+};
+
+// __device__ y-translation helper. Maps a global row index gy (in
+// [0, Ny)) to the local row index in our slab buffer.
+//
+// For multi-GPU, the slab "wraps around" the periodic boundary if
+// (y_lo - halo_h) is negative or (y_hi + halo_h) exceeds Ny. The math is
+// uniform: subtract the buffer's leftmost global row (y_lo - halo_h) and
+// add Ny once if we underflow, mod Ny.
+//
+// For G=1 this is exactly the identity (since y_lo=0, halo_h=0, ext=Ny).
+// ---------------------------------------------------------------------------
+__host__ __device__ __forceinline__
+int slab_local_y(int gy, int y_lo, int halo_h, int ext_height, int Ny) {
+    int dy = gy - y_lo + halo_h;
+    if (dy < 0)            dy += Ny;
+    else if (dy >= Ny)     dy -= Ny;
+    // dy is now in [0, Ny). For an in-slab access it must also be in
+    // [0, ext_height). The kernels guarantee this by construction (cells
+    // owned by this rank have all phi within [y_lo - halo_h, y_hi + halo_h)).
+    return dy;
+}
 
 // ---------------------------------------------------------------------------
 // All GPU arrays — SoA layout:
@@ -115,6 +178,14 @@ struct CellArrays {
 
     // Global sum field S(x,y) = sum_n phi_n(x,y)^2. Atomic-scatter target.
     float* S = nullptr;            // [Nx * Ny]
+
+    // Slab partition descriptor for S (single-GPU defaults: covers the
+    // whole grid). All kernels that touch S use these to translate a
+    // global y coordinate to a local row index in the S buffer; for the
+    // single-GPU defaults the translation is the identity.
+    int S_y_lo       = 0;          // first global row this rank's S covers
+    int S_halo_h     = 0;          // halo rows on each side (G=1: 0)
+    int S_ext_height = 0;          // (y_hi - y_lo) + 2*halo_h; equals Ny for G=1
 
     // Per-cell tile origin in global coords (gx0, gy0 interleaved).
     int* origin = nullptr;         // [2 * N]

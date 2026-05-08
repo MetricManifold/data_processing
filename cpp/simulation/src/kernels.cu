@@ -103,7 +103,8 @@ __global__ void k_scatter_S(
     const int*   __restrict__ origin,
     const int*   __restrict__ rect,
     float* __restrict__ S,
-    int N, int L, int CHUNK_PIXELS)
+    int N, int L, int CHUNK_PIXELS,
+    int y_lo, int halo_h)
 {
     const int n  = blockIdx.y;
     const int cb = blockIdx.x;       // chunk index within this cell
@@ -135,7 +136,8 @@ __global__ void k_scatter_S(
         // below f32 epsilon but not bit-exact.
         int gx = wrap_i(gx0 + lx, L);
         int gy = wrap_i(gy0 + ly, L);
-        atomicAdd(&S[gy * L + gx], v * v);
+        int sy = slab_local_y(gy, y_lo, halo_h, L, L);
+        atomicAdd(&S[sy * L + gx], v * v);
         lx += step_x; ly += step_y;
         if (lx >= rx_end) { lx -= rw; ly += 1; }
     }
@@ -144,7 +146,8 @@ __global__ void k_scatter_S(
 void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0) return;
-    const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
+    // S is sized by the slab's extended height (== Ny for G=1).
+    const size_t Sbytes = (size_t)c.S_ext_height * p.Nx * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes, stream);
     // Always multi-block: chunking by ~4096 pixels keeps the SMs saturated
     // even at large N (1152 cells * 9 chunks/cell = 10368 blocks vs the
@@ -154,7 +157,8 @@ void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     constexpr int BS = 256;
     constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
     k_scatter_S<<<dim3(chunks_per_cell, N), BS, 0, stream>>>(
-        c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
+        c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS,
+        c.S_y_lo, c.S_halo_h);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +207,8 @@ __global__ void k_evolve_l1(
     float* __restrict__ phi_out,
     int N, int L,
     float lambda_, float kappa, float mu,
-    float xi, float dt)
+    float xi, float dt,
+    int y_lo, int halo_h)
 {
     const int n = blockIdx.x;
     if (n >= N) return;
@@ -240,7 +245,8 @@ __global__ void k_evolve_l1(
         float gy = 0.5f * (yp_ - ym_);
         int gxg = wrap_i(gx0 + lx, L);
         int gyg = wrap_i(gy0 + ly, L);
-        float Sv   = S[gyg * L + gxg];
+        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+        float Sv   = S[sy * L + gxg];
         float Soth = Sv - c * c;
         if (Soth < 0.0f) Soth = 0.0f;
         float c2 = c * c;
@@ -329,7 +335,8 @@ __global__ void k_evolve_l1(
 
         int gxg = wrap_i(gx0 + lx, L);
         int gyg = wrap_i(gy0 + ly, L);
-        float Sv   = S[gyg * L + gxg];
+        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+        float Sv   = S[sy * L + gxg];
         float Soth = Sv - c * c;
         if (Soth < 0.0f) Soth = 0.0f;
 
@@ -391,7 +398,8 @@ __global__ void k_reduce_mb_fast(
     float* __restrict__ V_out,
     float* __restrict__ Ix_out,
     float* __restrict__ Iy_out,
-    int N, int L, int CHUNK_PIXELS)
+    int N, int L, int CHUNK_PIXELS,
+    int y_lo, int halo_h)
 {
     const int n  = blockIdx.y;
     const int cb = blockIdx.x;
@@ -431,7 +439,8 @@ __global__ void k_reduce_mb_fast(
         float gy = 0.5f * (yp_ - ym_);
         int gxg = wrap_i(gx0 + lx, L);
         int gyg = wrap_i(gy0 + ly, L);
-        float Sv   = __ldg(S + gyg * L + gxg);
+        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+        float Sv   = __ldg(S + sy * L + gxg);
         float Soth = Sv - c * c;
         if (Soth < 0.0f) Soth = 0.0f;
         sV  += c * c;
@@ -468,7 +477,8 @@ __global__ void k_reduce_mb_full(
     float* __restrict__ Cy_out,
     float* __restrict__ Cxx_out,
     float* __restrict__ Cyy_out,
-    int N, int L, int CHUNK_PIXELS)
+    int N, int L, int CHUNK_PIXELS,
+    int y_lo, int halo_h)
 {
     const int n  = blockIdx.y;
     const int cb = blockIdx.x;
@@ -508,7 +518,8 @@ __global__ void k_reduce_mb_full(
         float gy = 0.5f * (yp_ - ym_);
         int gxg = wrap_i(gx0 + lx, L);
         int gyg = wrap_i(gy0 + ly, L);
-        float Sv   = __ldg(S + gyg * L + gxg);
+        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+        float Sv   = __ldg(S + sy * L + gxg);
         float Soth = Sv - c * c;
         if (Soth < 0.0f) Soth = 0.0f;
         float c2 = c * c;
@@ -564,7 +575,8 @@ __global__ void k_rhs_mb(
     float* __restrict__ phi_out,
     int N, int L, int CHUNK_PIXELS,
     float lambda_, float kappa, float mu,
-    float xi, float dt)
+    float xi, float dt,
+    int y_lo, int halo_h)
 {
     const int n  = blockIdx.y;
     const int cb = blockIdx.x;
@@ -638,7 +650,8 @@ __global__ void k_rhs_mb(
         float gy  = 0.5f * (yp_ - ym_);
         int gxg = wrap_i(gx0 + lx, L);
         int gyg = wrap_i(gy0 + ly, L);
-        float Sv   = __ldg(S + gyg * L + gxg);
+        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+        float Sv   = __ldg(S + sy * L + gxg);
         float Soth = Sv - c * c;
         if (Soth < 0.0f) Soth = 0.0f;
         float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
@@ -679,12 +692,14 @@ void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
             c.phi_in, c.origin, c.rect, c.S,
             c.volumes, c.Ix, c.Iy, c.perimeters,
             c.Cx, c.Cy, c.Cxx, c.Cyy,
-            N, p.Nx, CHUNK_PIXELS);
+            N, p.Nx, CHUNK_PIXELS,
+            c.S_y_lo, c.S_halo_h);
     } else {
         k_reduce_mb_fast<<<grid_mb, BS, 0, stream>>>(
             c.phi_in, c.origin, c.rect, c.S,
             c.volumes, c.Ix, c.Iy,
-            N, p.Nx, CHUNK_PIXELS);
+            N, p.Nx, CHUNK_PIXELS,
+            c.S_y_lo, c.S_halo_h);
     }
     k_rhs_mb<<<grid_mb, BS, 0, stream>>>(
         c.phi_in, c.origin, c.rect, c.S,
@@ -695,7 +710,8 @@ void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
         c.phi_out,
         N, p.Nx, CHUNK_PIXELS,
         (float)p.lambda, (float)p.kappa, (float)p.mu,
-        (float)p.xi,     (float)p.dt);
+        (float)p.xi,     (float)p.dt,
+        c.S_y_lo, c.S_halo_h);
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1064,8 @@ __global__ void k_initial_velocity(
     float* __restrict__ vx_out,
     float* __restrict__ vy_out,
     int N, int L,
-    float lambda_, float kappa, float xi)
+    float lambda_, float kappa, float xi,
+    int y_lo, int halo_h)
 {
     const int n = blockIdx.x;
     if (n >= N) return;
@@ -1080,7 +1097,8 @@ __global__ void k_initial_velocity(
         float gy = 0.5f * (yp_ - ym_);
         int gxg = wrap_i(gx0 + lx, L);
         int gyg = wrap_i(gy0 + ly, L);
-        float Sv   = S[gyg * L + gxg];
+        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+        float Sv   = S[sy * L + gxg];
         float Soth = Sv - c * c;
         if (Soth < 0.0f) Soth = 0.0f;
         float c2 = c * c;
@@ -1125,14 +1143,17 @@ __global__ void k_initial_velocity(
 void launch_initial_velocity(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
-    const size_t Sbytes = (size_t)p.Nx * p.Ny * sizeof(float);
+    // S sized by slab (== Ny for G=1).
+    const size_t Sbytes = (size_t)c.S_ext_height * p.Nx * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes);
     {
         constexpr int CHUNK_PIXELS = 2048;
         constexpr int BS = 128;
         constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
         dim3 grid(MAX_CHUNKS, N);
-        k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS);
+        k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S,
+                                  N, p.Nx, CHUNK_PIXELS,
+                                  c.S_y_lo, c.S_halo_h);
     }
     k_initial_velocity<<<N, 256>>>(
         c.phi_in, c.origin, c.rect, c.S,
@@ -1140,7 +1161,8 @@ void launch_initial_velocity(CellArrays& c, const SimParams& p) {
         c.volumes, c.Cx, c.Cy, c.Cxx, c.Cyy, c.perimeters,
         c.velocities_x, c.velocities_y,
         N, p.Nx,
-        (float)p.lambda, (float)p.kappa, (float)p.xi);
+        (float)p.lambda, (float)p.kappa, (float)p.xi,
+        c.S_y_lo, c.S_halo_h);
 }
 
 // ---------------------------------------------------------------------------

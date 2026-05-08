@@ -115,7 +115,27 @@ void Simulation::alloc_gpu() {
     phi_A = cells.phi_pool;
     phi_B = cells.phi_pool + (size_t)n * TILE_AREA;
 
-    const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
+    // ----- Slab partition for S -----
+    // PHASE B0: regardless of `gpus`, every rank still allocates the full
+    // grid. The slab indexing helper (slab_local_y) is wired through every
+    // S kernel access, but with y_lo=0, halo_h=0, ext_height=Ny it is the
+    // identity. Both the single-GPU path and the existing replicated-S
+    // multi-GPU orchestrator (NCCL allreduce on full S) keep working.
+    //
+    // PHASE B1+ will flip this to a true slab partition (per-rank y_lo,
+    // halo_h=HALO_H, ext_height < Ny) and replace the orchestrator's
+    // allreduce with halo exchange. Bounds-check guard left in for the
+    // future flip.
+    cells.S_y_lo       = 0;
+    cells.S_halo_h     = 0;
+    cells.S_ext_height = params.Ny;
+    if (cells.S_ext_height > params.Ny) {
+        fprintf(stderr,
+            "[FATAL] alloc_gpu: slab ext_height (%d) > Ny (%d)\n",
+            cells.S_ext_height, params.Ny);
+        std::exit(1);
+    }
+    const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
     CK(cudaMalloc(&cells.S, S_bytes));
     CK(cudaMemset(cells.S, 0, S_bytes));
 
@@ -186,7 +206,8 @@ void Simulation::configure_l2_persistence() {
         return;
     }
 
-    const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
+    // S is sized by the slab's extended height, not Ny (== Ny for G=1).
+    const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
 
     // Use the full available carveout. When S fits, pin all of it; when
     // S exceeds the carveout, pin the leading carveout-worth of bytes
@@ -409,7 +430,7 @@ void Simulation::finalize_init() {
         cudaDeviceGetAttribute(&max_persist_bytes,
                                cudaDevAttrMaxPersistingL2CacheSize, 0);
         if (max_persist_bytes > 0) {
-            const size_t S_bytes = (size_t)params.Nx * params.Ny * sizeof(float);
+            const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
             const size_t window_bytes = std::min((size_t)max_persist_bytes, S_bytes);
             cudaStreamAttrValue attr = {};
             attr.accessPolicyWindow.base_ptr  = cells.S;
