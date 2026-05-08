@@ -144,16 +144,28 @@ struct SlabInfo {
 // add Ny once if we underflow, mod Ny.
 //
 // For G=1 this is exactly the identity (since y_lo=0, halo_h=0, ext=Ny).
+//
+// IMPORTANT: returns a value in [0, Ny). The caller is responsible for
+// ensuring it is also in [0, ext_height) — i.e. that this rank's slab
+// actually covers this global row. For multi-GPU runs this is the
+// "ownership contract": a cell owned by rank g writes into S only at
+// rows within g's window. Use slab_in_window() below to check.
 // ---------------------------------------------------------------------------
 __host__ __device__ __forceinline__
 int slab_local_y(int gy, int y_lo, int halo_h, int ext_height, int Ny) {
     int dy = gy - y_lo + halo_h;
     if (dy < 0)            dy += Ny;
     else if (dy >= Ny)     dy -= Ny;
-    // dy is now in [0, Ny). For an in-slab access it must also be in
-    // [0, ext_height). The kernels guarantee this by construction (cells
-    // owned by this rank have all phi within [y_lo - halo_h, y_hi + halo_h)).
     return dy;
+}
+
+// True iff a slab_local_y() result is a valid index into the slab buffer
+// (i.e. the global row is inside this rank's [y_lo - halo_h, y_hi + halo_h)
+// window). Always true for G=1 (ext_height == Ny). Used for debug
+// bounds-checking under -DCELL_SIM_SLAB_BOUNDS_CHECK.
+__host__ __device__ __forceinline__
+bool slab_in_window(int sy_local, int ext_height) {
+    return (unsigned)sy_local < (unsigned)ext_height;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,13 +180,19 @@ int slab_local_y(int gy, int y_lo, int halo_h, int ext_height, int Ny) {
 // ---------------------------------------------------------------------------
 struct CellArrays {
     int num_cells = 0;
+    // Allocated capacity for all per-cell arrays. For G=1 capacity ==
+    // num_cells. For G>1 capacity > num_cells so cell migration between
+    // ranks (at rebind boundaries) can grow num_cells without realloc.
+    // Set in alloc_gpu(); kernels iterate n < num_cells but allocations
+    // are sized by capacity.
+    int capacity  = 0;
 
     // Phi double buffer. `phi_in` points at the half currently holding state;
     // `phi_out` points at the scratch half. After each step we std::swap them
     // on the host (no kernel needed). Both point inside `phi_pool`.
-    float* phi_pool = nullptr;     // [2 * N * TILE_AREA]
-    float* phi_in   = nullptr;     // alias into phi_pool
-    float* phi_out  = nullptr;     // alias into phi_pool
+    float* phi_pool = nullptr;     // [2 * capacity * TILE_AREA]
+    float* phi_in   = nullptr;     // alias into phi_pool (current state half)
+    float* phi_out  = nullptr;     // alias into phi_pool (scratch half)
 
     // Global sum field S(x,y) = sum_n phi_n(x,y)^2. Atomic-scatter target.
     float* S = nullptr;            // [Nx * Ny]

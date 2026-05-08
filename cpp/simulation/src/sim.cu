@@ -98,22 +98,39 @@ void Simulation::compute_origins() {
 }
 
 // ---------------------------------------------------------------------------
-// GPU allocation. Single contiguous phi pool of 2*N*TILE_AREA floats; the
-// two halves are accessed via host-side phi_in/phi_out pointers that we
-// std::swap each step.
+// GPU allocation. Per-cell arrays are allocated to capacity, not to the
+// initial num_cells, so that cell migration between ranks (at rebind
+// boundaries) can grow num_cells without realloc. For G=1, capacity ==
+// num_cells (no migration possible). For G>1, capacity = max(initial_local,
+// 2 * (N_global / G)) — generous enough that even pathological imbalance
+// (one rank ending up with all the cells of one neighbour pushed in)
+// doesn't realloc. Phi pool is the only big buffer that actually scales
+// with capacity (TILE_AREA*4B per cell per pool half).
 // ---------------------------------------------------------------------------
 void Simulation::alloc_gpu() {
     const int n = (int)h_cells.size();
     cells.num_cells = n;
+    if (gpus <= 1) {
+        cells.capacity = n;
+    } else {
+        // 2x over-allocation. At G=4 N_global=12800: each rank starts with
+        // ~3200 cells, capacity = 6400 — never reached in practice but
+        // guarantees migration cannot OOM the per-cell arrays.
+        int per_rank_floor = (cells_global > 0)
+            ? (2 * cells_global / gpus + 16)
+            : (2 * n + 16);
+        cells.capacity = std::max(n, per_rank_floor);
+    }
+    const int cap = cells.capacity;
 
-    const size_t pool_bytes = 2ULL * n * TILE_AREA * sizeof(float);
+    const size_t pool_bytes = 2ULL * cap * TILE_AREA * sizeof(float);
     CK(cudaMalloc(&cells.phi_pool, pool_bytes));
     CK(cudaMemset(cells.phi_pool, 0, pool_bytes));
     cells.phi_in  = cells.phi_pool;
-    cells.phi_out = cells.phi_pool + (size_t)n * TILE_AREA;
+    cells.phi_out = cells.phi_pool + (size_t)cap * TILE_AREA;
     // Persistent half-pointers used by graph capture (parity-aware).
     phi_A = cells.phi_pool;
-    phi_B = cells.phi_pool + (size_t)n * TILE_AREA;
+    phi_B = cells.phi_pool + (size_t)cap * TILE_AREA;
 
     // ----- Slab partition for S -----
     // For G == 1: slab covers the whole grid (y_lo=0, halo=0, ext_height=Ny).
@@ -151,35 +168,39 @@ void Simulation::alloc_gpu() {
     auto ai = [&](int*&   p, size_t k) { CK(cudaMalloc(&p, k * sizeof(int))); };
     auto af = [&](float*& p, size_t k) { CK(cudaMalloc(&p, k * sizeof(float))); };
 
-    ai(cells.origin, 2 * n);
-    ai(cells.rect,   4 * n);
+    // All per-cell arrays sized by capacity. Slots [num_cells, capacity)
+    // are uninitialised junk; kernels never read them because they iterate
+    // n < num_cells. Migration (when added) writes into these slots and
+    // bumps num_cells.
+    ai(cells.origin, 2 * cap);
+    ai(cells.rect,   4 * cap);
 
-    af(cells.volumes,      n);
-    af(cells.Ix,           n);
-    af(cells.Iy,           n);
-    af(cells.Cx,           n);
-    af(cells.Cy,           n);
-    af(cells.Cxx,          n);
-    af(cells.Cyy,          n);
-    af(cells.perimeters,   n);
-    af(cells.velocities_x, n);
-    af(cells.velocities_y, n);
+    af(cells.volumes,      cap);
+    af(cells.Ix,           cap);
+    af(cells.Iy,           cap);
+    af(cells.Cx,           cap);
+    af(cells.Cy,           cap);
+    af(cells.Cxx,          cap);
+    af(cells.Cyy,          cap);
+    af(cells.perimeters,   cap);
+    af(cells.velocities_x, cap);
+    af(cells.velocities_y, cap);
 
-    af(cells.polar_theta,  n);
-    af(cells.polar_x,      n);
-    af(cells.polar_y,      n);
+    af(cells.polar_theta,  cap);
+    af(cells.polar_x,      cap);
+    af(cells.polar_y,      cap);
 
-    af(cells.gamma_cell,   n);
-    af(cells.v_A_cell,     n);
-    af(cells.tgt_radius,   n);
+    af(cells.gamma_cell,   cap);
+    af(cells.v_A_cell,     cap);
+    af(cells.tgt_radius,   cap);
 
-    CK(cudaMalloc(&cells.rng_states, n * sizeof(curandState)));
+    CK(cudaMalloc(&cells.rng_states, cap * sizeof(curandState)));
 
-    CK(cudaMemset(cells.velocities_x, 0, n * sizeof(float)));
-    CK(cudaMemset(cells.velocities_y, 0, n * sizeof(float)));
+    CK(cudaMemset(cells.velocities_x, 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.velocities_y, 0, cap * sizeof(float)));
 
-    printf("[GPU] %d cells, T=%d, pool=%.1f MB, S=%.1f MB (%dx%d)\n",
-           n, TILE_T, pool_bytes / 1e6, S_bytes / 1e6,
+    printf("[GPU] %d cells (cap %d), T=%d, pool=%.1f MB, S=%.1f MB (%dx%d)\n",
+           n, cap, TILE_T, pool_bytes / 1e6, S_bytes / 1e6,
            params.Nx, params.Ny);
 
     configure_l2_persistence();

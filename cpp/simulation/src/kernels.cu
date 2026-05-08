@@ -137,7 +137,11 @@ __global__ void k_scatter_S(
         // below f32 epsilon but not bit-exact.
         int gx = wrap_i(gx0 + lx, L);
         int gy = wrap_i(gy0 + ly, L);
-        int sy = slab_local_y(gy, y_lo, halo_h, L, L);
+        // Slab index. For G=1 this is the identity (halo_h=0). For G>1
+        // the ownership contract (cell migrated whenever its rebound COM
+        // crosses the slab interior boundary) guarantees sy is always a
+        // valid index into the (ext_height x L) slab buffer.
+        int sy = slab_local_y(gy, y_lo, halo_h, /*ext*/ L, L);
         atomicAdd(&S[sy * L + gx], v * v);
         lx += step_x; ly += step_y;
         if (lx >= rx_end) { lx -= rw; ly += 1; }
