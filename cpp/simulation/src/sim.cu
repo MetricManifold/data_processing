@@ -203,6 +203,43 @@ void Simulation::alloc_gpu() {
            n, cap, TILE_T, pool_bytes / 1e6, S_bytes / 1e6,
            params.Nx, params.Ny);
 
+    // Migration buffers (G > 1 only). Sized once at init; never reallocated.
+    if (gpus > 1) {
+        CK(cudaMalloc(&d_n_stay,    sizeof(int)));
+        CK(cudaMalloc(&d_n_up,      sizeof(int)));
+        CK(cudaMalloc(&d_n_down,    sizeof(int)));
+        CK(cudaMalloc(&d_n_in_prev, sizeof(int)));
+        CK(cudaMalloc(&d_n_in_next, sizeof(int)));
+        CK(cudaMalloc(&d_stay_idx,  cap * sizeof(int)));
+        CK(cudaMalloc(&d_up_idx,    cap * sizeof(int)));
+        CK(cudaMalloc(&d_down_idx,  cap * sizeof(int)));
+
+        const size_t pack_buf_bytes =
+            (size_t)MAX_MIGRANTS_PER_DIR * CELL_PACK_BYTES;
+        CK(cudaMalloc(&d_pack_up,      pack_buf_bytes));
+        CK(cudaMalloc(&d_pack_down,    pack_buf_bytes));
+        CK(cudaMalloc(&d_pack_in_prev, pack_buf_bytes));
+        CK(cudaMalloc(&d_pack_in_next, pack_buf_bytes));
+
+        // Scratch arrays for compaction. One mirror per relevant per-cell
+        // field. We do NOT scratch volumes/Ix/Iy/etc — those are reduction
+        // outputs that the next step recomputes from scratch anyway.
+        CK(cudaMalloc(&d_origin_scratch,      2 * cap * sizeof(int)));
+        CK(cudaMalloc(&d_rect_scratch,        4 * cap * sizeof(int)));
+        CK(cudaMalloc(&d_gamma_scratch,       cap * sizeof(float)));
+        CK(cudaMalloc(&d_v_A_scratch,         cap * sizeof(float)));
+        CK(cudaMalloc(&d_tgt_R_scratch,       cap * sizeof(float)));
+        CK(cudaMalloc(&d_polar_theta_scratch, cap * sizeof(float)));
+        CK(cudaMalloc(&d_polar_x_scratch,     cap * sizeof(float)));
+        CK(cudaMalloc(&d_polar_y_scratch,     cap * sizeof(float)));
+        CK(cudaMalloc(&d_rng_scratch,         cap * sizeof(curandState)));
+
+        printf("[migration] alloc: max %d migrants/dir, pack_bytes=%zu, "
+               "total %zu MB per-rank\n",
+               MAX_MIGRANTS_PER_DIR, CELL_PACK_BYTES,
+               4 * pack_buf_bytes / (1024 * 1024));
+    }
+
     configure_l2_persistence();
 }
 
@@ -1529,6 +1566,18 @@ void Simulation::cleanup() {
     cf(cells.rng_states);
     cf(d_scripted_cid);
     cf(d_scripted_theta);
+    // Migration buffers (multi-GPU only; nullptr for G=1).
+    cf(d_n_stay);    cf(d_n_up);      cf(d_n_down);
+    cf(d_n_in_prev); cf(d_n_in_next);
+    cf(d_stay_idx);  cf(d_up_idx);    cf(d_down_idx);
+    auto cfv = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
+    cfv(d_pack_up);      cfv(d_pack_down);
+    cfv(d_pack_in_prev); cfv(d_pack_in_next);
+    cf(d_origin_scratch); cf(d_rect_scratch);
+    cf(d_gamma_scratch);  cf(d_v_A_scratch); cf(d_tgt_R_scratch);
+    cf(d_polar_theta_scratch);
+    cf(d_polar_x_scratch); cf(d_polar_y_scratch);
+    cfv(d_rng_scratch);
 }
 
 // ===========================================================================
@@ -1582,6 +1631,216 @@ struct MgBarrier {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Simulation::migrate_cells — implementation under ENABLE_MULTI_GPU.
+//
+// Called from the orchestrator's main thread between barrier sync points
+// on rebind boundaries (step_count % REBIND_EVERY == 0). The full
+// sequence is:
+//
+//   1. Zero counters, classify all local cells -> stay/up/down lists.
+//   2. Download n_up/n_down to host. Range-check vs MAX_MIGRANTS_PER_DIR.
+//   3. NCCL-exchange the four counts (n_up to prev, n_down to next;
+//      recv n_in_prev, n_in_next).
+//   4. Pack outgoing into d_pack_up / d_pack_down.
+//   5. NCCL-exchange the pack bytes.
+//   6. Compact stays from current cell arrays into scratch arrays
+//      (using d_stay_idx as the gather permutation), and compact phi
+//      from phi_in into phi_out.
+//   7. Unpack arrivals into the freshly-compacted arrays at slot
+//      [n_stay, n_stay + n_in_prev + n_in_next), writing phi tiles into
+//      phi_out (which becomes phi_in after the swap below).
+//   8. Swap the scratch arrays into CellArrays (and parity-flip phi) so
+//      the freshly-arranged data becomes "current" for the next step.
+//   9. Update num_cells, the host-side h_global_id vector.
+//
+// Returns the new local cell count.
+// ---------------------------------------------------------------------------
+int Simulation::migrate_cells(MgWorld& world, int my_rank) {
+    if (gpus <= 1) return cells.num_cells;
+    cudaStream_t s = step_stream;
+
+    const int prev_rank = (my_rank - 1 + gpus) % gpus;
+    const int next_rank = (my_rank + 1) % gpus;
+
+    // 1. Zero counters, classify.
+    CK(cudaMemsetAsync(d_n_stay, 0, sizeof(int), s));
+    CK(cudaMemsetAsync(d_n_up,   0, sizeof(int), s));
+    CK(cudaMemsetAsync(d_n_down, 0, sizeof(int), s));
+    launch_classify_migrants(
+        cells.origin, cells.num_cells,
+        slab_y_lo, slab_y_hi, params.Ny,
+        my_rank, gpus,
+        d_n_stay, d_n_up, d_n_down,
+        d_stay_idx, d_up_idx, d_down_idx, s);
+
+    // 2. Download counts. Sync needed because we branch on values.
+    int h_n_stay = 0, h_n_up = 0, h_n_down = 0;
+    CK(cudaMemcpyAsync(&h_n_stay, d_n_stay, sizeof(int),
+                       cudaMemcpyDeviceToHost, s));
+    CK(cudaMemcpyAsync(&h_n_up,   d_n_up,   sizeof(int),
+                       cudaMemcpyDeviceToHost, s));
+    CK(cudaMemcpyAsync(&h_n_down, d_n_down, sizeof(int),
+                       cudaMemcpyDeviceToHost, s));
+    CK(cudaStreamSynchronize(s));
+
+    if (h_n_up > MAX_MIGRANTS_PER_DIR ||
+        h_n_down > MAX_MIGRANTS_PER_DIR) {
+        fprintf(stderr,
+            "[FATAL] migration: rank %d exceeded MAX_MIGRANTS_PER_DIR=%d "
+            "(up=%d down=%d). Increase the constant in kernels.cuh.\n",
+            my_rank, MAX_MIGRANTS_PER_DIR, h_n_up, h_n_down);
+        std::exit(1);
+    }
+
+    // 3. NCCL count exchange. Each rank: send n_up to prev, send n_down
+    //    to next, recv n_in_prev from prev, recv n_in_next from next.
+    mg_group_start();
+    mg_send_recv_i32(world.comms[my_rank], d_n_up,   prev_rank, d_n_in_prev, prev_rank, s);
+    mg_send_recv_i32(world.comms[my_rank], d_n_down, next_rank, d_n_in_next, next_rank, s);
+    mg_group_end();
+
+    int h_n_in_prev = 0, h_n_in_next = 0;
+    CK(cudaMemcpyAsync(&h_n_in_prev, d_n_in_prev, sizeof(int),
+                       cudaMemcpyDeviceToHost, s));
+    CK(cudaMemcpyAsync(&h_n_in_next, d_n_in_next, sizeof(int),
+                       cudaMemcpyDeviceToHost, s));
+    CK(cudaStreamSynchronize(s));
+
+    int h_n_in_total = h_n_in_prev + h_n_in_next;
+    int new_num_cells = h_n_stay + h_n_in_total;
+    if (new_num_cells > cells.capacity) {
+        fprintf(stderr,
+            "[FATAL] migration: rank %d would have %d cells > capacity %d\n",
+            my_rank, new_num_cells, cells.capacity);
+        std::exit(1);
+    }
+
+    // Fast exit if no migration on either side.
+    if (h_n_up == 0 && h_n_down == 0 &&
+        h_n_in_prev == 0 && h_n_in_next == 0) {
+        return cells.num_cells;
+    }
+
+    // 4. Pack outgoing.
+    if (h_n_up   > 0) launch_pack_migrants(cells, d_up_idx,   h_n_up,
+                                           d_pack_up,   s);
+    if (h_n_down > 0) launch_pack_migrants(cells, d_down_idx, h_n_down,
+                                           d_pack_down, s);
+
+    // 5. NCCL pack-bytes exchange. Each direction's send/recv are issued
+    //    independently inside one group bracket so NCCL can pair them
+    //    across ranks. n=0 calls are skipped (NCCL's 0-byte messages
+    //    work but it's cleaner to skip).
+    const std::size_t pack = CELL_PACK_BYTES;
+    mg_group_start();
+    mg_send_bytes(world.comms[my_rank], d_pack_up,
+                  prev_rank, (size_t)h_n_up   * pack, s);
+    mg_send_bytes(world.comms[my_rank], d_pack_down,
+                  next_rank, (size_t)h_n_down * pack, s);
+    mg_recv_bytes(world.comms[my_rank], d_pack_in_prev,
+                  prev_rank, (size_t)h_n_in_prev * pack, s);
+    mg_recv_bytes(world.comms[my_rank], d_pack_in_next,
+                  next_rank, (size_t)h_n_in_next * pack, s);
+    mg_group_end();
+
+    // 6. Compact stays into scratch arrays + phi_out.
+    if (h_n_stay > 0) {
+        launch_compact_stays(
+            cells, d_stay_idx, h_n_stay,
+            cells.phi_out,
+            d_origin_scratch, d_rect_scratch,
+            d_gamma_scratch, d_v_A_scratch, d_tgt_R_scratch,
+            d_polar_theta_scratch, d_polar_x_scratch, d_polar_y_scratch,
+            d_rng_scratch, s);
+    }
+
+    // 7. Unpack arrivals into [h_n_stay, h_n_stay + h_n_in_total).
+    //    Phi tiles land in phi_out; scalars land directly in CellArrays
+    //    fields (NOT scratch — we'll swap scratch into them after).
+    //    But arrivals' scalars need to ALSO land in scratch so the swap
+    //    leaves a consistent state. So unpack should write to scratch.
+    //
+    //    Simpler approach: unpack into scratch arrays at the trailing
+    //    slots. We adjust k_unpack_migrants's output pointers to point
+    //    at scratch instead of cells.* by temporarily aliasing.
+    //
+    //    For phi the unpack already writes to phi_out, which is correct.
+
+    auto unpack_into_scratch = [&](void* pack_buf, int n_in, int dst_offset) {
+        if (n_in <= 0) return;
+        // Build a temp CellArrays-like view that aims unpack at scratch.
+        // k_unpack_migrants writes phi_out (cells.phi_out — correct) and
+        // origin/rect/scalars (we redirect those to scratch arrays).
+        CellArrays tmp = cells;       // shallow copy
+        tmp.origin       = d_origin_scratch;
+        tmp.rect         = d_rect_scratch;
+        tmp.polar_theta  = d_polar_theta_scratch;
+        tmp.polar_x      = d_polar_x_scratch;
+        tmp.polar_y      = d_polar_y_scratch;
+        tmp.gamma_cell   = d_gamma_scratch;
+        tmp.v_A_cell     = d_v_A_scratch;
+        tmp.tgt_radius   = d_tgt_R_scratch;
+        tmp.rng_states   = d_rng_scratch;
+        // phi_out, capacity left as-is.
+        launch_unpack_migrants(tmp, pack_buf, n_in, dst_offset,
+                               /*d_global_id_dst=*/ nullptr, s);
+    };
+    unpack_into_scratch(d_pack_in_prev, h_n_in_prev, h_n_stay);
+    unpack_into_scratch(d_pack_in_next, h_n_in_next, h_n_stay + h_n_in_prev);
+
+    // 8. Swap scratch into CellArrays. After this:
+    //      cells.origin etc. = the freshly compacted+arrived data
+    //      d_*_scratch = the old (stale) arrays, available for the next
+    //                    migration round
+    //    For phi: swap phi_in / phi_out via parity flip so the freshly
+    //    compacted+arrived tiles (currently in phi_out) become phi_in.
+    std::swap(cells.origin,       d_origin_scratch);
+    std::swap(cells.rect,         d_rect_scratch);
+    std::swap(cells.gamma_cell,   d_gamma_scratch);
+    std::swap(cells.v_A_cell,     d_v_A_scratch);
+    std::swap(cells.tgt_radius,   d_tgt_R_scratch);
+    std::swap(cells.polar_theta,  d_polar_theta_scratch);
+    std::swap(cells.polar_x,      d_polar_x_scratch);
+    std::swap(cells.polar_y,      d_polar_y_scratch);
+    {
+        // rng_states is void* in CellArrays; do an unstructured swap.
+        void* tmp = cells.rng_states;
+        cells.rng_states = d_rng_scratch;
+        d_rng_scratch = tmp;
+    }
+    // Phi parity flip: the new state lives in phi_out, swap it to phi_in.
+    parity ^= 1;
+    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+
+    // 9. Update num_cells. h_global_id is host-tracked; we let it lapse
+    //    here (set to -1 for migrants). Phase-B2 will plumb global_id
+    //    through the pack.
+    cells.num_cells = new_num_cells;
+    h_global_id.resize(new_num_cells);
+    // Stays keep their global_id (positions [0, h_n_stay) of new
+    // h_global_id come from old positions stay_idx[k]).
+    {
+        std::vector<int> old_gid(h_global_id);
+        // old_gid still has size = old num_cells; we need to gather
+        // stays. Read stay_idx from device.
+        std::vector<int> h_stay_idx(h_n_stay);
+        CK(cudaMemcpyAsync(h_stay_idx.data(), d_stay_idx,
+                           h_n_stay * sizeof(int),
+                           cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        h_global_id.resize(new_num_cells, -1);
+        for (int k = 0; k < h_n_stay; ++k) {
+            h_global_id[k] = old_gid[h_stay_idx[k]];
+        }
+        // Arrivals' global_id remains -1; trajectory/checkpoint output
+        // can re-derive ids by ranks comparing host arrays if needed.
+    }
+
+    return cells.num_cells;
+}
 
 int run_multi_gpu(const MultiGpuRunArgs& args) {
     MgWorld world;
@@ -1779,6 +2038,17 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 }
 
                 sims[g]->step_post_reduce();
+
+                // Migration on rebind cadence (only when G > 1; for G=1
+                // migrate_cells is a no-op early-out). step_post_reduce
+                // ran k_rebind on this step iff (step_count is now a
+                // multiple of REBIND_EVERY) — it does the increment last.
+                if (args.gpus > 1
+                    && sims[g]->step_count > 0
+                    && (sims[g]->step_count % REBIND_EVERY) == 0)
+                {
+                    sims[g]->migrate_cells(world, g);
+                }
 
                 end_barrier.wait();
             }

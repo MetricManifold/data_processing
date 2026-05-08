@@ -85,6 +85,37 @@ void mg_send_recv_f32(MgComm* comm,
                       std::size_t n_floats,
                       cudaStream_t stream);
 
+// Generic byte send/recv pair. Used by cell migration where the payload
+// is a packed struct (phi tile + header). Internally just calls ncclSend
+// and ncclRecv with ncclChar — NCCL is byte-transparent. Same group-call
+// requirements as mg_send_recv_f32.
+void mg_send_recv_bytes(MgComm* comm,
+                        const void* src, int peer_send,
+                        void* dst, int peer_recv,
+                        std::size_t n_bytes,
+                        cudaStream_t stream);
+
+// Pure send / recv halves of mg_send_recv_bytes, for when the four
+// directions of a migration exchange (up-send, down-send, prev-recv,
+// next-recv) need independent counts. Caller must put them inside one
+// mg_group_start/mg_group_end pair so NCCL can pair them across ranks.
+void mg_send_bytes(MgComm* comm,
+                   const void* src, int peer,
+                   std::size_t n_bytes,
+                   cudaStream_t stream);
+void mg_recv_bytes(MgComm* comm,
+                   void* dst, int peer,
+                   std::size_t n_bytes,
+                   cudaStream_t stream);
+
+// Send a single int32 to `peer_send` and receive an int32 from
+// `peer_recv` into *dst. Used to exchange migration counts before the
+// payload-bytes exchange. Same group-call requirements.
+void mg_send_recv_i32(MgComm* comm,
+                      const int* src, int peer_send,
+                      int* dst, int peer_recv,
+                      cudaStream_t stream);
+
 // NCCL group brackets. Required around per-rank issuing in single-process
 // multi-device mode: every rank's ncclAllReduce call between Start/End is
 // coalesced into one collective. No-op when ENABLE_MULTI_GPU=OFF.

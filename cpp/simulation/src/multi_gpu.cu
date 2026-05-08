@@ -145,6 +145,79 @@ void mg_send_recv_f32(MgComm* comm,
     }
 }
 
+void mg_send_recv_bytes(MgComm* comm,
+                        const void* src, int peer_send,
+                        void* dst, int peer_recv,
+                        std::size_t n_bytes,
+                        cudaStream_t stream)
+{
+    if (!comm || n_bytes == 0) return;
+    ncclResult_t rs = ncclSend(src, n_bytes, ncclChar,
+                               peer_send, comm->c, stream);
+    if (rs != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclSend(bytes): %s\n",
+                ncclGetErrorString(rs));
+        std::exit(1);
+    }
+    ncclResult_t rr = ncclRecv(dst, n_bytes, ncclChar,
+                               peer_recv, comm->c, stream);
+    if (rr != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclRecv(bytes): %s\n",
+                ncclGetErrorString(rr));
+        std::exit(1);
+    }
+}
+
+void mg_send_bytes(MgComm* comm,
+                   const void* src, int peer,
+                   std::size_t n_bytes,
+                   cudaStream_t stream)
+{
+    if (!comm || n_bytes == 0) return;
+    ncclResult_t r = ncclSend(src, n_bytes, ncclChar, peer, comm->c, stream);
+    if (r != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclSend(bytes): %s\n",
+                ncclGetErrorString(r));
+        std::exit(1);
+    }
+}
+
+void mg_recv_bytes(MgComm* comm,
+                   void* dst, int peer,
+                   std::size_t n_bytes,
+                   cudaStream_t stream)
+{
+    if (!comm || n_bytes == 0) return;
+    ncclResult_t r = ncclRecv(dst, n_bytes, ncclChar, peer, comm->c, stream);
+    if (r != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclRecv(bytes): %s\n",
+                ncclGetErrorString(r));
+        std::exit(1);
+    }
+}
+
+void mg_send_recv_i32(MgComm* comm,
+                      const int* src, int peer_send,
+                      int* dst, int peer_recv,
+                      cudaStream_t stream)
+{
+    if (!comm) return;
+    ncclResult_t rs = ncclSend((const void*)src, 1, ncclInt32,
+                               peer_send, comm->c, stream);
+    if (rs != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclSend(i32): %s\n",
+                ncclGetErrorString(rs));
+        std::exit(1);
+    }
+    ncclResult_t rr = ncclRecv((void*)dst, 1, ncclInt32,
+                               peer_recv, comm->c, stream);
+    if (rr != ncclSuccess) {
+        fprintf(stderr, "[multi_gpu] ncclRecv(i32): %s\n",
+                ncclGetErrorString(rr));
+        std::exit(1);
+    }
+}
+
 void mg_group_start() { ncclGroupStart(); }
 void mg_group_end()   { ncclGroupEnd(); }
 
@@ -180,6 +253,32 @@ void mg_send_recv_f32(MgComm* /*c*/,
                       float* /*dst*/, int /*peer_recv*/,
                       std::size_t /*n*/, cudaStream_t /*s*/) {
     fprintf(stderr, "[multi_gpu] mg_send_recv_f32 called in stub build\n");
+    std::exit(1);
+}
+
+void mg_send_recv_bytes(MgComm* /*c*/,
+                        const void* /*src*/, int /*peer_send*/,
+                        void* /*dst*/, int /*peer_recv*/,
+                        std::size_t /*n*/, cudaStream_t /*s*/) {
+    fprintf(stderr, "[multi_gpu] mg_send_recv_bytes called in stub build\n");
+    std::exit(1);
+}
+
+void mg_send_bytes(MgComm*, const void*, int, std::size_t, cudaStream_t) {
+    fprintf(stderr, "[multi_gpu] mg_send_bytes called in stub build\n");
+    std::exit(1);
+}
+
+void mg_recv_bytes(MgComm*, void*, int, std::size_t, cudaStream_t) {
+    fprintf(stderr, "[multi_gpu] mg_recv_bytes called in stub build\n");
+    std::exit(1);
+}
+
+void mg_send_recv_i32(MgComm* /*c*/,
+                      const int* /*src*/, int /*peer_send*/,
+                      int* /*dst*/, int /*peer_recv*/,
+                      cudaStream_t /*s*/) {
+    fprintf(stderr, "[multi_gpu] mg_send_recv_i32 called in stub build\n");
     std::exit(1);
 }
 

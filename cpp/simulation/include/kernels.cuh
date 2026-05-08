@@ -1,5 +1,6 @@
 #pragma once
 #include "types.cuh"
+#include <cstddef>
 
 // ---------------------------------------------------------------------------
 // sim_v3 launch wrappers.
@@ -66,3 +67,81 @@ void launch_initial_velocity(CellArrays& c, const SimParams& p);
 // data in a staging buffer.
 void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
                      cudaStream_t stream);
+
+// ===========================================================================
+// Cell migration (multi-GPU only). When a cell's rebound COM crosses
+// outside its owning rank's slab, the cell must be moved to the
+// neighbour rank that now owns its COM. This happens at rebind cadence
+// (every REBIND_EVERY=8 steps).
+// ===========================================================================
+
+// Maximum cells migrating in any one direction per rebind round. Sized
+// generously vs typical drift (drift per rebind ≈ 0.04 px ≪ slab height,
+// so almost no cells cross at any one rebind), but bounded so the pack
+// buffers stay reasonable in VRAM. Failure to fit is a fatal error
+// (host-side check after classify).
+//   memory: 4 * MAX_MIGRANTS_PER_DIR * pack_size_per_cell bytes per rank.
+//   At pack_size ~ 410 KB and the value below: 4 * 128 * 410 KB = ~205 MB.
+static constexpr int MAX_MIGRANTS_PER_DIR = 128;
+
+// Per-cell pack size in bytes. Includes the full TILE_AREA phi tile + a
+// small header (origin/rect/global_id/scalars/rng_state). Defined in
+// kernels.cu so the curandState size dependency stays out of this header.
+extern const std::size_t CELL_PACK_BYTES;
+
+// Classify all local cells into stay/up/down based on rebound COM y vs
+// slab boundaries. After this kernel:
+//   *d_n_stay = number of cells staying on this rank
+//   *d_n_up   = number going to prev_rank (= (rank-1+G)%G)
+//   *d_n_down = number going to next_rank (= (rank+1)%G)
+//   stay_idx[0..n_stay)  = local indices of stayers
+//   up_idx[0..n_up)      = local indices of cells leaving up
+//   down_idx[0..n_down)  = local indices of cells leaving down
+//
+// Counters MUST be zeroed by the caller before launch (cudaMemsetAsync).
+//
+// For G=2 prev_rank == next_rank: a cell that needs to leave is always
+// classified as "up" (down list stays empty). The orchestrator's symmetric
+// send/recv pattern still works because n_down=0 turns the down-direction
+// NCCL calls into 0-byte no-ops.
+void launch_classify_migrants(
+    const int* origin, int N,
+    int slab_y_lo, int slab_y_hi, int Ny,
+    int rank, int gpus,
+    int* d_n_stay, int* d_n_up, int* d_n_down,
+    int* stay_idx, int* up_idx, int* down_idx,
+    cudaStream_t stream);
+
+// Pack `count` migrants into a contiguous byte buffer (count * CELL_PACK_BYTES).
+// Source per-cell data is gathered from CellArrays at the indices in
+// migrant_idx. The phi tile is copied from phi_in (current state half).
+void launch_pack_migrants(
+    const CellArrays& c,
+    const int* migrant_idx, int count,
+    void* pack_buf,
+    cudaStream_t stream);
+
+// Unpack `count` arrivals into per-cell arrays starting at slot dst_offset.
+// Phi tiles are written into phi_out (the scratch half — caller is
+// responsible for swapping after compact + unpack are both done). The
+// caller must also ensure dst_offset + count <= capacity.
+void launch_unpack_migrants(
+    CellArrays& c,
+    const void* pack_buf, int count,
+    int dst_offset,
+    int* h_global_id_dst,   // device-resident int array used by host post-step
+    cudaStream_t stream);
+
+// Compact the stays into the front of phi_out + scalar scratch arrays.
+// Reads from phi_in / current cell arrays, writes to phi_out / scratch.
+// stay_idx contains the local indices of cells to keep.
+void launch_compact_stays(
+    const CellArrays& c,
+    const int* stay_idx, int n_stay,
+    float* phi_dst,                  // = phi_out (scratch half)
+    int*   origin_dst, int* rect_dst,
+    float* gamma_dst, float* v_A_dst, float* tgt_R_dst,
+    float* polar_theta_dst, float* polar_x_dst, float* polar_y_dst,
+    void*  rng_dst,                  // curandState array
+    cudaStream_t stream);
+

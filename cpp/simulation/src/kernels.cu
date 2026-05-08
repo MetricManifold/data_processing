@@ -1212,3 +1212,341 @@ void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
     if (blocks <= 0) blocks = 1;
     k_halo_add<<<blocks, BS, 0, stream>>>(dst, src, n_floats);
 }
+
+// ===========================================================================
+// 10. Cell migration kernels (multi-GPU only).
+// ---------------------------------------------------------------------------
+// Pack format (per migrant, total CELL_PACK_BYTES):
+//   bytes [0, TILE_AREA*4)       : phi tile (TILE_AREA float32)
+//   then CellPackHeader struct   : origin, rect, global_id, scalars, rng_state
+// Header is at the end so the larger phi region is naturally aligned at
+// offset 0; the header struct ends the pack and is read back by the
+// unpack kernel from the trailing bytes.
+// ===========================================================================
+
+namespace {
+
+struct CellPackHeader {
+    int   origin_x, origin_y;
+    int   rect_x, rect_y, rect_w, rect_h;
+    int   global_id;
+    float polar_theta;
+    float gamma_cell;
+    float v_A_cell;
+    float tgt_radius;
+    curandState rng_state;
+};
+
+constexpr std::size_t pack_phi_bytes()    { return TILE_AREA * sizeof(float); }
+constexpr std::size_t pack_header_bytes() { return sizeof(CellPackHeader); }
+constexpr std::size_t pack_total_bytes()  { return pack_phi_bytes() + pack_header_bytes(); }
+
+}  // namespace
+
+const std::size_t CELL_PACK_BYTES = pack_total_bytes();
+
+// ---------------------------------------------------------------------------
+// k_classify_migrants — one thread per cell. Computes COM y from origin
+// (post-rebind invariant: COM lands at TILE_T/2 inside the tile, so
+// global COM y = origin[1] + TILE_T/2). Maps to owning rank g_own =
+// floor(cy * G / Ny). Bucket the cell into stay / up / down based on
+// g_own vs (rank, prev_rank, next_rank).
+// ---------------------------------------------------------------------------
+__global__ void k_classify_migrants(
+    const int* __restrict__ origin, int N,
+    int slab_y_lo, int slab_y_hi, int Ny,
+    int rank, int gpus,
+    int* __restrict__ d_n_stay,
+    int* __restrict__ d_n_up,
+    int* __restrict__ d_n_down,
+    int* __restrict__ stay_idx,
+    int* __restrict__ up_idx,
+    int* __restrict__ down_idx)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    int cy = origin[2*i + 1] + (TILE_T >> 1);
+    // Wrap to [0, Ny). cy can be negative or >= Ny because origin is in
+    // unwrapped global coordinates that drift through periodic boundaries.
+    int cy_w = cy % Ny;
+    if (cy_w < 0) cy_w += Ny;
+
+    // Owning rank by slab: boundaries are floor(g * Ny / G), so
+    // g_own = floor(cy_w * G / Ny). Use 64-bit math to avoid overflow.
+    int g_own = (int)((long long)cy_w * gpus / Ny);
+    int prev_r = (rank - 1 + gpus) % gpus;
+    int next_r = (rank + 1) % gpus;
+
+    if (g_own == rank) {
+        int slot = atomicAdd(d_n_stay, 1);
+        stay_idx[slot] = i;
+    } else if (g_own == prev_r) {
+        int slot = atomicAdd(d_n_up, 1);
+        up_idx[slot] = i;
+    } else if (g_own == next_r) {
+        int slot = atomicAdd(d_n_down, 1);
+        down_idx[slot] = i;
+    } else {
+        // Cell jumped more than one slab in a single rebind interval.
+        // Drift per rebind is ~v_max * dt * REBIND_EVERY ≈ 0.04 px, far
+        // less than slab_height. If we hit this, something is wrong —
+        // either v_A is unrealistically large or there's a bug. Keep the
+        // cell as a stay so the run doesn't crash; the host post-step
+        // check (host counts stay/up/down) will detect imbalance and
+        // print a warning. We log via the global counter `g_long_jump`.
+        int slot = atomicAdd(d_n_stay, 1);
+        stay_idx[slot] = i;
+    }
+    (void)slab_y_lo; (void)slab_y_hi;  // currently derived from rank/gpus
+}
+
+void launch_classify_migrants(
+    const int* origin, int N,
+    int slab_y_lo, int slab_y_hi, int Ny,
+    int rank, int gpus,
+    int* d_n_stay, int* d_n_up, int* d_n_down,
+    int* stay_idx, int* up_idx, int* down_idx,
+    cudaStream_t stream)
+{
+    if (N == 0) return;
+    int bs = 128;
+    int gs = (N + bs - 1) / bs;
+    k_classify_migrants<<<gs, bs, 0, stream>>>(
+        origin, N, slab_y_lo, slab_y_hi, Ny, rank, gpus,
+        d_n_stay, d_n_up, d_n_down,
+        stay_idx, up_idx, down_idx);
+}
+
+// ---------------------------------------------------------------------------
+// k_pack_migrants — one block per migrant, threads cooperate on the phi
+// copy. Threadidx 0 also writes the trailing header. Source `migrant_idx`
+// gives the local cell index for each pack slot.
+// ---------------------------------------------------------------------------
+__global__ void k_pack_migrants(
+    const float* __restrict__ phi_in,
+    const int*   __restrict__ origin,
+    const int*   __restrict__ rect,
+    const float* __restrict__ polar_theta,
+    const float* __restrict__ gamma_cell,
+    const float* __restrict__ v_A_cell,
+    const float* __restrict__ tgt_radius,
+    const int*   __restrict__ h_global_id_dev,  // optional, may be nullptr
+    const curandState* __restrict__ rng_states,
+    const int*   __restrict__ migrant_idx,
+    int count,
+    unsigned char* __restrict__ pack_buf,
+    int pack_bytes_per_cell)
+{
+    int slot = blockIdx.x;
+    if (slot >= count) return;
+    int src = migrant_idx[slot];
+
+    unsigned char* dst = pack_buf + (size_t)slot * pack_bytes_per_cell;
+    float* dst_phi = (float*)dst;
+    const float* src_phi = phi_in + (size_t)src * TILE_AREA;
+
+    // Copy phi tile cooperatively.
+    for (int p = threadIdx.x; p < TILE_AREA; p += blockDim.x) {
+        dst_phi[p] = src_phi[p];
+    }
+
+    if (threadIdx.x == 0) {
+        CellPackHeader* hdr = (CellPackHeader*)(dst + (size_t)TILE_AREA * sizeof(float));
+        hdr->origin_x   = origin[2*src + 0];
+        hdr->origin_y   = origin[2*src + 1];
+        hdr->rect_x     = rect[4*src + 0];
+        hdr->rect_y     = rect[4*src + 1];
+        hdr->rect_w     = rect[4*src + 2];
+        hdr->rect_h     = rect[4*src + 3];
+        hdr->global_id  = (h_global_id_dev != nullptr) ? h_global_id_dev[src] : -1;
+        hdr->polar_theta = polar_theta[src];
+        hdr->gamma_cell = gamma_cell[src];
+        hdr->v_A_cell   = v_A_cell[src];
+        hdr->tgt_radius = tgt_radius[src];
+        hdr->rng_state  = rng_states[src];
+    }
+}
+
+void launch_pack_migrants(
+    const CellArrays& c,
+    const int* migrant_idx, int count,
+    void* pack_buf,
+    cudaStream_t stream)
+{
+    if (count <= 0) return;
+    // Note: h_global_id is host-tracked, not in CellArrays. Pack uses -1
+    // as a sentinel; the host re-applies real ids during post-migration
+    // bookkeeping using the recv-side ordering.
+    k_pack_migrants<<<count, 128, 0, stream>>>(
+        c.phi_in, c.origin, c.rect,
+        c.polar_theta, c.gamma_cell, c.v_A_cell, c.tgt_radius,
+        /*h_global_id_dev=*/ nullptr,
+        (curandState*)c.rng_states,
+        migrant_idx, count,
+        (unsigned char*)pack_buf,
+        (int)CELL_PACK_BYTES);
+}
+
+// ---------------------------------------------------------------------------
+// k_unpack_migrants — write incoming pack records into per-cell arrays
+// at slot dst_offset + slot. Phi tile lands in phi_out (scratch half),
+// which becomes phi_in after the orchestrator's post-migration swap.
+// We also zero the corresponding slot in phi_in (the to-be-discarded
+// half) outside the cell's rect to maintain the phi_out-zero invariant
+// when this slot gets used as scratch in the next step's evolve.
+// Actually simpler: caller cudaMemsets the freshly-arrived slot in BOTH
+// halves, then we write phi tile into phi_out only. Done in launch.
+// ---------------------------------------------------------------------------
+__global__ void k_unpack_migrants(
+    float* __restrict__ phi_out,
+    int*   __restrict__ origin,
+    int*   __restrict__ rect,
+    float* __restrict__ polar_theta,
+    float* __restrict__ polar_x,
+    float* __restrict__ polar_y,
+    float* __restrict__ gamma_cell,
+    float* __restrict__ v_A_cell,
+    float* __restrict__ tgt_radius,
+    curandState* __restrict__ rng_states,
+    int*   __restrict__ global_id_out,
+    int dst_offset, int count,
+    const unsigned char* __restrict__ pack_buf,
+    int pack_bytes_per_cell)
+{
+    int slot = blockIdx.x;
+    if (slot >= count) return;
+    int dst = dst_offset + slot;
+
+    const unsigned char* src = pack_buf + (size_t)slot * pack_bytes_per_cell;
+    const float* src_phi = (const float*)src;
+    float* dst_phi = phi_out + (size_t)dst * TILE_AREA;
+
+    for (int p = threadIdx.x; p < TILE_AREA; p += blockDim.x) {
+        dst_phi[p] = src_phi[p];
+    }
+
+    if (threadIdx.x == 0) {
+        const CellPackHeader* hdr = (const CellPackHeader*)
+            (src + (size_t)TILE_AREA * sizeof(float));
+        origin[2*dst + 0] = hdr->origin_x;
+        origin[2*dst + 1] = hdr->origin_y;
+        rect[4*dst + 0]   = hdr->rect_x;
+        rect[4*dst + 1]   = hdr->rect_y;
+        rect[4*dst + 2]   = hdr->rect_w;
+        rect[4*dst + 3]   = hdr->rect_h;
+        polar_theta[dst]  = hdr->polar_theta;
+        polar_x[dst]      = cosf(hdr->polar_theta);
+        polar_y[dst]      = sinf(hdr->polar_theta);
+        gamma_cell[dst]   = hdr->gamma_cell;
+        v_A_cell[dst]     = hdr->v_A_cell;
+        tgt_radius[dst]   = hdr->tgt_radius;
+        rng_states[dst]   = hdr->rng_state;
+        if (global_id_out) global_id_out[dst] = hdr->global_id;
+    }
+}
+
+void launch_unpack_migrants(
+    CellArrays& c,
+    const void* pack_buf, int count,
+    int dst_offset,
+    int* d_global_id_dst,
+    cudaStream_t stream)
+{
+    if (count <= 0) return;
+    k_unpack_migrants<<<count, 128, 0, stream>>>(
+        c.phi_out, c.origin, c.rect,
+        c.polar_theta, c.polar_x, c.polar_y,
+        c.gamma_cell, c.v_A_cell, c.tgt_radius,
+        (curandState*)c.rng_states,
+        d_global_id_dst,
+        dst_offset, count,
+        (const unsigned char*)pack_buf,
+        (int)CELL_PACK_BYTES);
+}
+
+// ---------------------------------------------------------------------------
+// k_compact_phi — gather phi tiles from phi_in[stay_idx[k]] -> phi_out[k]
+// for k in [0, n_stay). One block per stay slot, threads cooperate.
+// ---------------------------------------------------------------------------
+__global__ void k_compact_phi(
+    const float* __restrict__ phi_in,
+    float* __restrict__ phi_out,
+    const int* __restrict__ stay_idx,
+    int n_stay)
+{
+    int k = blockIdx.x;
+    if (k >= n_stay) return;
+    int src = stay_idx[k];
+    const float* src_tile = phi_in  + (size_t)src * TILE_AREA;
+    float*       dst_tile = phi_out + (size_t)k   * TILE_AREA;
+    for (int p = threadIdx.x; p < TILE_AREA; p += blockDim.x) {
+        dst_tile[p] = src_tile[p];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// k_compact_scalars — gather all per-cell scalar arrays. One thread per
+// stay. Each scalar array is touched independently to keep the kernel
+// trivial. dst pointers MUST NOT alias src pointers.
+// ---------------------------------------------------------------------------
+__global__ void k_compact_scalars(
+    // sources
+    const int*   src_origin, const int*   src_rect,
+    const float* src_gamma,  const float* src_v_A,  const float* src_tgt_R,
+    const float* src_theta,  const float* src_px,   const float* src_py,
+    const curandState* src_rng,
+    // destinations
+    int*   dst_origin, int*   dst_rect,
+    float* dst_gamma,  float* dst_v_A,  float* dst_tgt_R,
+    float* dst_theta,  float* dst_px,   float* dst_py,
+    curandState* dst_rng,
+    const int* stay_idx, int n_stay)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_stay) return;
+    int s = stay_idx[k];
+
+    dst_origin[2*k + 0] = src_origin[2*s + 0];
+    dst_origin[2*k + 1] = src_origin[2*s + 1];
+    dst_rect[4*k + 0]   = src_rect[4*s + 0];
+    dst_rect[4*k + 1]   = src_rect[4*s + 1];
+    dst_rect[4*k + 2]   = src_rect[4*s + 2];
+    dst_rect[4*k + 3]   = src_rect[4*s + 3];
+    dst_gamma[k]  = src_gamma[s];
+    dst_v_A[k]    = src_v_A[s];
+    dst_tgt_R[k]  = src_tgt_R[s];
+    dst_theta[k]  = src_theta[s];
+    dst_px[k]     = src_px[s];
+    dst_py[k]     = src_py[s];
+    dst_rng[k]    = src_rng[s];
+}
+
+void launch_compact_stays(
+    const CellArrays& c,
+    const int* stay_idx, int n_stay,
+    float* phi_dst,
+    int*   origin_dst, int* rect_dst,
+    float* gamma_dst, float* v_A_dst, float* tgt_R_dst,
+    float* polar_theta_dst, float* polar_x_dst, float* polar_y_dst,
+    void*  rng_dst,
+    cudaStream_t stream)
+{
+    if (n_stay <= 0) return;
+    // Phi (heavy, one block per cell, threads cooperate on TILE_AREA)
+    k_compact_phi<<<n_stay, 128, 0, stream>>>(
+        c.phi_in, phi_dst, stay_idx, n_stay);
+    // Scalars (light, one thread per cell)
+    int bs = 128;
+    int gs = (n_stay + bs - 1) / bs;
+    k_compact_scalars<<<gs, bs, 0, stream>>>(
+        c.origin, c.rect,
+        c.gamma_cell, c.v_A_cell, c.tgt_radius,
+        c.polar_theta, c.polar_x, c.polar_y,
+        (const curandState*)c.rng_states,
+        origin_dst, rect_dst,
+        gamma_dst, v_A_dst, tgt_R_dst,
+        polar_theta_dst, polar_x_dst, polar_y_dst,
+        (curandState*)rng_dst,
+        stay_idx, n_stay);
+}

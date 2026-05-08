@@ -129,6 +129,46 @@ struct Simulation {
     // of these — it remains the hot path for --gpus 1.
     void step_pre_reduce();
     void step_post_reduce();
+
+    // ---- Migration state (multi-GPU only). Allocated by alloc_gpu when
+    // gpus > 1. Used by migrate_cells() (called from the orchestrator at
+    // rebind cadence) to move cells between ranks when their rebound COM
+    // crosses a slab boundary. All pointers are device memory.
+    int*   d_n_stay        = nullptr;     // single int
+    int*   d_n_up          = nullptr;     // single int
+    int*   d_n_down        = nullptr;     // single int
+    int*   d_n_in_prev     = nullptr;     // single int (recv'd from prev)
+    int*   d_n_in_next     = nullptr;     // single int (recv'd from next)
+    int*   d_stay_idx      = nullptr;     // [capacity]
+    int*   d_up_idx        = nullptr;     // [capacity]
+    int*   d_down_idx      = nullptr;     // [capacity]
+    void*  d_pack_up       = nullptr;     // [MAX_MIGRANTS_PER_DIR * CELL_PACK_BYTES]
+    void*  d_pack_down     = nullptr;
+    void*  d_pack_in_prev  = nullptr;
+    void*  d_pack_in_next  = nullptr;
+    // Scratch arrays for compaction. Same layout as the corresponding
+    // CellArrays fields, allocated to capacity. Used to gather stays via
+    // a kernel, then we swap pointers with the originals.
+    int*   d_origin_scratch     = nullptr;  // [2*capacity]
+    int*   d_rect_scratch       = nullptr;  // [4*capacity]
+    float* d_gamma_scratch      = nullptr;
+    float* d_v_A_scratch        = nullptr;
+    float* d_tgt_R_scratch      = nullptr;
+    float* d_polar_theta_scratch = nullptr;
+    float* d_polar_x_scratch    = nullptr;
+    float* d_polar_y_scratch    = nullptr;
+    void*  d_rng_scratch        = nullptr;  // curandState array
+
+    // Migrate cells whose rebound COM crossed a slab boundary. Called
+    // from run_multi_gpu's main thread between barrier sync points, and
+    // ONLY on rebind boundaries (step_count % REBIND_EVERY == 0). For
+    // gpus == 1 this is a no-op.
+    //
+    // NOTE: this function issues NCCL calls and so must be invoked while
+    // holding the per-rank stream + comm; it expects the caller to do
+    // appropriate synchronisation around it. Implemented in sim.cu under
+    // ENABLE_MULTI_GPU.
+    int migrate_cells(struct MgWorld& world, int rank);
     void print_status();
     void write_trajectory();
     void write_vtk();
