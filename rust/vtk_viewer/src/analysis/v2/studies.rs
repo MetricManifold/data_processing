@@ -422,12 +422,19 @@ impl Workspace {
 /// metrics here. For phase 6 we ship just MSD's basic metrics.
 pub fn metric_registry() -> BTreeMap<&'static str, MetricExtractor> {
     use crate::analysis::v2::observables::msd::Msd;
+    use crate::analysis::v2::observables::msd_palmieri::MsdPalmieri;
     let mut m: BTreeMap<&'static str, MetricExtractor> = BTreeMap::new();
     m.insert("msd_lag1", crate::v2_metric!(Msd, |out| {
         out.cell0_values.first().copied().unwrap_or(f64::NAN)
     }));
     m.insert("msd_pop_lag1", crate::v2_metric!(Msd, |out| {
         out.values.first().copied().unwrap_or(f64::NAN)
+    }));
+    m.insert("deff_palmieri", crate::v2_metric!(MsdPalmieri, |out| {
+        out.d_eff_cell
+    }));
+    m.insert("deff_pop_palmieri", crate::v2_metric!(MsdPalmieri, |out| {
+        out.d_eff_pop
     }));
     m
 }
@@ -596,12 +603,26 @@ fn execute_op(
             Ok(())
         }
         AggregateToml::Sweep { axis, input, into } => {
-            let summaries = match ws.get(input)? {
-                Slot::Summaries(s) => s,
-                _ => return Err(anyhow!("sweep expects `summaries` input `{}`", input)),
-            };
-            let curve = Sweep { axis }.run(summaries)?;
-            ws.insert(into, Slot::Curve(curve));
+            match ws.get(input)? {
+                Slot::Summaries(s) => {
+                    let curve = Sweep { axis }.run(s)?;
+                    ws.insert(into, Slot::Curve(curve));
+                }
+                Slot::Pairs(pairs) => {
+                    let as_summaries: Vec<GroupSummary> = pairs
+                        .iter()
+                        .map(|p| GroupSummary {
+                            key: p.key.clone(),
+                            variables: p.variables.clone(),
+                            n: p.numerator.n,
+                            metrics: p.ratios.clone(),
+                        })
+                        .collect();
+                    let curve = Sweep { axis }.run(&as_summaries)?;
+                    ws.insert(into, Slot::Curve(curve));
+                }
+                _ => return Err(anyhow!("sweep expects `summaries` or `pairs` input `{}`", input)),
+            }
             Ok(())
         }
         AggregateToml::PairRatio {

@@ -7,6 +7,66 @@
 //!   `snapshot` — render phase-field PNGs from checkpoints / VTK frames.
 //!   `check`    — validate trajectory/checkpoint integrity.
 //!   `list`     — list available observables, panels, aggregators.
+//!
+//! ----------------------------------------------------------------------
+//! TODO(movie + observable trace overlay subcommand)
+//! ----------------------------------------------------------------------
+//! Replaces the deleted Python script
+//! `cpp/simulation/postprocessing/visualize_combined.py`. Required CLI:
+//!
+//!   cell_analyze movie <out_dir> --observable {volume,msd,velocity,shape}
+//!                                -o out.mp4 --fps 15
+//!
+//! Behaviour:
+//!   1. For every VTK frame in <out_dir>/output_*.vtk render the phi
+//!      panel using the same colormap pipeline `snapshot --color-by phi`
+//!      already uses.
+//!   2. Read <out_dir>/trajectory.txt and compute the chosen time-series
+//!      observable across all cells (mean unless --per-cell):
+//!        volume   — mean phi-weighted area per frame
+//!        msd      — population MSD vs lag
+//!        velocity — mean |v|
+//!        shape    — mean L_n shape index (perimeter / 2πR)
+//!   3. For each frame at sim time t_k stack vertically:
+//!        top    = rendered phi panel (snapshot output)
+//!        bottom = observable time series plotted up to t_k only
+//!                 (the trace draws itself out as the movie plays).
+//!                 y-axis fixed by the global min/max so it does not jump.
+//!   4. ffmpeg-encode at the given fps, mirroring the path used by
+//!      `snapshot --movie --fps N`.
+//!
+//! Until this lands there is no combined sim+observable movie tool.
+//! ----------------------------------------------------------------------
+//!
+//! TODO(stress field visualization)
+//! ----------------------------------------------------------------------
+//! Replaces the deleted Python script
+//! `cpp/simulation/postprocessing/visualize_stress.py`. Out of scope
+//! until the C++ simulator emits stress fields again — the post-cutover
+//! `cell_sim` writes phi only into VTK and the historical
+//! `ENABLE_STRESS_FIELDS` CMake flag was dropped during the v2 cutover.
+//!
+//! Required pre-work in the simulator (NOT in Rust):
+//!   - Restore `ENABLE_STRESS_FIELDS` (or new equivalent flag) in
+//!     `cpp/simulation/CMakeLists.txt`.
+//!   - Have `Simulation::write_vtk()` append SCALARS blocks for
+//!     `sigma_xx`, `sigma_yy`, `sigma_xy`, `phi` when the flag is on.
+//!
+//! Once those land, add a `cell_analyze stress <out_dir>` subcommand:
+//!   - Read SCALARS sigma_xx, sigma_yy, sigma_xy from each frame.
+//!   - Compute derived fields per pixel:
+//!       von_mises = sqrt(sigma_xx^2 - sigma_xx*sigma_yy + sigma_yy^2
+//!                        + 3*sigma_xy^2)
+//!       tau_max   = sqrt(((sigma_xx - sigma_yy)/2)^2 + sigma_xy^2)
+//!       pressure  = -(sigma_xx + sigma_yy)/2
+//!       sigma_1, sigma_2 = principal stresses (eigenvalues of the 2x2)
+//!   - Selectable via `--field {von_mises,tau_max,pressure,sigma_xx,
+//!     sigma_yy,sigma_xy,sigma_1,sigma_2}` (default von_mises).
+//!   - Mask by phi > eps (so vacuum pixels are not drawn).
+//!   - Same `--movie/--fps` story as `snapshot --movie`.
+//!   - Diverging colormap for pressure/principal stresses; sequential
+//!     for von_mises/tau_max.
+//! ----------------------------------------------------------------------
 #![allow(dead_code)]
 
 mod analysis;
