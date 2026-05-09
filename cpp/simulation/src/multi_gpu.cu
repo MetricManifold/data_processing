@@ -53,16 +53,40 @@ bool mg_init_world(int world_size, MgWorld& out) {
 
     int dev_count = 0;
     MG_CUDA_CK(cudaGetDeviceCount(&dev_count));
-    if (dev_count < world_size) {
+
+    // Loopback test mode: pin every rank to the same physical device.
+    // Lets us validate the multi-GPU code path on single-GPU hardware
+    // (WSL laptop) without real multi-GPU. NCCL supports same-device
+    // peers and uses a fast in-memory channel.
+    //   CELL_SIM_LOOPBACK_DEVICE=0 (or any valid device id)
+    //   -> all ranks attached to that device.
+    // Not for production runs; the env var is the deliberate signal.
+    const char* loopback_env = std::getenv("CELL_SIM_LOOPBACK_DEVICE");
+    int loopback_dev = -1;
+    if (loopback_env && loopback_env[0] != '\0') {
+        loopback_dev = std::atoi(loopback_env);
+        if (loopback_dev < 0 || loopback_dev >= dev_count) {
+            fprintf(stderr,
+                "[multi_gpu] CELL_SIM_LOOPBACK_DEVICE=%d invalid (have %d devices)\n",
+                loopback_dev, dev_count);
+            return false;
+        }
+        fprintf(stdout,
+            "[multi_gpu] LOOPBACK MODE: all %d ranks on device %d\n",
+            world_size, loopback_dev);
+    } else if (dev_count < world_size) {
         fprintf(stderr,
                 "[multi_gpu] requested %d GPUs but only %d visible. "
-                "Set CUDA_VISIBLE_DEVICES or reduce --gpus.\n",
+                "Set CUDA_VISIBLE_DEVICES, reduce --gpus, or set "
+                "CELL_SIM_LOOPBACK_DEVICE=<id> for testing.\n",
                 world_size, dev_count);
         return false;
     }
 
     out.devices.resize(world_size);
-    for (int g = 0; g < world_size; ++g) out.devices[g] = g;
+    for (int g = 0; g < world_size; ++g) {
+        out.devices[g] = (loopback_dev >= 0) ? loopback_dev : g;
+    }
 
     out.streams.resize(world_size, nullptr);
     for (int g = 0; g < world_size; ++g) {
