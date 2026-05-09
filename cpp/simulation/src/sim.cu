@@ -2009,74 +2009,127 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 } else {
                     // Halo exchange.
                     //
-                    // NCCL pairing: rank g's K-th send (to peer p) matches
-                    // rank p's K-th recv (from peer g). So if I send my
-                    // top_band first to prev, the data arrives in prev's
-                    // FIRST recv-from-me buffer. From prev's perspective,
-                    // I am its `next`, so prev's first send/recv-pair
-                    // involves me as next, and the recv-target it issues
-                    // for that pair must be its `bot` recv buffer (since
-                    // my top boundary IS prev's bot boundary in global y).
+                    // For G >= 3, prev_rank != next_rank. NCCL pairs sends
+                    // and recvs PER PEER in issue order. Each rank issues:
+                    //   op 1: send my top_band → prev,  recv from prev → halo_top_recv
+                    //   op 2: send my bot_band → next,  recv from next → halo_bot_recv
+                    // My op-1 recv from prev pairs with prev's first send
+                    // to its `next` (= me): prev's `bot_band`. That holds
+                    // contributions to global rows [y_hi_prev - H, y_hi_prev + H)
+                    // = [y_lo - H, y_lo + H) — exactly my top_band's rows.
+                    // Symmetrically halo_bot_recv = next's top_band, same
+                    // rows as my bot_band. Add gives global S. ✓
                     //
-                    // To keep all ranks symmetric without per-rank logic,
-                    // every rank issues:
-                    //    SR(top_band -> prev,  recv_into_bot)
-                    //    SR(bot_band -> next,  recv_into_top)
-                    // The "swap" of recv targets is the explicit
-                    // recognition that "my top boundary == prev's bot
-                    // boundary" and vice versa. After the kernel-add the
-                    // bands hold the global S contribution from both
-                    // ranks at the matching rows.
-                    mg_group_start();
-                    mg_send_recv_f32(world.comms[g],
-                                     my_top_band, prev_rank,
-                                     halo_bot_recv[g], prev_rank,
-                                     halo_band_floats,
-                                     sims[g]->step_stream);
-                    mg_send_recv_f32(world.comms[g],
-                                     my_bot_band, next_rank,
-                                     halo_top_recv[g], next_rank,
-                                     halo_band_floats,
-                                     sims[g]->step_stream);
-                    mg_group_end();
-
-                    // Add neighbour contributions into the matching bands.
-                    //   halo_top_recv = next's top_band -> goes into bot
-                    //   halo_bot_recv = prev's top_band -> goes into top? NO!
+                    // For G == 2, prev_rank == next_rank (the only other
+                    // rank). NCCL pairing is per-(rank,peer)-pair only,
+                    // and BOTH op 1's send and op 2's send go to the same
+                    // peer. So my 1st send (top) pairs with peer's 1st
+                    // recv (its halo_top_recv) — that's prev's TOP band,
+                    // not its bot band. Different global rows; the protocol
+                    // breaks.
                     //
-                    // Re-derive: rank g's halo_bot_recv received PREV's
-                    // top_band (NCCL paired my SR1.recv with prev's SR1.send).
-                    // PREV's top_band is global rows [y_lo_prev - H, y_lo_prev + H)
-                    // = [y_hi_prev - H, y_hi_prev + H) (for G=2 with periodic wrap)
-                    // WAIT - for G=2, y_hi_prev = y_lo (the boundary between
-                    // me and prev). Different boundary from what I called
-                    // top vs bot. Let me re-check by physical interpretation:
-                    //   my top_band  = global [y_lo - H, y_lo + H)
-                    //   prev's bot_band = global [y_hi_prev - H, y_hi_prev + H)
-                    //                   = [y_lo - H, y_lo + H)  (y_hi_prev=y_lo)
-                    //   These are the SAME rows. Their sum is global S there.
-                    //   So my top_band += prev's bot_band gives me global S.
-                    //
-                    // But I send top to prev and prev receives my top into
-                    // its halo_BOT_recv (we swapped the target). So prev
-                    // adds my top_band to ITS bot_band. ✓
-                    //
-                    // What about MY recv? Rank g's halo_BOT_recv receives
-                    // prev's send-to-its-next-of-prev = me. Prev's first
-                    // send to me (its NEXT in G=2) is its top_band. So
-                    // my halo_BOT_recv = prev's top_band, which equals
-                    // [y_lo_prev - H, y_lo_prev + H). For G=2 with rank g=1,
-                    // prev=0, y_lo_prev=0, so prev's top is at the WRAP
-                    // boundary [Ny-H, Ny) ∪ [0, H). My bot boundary
-                    // is at [y_hi - H, y_hi + H) = [Ny - H, Ny) ∪ [0, H)
-                    // (since y_hi = Ny). SAME rows. ✓
-                    //
-                    // So launch_halo_add(my_bot_band, halo_bot_recv) correctly
-                    // sums across the wrap boundary. Symmetric for top.
-                    launch_halo_add(my_top_band, halo_top_recv[g],
-                                    halo_band_floats, sims[g]->step_stream);
-                    launch_halo_add(my_bot_band, halo_bot_recv[g],
-                                    halo_band_floats, sims[g]->step_stream);
+                    // Fix for G==2: pack BOTH bands into a single buffer
+                    // [top | bot] of size 4H·Nx, do ONE send/recv pair,
+                    // and split on the recv side. This disambiguates the
+                    // two boundaries by buffer offset rather than by
+                    // peer/op pairing.
+                    if (args.gpus == 2) {
+                        // Bands are contiguous in the S buffer:
+                        //   top_band = S[0 .. 2H·Nx)
+                        //   bot_band = S[slab_h·Nx .. (slab_h+2H)·Nx)
+                        // We can't send them as one chunk because they're
+                        // not adjacent. We DO send them as two consecutive
+                        // chunks into a peer buffer of size 4H·Nx, then
+                        // unpack. For now: send them as a single
+                        // contiguous "combined" staging buffer using two
+                        // sequential cudaMemcpyAsync into a packed staging
+                        // area on the SEND side, NCCL one-shot, then split.
+                        //
+                        // Simpler path: do TWO send/recvs but to two
+                        // different peer "logical" channels. NCCL has no
+                        // tags, so the trick is to use TWO sub-communicators
+                        // — one for top boundaries, one for bot. That's
+                        // structural overhead we don't have today.
+                        //
+                        // Pragmatic fix: pack [top|bot] into a single 4H·Nx
+                        // staging buffer per rank, send/recv that, then
+                        // split. Use halo_top_recv/halo_bot_recv as the
+                        // single combined buffer (their combined size is
+                        // 2 × 2H·Nx = 4H·Nx — and they happen to be
+                        // allocated contiguously in memory if cudaMalloc
+                        // happened to put them next to each other, which
+                        // we cannot rely on). Allocate a dedicated combined
+                        // buffer at world setup time? Simpler: send twice,
+                        // recv twice, but ROUTE the recvs explicitly using
+                        // ncclSend/ncclRecv with an awareness that NCCL
+                        // pairs by issuance order across same-peer pairs.
+                        //
+                        // The simplest deterministic fix: BOTH ranks issue
+                        // the SAME op order, so NCCL's pairing collapses
+                        // to "my k-th send/recv pairs with peer's k-th
+                        // send/recv on the same channel." If both ranks
+                        // do (Send_top, Recv_top, Send_bot, Recv_bot)
+                        // [in this order, NOT interleaved as send_recv
+                        // pairs], then:
+                        //   my Send_top (op 1) pairs with peer's Recv_top
+                        //   (op 2). So peer's halo_top_recv gets my top.
+                        //   my Recv_top (op 2) pairs with peer's Send_top
+                        //   (op 1). So my halo_top_recv gets peer's top.
+                        // top vs bot stays straight because of the
+                        // 4-issue ordering. The problem with the
+                        // mg_send_recv_f32 helper is it issues
+                        // Send-then-Recv inline; for G==2 we need to
+                        // separate them.
+                        mg_group_start();
+                        mg_send_bytes(world.comms[g],
+                                      my_top_band, prev_rank,
+                                      halo_band_floats * sizeof(float),
+                                      sims[g]->step_stream);
+                        mg_recv_bytes(world.comms[g],
+                                      halo_top_recv[g], prev_rank,
+                                      halo_band_floats * sizeof(float),
+                                      sims[g]->step_stream);
+                        mg_send_bytes(world.comms[g],
+                                      my_bot_band, next_rank,
+                                      halo_band_floats * sizeof(float),
+                                      sims[g]->step_stream);
+                        mg_recv_bytes(world.comms[g],
+                                      halo_bot_recv[g], next_rank,
+                                      halo_band_floats * sizeof(float),
+                                      sims[g]->step_stream);
+                        mg_group_end();
+                        // After: halo_top_recv = peer's top_band, which
+                        // is at global [y_lo_peer - H, y_lo_peer + H).
+                        // For G=2, peer's y_lo == my y_hi (mod Ny), so
+                        // peer's top boundary IS my bot boundary.
+                        // Therefore halo_top_recv adds into my BOT band,
+                        // and halo_bot_recv adds into my TOP band (because
+                        // peer's bot is at peer's y_hi, which is my y_lo
+                        // via wrap).
+                        launch_halo_add(my_bot_band, halo_top_recv[g],
+                                        halo_band_floats, sims[g]->step_stream);
+                        launch_halo_add(my_top_band, halo_bot_recv[g],
+                                        halo_band_floats, sims[g]->step_stream);
+                    } else {
+                        // G >= 3: distinct prev/next; the standard
+                        // send-recv pairing protocol works.
+                        mg_group_start();
+                        mg_send_recv_f32(world.comms[g],
+                                         my_top_band, prev_rank,
+                                         halo_top_recv[g], prev_rank,
+                                         halo_band_floats,
+                                         sims[g]->step_stream);
+                        mg_send_recv_f32(world.comms[g],
+                                         my_bot_band, next_rank,
+                                         halo_bot_recv[g], next_rank,
+                                         halo_band_floats,
+                                         sims[g]->step_stream);
+                        mg_group_end();
+                        launch_halo_add(my_top_band, halo_top_recv[g],
+                                        halo_band_floats, sims[g]->step_stream);
+                        launch_halo_add(my_bot_band, halo_bot_recv[g],
+                                        halo_band_floats, sims[g]->step_stream);
+                    }
                 }
 
                 sims[g]->step_post_reduce();
