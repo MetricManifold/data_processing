@@ -1,0 +1,125 @@
+[package]
+name = "cell_analyze"
+version = "0.1.0"
+edition = "2021"
+description = "Trajectory analysis + study pipeline for the multi-cell phase-field simulator."
+
+[dependencies]
+anyhow = "1.0"
+bitflags = "2"
+clap = { version = "4", features = ["derive"] }
+plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
+png = "0.17"
+rayon = "1.8"
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+[lib]
+name = "cell_analyze"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cell_analyze"
+path = "src/main.rs"
+
+# Per-observable runnable examples. Each one loads a trajectory and
+# computes one observable. Run with:
+#   cargo run --release --example <name>           # uses default ctrl run
+#   cargo run --release --example <name> -- <dir>  # specify run dir
+[[example]]
+name = "msd"
+path = "examples/observables/msd.rs"
+
+[[example]]
+name = "msd_palmieri"
+path = "examples/observables/msd_palmieri.rs"
+
+[[example]]
+name = "ln_perimeter"
+path = "examples/observables/ln_perimeter.rs"
+
+[[example]]
+name = "displacement_velocities"
+path = "examples/observables/displacement_velocities.rs"
+
+[[example]]
+name = "velocity_distribution"
+path = "examples/observables/velocity_distribution.rs"
+
+[[example]]
+name = "bursts"
+path = "examples/observables/bursts.rs"
+
+[[example]]
+name = "diffusion"
+path = "examples/observables/diffusion.rs"
+
+[[example]]
+name = "msd_log_slope"
+path = "examples/observables/msd_log_slope.rs"
+
+[[example]]
+name = "cage_length"
+path = "examples/observables/cage_length.rs"
+
+[[example]]
+name = "per_cell_diffusion"
+path = "examples/observables/per_cell_diffusion.rs"
+
+[[example]]
+name = "displacement"
+path = "examples/observables/displacement.rs"
+
+[[example]]
+name = "alpha2"
+path = "examples/observables/alpha2.rs"
+
+[[example]]
+name = "overlap_chi4"
+path = "examples/observables/overlap_chi4.rs"
+
+[[example]]
+name = "structure_factor"
+path = "examples/observables/structure_factor.rs"
+
+[[example]]
+name = "fs_qstar"
+path = "examples/observables/fs_qstar.rs"
+
+[[example]]
+name = "van_hove"
+path = "examples/observables/van_hove.rs"
+
+[[example]]
+name = "spatial_correlation"
+path = "examples/observables/spatial_correlation.rs"
+
+[[example]]
+name = "velocity_autocorrelation"
+path = "examples/observables/velocity_autocorrelation.rs"
+
+[[example]]
+name = "va_mobility_correlation"
+path = "examples/observables/va_mobility_correlation.rs"
+
+[[example]]
+name = "shape_index"
+path = "examples/observables/shape_index.rs"
+
+[[example]]
+name = "hexatic_order"
+path = "examples/observables/hexatic_order.rs"
+
+[[example]]
+name = "voronoi_shape"
+path = "examples/observables/voronoi_shape.rs"
+
+[[example]]
+name = "polarity_tau"
+path = "examples/observables/polarity_tau.rs"
+
+[[example]]
+name = "kinetic_energy"
+path = "examples/observables/kinetic_energy.rs"
