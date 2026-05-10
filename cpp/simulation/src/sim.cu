@@ -2138,7 +2138,17 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 // migrate_cells is a no-op early-out). step_post_reduce
                 // ran k_rebind on this step iff (step_count is now a
                 // multiple of REBIND_EVERY) — it does the increment last.
-                if (args.gpus > 1
+                //
+                // Diagnostic: CELL_SIM_SKIP_MIGRATION=1 disables migration
+                // entirely. Useful for short runs where no cell crosses a
+                // slab boundary, isolating the per-step halo cost from
+                // the migration host-sync cost. Does NOT disable rebind.
+                static const bool skip_migration = []() {
+                    const char* e = std::getenv("CELL_SIM_SKIP_MIGRATION");
+                    return e && e[0] == '1';
+                }();
+                if (!skip_migration
+                    && args.gpus > 1
                     && sims[g]->step_count > 0
                     && (sims[g]->step_count % REBIND_EVERY) == 0)
                 {
