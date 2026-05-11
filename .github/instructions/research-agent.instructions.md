@@ -1,445 +1,116 @@
-# Research Agent Instructions: Phase Field Model Studies of Tissue Mechanics
+# Phase Field Tissue Mechanics — Research Agent Instructions
 
-> **When to consult this file:** You are exploring research questions, designing experiments, analyzing results in the context of tissue mechanics literature, or connecting simulation output to physical interpretations. This file has no `applyTo` scope — it applies to any research-oriented task across the codebase. For simulation mechanics or CLI, see [cell-simulation.instructions.md](cell-simulation.instructions.md). For the adhesion-specific study, see [adhesion-study.instructions.md](adhesion-study.instructions.md).
-
-## Mission Statement
-
-You are assisting with computational research on the glass/jamming transition in biological tissues using a **phase field model** (PFM). Your role is to help identify novel results that fill gaps in the existing literature, which has primarily relied on **vertex models**. The phase field approach offers unique advantages that can address questions the vertex model cannot answer well.
+> **When to consult this file:** You are reasoning about *research questions* — what physics to probe, what observables matter, how to interpret results in light of the vertex-model and active-matter literature. For *how* to build / run / analyze, use the relevant tooling instructions: simulation builds and CLI in [cell-simulation.instructions.md](cell-simulation.instructions.md), cluster jobs in [cluster-operations.instructions.md](cluster-operations.instructions.md), analysis via `cell_analyze --help` and `cell_analyze list`. Study-specific physics and protocol live in the per-study files (`adhesion-study`, `griffiths-study`, `palmieri-extension`).
 
 ---
 
-## Essential Background
+## Mission
 
-### Required Reading
+Use a multi-cell **phase field model** (PFM) to study glass/jamming and active-matter physics in confluent and near-confluent tissues, focusing on questions that *vertex models* and *cellular Potts models* cannot answer cleanly.
 
-Before proceeding, familiarize yourself with the theoretical background and literature:
+Each cell is a continuous field $\phi_i(\mathbf{r},t)$ with:
 
-📖 **Primary References:**
-- `cpp/simulation/AGENT_ONBOARDING.md` — Physics model, equations of motion, parameter definitions
-- `cpp/simulation/RUNBOOK.md` — Operational runbook
-- Key papers listed in the [Key References](#key-references-quick-links) section below
+- Cahn–Hilliard interface energy ($\gamma |\nabla\phi|^2$ + double-well bulk)
+- Quartic steric repulsion ($\kappa \sum_{i<j}\phi_i^2\phi_j^2$)
+- Soft volume constraint ($\mu (V_i-A_0)^2$)
+- Optional gradient-coupling adhesion ($J \sum_{i<j}\int \nabla\phi_i\cdot\nabla\phi_j\,dA$)
+- Self-propulsion via run-and-tumble polarity dynamics ($v_A$, $\tau$)
 
-### The Research Gap
-
-The vertex model literature (Bi et al. 2015, 2016; Barton et al. 2017) has established:
-- The shape index $p_0 \approx 3.81$ controls the solid-fluid transition
-- Cell motility can drive unjamming
-- T1 transitions (neighbor exchanges) are the elementary rearrangement events
-
-**However, vertex models have fundamental limitations:**
-
-| Vertex Model Limitation | Phase Field Model Advantage |
-|------------------------|----------------------------|
-| Cells have straight edges | Cells have realistic curved boundaries |
-| Discrete topology changes (T1s) | Continuous interface evolution |
-| Assumes confluent tissue (no gaps) | Naturally handles non-confluent states |
-| Cell shape is polygon-based | Cell shape emerges from field dynamics |
-| Adhesion is a line tension parameter | Adhesion arises from field interactions |
-| Motility is an external force | Motility can couple to internal dynamics |
-| Fixed cell number between divisions | Cells can smoothly merge/split |
+The simulation is GPU-resident (CUDA) and supports 2D and 3D up to ~10⁴ cells. Detailed dynamics, parameter sets (Palmieri vs Bresler), and the EOM live in the simulation source and study-specific files — do not re-derive them here.
 
 ---
 
-## The Phase Field Model
+## Where the PFM has an edge over vertex models
 
-### Model Overview
+| Vertex model assumption | PFM relaxes it via |
+|---|---|
+| Straight polygonal edges | Curved interfaces with finite width $\lambda$ |
+| Discrete T1 events (instantaneous topology flips) | Continuous interface evolution; rearrangements have a finite trajectory |
+| 100% confluence | Free surfaces and gaps are natural ($\rho < 1$) |
+| No overlap | Compression / interpenetration accessible (limited by $\kappa$) |
+| Adhesion as one line-tension parameter $\Lambda$ | Adhesion is a variational gradient coupling with a closed-form stability bound $J < 2\gamma$ |
+| Motility as an external force | Active velocity couples directly to the field via advection $-v\cdot\nabla\phi$ |
+| Frozen at $T = 0$, $v_0 = 0$ | Pure gradient-descent quench is meaningful (the "adhesion quench" protocol uses this) |
 
-Our simulation represents each cell $i$ as a continuous **phase field** $\phi_i(\mathbf{r}, t)$ where:
-- $\phi_i \approx 1$ inside cell $i$
-- $\phi_i \approx 0$ outside cell $i$
-- Smooth interface of width $\epsilon$ between cells
-
-The total phase field $\phi = \sum_i \phi_i$ represents local cell density.
-
-### Energy Functional
-
-The system evolves to minimize a free energy functional:
-
-$$F = \int d\mathbf{r} \left[ \sum_i f_{CH}(\phi_i) + \sum_{i<j} f_{int}(\phi_i, \phi_j) + f_{bulk}(\phi) \right]$$
-
-Where:
-- $f_{CH}$: Cahn-Hilliard term (interface energy, cell shape)
-- $f_{int}$: Cell-cell interaction — **repulsion** ($\kappa \sum \phi_i^2 \phi_j^2$) and **adhesion** (gradient coupling, enabled via `--adhesion J`)
-- $f_{bulk}$: Bulk constraint (area/volume conservation)
-
-**Adhesion term (implemented):** $F_{\text{adh}} = J \sum_{i<j} \int \nabla\phi_i \cdot \nabla\phi_j \, dA$ (gradient coupling). The variational derivative $\delta F/\delta \phi_i = -J(\nabla^2 S - \nabla^2\phi_i)$ where $S = \sum_k\phi_k$, computed via a global sum field and five-point Laplacian stencil. This is surface-localized, variational, and has a stability bound $J < 2\gamma$. See [adhesion-study.instructions.md](adhesion-study.instructions.md) for full physics. When `--adhesion` is not specified (J=0), no extra memory is allocated and zero overhead is incurred.
-
-### Dynamics
-
-Each phase field evolves according to:
-
-$$\frac{\partial \phi_i}{\partial t} = -M \frac{\delta F}{\delta \phi_i} + \mathbf{v}_i \cdot \nabla \phi_i + \eta_i$$
-
-Where:
-- $M$: mobility coefficient
-- $\mathbf{v}_i$: active velocity (self-propulsion)
-- $\eta_i$: noise term
-
-### Key Parameters
-
-| Parameter | Symbol | Physical Meaning |
-|-----------|--------|------------------|
-| Motility | `vA` | Self-propulsion speed |
-| Packing fraction | `phi` | Area fraction occupied by cells |
-| Interface width | `epsilon` / `lambda` | Cell boundary sharpness |
-| Gradient energy | `gamma` | Interfacial stiffness / surface tension |
-| Repulsion | `kappa` | Cell-cell repulsion strength |
-| Volume constraint | `mu` | Resistance to area changes |
-| Friction | `xi` | Friction coefficient (dissipation rate) |
-| Adhesion strength | `J` | Cell-cell attraction (`--adhesion J`; 0=disabled, no overhead) |
-| Number of cells | `N` | System size |
-| Box size | `L` | Determines effective density |
-
-### Parameter Sets
-
-Two parameter calibrations exist in the codebase. **Each study specifies which set it uses.**
-
-- **Palmieri (2015):** The binary defaults. No parameter overrides needed. Run `cell_sim -h` to see current values.
-- **Bresler (2018):** Reparametrised for the sharp-interface limit. Requires overrides: `gamma=3.75`, `mu=0.5`, `xi=1000`. All other parameters use binary defaults.
-
-The Bresler calibration reparametrised $\gamma$, $\mu$, $\xi$ for the sharp-interface limit. The two sets produce **different physics** and are not interchangeable. Check the study-specific instructions for which to use.
+Research-question priority should weight these gaps. Vertex-model reproductions are useful as validation; novelty lies in regimes vertex models cannot touch.
 
 ---
 
-## Research Questions to Explore
+## Open research directions
 
-### Priority 1: Novel Results (Vertex Model Gaps)
+Listed by where the PFM advantage is strongest. Each line is one phrasing; the actual hypothesis lives in the study TOML / LOG_BOOK once a direction is picked up.
 
-These questions **cannot be answered** by vertex models and represent the highest-impact research directions:
+### Interface and shape dynamics
+- Boundary fluctuation spectrum $S(k) = \langle |\hat\phi(k)|^2\rangle$ across the jamming transition — do they diverge or change scaling?
+- Continuous-vs-discrete rearrangements: time-resolved contact-area trajectory during would-be T1 events. Is the "T1" a singular event or a finite-width process?
+- Effective shape index $p_\mathrm{eff} = L_n \cdot 2\sqrt{\pi}$ extracted from $\phi = 0.5$ contours, compared to the vertex-model $p_0^* \approx 3.81$.
 
-#### 1.1 Cell Shape Fluctuations at the Transition
+### Non-confluent and compressible regimes
+- Second jamming transition at intermediate $\phi$ (geometric caging vs shape transition).
+- Gap-size distribution $P(A_\mathrm{gap})$ and its percolation threshold.
+- Overlap-dominated regime under compression: where does cell-shape control give way to overlap control?
 
-**Question:** How do cell boundary fluctuations (membrane undulations) change across the jamming transition?
+### Adhesion-controlled rigidity (active study)
+- $(\tilde J, v_A)$ phase diagram. Adhesion lowers the motility threshold for unjamming — by how much, and does $\langle p_\mathrm{eff}\rangle$ at the boundary land near 3.81?
+- Adhesion quench at $v_A = 0$: continuous relaxation path to local minima, inaccessible to vertex models.
+- See [adhesion-study.instructions.md](adhesion-study.instructions.md) for protocol, parameters, manuscript.
 
-**Why vertex models can't answer:** Vertex models have straight edges with no fluctuations. The shape index $p$ is computed from polygon geometry, missing dynamic boundary fluctuations.
+### Quenched motility disorder (active study)
+- Griffiths rare-region prediction vs "stirred glass" prediction. Single-cell observables ($\alpha_2$, CV of $D_i$) are ambiguous; collective observables ($\beta$ from $Q(t)$ fits, $\chi_4$ peak) are decisive.
+- Non-monotone $\bar v_A$ dependence of fluidization (testable signature of the Debets cage-scanning picture).
+- See [griffiths-study.instructions.md](griffiths-study.instructions.md).
 
-**What to measure:**
-- Interface roughness: $\langle (\nabla \phi)^2 \rangle$
-- Fluctuation spectrum: $S(k) = \langle |\hat{\phi}(k)|^2 \rangle$
-- Temporal correlations of boundary position
+### Heterogeneity beyond a single soft cell (active study)
+- Finite-size scaling of Palmieri's single-soft-cell motility enhancement — does the headline ratio $D_\mathrm{eff}^c/D_\mathrm{eff}^n$ survive $N \to \infty$?
+- Percolation of fluidization as cancer-cell fraction $f_c$ grows.
+- Polydispersity (size $R$ and stiffness $\gamma$) and its effect on shape-index transitions.
+- See [palmieri-extension.instructions.md](palmieri-extension.instructions.md).
 
-**Hypothesis:** Boundary fluctuations may diverge at the transition (critical fluctuations) or show qualitatively different scaling in solid vs. fluid phases.
-
-#### 1.2 Non-Confluent Jamming
-
-**Question:** How does the jamming transition change when tissues are not fully confluent (gaps exist between cells)?
-
-**Why vertex models can't answer:** Vertex models assume 100% confluence by construction. They cannot represent gaps.
-
-**What to measure:**
-- Jamming transition as function of packing fraction $\phi < 1$
-- Gap size distribution $P(A_{gap})$
-- Percolation of cell-free regions
-- Compare $\phi_c$ (critical packing) vs. $p_0^*$ (shape index transition)
-
-**Hypothesis:** There may be a second jamming transition at intermediate $\phi$ distinct from the confluent $p_0^*$ transition.
-
-#### 1.3 Cell Overlap and Compression
-
-**Question:** What happens when cells are forced to overlap (high compression)?
-
-**Why vertex models can't answer:** Vertex models assume cells tile the plane with no overlap—this is geometrically enforced.
-
-**What to measure:**
-- Overlap integral: $O = \int \phi_i \phi_j \, d\mathbf{r}$ for neighboring cells
-- Stress under compression
-- Transition from overlap-dominated to shape-dominated regime
-
-**Hypothesis:** High compression may create a distinct "squeezed" phase not accessible to vertex models.
-
-#### 1.4 Continuous vs. Discrete Rearrangements
-
-**Question:** Are cell rearrangements truly discrete "T1 events" or continuous processes?
-
-**Why vertex models can't answer:** Vertex models enforce discrete topology—edges either exist or don't. T1s are instantaneous by construction.
-
-**What to measure:**
-- Time evolution of neighbor contact area during rearrangements
-- Distribution of rearrangement timescales
-- Intermediate states during "T1-like" events
-
-**Hypothesis:** Rearrangements may be continuous, with the discrete T1 picture being an artifact of the vertex model discretization.
-
-#### 1.5 Interface Mechanics and Adhesion Gradients
-
-**Question:** How does spatially varying adhesion affect tissue mechanics?
-
-**Why vertex models can't answer:** Vertex models have a single line tension $\Lambda$ per edge. They cannot represent adhesion gradients along a single interface.
-
-**Status:** Uniform adhesion $J$ is now implemented (`--adhesion` flag). Spatially varying adhesion would require per-cell $J_i$ values (future extension).
-
-**What to measure:**
-- Response to adhesion gradients
-- Cell sorting with continuous adhesion variation
-- Interface width changes with local adhesion
+### 3D-specific
+- Surface-vs-bulk dynamics in finite 3D tissues (layer-resolved MSD, T1 gradient).
+- 3D analog of the shape-index transition (surface-area-to-volume scaling, asphericity).
 
 ---
 
-### Priority 2: Validate/Extend Vertex Model Results
+## Analysis workflow
 
-These questions test whether vertex model predictions hold in a more realistic model:
+All quantitative observables are computed by the `cell_analyze` Rust binary. Do not reinvent them in Python.
 
-#### 2.1 Shape Index Transition
+- `cell_analyze list` enumerates every observable, aggregator, panel, and template.
+- TOML studies in `cpp/simulation/study/templates/` show the canonical pipelines (FSS sweep, soft/ctrl pair, overlay sweep, single-run, pairwise separation).
+- Each study run produces both figures and a `study_results.json` with full raw numbers — feed that into manuscript plotting / hypothesis checks.
 
-**Question:** Does the $p_0^* \approx 3.81$ transition survive in phase field models?
-
-**What to measure:**
-- Compute effective shape index: $p = P/\sqrt{A}$ from phase field contours
-- Identify solid-fluid transition point
-- Compare to vertex model critical value
-
-**Expected outcome:** May find a shifted or broadened transition due to interface fluctuations.
-
-#### 2.2 Motility-Driven Unjamming
-
-**Question:** Does increasing motility $v_A$ fluidize jammed tissues as predicted?
-
-**What to measure:**
-- MSD as function of $v_A$ at fixed packing
-- Transition line in $(v_A, \phi)$ or $(v_A, p)$ space
-- Compare to Bi et al. 2016 phase diagram
-
-#### 2.3 Dynamic Heterogeneity
-
-**Question:** Do phase field tissues exhibit the same dynamic heterogeneity (fast/slow regions) as vertex models?
-
-**What to measure:**
-- Four-point susceptibility $\chi_4(t)$
-- Spatial correlation of mobility
-- Non-Gaussian parameter of displacements
+If a new observable or aggregator is needed: drop a file in `rust/cell_analyze/src/analysis/observables/` (or `aggregate.rs`), register it, and rebuild. The crate is set up so adding metrics does not require touching the pipeline.
 
 ---
 
-### Priority 3: 3D-Specific Questions
+## How to design and report an experiment
 
-The simulation supports 3D. These questions are uniquely accessible:
-
-#### 3.1 Surface vs. Bulk Dynamics
-
-**Question:** How do cells at tissue surfaces behave differently from bulk cells?
-
-**What to measure:**
-- Layer-resolved MSD
-- Surface cell shape vs. bulk cell shape
-- T1 rate gradient from surface to bulk
-
-#### 3.2 3D Cell Shape and Jamming
-
-**Question:** What is the 3D analog of the shape index transition?
-
-**What to measure:**
-- 3D shape metrics: surface area to volume ratio $s = S/V^{2/3}$
-- Asphericity, acylindricity
-- Identify 3D critical shape
+1. **Pose the question physically.** What null hypothesis does the existing literature predict? What signature distinguishes alternatives?
+2. **Identify the decisive observable.** Prefer collective / disorder-distinguishing observables when single-cell ones are ambiguous (e.g. $\chi_4$ over $\alpha_2$).
+3. **Author the study TOML.** Discovery pattern, observables, aggregators, figures. Drop figures if you only want raw numbers — `study_results.json` is always written.
+4. **Run.** Local for smoke; cluster (via MCP `start_simulation` / `resume_simulation` / `run_analysis`) for production. See [cluster-operations.instructions.md](cluster-operations.instructions.md).
+5. **Interpret with literature in hand.** State explicitly what's reproduced, what's new, and which PFM affordance enables the new part.
+6. **Log in the study LOG_BOOK.md.** That file is the source of truth for current status, not this instruction file.
 
 ---
 
-## Simulation Infrastructure
+## Terminology
 
-### Code Location
+- *Jammed* — solid-like, non-diffusive, caged dynamics.
+- *Unjammed / fluid* — diffusive, free cell rearrangements.
+- *Confluent* — no gaps ($\phi \to 1$); vertex-model regime.
+- *Shape index* — $p = P/\sqrt{A}$ (measured) or $p_0$ (vertex-model target).
+- *T1 transition* — neighbor exchange; in PFM it's a continuous process, not an instantaneous flip.
+- *Tagged cell* — cell 0 by convention; the cancer / soft cell in Palmieri-style runs.
 
-```
-cpp/simulation/
-├── include/           # Header files
-│   ├── cell.cuh       # 2D cell operations
-│   ├── cell3d.cuh     # 3D cell operations
-│   ├── simulation.cuh # Main simulation class
-│   └── ...
-├── src/               # CUDA source files
-│   ├── main.cu        # Entry point
-│   ├── kernels_solver.cu   # Production GPU solver kernels
-│   ├── kernels_shared.cu   # Shared helper kernels
-│   ├── kernels3d.cu        # 3D kernel implementations
-│   └── ...
-├── cluster/           # HPC job management
-│   └── ...
-└── postprocessing/    # Visualization & analysis tools
-```
-
-### Running Simulations
-
-**On the cluster (nibi.alliancecan.ca):**
-
-All cluster operations go through the **compute-canada MCP tool**:
-- `connect` — establish SSH session
-- `start_simulation` — submit a fresh simulation
-- `resume_simulation` — continue from checkpoint
-- `list_jobs` / `check_progress` — monitor status
-
-**Do NOT use `run_command` with `sbatch` or legacy submission scripts.** The MCP tools handle GPU selection, SLURM accounts, job chaining, and validation automatically.
-
-**Key directories:**
-- Production: `/scratch/ssilber/jamming_study/production/vA_*/run_*/`
-- Equilibration: `/scratch/ssilber/eq_phi*/run_*/`
-
-### Output Format
-
-Simulations output VTK files containing:
-- Phase field values $\phi_i$ at each grid point
-- Cell centroids
-- Local density
-
-Analysis scripts can compute:
-- Cell shapes (from contours)
-- Mean squared displacement
-- Neighbor lists
-- Order parameters
+Stick to this vocabulary in writing and code so observables stay searchable.
 
 ---
 
-## Analysis Guidance
+## What this file does *not* contain
 
-### Key Observables
-
-| Observable | Definition | What it reveals |
-|------------|------------|-----------------|
-| MSD | $\langle |\mathbf{r}(t) - \mathbf{r}(0)|^2 \rangle$ | Diffusive vs. caged dynamics |
-| Shape index | $p = P/\sqrt{A}$ | Cell geometry |
-| Overlap function | $Q(t) = \langle \theta(a - |\mathbf{r}_i(t) - \mathbf{r}_i(0)|) \rangle$ | Structural relaxation |
-| T1 rate | Number of neighbor changes per time | Fluidity |
-| Interface width | $w = \int |\nabla \phi|^{-1} d\ell$ | Adhesion/mechanics |
-| Non-Gaussianity | $\alpha_2 = \langle r^4 \rangle / (d+2)\langle r^2 \rangle^2 - 1$ | Dynamic heterogeneity |
-
-### Phase Diagram Exploration
-
-The primary phase diagram axes are:
-1. **Motility** $v_A$: 0.004 to 0.013 (10 values in production)
-2. **Packing fraction** $\phi$: 0.85 and 0.89 currently
-
-**Suggested extensions:**
-- Lower $\phi$ (0.6-0.8) to study non-confluent regime
-- Higher $v_A$ to find full fluidization
-- Vary adhesion strength to probe different physics
-
-### Statistical Requirements
-
-For publication-quality results:
-- **Replicas:** 100 independent runs per parameter set (current setup)
-- **Equilibration:** Verify energy plateau before production
-- **Time series:** Long enough to observe diffusive regime (MSD linear in $t$)
-- **System size:** N=288 is modest; consider finite-size checks at N=576, N=1152
-
----
-
-## Workflow for Novel Results
-
-### Step 1: Identify the Question
-
-Choose a research question from Priority 1 (vertex model gaps). Be specific about:
-- What observable will you measure?
-- What parameter range will you explore?
-- What is the null hypothesis (vertex model prediction)?
-
-### Step 2: Design the Simulation
-
-Determine required:
-- Parameter values
-- System size
-- Run duration
-- Number of replicas
-
-### Step 3: Run Production
-
-Submit jobs using the `start_simulation` or `resume_simulation` MCP tools. Monitor with `list_jobs` and `check_progress`.
-
-### Step 4: Analyze Data
-
-Write analysis scripts to compute observables. Use:
-- Python with numpy, scipy
-- VTK file readers (pyvista, vtk)
-- Visualization (matplotlib, pyvista)
-
-### Step 5: Compare to Literature
-
-Reference the papers in the [Key References](#key-references-quick-links) section:
-- How do your results compare to vertex model predictions?
-- What is genuinely new?
-- What is the physical interpretation?
-
-### Step 6: Document Findings
-
-Record:
-- Parameter values used
-- Raw data location
-- Analysis scripts
-- Key figures
-- Physical interpretation
-
----
-
-## Communication Guidelines
-
-### When Reporting Results
-
-Always specify:
-1. **Parameter values:** $v_A$, $\phi$, $N$, $L$, and any others varied
-2. **Statistics:** Number of replicas, run duration, equilibration time
-3. **Comparison:** How does this relate to vertex model literature?
-4. **Novelty:** What can phase field models reveal that vertex models cannot?
-
-### Terminology
-
-Use consistent terminology:
-- "Jammed" = solid-like, non-diffusive, caged
-- "Unjammed" = fluid-like, diffusive, freely rearranging
-- "Confluent" = no gaps between cells ($\phi \approx 1$)
-- "Shape index" = $p = P/\sqrt{A}$ (measured) or $p_0$ (target, in vertex models)
-- "T1 transition" = neighbor exchange event
-
-### Figures to Generate
-
-Key figures for any study:
-1. **Phase diagram** showing jammed/unjammed regions
-2. **MSD curves** showing caging plateau (jammed) vs. linear growth (unjammed)
-3. **Shape distributions** $P(p)$ in different phases
-4. **Snapshots** showing cell configurations
-
----
-
-## Current State of Production Runs
-
-As of February 2026, three concurrent studies are running:
-
-| Study | Status | Instruction file |
-|-------|--------|------------------|
-| **Adhesion** | Phases 0-2 in progress (Bresler params, $\rho = 0.89$, N=288) | `adhesion-study.instructions.md` |
-| **Griffiths** | Production runs on cluster (Bresler params, $\rho = 0.89$, N=288) | `griffiths-study.instructions.md` |
-| **Palmieri extension** | Equilibration campaign starting (Palmieri params, multiple $\rho$, N=100–12800) | `palmieri-extension.instructions.md` |
-
-Check the study-specific LOG_BOOK.md files for current status. Use `list_jobs` and `check_progress` MCP tools for cluster status.
-
----
-
-## Key References Quick Links
-
-| Paper | Key Result | DOI |
-|-------|-----------|-----|
-| Bi 2015 | Shape index transition $p_0^* = 3.81$ | [10.1038/nphys3471](https://doi.org/10.1038/nphys3471) |
-| Bi 2016 | Motility-driven unjamming | [10.1103/PhysRevX.6.021011](https://doi.org/10.1103/PhysRevX.6.021011) |
-| Barton 2017 | Active Vertex Model | [10.1371/journal.pcbi.1005569](https://doi.org/10.1371/journal.pcbi.1005569) |
-| Czajkowski 2019 | Cell division/death effects | [10.1039/c9sm00916g](https://doi.org/10.1039/c9sm00916g) |
-| Giavazzi 2018 | Flocking transitions | [10.1039/c8sm00126j](https://doi.org/10.1039/c8sm00126j) |
-
-**Full summaries:** See `cpp/simulation/AGENT_ONBOARDING.md` and the papers listed in [Key References](#key-references-quick-links).
-
----
-
-## Summary: Your Research Mission
-
-1. **Understand the background** by reading `cpp/simulation/AGENT_ONBOARDING.md`
-2. **Identify vertex model gaps** from the Priority 1 questions above
-3. **Design simulations** that probe these gaps using phase field advantages
-4. **Analyze results** with appropriate observables
-5. **Compare to literature** to establish novelty
-6. **Document findings** for publication
-
-The goal is to produce results that are:
-- **Novel:** Only accessible to phase field models
-- **Significant:** Address important open questions in tissue mechanics
-- **Rigorous:** Well-controlled, statistically sound, physically interpretable
-
-Good luck with the research!
-
----
-
-*Last updated: January 15, 2026*
+- File paths to scripts, data, or checkpoints (they drift).
+- Production-run status (lives in study `LOG_BOOK.md`).
+- CLI flags or build commands (use `--help` and the simulation instruction file).
+- Manuscript style rules (see [manuscript-writing.instructions.md](manuscript-writing.instructions.md)).

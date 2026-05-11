@@ -4,7 +4,7 @@ applyTo: "cpp/simulation/**"
 
 # Cell Simulation Project Instructions
 
-> **When to consult this file:** You are building, running, testing, or modifying the cell simulation code (CUDA). This covers local builds, CLI reference, physics parameters, validation tests, visualization, and performance benchmarks. For cluster job submission, see [cluster-operations.instructions.md](cluster-operations.instructions.md). For post-processing analysis, see [postprocessing.instructions.md](postprocessing.instructions.md).
+> **When to consult this file:** You are building, running, testing, or modifying the cell simulation code (CUDA). This covers local builds, CLI reference, physics parameters, and validation tests. For cluster job submission, see [cluster-operations.instructions.md](cluster-operations.instructions.md). For analyzing simulation output and rendering snapshots, use the `cell_analyze` Rust binary (`cell_analyze list` / `cell_analyze --help`).
 
 ## Key Project Locations
 
@@ -15,7 +15,7 @@ applyTo: "cpp/simulation/**"
 - **Test output**: `cpp/simulation/agent_test_runs/`
 
 ### Shared Resources
-- **Visualization scripts**: `cpp/simulation/*.py` (work with both versions)
+- **Visualization & analysis**: `cell_analyze` (Rust binary in `rust/cell_analyze/`); 3D-only Python helpers live in `cpp/simulation/postprocessing/`
 - **Cluster scripts**: `cpp/simulation/cluster/`
 
 ## Build Commands
@@ -270,39 +270,18 @@ Key options (see `-h` for the complete list and defaults):
 # Expected: cells interact and repel, no collapse
 ```
 
-## Visualization Commands
+## Visualization & Analysis
+
+All 2D analysis and snapshot rendering goes through the `cell_analyze` binary (`rust/cell_analyze/`). It is TOML-driven for studies and has dedicated subcommands for one-off snapshots, movies, and trajectory integrity checks. Discover everything via:
 
 ```powershell
-# 2D: Plot last frame
-python visualize.py agent_test_runs/my_sim --last 1
-
-# 2D: Generate movie
-python visualize.py agent_test_runs/my_sim --movie
-
-# 2D: Specific frame range
-python visualize.py agent_test_runs/my_sim --start 0 --end 100
-
-# 3D: Soap bubble visualization (DEFAULT - shows cell membranes only)
-python postprocessing/visualize_3d.py agent_test_runs/my_3d_sim --volume
-
-# 3D: Generate movie with soap bubble effect
-python postprocessing/visualize_3d.py agent_test_runs/my_3d_sim --movie --volume
-
-# 3D: Solid volume rendering (show cell interiors)
-python postprocessing/visualize_3d.py agent_test_runs/my_3d_sim --volume --no-boundary
-
-# 3D: Isosurface rendering (opaque colored surfaces)
-python postprocessing/visualize_3d.py agent_test_runs/my_3d_sim --iso 0.5
-
-# Trajectory analysis (MSD, velocity autocorrelation)
-python analyze_trajectory.py agent_test_runs/my_sim --no-show
+cell_analyze --help          # subcommands: study, snapshot, check, list
+cell_analyze list            # all observables, aggregators, panel types, templates
+cell_analyze study --help    # TOML pipeline (figures + raw study_results.json)
+cell_analyze snapshot --help # PNGs/movies from checkpoints or VTK frames
 ```
 
-**IMPORTANT Visualization Notes:**
-- **3D: Always use `--volume` flag** for soap bubble visualization (transparent interiors, visible membranes)
-- Add `--no-boundary` to `--volume` if you want to see solid cell interiors
-- Pass directory as positional argument (not with `-d` flag)
-- Use `-f FRAME` to visualize a specific frame number
+Reference study TOMLs live in `cpp/simulation/study/templates/`. 3D output (which `cell_analyze` does not yet handle) uses the Python helpers in `cpp/simulation/postprocessing/`; see that directory's README.
 
 ## Key Physical Parameters
 
@@ -523,12 +502,11 @@ Term details:
 |------|-----------------|
 | Running jobs on cluster (Nibi) | [cluster-operations.instructions.md](cluster-operations.instructions.md) |
 | Production runs with job chaining | [cluster-operations.instructions.md](cluster-operations.instructions.md) - see "Jamming Study Production" |
-| Post-processing simulation output | [postprocessing.instructions.md](postprocessing.instructions.md) |
-| Developing analysis tools for cluster | [cluster-postprocessing.instructions.md](cluster-postprocessing.instructions.md) |
-| VTK viewer (Rust) | [vtk-viewer.instructions.md](vtk-viewer.instructions.md) |
+| Analyzing simulation output | `cell_analyze --help` and `cell_analyze list` (no instruction file — the CLI is self-documenting) |
+| VTK viewer (Rust GUI) | [vtk-viewer.instructions.md](vtk-viewer.instructions.md) |
 **Quick-reference READMEs:**
 - [cluster/README.md](cpp/simulation/cluster/README.md) - Cluster submission quick start
-- [postprocessing/README.md](cpp/simulation/postprocessing/README.md) - Analysis scripts overview
+- [postprocessing/README.md](cpp/simulation/postprocessing/README.md) - 3D Python helpers
 **Critical reminders:**
 - For cluster production runs, use `start_simulation` or `resume_simulation` MCP tools (auto-chains jobs)
 - Never run compute on cluster login nodes - always submit via SLURM
