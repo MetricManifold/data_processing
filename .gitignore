@@ -2,6 +2,7 @@
 data
 *.bib*
 *.mp4
+plot_bresler.ipynb
 **/*/target
 build
 .vscode
@@ -32,7 +33,6 @@ tmp_*
 !cpp/simulation/src
 !cpp/simulation/src/**
 !cpp/simulation/scripts
-!cpp/simulation/*.md
 !cpp/simulation/postprocessing
 !cpp/simulation/postprocessing/*.py
 !cpp/simulation/postprocessing/output/.gitkeep
