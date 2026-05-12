@@ -58,6 +58,11 @@ struct Simulation {
     float* d_scripted_theta = nullptr;
     int    scripted_cursor  = 0;          // first unprocessed event idx
 
+    // Set true when init_from_checkpoint successfully restored RNG state
+    // from a checkpoint sidecar; finalize_init() then skips launch_rng_init
+    // to preserve the random-stream continuity across resume.
+    bool   rng_restored_from_ckpt = false;
+
     // ---- CUDA Graph capture for the hot step pipeline.
     // step_stream is a non-default stream so launches can be captured.
     // step_graph[parity] is the cached executable graph for the

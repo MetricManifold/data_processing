@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 
 #define CK(call) do {                                                      \
@@ -483,7 +484,14 @@ void Simulation::finalize_init() {
     unsigned long polar_seed = params.polarity_seed
                                  ? params.polarity_seed
                                  : (params.seed ? params.seed : 1234u);
-    launch_rng_init(cells, polar_seed);
+    // Preserve random-stream continuity on resume: only initialize the
+    // per-cell curandStates here when they were NOT restored from the
+    // checkpoint's RNGS sidecar. (Without this guard, a chained run with
+    // the same polarity_seed re-seeds each cell back to offset 0 and
+    // replays the same tumble decisions across resume.)
+    if (!rng_restored_from_ckpt) {
+        launch_rng_init(cells, polar_seed);
+    }
     launch_initial_velocity(cells, params);
     // Dedicated stream for the captured step pipeline. Non-blocking so it
     // doesn't serialize against the default stream used by I/O paths.
@@ -802,8 +810,9 @@ bool Simulation::init_from_checkpoint(const std::string& path,
         params.halo = 0;
     }
 
-    // Optional per-cell magic-tagged sidecar arrays (VA_A, GAMA, RADI, POLR).
+    // Optional per-cell magic-tagged sidecar arrays (VA_A, GAMA, RADI, POLR, RNGS).
     std::vector<float> per_vA, per_gamma, per_radius, per_polar_theta;
+    std::vector<uint8_t> per_rng_bytes;  // raw curandState blob, empty if absent
     while (true) {
         long pos = ftell(f);
         uint32_t m;
@@ -820,6 +829,15 @@ bool Simulation::init_from_checkpoint(const std::string& path,
             else if (m == 0x47414D41) per_gamma       = std::move(data);
             else if (m == 0x52414449) per_radius      = std::move(data);
             else                      per_polar_theta = std::move(data);
+        } else if (m == 0x53474E52 /* 'RNGS' */) {
+            // Raw curandState bytes: count cells, sizeof(curandState) per cell.
+            // Size is implicit in the build's curand type; if a future build
+            // changes the curand variant, the load will read the wrong byte
+            // count. Mismatch is rejected by comparing payload size.
+            fread(&count, 4, 1, f);
+            const size_t payload = (size_t)count * sizeof(curandState);
+            per_rng_bytes.assign(payload, 0);
+            if (payload > 0) fread(per_rng_bytes.data(), 1, payload, f);
         } else {
             fseek(f, pos, SEEK_SET);
             break;
@@ -919,6 +937,24 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     }
     CK(cudaMemcpy(cells.velocities_x, ck_vx.data(), n*sizeof(float), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(cells.velocities_y, ck_vy.data(), n*sizeof(float), cudaMemcpyHostToDevice));
+
+    // Restore per-cell curandState from the RNGS sidecar (when present and
+    // sized as expected). A user-supplied --polarity-seed on resume defeats
+    // the restore so they get a fresh independent stream. Without restore,
+    // finalize_init() re-seeds and the resumed run replays correlated RNG.
+    if (!ov.polarity_seed &&
+        !per_rng_bytes.empty() &&
+        per_rng_bytes.size() == (size_t)n * sizeof(curandState)) {
+        CK(cudaMemcpy(cells.rng_states, per_rng_bytes.data(),
+                      per_rng_bytes.size(), cudaMemcpyHostToDevice));
+        rng_restored_from_ckpt = true;
+        printf("[SIM] restored RNG state for %d cells from checkpoint\n", n);
+    } else if (!per_rng_bytes.empty()) {
+        fprintf(stderr,
+                "[SIM] WARNING: RNGS sidecar present (%zu bytes) but ignored "
+                "(--polarity-seed override or size mismatch; expected %zu).\n",
+                per_rng_bytes.size(), (size_t)n * sizeof(curandState));
+    }
 
     finalize_init();
 
@@ -1364,9 +1400,10 @@ void Simulation::write_trajectory() {
         double perim = per[i] * dA;
         double Ln = perim / (2.0 * M_PI * tgt_r);
         double vol = V[i] * dA;
+        int gid = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
         fprintf(traj_fp,
                 "%.6f %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
-                cur_time, i, cx_g, cy_g, vx[i], vy[i],
+                cur_time, gid, cx_g, cy_g, vx[i], vy[i],
                 px[i], py[i], theta, vA[i], Ln, vol);
     }
     fflush(traj_fp);
@@ -1466,8 +1503,13 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         snprintf(fn, sizeof(fn), "%s/checkpoint.bin", dir.c_str());
     else
         snprintf(fn, sizeof(fn), "%s/checkpoint_%s.bin", dir.c_str(), tag.c_str());
-    FILE* f = fopen(fn, "wb");
-    if (!f) { fprintf(stderr, "Failed to open %s\n", fn); return; }
+    // C3: atomic write. Write to <fn>.tmp and rename on close. Without this,
+    // a SLURM SIGTERM-on-timeout mid-write truncates checkpoint.bin and
+    // overwrites the previous good copy, losing the run.
+    char fn_tmp[520];
+    snprintf(fn_tmp, sizeof(fn_tmp), "%s.tmp", fn);
+    FILE* f = fopen(fn_tmp, "wb");
+    if (!f) { fprintf(stderr, "Failed to open %s\n", fn_tmp); return; }
 
     uint32_t magic = 0x43454C4C;
     uint32_t ver = 7;
@@ -1536,7 +1578,30 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     write_per_cell(0x56415F41 /* 'VA_A' */, cells.v_A_cell);
     write_per_cell(0x504F4C52 /* 'POLR' */, cells.polar_theta);
 
+    // C2: RNGS sidecar — per-cell curandState bytes so resume preserves
+    // the random-stream continuity. Without this, chained jobs replay the
+    // same tumble decisions from offset 0 every time finalize_init runs.
+    {
+        const size_t bytes = (size_t)n * sizeof(curandState);
+        std::vector<uint8_t> h_rng(bytes);
+        CK(cudaMemcpy(h_rng.data(), cells.rng_states, bytes, cudaMemcpyDeviceToHost));
+        uint32_t mrng = 0x53474E52; // 'RNGS' little-endian
+        int32_t  cnt  = n;
+        fwrite(&mrng, 4, 1, f);
+        fwrite(&cnt,  4, 1, f);
+        fwrite(h_rng.data(), 1, bytes, f);
+    }
+
     fclose(f);
+
+    // Atomic rename: replace existing checkpoint.bin with the .tmp we just
+    // wrote. std::filesystem::rename replaces on both Windows and POSIX.
+    try {
+        std::filesystem::rename(fn_tmp, fn);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Failed to rename %s -> %s: %s\n", fn_tmp, fn, e.what());
+        return;
+    }
     printf("Saved checkpoint: step=%d, t=%.4f, cells=%d (%s)\n", cs, ct, n, fn);
 }
 
@@ -1724,10 +1789,25 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
     }
 
     // 4. Pack outgoing.
+    //    Upload h_global_id to a device buffer so the pack can include
+    //    each migrant's gid in its header. Allocate a capacity-sized
+    //    arrival gid buffer so the unpack can write directly at the
+    //    arrival slot indices.
+    int* d_gid_src = nullptr;
+    int* d_gid_arr = nullptr;
+    if (h_n_up > 0 || h_n_down > 0 || h_n_in_prev > 0 || h_n_in_next > 0) {
+        CK(cudaMallocAsync(&d_gid_src, (size_t)cells.num_cells * sizeof(int), s));
+        CK(cudaMemcpyAsync(d_gid_src, h_global_id.data(),
+                           (size_t)cells.num_cells * sizeof(int),
+                           cudaMemcpyHostToDevice, s));
+        if (h_n_in_total > 0) {
+            CK(cudaMallocAsync(&d_gid_arr, (size_t)cells.capacity * sizeof(int), s));
+        }
+    }
     if (h_n_up   > 0) launch_pack_migrants(cells, d_up_idx,   h_n_up,
-                                           d_pack_up,   s);
+                                           d_gid_src, d_pack_up,   s);
     if (h_n_down > 0) launch_pack_migrants(cells, d_down_idx, h_n_down,
-                                           d_pack_down, s);
+                                           d_gid_src, d_pack_down, s);
 
     // 5. NCCL pack-bytes exchange. Each direction's send/recv are issued
     //    independently inside one group bracket so NCCL can pair them
@@ -1785,7 +1865,7 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
         tmp.rng_states   = d_rng_scratch;
         // phi_out, capacity left as-is.
         launch_unpack_migrants(tmp, pack_buf, n_in, dst_offset,
-                               /*d_global_id_dst=*/ nullptr, s);
+                               d_gid_arr, s);
     };
     unpack_into_scratch(d_pack_in_prev, h_n_in_prev, h_n_stay);
     unpack_into_scratch(d_pack_in_next, h_n_in_next, h_n_stay + h_n_in_prev);
@@ -1815,29 +1895,32 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
     cells.phi_in  = (parity == 0) ? phi_A : phi_B;
     cells.phi_out = (parity == 0) ? phi_B : phi_A;
 
-    // 9. Update num_cells. h_global_id is host-tracked; we let it lapse
-    //    here (set to -1 for migrants). Phase-B2 will plumb global_id
-    //    through the pack.
+    // 9. Update num_cells and host-side h_global_id. Stays inherit
+    //    their old gid via stay_idx; arrivals' gids are read back from
+    //    d_gid_arr (filled by the unpack kernels).
     cells.num_cells = new_num_cells;
-    h_global_id.resize(new_num_cells);
-    // Stays keep their global_id (positions [0, h_n_stay) of new
-    // h_global_id come from old positions stay_idx[k]).
     {
         std::vector<int> old_gid(h_global_id);
-        // old_gid still has size = old num_cells; we need to gather
-        // stays. Read stay_idx from device.
         std::vector<int> h_stay_idx(h_n_stay);
-        CK(cudaMemcpyAsync(h_stay_idx.data(), d_stay_idx,
-                           h_n_stay * sizeof(int),
-                           cudaMemcpyDeviceToHost, s));
+        if (h_n_stay > 0) {
+            CK(cudaMemcpyAsync(h_stay_idx.data(), d_stay_idx,
+                               h_n_stay * sizeof(int),
+                               cudaMemcpyDeviceToHost, s));
+        }
+        h_global_id.assign(new_num_cells, -1);
+        if (h_n_in_total > 0) {
+            CK(cudaMemcpyAsync(h_global_id.data() + h_n_stay,
+                               d_gid_arr + h_n_stay,
+                               (size_t)h_n_in_total * sizeof(int),
+                               cudaMemcpyDeviceToHost, s));
+        }
         CK(cudaStreamSynchronize(s));
-        h_global_id.resize(new_num_cells, -1);
         for (int k = 0; k < h_n_stay; ++k) {
             h_global_id[k] = old_gid[h_stay_idx[k]];
         }
-        // Arrivals' global_id remains -1; trajectory/checkpoint output
-        // can re-derive ids by ranks comparing host arrays if needed.
     }
+    if (d_gid_src) CK(cudaFreeAsync(d_gid_src, s));
+    if (d_gid_arr) CK(cudaFreeAsync(d_gid_arr, s));
 
     return cells.num_cells;
 }
