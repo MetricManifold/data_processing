@@ -184,6 +184,60 @@ When resuming from an equilibration checkpoint (where all v_A=0), you **must** s
 
 ---
 
+## Multi-GPU (NCCL Domain Decomposition)
+
+For large-N runs, `start_simulation` and `resume_simulation` accept a `gpus` parameter that enables NCCL-based 1D-slab domain decomposition across multiple GPUs on a single node.
+
+### When to use it
+
+| N_cells | Recommended `gpus` |
+|---------|---:|
+| < 3200 | 1 (default) — overhead dominates speedup |
+| 3200 – 4000 | 2 |
+| ≥ 4000 | 4 |
+
+The MCP tool emits a warning whenever `n_cells ≥ 3200` is submitted with `gpus=1`. Resubmit with the `gpus` parameter set to follow the warning's recommendation.
+
+### What `gpus=N` does
+
+- Swaps to the multi-GPU build (`~/cell_simulation/build_mg/bin/cell_sim`)
+- Requests `<gpu_type>:N` in the SLURM `--gpus`/`--gres` directive
+- Loads the `nccl/2.29.7` module and exports `NCCL_P2P_LEVEL=NVL`
+- Appends `--gpus N` to the cell_sim command line
+- Scales `--mem` linearly by N (host-side scratch is per-process; **GPU VRAM is independent and per-rank**, typically fine on A100/H100)
+
+### Measured performance (Narval A100×4, N=4608, t=1500)
+
+| GPUs | ms/step | Speedup | Efficiency |
+|---:|---:|---:|---:|
+| 1 | 4.98 | 1.00× | — |
+| 2 | 2.92 | 1.71× | 85% |
+| 4 | 1.50 | 3.33× | **83%** |
+
+### Checkpoint compatibility
+
+- Multi-GPU runs write a **per-rank checkpoint set**: rank 0 in `<outdir>/checkpoint.bin`, rank K in `<outdir>/rankK/checkpoint.bin`. The format is v8 with a self-describing `(num_ranks, rank_id, num_cells_global)` header.
+- `resume_simulation` requires `gpus` to **match the saved checkpoint's `num_ranks`** (the C++ loader bails with a clear error otherwise).
+- To change `--gpus` between runs (e.g. resume a G=4 checkpoint as G=1 for analysis), first consolidate the per-rank files into a single-rank v8 checkpoint:
+
+```bash
+cell_analyze merge-ckpt <outdir>/checkpoint.bin -o <outdir>/merged.bin
+```
+
+The merged file is a normal v8 checkpoint that resumes with any `--gpus` value.
+
+### Analysis tools
+
+`cell_analyze` (snapshot, check, study, MSD, etc.) **auto-detects** multi-rank runs and unions all sibling `rankN/trajectory.txt` files transparently. No manual merging is needed for trajectory analysis. For checkpoint rendering, run `merge-ckpt` first.
+
+### What `gpus` doesn't do
+
+- **Doesn't validate** against your saved checkpoint at submission time. If you set `gpus=4` to resume a G=1 checkpoint, the cell_sim binary fails at startup with a clear error — but the SLURM job still queues. Run `dry_run=true` first if you're unsure.
+- **Not auto-selected.** You opt in explicitly so the build/module costs are visible.
+- **Requires `~/cell_simulation/build_mg/`** to exist on the target cluster. Build it with `sync_and_build` (the multi-GPU CMake target is set up under `build_mg/`).
+
+---
+
 ## MPI/CPU Version (Fallback)
 
 The MCP tool does not manage MPI builds or submissions. When GPU queues are heavily congested, the MPI/CPU version is a manual alternative.

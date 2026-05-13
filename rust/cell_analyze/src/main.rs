@@ -129,6 +129,31 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Find a pair of cells separated by approximately `distance` pixels.
+    /// Useful for Phase 3A: pick two cells at a controlled separation, then
+    /// resume with `--gamma <f>:nearest(x1,y1) --gamma <f>:nearest(x2,y2)`.
+    /// Prints the chosen pair's ids, COMs, and actual separation. With
+    /// `--format gamma-flags`, emits ready-to-paste `--gamma` arguments.
+    ///
+    /// IMPORTANT: the (x,y) coordinates printed are valid only for runs
+    /// that resume from THIS checkpoint. If you re-equilibrate from t=0
+    /// with a different `--seed`, the cells at those coordinates will be
+    /// different (or absent). Workflow: equilibrate once → find-pair on
+    /// that checkpoint → resume from the same checkpoint with the printed
+    /// flags. Do NOT pass `--seed` on the resume.
+    FindPair {
+        /// Checkpoint file (single-rank or multi-rank; multi-rank auto-merges in memory).
+        checkpoint: PathBuf,
+        /// Target separation in pixels (periodic distance).
+        #[arg(long)]
+        distance: f64,
+        /// Soft gamma value (only used with --format gamma-flags). Default 0.35.
+        #[arg(long, default_value_t = 0.35)]
+        soft_gamma: f64,
+        /// Output format: "text" (human-readable) or "gamma-flags" (CLI snippet).
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -499,8 +524,79 @@ fn main() -> Result<()> {
             });
             cell_analyze::analysis::merge_checkpoint::merge_checkpoints(&input, &out)?;
         }
+        Commands::FindPair { checkpoint, distance, soft_gamma, format } => {
+            run_find_pair(&checkpoint, distance, soft_gamma, &format)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Find the cell pair whose periodic distance is closest to `target_d`.
+/// Emits either human-readable text or `--gamma` CLI flags for the resume call.
+fn run_find_pair(checkpoint: &Path, target_d: f64, soft_gamma: f64, format: &str) -> Result<()> {
+    use cell_analyze::analysis::checkpoint::load_checkpoint;
+    let ckpt = load_checkpoint(checkpoint)
+        .with_context(|| format!("loading checkpoint {}", checkpoint.display()))?;
+    let lx = ckpt.params.nx as f64;
+    let ly = ckpt.params.ny as f64;
+    let cells = &ckpt.cells;
+    let n = cells.len();
+    if n < 2 {
+        anyhow::bail!("checkpoint has {} cells; need at least 2", n);
+    }
+    let wrap = |dx: f64, l: f64| {
+        let m = dx.rem_euclid(l);
+        if m > 0.5 * l { m - l } else { m }
+    };
+    // Find the (i, j) pair whose periodic distance is closest to target_d.
+    // O(N²) — fine up to N≈10^4. The cell COM in the checkpoint is the
+    // wrapped-to-domain value (centroid: (f32, f32) field).
+    let mut best_i: usize = 0;
+    let mut best_j: usize = 1;
+    let mut best_diff = f64::INFINITY;
+    let mut best_d = 0.0f64;
+    for i in 0..n {
+        let (xi, yi) = (cells[i].centroid.0 as f64, cells[i].centroid.1 as f64);
+        for j in (i + 1)..n {
+            let (xj, yj) = (cells[j].centroid.0 as f64, cells[j].centroid.1 as f64);
+            let dx = wrap(xj - xi, lx);
+            let dy = wrap(yj - yi, ly);
+            let d = (dx * dx + dy * dy).sqrt();
+            let diff = (d - target_d).abs();
+            if diff < best_diff {
+                best_diff = diff;
+                best_i = i;
+                best_j = j;
+                best_d = d;
+            }
+        }
+    }
+    let ci = &cells[best_i];
+    let cj = &cells[best_j];
+    match format {
+        "gamma-flags" => {
+            // Emit ready-to-paste CLI fragment. nearest() resolves by COM
+            // in the resumed sim, so we pass the saved centroid here.
+            println!(
+                "--gamma {g}:nearest({x1:.3},{y1:.3}) --gamma {g}:nearest({x2:.3},{y2:.3})",
+                g = soft_gamma,
+                x1 = ci.centroid.0, y1 = ci.centroid.1,
+                x2 = cj.centroid.0, y2 = cj.centroid.1,
+            );
+        }
+        _ => {
+            // Default: human-readable.
+            println!("found pair at target d = {:.3} px (domain {}×{})", target_d, lx as i32, ly as i32);
+            println!("  cell {} at ({:.3}, {:.3})", ci.id, ci.centroid.0, ci.centroid.1);
+            println!("  cell {} at ({:.3}, {:.3})", cj.id, cj.centroid.0, cj.centroid.1);
+            println!("  actual periodic distance = {:.3} px (diff {:.3} px from target)", best_d, best_diff);
+            println!("# resume FROM THIS CHECKPOINT only. Do not change --seed.");
+            println!("# example: resume_simulation -c {} --gamma {:.2}:nearest({:.3},{:.3}) --gamma {:.2}:nearest({:.3},{:.3})",
+                     checkpoint.display(), soft_gamma, ci.centroid.0, ci.centroid.1,
+                     soft_gamma, cj.centroid.0, cj.centroid.1);
+        }
+    }
     Ok(())
 }
 

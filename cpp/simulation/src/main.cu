@@ -106,11 +106,21 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--v-A-sigma") && i+1<argc) { v_A_sigma = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--tau") && i+1<argc) { p.tau = atof(argv[++i]); ov.tau = true; }
         else if (!strcmp(argv[i], "--gamma") && i+1<argc) {
-            gamma_spec = argv[++i];
-            // If purely numeric (no colon, no %), also update scalar + override flag
-            if (gamma_spec.find(':') == std::string::npos && gamma_spec.find('%') == std::string::npos) {
-                p.gamma = atof(gamma_spec.c_str());
-                ov.gamma = true;
+            // Composable: multiple --gamma flags accumulate, separated by ';'.
+            // apply_gamma_spec() in sim.cu walks the segments in order.
+            // The FIRST segment, if it's a bare scalar (no ':' / '%'), also
+            // updates p.gamma globally (sets the baseline for all cells).
+            std::string new_spec = argv[++i];
+            if (gamma_spec.empty()) {
+                gamma_spec = new_spec;
+                if (new_spec.find(':') == std::string::npos &&
+                    new_spec.find('%') == std::string::npos) {
+                    p.gamma = atof(new_spec.c_str());
+                    ov.gamma = true;
+                }
+            } else {
+                gamma_spec += ";";
+                gamma_spec += new_spec;
             }
         }
         else if (!strcmp(argv[i], "--kappa") && i+1<argc) { p.kappa = atof(argv[++i]); ov.kappa = true; }

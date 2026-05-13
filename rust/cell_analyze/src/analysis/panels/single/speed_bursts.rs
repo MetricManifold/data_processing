@@ -65,11 +65,14 @@ impl<'a, 'b> Panel<'a, 'b> for SpeedBurstsSingle {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
+        // Decimate by max(1, n/2000) — see panels/pair/speed_bursts.rs.
+        let n_dec = (v.t_tau.len() / 2000).max(1);
         chart
             .draw_series(LineSeries::new(
                 v.t_tau
                     .iter()
-                    .zip(v.speeds.iter())
+                    .step_by(n_dec)
+                    .zip(v.speeds.iter().step_by(n_dec))
                     .map(|(&t, &s)| (t, s.min(y_max))),
                 SINGLE_COLOR.stroke_width(1),
             ))?

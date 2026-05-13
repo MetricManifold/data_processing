@@ -403,20 +403,24 @@ void Simulation::upload_initial_state() {
 //   "<f>:nearest(x,y)"             cell closest to (x,y)
 //   "<f>:cluster(p%,x,y)"          floor(p% * N) cells nearest to (x,y)
 //   "<f>:<p>%"                     floor(p% * N) cells (lowest-id first)
+// Multiple segments may be chained with ';' (composable --gamma flags):
+//   "1.0;0.35:cell0;0.35:nearest(500,500)" sets baseline 1.0, then
+//   overrides cell 0 and the cell nearest (500,500) to 0.35.
 // Unrecognised strings fall back to "all cells = parsed scalar".
 // ---------------------------------------------------------------------------
-void Simulation::apply_gamma_spec() {
-    if (gamma_spec.empty()) return;
+static void apply_one_gamma_segment(std::vector<CellHost>& h_cells,
+                                    const std::string& spec) {
+    if (spec.empty()) return;
     const int n = (int)h_cells.size();
     if (n == 0) return;
 
-    double soft_gamma = atof(gamma_spec.c_str());
-    size_t colon = gamma_spec.find(':');
+    double soft_gamma = atof(spec.c_str());
+    size_t colon = spec.find(':');
     if (colon == std::string::npos) {
         for (auto& c : h_cells) c.gamma = soft_gamma;
         return;
     }
-    std::string sel = gamma_spec.substr(colon + 1);
+    std::string sel = spec.substr(colon + 1);
 
     auto pct_to_count = [&](double pct) {
         int k = (int)std::floor(pct * 0.01 * n);
@@ -458,6 +462,24 @@ void Simulation::apply_gamma_spec() {
     } else {
         // Fallback: treat the whole spec as a bare number.
         for (auto& c : h_cells) c.gamma = soft_gamma;
+    }
+}
+
+void Simulation::apply_gamma_spec() {
+    if (gamma_spec.empty()) return;
+    // Split on ';' so multiple --gamma flags compose. Segments apply in
+    // CLI order; later segments overwrite earlier ones for overlapping
+    // cells, which is intuitive: `--gamma 1.0 --gamma 0.35:cell0` leaves
+    // every cell at 1.0 except cell 0 at 0.35.
+    size_t start = 0;
+    while (start <= gamma_spec.size()) {
+        size_t sep = gamma_spec.find(';', start);
+        std::string seg = (sep == std::string::npos)
+            ? gamma_spec.substr(start)
+            : gamma_spec.substr(start, sep - start);
+        if (!seg.empty()) apply_one_gamma_segment(h_cells, seg);
+        if (sep == std::string::npos) break;
+        start = sep + 1;
     }
 }
 
