@@ -147,10 +147,17 @@ struct Simulation {
     int*   d_stay_idx      = nullptr;     // [capacity]
     int*   d_up_idx        = nullptr;     // [capacity]
     int*   d_down_idx      = nullptr;     // [capacity]
-    void*  d_pack_up       = nullptr;     // [MAX_MIGRANTS_PER_DIR * CELL_PACK_BYTES]
+    void*  d_pack_up       = nullptr;     // [max_migrants_per_dir * CELL_PACK_BYTES]
     void*  d_pack_down     = nullptr;
     void*  d_pack_in_prev  = nullptr;
     void*  d_pack_in_next  = nullptr;
+    // Per-direction migration capacity. Sized in alloc_gpu as
+    // max(MAX_MIGRANTS_DEFAULT, capacity/4) so a full boundary "row"
+    // can always migrate at once even at large N or G. The four pack
+    // buffers above are each this many slots; the host classify-check
+    // bails fatally on overflow with a clear "raise this and rebuild"
+    // message.
+    int    max_migrants_per_dir = 0;
     // Scratch arrays for compaction. Same layout as the corresponding
     // CellArrays fields, allocated to capacity. Used to gather stays via
     // a kernel, then we swap pointers with the originals.
@@ -163,6 +170,12 @@ struct Simulation {
     float* d_polar_x_scratch    = nullptr;
     float* d_polar_y_scratch    = nullptr;
     void*  d_rng_scratch        = nullptr;  // curandState array
+    // Per-cell global ids in device memory. Two persistent buffers sized to
+    // capacity (allocated once in alloc_gpu, freed in cleanup). Replaces
+    // per-migration cudaMallocAsync/Free which the nsys profile showed
+    // accounted for ~20% of host API time on the multi-GPU path.
+    int*   d_gid_src           = nullptr;  // [capacity] — gid for current cell layout
+    int*   d_gid_arr           = nullptr;  // [capacity] — gid scratch for arrivals
 
     // Migrate cells whose rebound COM crossed a slab boundary. Called
     // from run_multi_gpu's main thread between barrier sync points, and

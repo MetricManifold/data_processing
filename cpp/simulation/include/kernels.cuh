@@ -75,14 +75,14 @@ void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
 // (every REBIND_EVERY=8 steps).
 // ===========================================================================
 
-// Maximum cells migrating in any one direction per rebind round. Sized
-// generously vs typical drift (drift per rebind ≈ 0.04 px ≪ slab height,
-// so almost no cells cross at any one rebind), but bounded so the pack
-// buffers stay reasonable in VRAM. Failure to fit is a fatal error
-// (host-side check after classify).
-//   memory: 4 * MAX_MIGRANTS_PER_DIR * pack_size_per_cell bytes per rank.
-//   At pack_size ~ 410 KB and the value below: 4 * 128 * 410 KB = ~205 MB.
-static constexpr int MAX_MIGRANTS_PER_DIR = 128;
+// Default maximum cells migrating in any one direction per rebind round.
+// Used as a floor; the runtime value is sized to max(MAX_MIGRANTS_DEFAULT,
+// capacity / 4) at alloc time so it scales with per-rank cell count.
+// Memory: 4 * runtime_max * pack_size_per_cell bytes per rank.
+// At pack_size ~ 410 KB and runtime_max=128: ~205 MB.
+// At capacity=6400 (N=12800 G=4), runtime_max=1600: ~2.6 GB per rank.
+// Failure to fit at runtime is a fatal error (host-side check after classify).
+static constexpr int MAX_MIGRANTS_DEFAULT = 128;
 
 // Per-cell pack size in bytes. Includes the full TILE_AREA phi tile + a
 // small header (origin/rect/global_id/scalars/rng_state). Defined in
@@ -118,6 +118,7 @@ void launch_classify_migrants(
 void launch_pack_migrants(
     const CellArrays& c,
     const int* migrant_idx, int count,
+    const int* d_global_id_src,
     void* pack_buf,
     cudaStream_t stream);
 

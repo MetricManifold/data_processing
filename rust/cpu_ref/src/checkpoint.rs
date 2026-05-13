@@ -149,8 +149,8 @@ pub fn read(path: &Path) -> Result<Checkpoint> {
         bail!("bad magic 0x{:x}", magic);
     }
     let version = c.read_u32::<LittleEndian>()?;
-    if version < 7 {
-        bail!("only checkpoint version >= 7 supported (got {})", version);
+    if version < 7 || version > 8 {
+        bail!("only checkpoint versions 7 and 8 supported (got {})", version);
     }
     let _step = c.read_i32::<LittleEndian>()?;
     let t = c.read_f64::<LittleEndian>()?;
@@ -169,6 +169,23 @@ pub fn read(path: &Path) -> Result<Checkpoint> {
 
     let tile_t = c.read_i32::<LittleEndian>()? as usize;
     let tt = tile_t * tile_t;
+
+    // v8 trailer: (num_ranks, rank_id, num_cells_global). The CPU reference
+    // is single-process and validates against the full global state, so we
+    // refuse multi-rank inputs — use `cell_analyze merge-ckpt` first.
+    if version >= 8 {
+        let num_ranks = c.read_i32::<LittleEndian>()?;
+        let _rank_id = c.read_i32::<LittleEndian>()?;
+        let _num_cells_global = c.read_i32::<LittleEndian>()?;
+        if num_ranks != 1 {
+            bail!(
+                "cpu_ref does not support multi-rank checkpoints \
+                 (this file has num_ranks={}). Consolidate with \
+                 `cell_analyze merge-ckpt` and rerun.",
+                num_ranks
+            );
+        }
+    }
 
     let mut cells = Vec::with_capacity(num_cells);
     for _ in 0..num_cells {

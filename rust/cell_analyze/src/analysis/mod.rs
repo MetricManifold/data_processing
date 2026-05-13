@@ -17,6 +17,7 @@ pub mod analyze_run;
 pub mod checkpoint;
 pub mod discovery;
 pub mod io;
+pub mod merge_checkpoint;
 pub mod metadata;
 pub mod observable;
 pub mod observables;

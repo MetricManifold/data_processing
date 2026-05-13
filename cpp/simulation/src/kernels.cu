@@ -1371,17 +1371,15 @@ __global__ void k_pack_migrants(
 void launch_pack_migrants(
     const CellArrays& c,
     const int* migrant_idx, int count,
+    const int* d_global_id_src,
     void* pack_buf,
     cudaStream_t stream)
 {
     if (count <= 0) return;
-    // Note: h_global_id is host-tracked, not in CellArrays. Pack uses -1
-    // as a sentinel; the host re-applies real ids during post-migration
-    // bookkeeping using the recv-side ordering.
     k_pack_migrants<<<count, 128, 0, stream>>>(
         c.phi_in, c.origin, c.rect,
         c.polar_theta, c.gamma_cell, c.v_A_cell, c.tgt_radius,
-        /*h_global_id_dev=*/ nullptr,
+        d_global_id_src,
         (curandState*)c.rng_states,
         migrant_idx, count,
         (unsigned char*)pack_buf,

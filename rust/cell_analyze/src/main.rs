@@ -116,6 +116,19 @@ enum Commands {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Merge per-rank v8 checkpoint files into a single single-rank file.
+    /// Pass the path to rank 0's checkpoint.bin (or the run directory);
+    /// sibling rank{1..N-1}/checkpoint.bin files are discovered
+    /// automatically. The merged file is a normal v8 checkpoint
+    /// (num_ranks=1) that the simulator can resume with any `--gpus`.
+    MergeCkpt {
+        /// Path to rank-0 checkpoint.bin or its containing directory.
+        input: PathBuf,
+        /// Output path for the merged checkpoint. Defaults to
+        /// `<input dir>/checkpoint_merged.bin`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -475,6 +488,17 @@ fn main() -> Result<()> {
         Commands::List { what } => {
             list_what(&what);
         }
+        Commands::MergeCkpt { input, output } => {
+            let out = output.unwrap_or_else(|| {
+                let dir = if input.is_dir() {
+                    input.clone()
+                } else {
+                    input.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+                };
+                dir.join("checkpoint_merged.bin")
+            });
+            cell_analyze::analysis::merge_checkpoint::merge_checkpoints(&input, &out)?;
+        }
     }
 
     Ok(())
@@ -589,9 +613,19 @@ fn run_check(
         return Ok(1);
     }
 
-    // Parse trajectory
-    let f = std::fs::File::open(&traj_path)?;
-    let reader = BufReader::new(f);
+    // Multi-GPU runs: union rank-0 trajectory with sibling rankN/.
+    let mut traj_paths: Vec<PathBuf> = vec![traj_path.clone()];
+    for k in 1.. {
+        let candidate = dir.join(format!("rank{}", k)).join("trajectory.txt");
+        if candidate.exists() {
+            traj_paths.push(candidate);
+        } else {
+            break;
+        }
+    }
+    if traj_paths.len() > 1 {
+        eprintln!("check: detected multi-GPU run, reading {} rank trajectories", traj_paths.len());
+    }
 
     let mut header_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut timestamps: Vec<f64> = Vec::new();
@@ -600,42 +634,53 @@ fn run_check(
     let mut any_non_numeric = false;
     let mut row_count: usize = 0;
 
-    for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
-        let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        if trimmed.starts_with('#') {
-            for tok in trimmed.split_whitespace() {
-                if let Some((k, v)) = tok.split_once('=') {
-                    header_fields.insert(k.to_string(), v.to_string());
+    for tp in &traj_paths {
+        let f = std::fs::File::open(tp)?;
+        let reader = BufReader::new(f);
+        for line in reader.lines() {
+            let line = match line { Ok(l) => l, Err(_) => continue };
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            if trimmed.starts_with('#') {
+                for tok in trimmed.split_whitespace() {
+                    if let Some((k, v)) = tok.split_once('=') {
+                        // Prefer N_global over N when present (multi-GPU rank
+                        // headers report N_local + N_global; single-GPU runs
+                        // emit N only).
+                        let key = if k == "N_global" { "N".to_string() } else { k.to_string() };
+                        header_fields.entry(key).or_insert(v.to_string());
+                    }
+                }
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() < 4 { continue; }
+            let t = match parts[0].parse::<f64>() {
+                Ok(v) => v,
+                Err(_) => { any_non_numeric = true; continue; }
+            };
+            if !t.is_finite() { any_nan = true; continue; }
+            // Check x,y for NaN
+            for idx in [2usize, 3] {
+                if idx < parts.len() {
+                    match parts[idx].parse::<f64>() {
+                        Ok(v) if !v.is_finite() => any_nan = true,
+                        Err(_) => any_non_numeric = true,
+                        _ => {}
+                    }
                 }
             }
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 4 { continue; }
-        let t = match parts[0].parse::<f64>() {
-            Ok(v) => v,
-            Err(_) => { any_non_numeric = true; continue; }
-        };
-        if !t.is_finite() { any_nan = true; continue; }
-        // Check x,y for NaN
-        for idx in [2usize, 3] {
-            if idx < parts.len() {
-                match parts[idx].parse::<f64>() {
-                    Ok(v) if !v.is_finite() => any_nan = true,
-                    Err(_) => any_non_numeric = true,
-                    _ => {}
-                }
+            let t_bits = t.to_bits();
+            *rows_per_t.entry(t_bits).or_insert(0) += 1;
+            if rows_per_t[&t_bits] == 1 {
+                timestamps.push(t);
             }
+            row_count += 1;
         }
-        let t_bits = t.to_bits();
-        *rows_per_t.entry(t_bits).or_insert(0) += 1;
-        if rows_per_t[&t_bits] == 1 {
-            timestamps.push(t);
-        }
-        row_count += 1;
     }
+    // Sort timestamps so monotonicity check sees a single ordered timeline
+    // (rank files were concatenated, not interleaved).
+    timestamps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // Check 1: header present with required keys
     let required_keys = ["N", "Lx", "Ly", "dim", "tau", "v_A"];
@@ -734,10 +779,18 @@ fn run_check(
     let ckpt_path = dir.join("checkpoint.bin");
     if ckpt_path.exists() {
         match analysis::checkpoint::load_checkpoint_header_only(&ckpt_path) {
-            Ok((ckpt_t, ckpt_n, ckpt_ver)) => {
+            Ok((ckpt_t, ckpt_n_local, ckpt_ver, ckpt_n_global)) => {
                 let mut ok = true;
                 let mut msgs: Vec<String> = Vec::new();
-                msgs.push(format!("v{} step_t={:.3} N={}", ckpt_ver, ckpt_t, ckpt_n));
+                // For v8 multi-rank, the N a user expects is the global
+                // count; the local count is just rank 0's slab.
+                let ckpt_n_for_check = if ckpt_ver >= 8 { ckpt_n_global } else { ckpt_n_local };
+                if ckpt_ver >= 8 && ckpt_n_local != ckpt_n_global {
+                    msgs.push(format!("v{} step_t={:.3} N={} (local={}, multi-rank)",
+                                      ckpt_ver, ckpt_t, ckpt_n_global, ckpt_n_local));
+                } else {
+                    msgs.push(format!("v{} step_t={:.3} N={}", ckpt_ver, ckpt_t, ckpt_n_local));
+                }
                 if let Some(&last_t) = timestamps.last() {
                     let tol = (ckpt_t.abs() * 0.01).max(1.0);
                     if (ckpt_t - last_t).abs() > tol {
@@ -746,9 +799,9 @@ fn run_check(
                     }
                 }
                 if let Some(n) = expected_rows_per_frame {
-                    if ckpt_n as usize != n {
+                    if ckpt_n_for_check as usize != n {
                         ok = false;
-                        msgs.push(format!("checkpoint N={} disagrees with expected {}", ckpt_n, n));
+                        msgs.push(format!("checkpoint N={} disagrees with expected {}", ckpt_n_for_check, n));
                     }
                 }
                 push("checkpoint_consistency", ok, msgs.join("; "));

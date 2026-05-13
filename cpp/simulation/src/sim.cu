@@ -206,6 +206,13 @@ void Simulation::alloc_gpu() {
 
     // Migration buffers (G > 1 only). Sized once at init; never reallocated.
     if (gpus > 1) {
+        // Per-direction migration capacity scales with cell capacity so a
+        // full boundary "row" can migrate in one rebind cycle even at
+        // high N or G. capacity/16 gives ~3× headroom over realistic
+        // boundary-row counts (~120 cells at N=12800,G=4) while keeping
+        // the pack buffer footprint tight: 4 buffers × capacity/16 ×
+        // ~410 KB/cell ≈ 656 MB per rank at N=12800.
+        max_migrants_per_dir = std::max(MAX_MIGRANTS_DEFAULT, cap / 16);
         CK(cudaMalloc(&d_n_stay,    sizeof(int)));
         CK(cudaMalloc(&d_n_up,      sizeof(int)));
         CK(cudaMalloc(&d_n_down,    sizeof(int)));
@@ -216,7 +223,7 @@ void Simulation::alloc_gpu() {
         CK(cudaMalloc(&d_down_idx,  cap * sizeof(int)));
 
         const size_t pack_buf_bytes =
-            (size_t)MAX_MIGRANTS_PER_DIR * CELL_PACK_BYTES;
+            (size_t)max_migrants_per_dir * CELL_PACK_BYTES;
         CK(cudaMalloc(&d_pack_up,      pack_buf_bytes));
         CK(cudaMalloc(&d_pack_down,    pack_buf_bytes));
         CK(cudaMalloc(&d_pack_in_prev, pack_buf_bytes));
@@ -234,10 +241,13 @@ void Simulation::alloc_gpu() {
         CK(cudaMalloc(&d_polar_x_scratch,     cap * sizeof(float)));
         CK(cudaMalloc(&d_polar_y_scratch,     cap * sizeof(float)));
         CK(cudaMalloc(&d_rng_scratch,         cap * sizeof(curandState)));
+        // Persistent global-id buffers (replaces per-migration cudaMallocAsync).
+        CK(cudaMalloc(&d_gid_src,             cap * sizeof(int)));
+        CK(cudaMalloc(&d_gid_arr,             cap * sizeof(int)));
 
-        printf("[migration] alloc: max %d migrants/dir, pack_bytes=%zu, "
-               "total %zu MB per-rank\n",
-               MAX_MIGRANTS_PER_DIR, CELL_PACK_BYTES,
+        printf("[migration] alloc: max %d migrants/dir (capacity=%d), "
+               "pack_bytes=%zu, total %zu MB per-rank\n",
+               max_migrants_per_dir, cap, CELL_PACK_BYTES,
                4 * pack_buf_bytes / (1024 * 1024));
     }
 
@@ -584,10 +594,78 @@ void Simulation::init(const SimParams& p, int n_cells) {
 // init_from_checkpoint — versions 3..7. v3-v6 use variable W/H tiles
 // (legacy format); we re-tile them into TILE_T uniform buffers on load.
 // v7 is the native format produced by save_checkpoint() below.
+// v8 adds (num_ranks, rank_id, num_cells_global) immediately after T_w.
+// For v8 multi-rank checkpoints, each rank reads its own per-rank file
+// (path = <dir>/rank{K}/checkpoint.bin for K>0; rank 0 reuses the supplied
+// path). Resuming with a different --gpus is unsupported in C++; use
+// `cell_analyze merge-ckpt` to consolidate first.
 // ---------------------------------------------------------------------------
-bool Simulation::init_from_checkpoint(const std::string& path,
+namespace {
+// Peek the v8 header fields without disturbing the main reader's logic.
+// Returns true if the file is v8 and the three new fields were populated.
+// On v3..v7 or on any error, returns false with outputs left at defaults.
+bool peek_v8_rank_header(const std::string& path,
+                         int32_t& num_ranks, int32_t& rank_id,
+                         int32_t& num_cells_global) {
+    num_ranks = 1; rank_id = 0; num_cells_global = 0;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    uint32_t magic = 0, ver = 0;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
+        magic != 0x43454C4C || ver < 8) {
+        fclose(f); return false;
+    }
+    // After magic+ver (8 bytes), skip: step(4)+cur_time(8)+nc(4)+si(4)
+    //   +reserved(4)+ts(4)+bools(4) = 32 bytes. Now at sp_sz.
+    if (fseek(f, 32, SEEK_CUR) != 0) { fclose(f); return false; }
+    uint32_t sp_sz = 0;
+    if (fread(&sp_sz, 4, 1, f) != 1) { fclose(f); return false; }
+    // Skip SimParams blob + T_w(4). Now at the v8 trailer (3 i32s).
+    if (fseek(f, (long)sp_sz + 4, SEEK_CUR) != 0) { fclose(f); return false; }
+    if (fread(&num_ranks,        4, 1, f) != 1 ||
+        fread(&rank_id,          4, 1, f) != 1 ||
+        fread(&num_cells_global, 4, 1, f) != 1) {
+        fclose(f); return false;
+    }
+    fclose(f);
+    return true;
+}
+}  // namespace
+
+bool Simulation::init_from_checkpoint(const std::string& path_in,
                                       const SimParams& cli,
                                       const SimOverrides& ov) {
+    // ---- v8 multi-rank dispatch ----
+    // If the supplied checkpoint is v8 with num_ranks > 1, each rank
+    // resolves to its own per-rank file. Rank 0 stays at the supplied
+    // path; rank K (K>0) opens <dirname(path)>/rank{K}/checkpoint.bin.
+    // We also validate that the requested --gpus matches the checkpoint
+    // layout, since this C++ loader only supports same-G resumes.
+    std::string path = path_in;
+    {
+        int32_t ck_num_ranks = 1, ck_rank_id = 0, ck_n_global = 0;
+        if (peek_v8_rank_header(path_in, ck_num_ranks, ck_rank_id, ck_n_global) &&
+            ck_num_ranks > 1) {
+            if (gpus != ck_num_ranks) {
+                fprintf(stderr,
+                    "[ckpt] checkpoint was saved with --gpus %d but you "
+                    "requested --gpus %d. Use `cell_analyze merge-ckpt %s` "
+                    "to consolidate into a single-rank checkpoint, then "
+                    "resume with any --gpus value.\n",
+                    ck_num_ranks, gpus, path_in.c_str());
+                return false;
+            }
+            if (rank > 0) {
+                // Redirect to /<dir>/rank{K}/<basename(path_in)>.
+                std::string p = path_in;
+                size_t slash = p.find_last_of('/');
+                std::string dir = (slash == std::string::npos) ? "." : p.substr(0, slash);
+                std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
+                path = dir + "/rank" + std::to_string(rank) + "/" + base;
+            }
+        }
+    }
+
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) {
         fprintf(stderr, "Failed to open checkpoint %s\n", path.c_str());
@@ -620,15 +698,15 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     fread(bools, 1, 4, f);
     fread(&sp_sz, 4, 1, f);
 
-    if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7)) {
+    if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7 || ver == 8)) {
         fread(&params, sp_sz, 1, f);
         // subdomain_padding was a dead field in v6/v7 ckpts; reset to
         // current default so resumed runs use a sane adaptive-rect K.
         // CLI override below still wins.
         params.subdomain_padding = SimParams{}.subdomain_padding;
-    } else if (ver == 7) {
-        fprintf(stderr, "v7 checkpoint with foreign SimParams (sp=%u, ours=%zu)\n",
-                sp_sz, sizeof(SimParams));
+    } else if (ver == 7 || ver == 8) {
+        fprintf(stderr, "v%u checkpoint with foreign SimParams (sp=%u, ours=%zu)\n",
+                ver, sp_sz, sizeof(SimParams));
         fclose(f); return false;
     } else {
         // Legacy v3/v4/v5: SimParams was a packed f32 layout. Decode by hand.
@@ -714,21 +792,32 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     std::vector<float> ck_cx(nc), ck_cy(nc), ck_vx(nc), ck_vy(nc), ck_vol(nc);
     std::vector<int>   ck_ox(nc), ck_oy(nc);
     std::vector<std::vector<float>> ck_phi(nc);
+    // v8 multi-rank info (default to single-rank values for v3..v7).
+    int32_t v8_num_ranks = 1, v8_rank_id = 0, v8_n_global = nc;
+    // Per-cell global ids; populated on v8 reads (otherwise = local index).
+    std::vector<int> ck_gid(nc);
+    for (int i = 0; i < nc; ++i) ck_gid[i] = i;
 
-    if (ver == 7) {
-        // Native format: uniform tiles of size T_in. T_in usually matches the
-        // build's TILE_T but we accept any size and re-tile (centred) into
-        // TILE_T x TILE_T buffers, mirroring the legacy v3-v6 path.
+    if (ver == 7 || ver == 8) {
+        // Native v7/v8 format: uniform tiles of size T_in. T_in usually
+        // matches the build's TILE_T but we accept any size and re-tile
+        // (centred) into TILE_T x TILE_T buffers.
         int32_t T_in = 0;
         fread(&T_in, 4, 1, f);
         const int Tin = T_in;
         const size_t Tin_area = (size_t)Tin * Tin;
         if (Tin != TILE_T) {
-            fprintf(stderr, "[ckpt] v7 TILE_T re-tile: file=%d build=%d\n",
-                    Tin, TILE_T);
+            fprintf(stderr, "[ckpt] v%u TILE_T re-tile: file=%d build=%d\n",
+                    ver, Tin, TILE_T);
+        }
+        if (ver == 8) {
+            fread(&v8_num_ranks, 4, 1, f);
+            fread(&v8_rank_id,   4, 1, f);
+            fread(&v8_n_global,  4, 1, f);
         }
         for (int i = 0; i < nc; i++) {
             int32_t cid; fread(&cid, 4, 1, f);
+            if (ver == 8) ck_gid[i] = cid;
             int32_t ox, oy;
             fread(&ox, 4, 1, f); fread(&oy, 4, 1, f);
             fread(&ck_cx[i],  4, 1, f); fread(&ck_cy[i],  4, 1, f);
@@ -852,6 +941,39 @@ bool Simulation::init_from_checkpoint(const std::string& path,
         std::exit(1);
     }
 
+    // ---- Multi-GPU slab geometry on resume ----
+    // alloc_gpu() needs slab_y_lo/hi set before it allocates S, so do
+    // this here. Three resume cases:
+    //  (a) gpus == 1: trivial single-GPU.
+    //  (b) gpus > 1 with a v8 multi-rank checkpoint matching gpus: each
+    //      rank's file already contains only its own slab cells.
+    //  (c) gpus > 1 with v7 or v8-single-rank: not supported by the C++
+    //      loader (would need cross-rank scatter; use cell_analyze to
+    //      consolidate or split first).
+    if (gpus > 1) {
+        if (ver == 8 && v8_num_ranks == gpus) {
+            cells_global = v8_n_global;
+            slab_y_lo = (int)((long long)rank       * params.Ny / gpus);
+            slab_y_hi = (int)((long long)(rank + 1) * params.Ny / gpus);
+            h_global_id = ck_gid;
+        } else {
+            std::string layout_desc = (ver == 8)
+                ? (std::to_string(v8_num_ranks) + "-rank")
+                : "single-rank";
+            fprintf(stderr,
+                "[ckpt] cannot resume a v%u %s checkpoint with --gpus %d. "
+                "Save with the same --gpus, or use `cell_analyze merge-ckpt`/"
+                "`split-ckpt` to consolidate or repartition the per-rank "
+                "files first.\n",
+                ver, layout_desc.c_str(), gpus);
+            return false;
+        }
+    } else {
+        // gpus == 1: keep slab covering the full grid (already the default).
+        cells_global = nc;
+        h_global_id = ck_gid;
+    }
+
     alloc_gpu();
     const int n = cells.num_cells;
 
@@ -959,17 +1081,9 @@ bool Simulation::init_from_checkpoint(const std::string& path,
     finalize_init();
 
     if (gpus > 1) {
-        cells_global = nc;
-        // TODO(multi-gpu phase B): partition checkpoint load across ranks.
-        // Currently all ranks load the entire checkpoint and only one
-        // rank's worth is on-device. Acceptable for first multi-GPU
-        // bring-up; revisit when N_global * (TILE_AREA*4 + ~8 floats)
-        // becomes large enough that loading time matters.
-        fprintf(stderr,
-                "[multi-gpu] WARNING: checkpoint resume on --gpus>1 currently "
-                "loads the full checkpoint on every rank without slicing. "
-                "First-pass support; correctness for resumed multi-GPU runs "
-                "is not yet validated.\n");
+        printf("[multi-gpu] rank %d/%d resumed from per-rank checkpoint: "
+               "slab y in [%d,%d), %d/%d cells\n",
+               rank, gpus, slab_y_lo, slab_y_hi, n, cells_global);
     }
     printf("[SIM] resumed from %s: step=%d, t=%.4f, %d cells, %dx%d, t_end=%.1f\n",
            path.c_str(), step_count, cur_time, n,
@@ -1392,8 +1506,15 @@ void Simulation::write_trajectory() {
         return m;
     };
 
+    int skipped_v0 = 0;
     for (int i = 0; i < n; i++) {
-        double invV = (V[i] > 1e-6f) ? 1.0 / V[i] : 0.0;
+        // Skip cells whose volume hasn't been refreshed yet — happens for
+        // arrival slots in the rebind step that triggered a migration: the
+        // tile is copied over but volumes/Cx/Cy aren't refilled until the
+        // next reduce. Without this guard, Cx/V=0 emits the bare origin
+        // and produces a fake L/2-sized cell jump for one frame.
+        if (V[i] < 1e-6f) { ++skipped_v0; continue; }
+        double invV = 1.0 / V[i];
         double cx_g = wrap_d(h_or[2*i + 0] + Cx[i] * invV, Nx);
         double cy_g = wrap_d(h_or[2*i + 1] + Cy[i] * invV, Ny);
         float theta = atan2f(py[i], px[i]);
@@ -1407,6 +1528,12 @@ void Simulation::write_trajectory() {
                 px[i], py[i], theta, vA[i], Ln, vol);
     }
     fflush(traj_fp);
+    if (skipped_v0 > 0) {
+        fprintf(stderr,
+            "[traj] rank %d t=%.4f: skipped %d cell(s) with V=0 "
+            "(post-migration pre-reduce); next sample will include them\n",
+            rank, cur_time, skipped_v0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,7 +1639,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     if (!f) { fprintf(stderr, "Failed to open %s\n", fn_tmp); return; }
 
     uint32_t magic = 0x43454C4C;
-    uint32_t ver = 7;
+    uint32_t ver = 8;
     int32_t cs = step_count;
     double  ct = cur_time;
     int32_t nc = n;
@@ -1522,6 +1649,13 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     uint8_t bools[4] = {0, 0, 0, 0};
     uint32_t sp_sz = sizeof(SimParams);
     int32_t T_w = TILE_T;
+    // v8 multi-rank header: every checkpoint carries (num_ranks, rank_id,
+    // num_cells_global). Single-GPU runs write (1, 0, nc). Multi-rank
+    // runs write the per-rank coordinates, and each cell record uses its
+    // GLOBAL id so the per-rank files can be merged unambiguously.
+    int32_t v8_num_ranks  = (gpus > 1) ? gpus : 1;
+    int32_t v8_rank_id    = (gpus > 1) ? rank : 0;
+    int32_t v8_n_global   = (gpus > 1) ? cells_global : nc;
 
     fwrite(&magic, 4, 1, f);
     fwrite(&ver,   4, 1, f);
@@ -1535,6 +1669,9 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     fwrite(&sp_sz, 4, 1, f);
     fwrite(&params, sp_sz, 1, f);
     fwrite(&T_w,   4, 1, f);
+    fwrite(&v8_num_ranks, 4, 1, f);
+    fwrite(&v8_rank_id,   4, 1, f);
+    fwrite(&v8_n_global,  4, 1, f);
 
     auto wrap_d = [](double v, int L) {
         double m = std::fmod(v, (double)L);
@@ -1550,7 +1687,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         float cy = (float)wrap_d(h_or[2*i + 1] + Cy[i] * invV, Ny);
         float vol = V[i] * (float)params.dA();
 
-        int32_t cid = i;
+        int32_t cid = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
         int32_t ox = h_or[2*i + 0];
         int32_t oy = h_or[2*i + 1];
         fwrite(&cid, 4, 1, f);
@@ -1643,6 +1780,7 @@ void Simulation::cleanup() {
     cf(d_polar_theta_scratch);
     cf(d_polar_x_scratch); cf(d_polar_y_scratch);
     cfv(d_rng_scratch);
+    cf(d_gid_src); cf(d_gid_arr);
 }
 
 // ===========================================================================
@@ -1705,7 +1843,7 @@ struct MgBarrier {
 // sequence is:
 //
 //   1. Zero counters, classify all local cells -> stay/up/down lists.
-//   2. Download n_up/n_down to host. Range-check vs MAX_MIGRANTS_PER_DIR.
+//   2. Download n_up/n_down to host. Range-check vs max_migrants_per_dir.
 //   3. NCCL-exchange the four counts (n_up to prev, n_down to next;
 //      recv n_in_prev, n_in_next).
 //   4. Pack outgoing into d_pack_up / d_pack_down.
@@ -1750,12 +1888,14 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
                        cudaMemcpyDeviceToHost, s));
     CK(cudaStreamSynchronize(s));
 
-    if (h_n_up > MAX_MIGRANTS_PER_DIR ||
-        h_n_down > MAX_MIGRANTS_PER_DIR) {
+    if (h_n_up > max_migrants_per_dir ||
+        h_n_down > max_migrants_per_dir) {
         fprintf(stderr,
-            "[FATAL] migration: rank %d exceeded MAX_MIGRANTS_PER_DIR=%d "
-            "(up=%d down=%d). Increase the constant in kernels.cuh.\n",
-            my_rank, MAX_MIGRANTS_PER_DIR, h_n_up, h_n_down);
+            "[FATAL] migration: rank %d exceeded max_migrants_per_dir=%d "
+            "(up=%d down=%d). The per-direction pack buffer is sized at "
+            "alloc time to max(128, capacity/16). Raise it by increasing "
+            "cell capacity (currently %d) or by hand-editing alloc_gpu().\n",
+            my_rank, max_migrants_per_dir, h_n_up, h_n_down, cells.capacity);
         std::exit(1);
     }
 
@@ -1789,20 +1929,14 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
     }
 
     // 4. Pack outgoing.
-    //    Upload h_global_id to a device buffer so the pack can include
-    //    each migrant's gid in its header. Allocate a capacity-sized
-    //    arrival gid buffer so the unpack can write directly at the
-    //    arrival slot indices.
-    int* d_gid_src = nullptr;
-    int* d_gid_arr = nullptr;
-    if (h_n_up > 0 || h_n_down > 0 || h_n_in_prev > 0 || h_n_in_next > 0) {
-        CK(cudaMallocAsync(&d_gid_src, (size_t)cells.num_cells * sizeof(int), s));
+    //    Upload h_global_id into the persistent d_gid_src buffer (allocated
+    //    once in alloc_gpu). Pack reads gid from there; unpack writes the
+    //    arrival cells' gids into d_gid_arr at the trailing slots so the
+    //    host post-step code can read them back at the right offset.
+    if (cells.num_cells > 0) {
         CK(cudaMemcpyAsync(d_gid_src, h_global_id.data(),
                            (size_t)cells.num_cells * sizeof(int),
                            cudaMemcpyHostToDevice, s));
-        if (h_n_in_total > 0) {
-            CK(cudaMallocAsync(&d_gid_arr, (size_t)cells.capacity * sizeof(int), s));
-        }
     }
     if (h_n_up   > 0) launch_pack_migrants(cells, d_up_idx,   h_n_up,
                                            d_gid_src, d_pack_up,   s);
@@ -1919,8 +2053,6 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
             h_global_id[k] = old_gid[h_stay_idx[k]];
         }
     }
-    if (d_gid_src) CK(cudaFreeAsync(d_gid_src, s));
-    if (d_gid_arr) CK(cudaFreeAsync(d_gid_arr, s));
 
     return cells.num_cells;
 }

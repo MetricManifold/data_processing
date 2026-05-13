@@ -303,6 +303,16 @@ def read_checkpoint(path):
         if version >= 7:
             T = struct.unpack("<i", f.read(4))[0]
             params["tile_T"] = T
+            # v8 trailer: (num_ranks, rank_id, num_cells_global) immediately
+            # after T. v7 has no trailer.
+            if version >= 8:
+                params["num_ranks"] = struct.unpack("<i", f.read(4))[0]
+                params["rank_id"] = struct.unpack("<i", f.read(4))[0]
+                params["num_cells_global"] = struct.unpack("<i", f.read(4))[0]
+            else:
+                params["num_ranks"] = 1
+                params["rank_id"] = 0
+                params["num_cells_global"] = num_cells
             # The Phase-H test framework treats every tile as
             # halo + inner + halo and uses ``bbox[0] - halo_width`` to
             # recover the global origin. sim_v3 has no halo concept, but

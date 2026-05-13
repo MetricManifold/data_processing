@@ -117,9 +117,40 @@ pub fn load_trajectory(path: &Path) -> Result<Trajectory> {
 
 /// Load a trajectory file with optional subsampling.
 /// `subsample` = 1 means keep every frame, 10 means keep every 10th, etc.
+///
+/// Multi-GPU runs: if `path` is rank 0's `trajectory.txt` and sibling
+/// `rankN/trajectory.txt` files exist, all rank files are read together
+/// so the trajectory covers every cell at every time. Caller doesn't
+/// need to know whether a run was single- or multi-GPU.
 pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajectory> {
-    let file = fs::File::open(path).context("Opening trajectory file")?;
-    let reader = BufReader::new(file);
+    // Discover sibling per-rank files. Rule: if `path` is at
+    // `<dir>/trajectory.txt` and `<dir>/rank1/trajectory.txt` exists,
+    // collect all `rankN/trajectory.txt` siblings until the chain breaks.
+    let mut paths: Vec<std::path::PathBuf> = vec![path.to_path_buf()];
+    if let (Some(parent), Some(base)) = (path.parent(), path.file_name()) {
+        for k in 1.. {
+            let candidate = parent.join(format!("rank{}", k)).join(base);
+            if candidate.exists() {
+                paths.push(candidate);
+            } else {
+                break;
+            }
+        }
+    }
+    if paths.len() > 1 {
+        eprintln!(
+            "load_trajectory: detected multi-GPU run, reading {} rank files",
+            paths.len()
+        );
+    }
+    let readers: Vec<BufReader<fs::File>> = paths
+        .iter()
+        .map(|p| {
+            fs::File::open(p)
+                .with_context(|| format!("Opening trajectory file {}", p.display()))
+                .map(BufReader::new)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut params = TrajectoryParams::default();
     let subsample = subsample.max(1);
@@ -134,6 +165,7 @@ pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajec
     let mut cell0_count: usize = 0;
     let mut keep_frame = true;
 
+    for reader in readers {
     for line in reader.lines() {
         let line = line?;
         if line.starts_with('#') {
@@ -175,13 +207,18 @@ pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajec
         let t: f64 = parts[0].parse().unwrap_or(0.0);
         let cid: u32 = parts[1].parse().unwrap_or(0);
 
-        // Subsampling: count cell-0 appearances to track frame number
-        if cid == 0 {
-            keep_frame = cell0_count % subsample == 0;
-            cell0_count += 1;
-        }
-        if !keep_frame {
-            continue;
+        // Subsampling: count cell-0 appearances to track frame number.
+        // For multi-rank runs, cell 0 lives in only one rank — subsampling
+        // is applied AFTER the sort, so accept everything here.
+        let multi_rank = paths.len() > 1;
+        if !multi_rank {
+            if cid == 0 {
+                keep_frame = cell0_count % subsample == 0;
+                cell0_count += 1;
+            }
+            if !keep_frame {
+                continue;
+            }
         }
 
         let snap = if parts.len() >= 14 || params.dim == 3 {
@@ -218,6 +255,38 @@ pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajec
         };
 
         rows.push(RawRow { time: t, cell_id: cid, snap });
+    }
+    }  // end `for reader in readers`
+
+    // When multiple rank files were concatenated, their rows are
+    // separately time-ordered but the concatenation interleaves them
+    // poorly (rank 0's full timeline, then rank 1's, etc). Sort by
+    // (time, cell_id) so cell-0 indexing and chain-job overlap detection
+    // see a single monotonic timeline. Single-file runs are already
+    // sorted, so this is a no-op cost (Rust uses a stable Timsort).
+    if paths.len() > 1 {
+        rows.sort_by(|a, b| {
+            a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cell_id.cmp(&b.cell_id))
+        });
+        // Subsample bookkeeping uses cell_0 appearances; we need to
+        // recompute keep_frame on the SORTED stream. Easiest: rebuild
+        // `rows` by filtering with a fresh cell0 counter. With single
+        // file this loop is skipped above; for multi-file we always
+        // accept all rows here and let the subsample mask apply below.
+        // (The original on-the-fly filter was applied before the sort;
+        // for correctness we redo it.)
+        if subsample > 1 {
+            let mut counter = 0usize;
+            let mut keep = true;
+            rows.retain(|r| {
+                if r.cell_id == 0 {
+                    keep = counter % subsample == 0;
+                    counter += 1;
+                }
+                keep
+            });
+        }
     }
 
     // Phase 2: Detect chain-job overlaps via cell-0 backward time jumps

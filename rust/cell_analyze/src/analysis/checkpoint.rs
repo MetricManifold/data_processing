@@ -26,6 +26,13 @@ pub struct CheckpointHeader {
     pub compute_diagnostics: bool,
     pub save_individual_fields: bool,
     pub sim_params_size: u32,
+    /// v8+ only: number of ranks this checkpoint was split across.
+    /// 1 for single-GPU runs. Older versions report 1.
+    pub num_ranks: i32,
+    /// v8+ only: this file's rank index (0..num_ranks-1). 0 for older versions.
+    pub rank_id: i32,
+    /// v8+ only: total cells across all ranks. Equals num_cells for older versions.
+    pub num_cells_global: i32,
 }
 
 /// Subset of SimParams we care about.
@@ -147,8 +154,8 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     // Version
     f.read_exact(&mut buf4)?;
     let version = u32::from_le_bytes(buf4);
-    if version < 2 || version > 7 {
-        anyhow::bail!("Unsupported checkpoint version {} (expected 2-7)", version);
+    if version < 2 || version > 8 {
+        anyhow::bail!("Unsupported checkpoint version {} (expected 2-8)", version);
     }
 
     // Step
@@ -209,7 +216,7 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         }
     }
 
-    let header = CheckpointHeader {
+    let mut header = CheckpointHeader {
         magic, version, step, time, num_cells,
         save_interval, checkpoint_interval, trajectory_samples,
         save_vtk: flags[0] != 0,
@@ -217,6 +224,10 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         compute_diagnostics: flags[2] != 0,
         save_individual_fields: flags[3] != 0,
         sim_params_size,
+        // v8 fields populated after T_w; default to single-rank for v3..v7.
+        num_ranks: 1,
+        rank_id: 0,
+        num_cells_global: num_cells,
     };
 
     // Read SimParams — we only need a few fields.
@@ -284,15 +295,31 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     }
 
     // v7 (sim_v3): uniform TILE_T tiles, no halo. Tile edge follows SimParams.
-    let tile_t: i32 = if version == 7 {
+    // v8: same per-cell layout as v7, but with a 3-i32 trailer (num_ranks,
+    // rank_id, num_cells_global) between T_w and the per-cell records.
+    let tile_t: i32 = if version >= 7 {
         f.read_exact(&mut buf4)?;
         i32::from_le_bytes(buf4)
     } else {
         0
     };
-    // For v7, halo is implicit in the tile (0 padding). Force halo=0 so
+    let (num_ranks, rank_id, num_cells_global) = if version >= 8 {
+        f.read_exact(&mut buf4)?;
+        let nr = i32::from_le_bytes(buf4);
+        f.read_exact(&mut buf4)?;
+        let rid = i32::from_le_bytes(buf4);
+        f.read_exact(&mut buf4)?;
+        let ng = i32::from_le_bytes(buf4);
+        (nr, rid, ng)
+    } else {
+        (1, 0, num_cells)
+    };
+    header.num_ranks = num_ranks;
+    header.rank_id = rank_id;
+    header.num_cells_global = num_cells_global;
+    // For v7/v8, halo is implicit in the tile (0 padding). Force halo=0 so
     // composite_phi() places tiles at their raw origins.
-    let halo_width = if version == 7 { 0 } else { halo_width };
+    let halo_width = if version >= 7 { 0 } else { halo_width };
     let params = SimParams { nx, ny, dx, dy, dt, target_radius, v_a, tau, halo_width, lambda, seed, polarity_seed };
 
     eprintln!("Checkpoint: v={}, step={}, t={:.0} ({:.1}τ), cells={}, domain={}×{}",
@@ -307,7 +334,7 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
         let id = i32::from_le_bytes(buf4);
 
         let bbox;
-        if version == 7 {
+        if version >= 7 {
             // origin (ox, oy) — 2 i32 — defines the world-coord position of the
             // tile's (0,0) corner. Tile spans (ox..ox+T, oy..oy+T).
             let mut og = [0u8; 8];
@@ -399,9 +426,10 @@ pub fn load_checkpoint(path: &Path) -> Result<Checkpoint> {
     })
 }
 
-/// Lightweight header-only read. Returns (time, num_cells, version).
+/// Lightweight header-only read. Returns (time, num_cells_local, version,
+/// num_cells_global). For v<8, num_cells_global == num_cells_local.
 /// Used by `cell_analyze check` for fast validation without loading phi fields.
-pub fn load_checkpoint_header_only(path: &Path) -> Result<(f64, i32, u32)> {
+pub fn load_checkpoint_header_only(path: &Path) -> Result<(f64, i32, u32, i32)> {
     let mut f = std::fs::File::open(path)
         .with_context(|| format!("Opening checkpoint: {}", path.display()))?;
     let mut buf4 = [0u8; 4];
@@ -425,7 +453,25 @@ pub fn load_checkpoint_header_only(path: &Path) -> Result<(f64, i32, u32)> {
     };
     f.read_exact(&mut buf4)?;
     let num_cells = i32::from_le_bytes(buf4);
-    Ok((time, num_cells, version))
+
+    // For v8, we'd like num_cells_global too. It lives after SimParams
+    // and tile_t, which are variable-width. Cheap way: skip to sp_sz
+    // (24 more bytes: si+ci+ts+bools(4)), read sp_sz, skip SimParams +
+    // tile_t (sp_sz + 4), then read num_ranks/rank_id/n_global.
+    let mut num_cells_global = num_cells;
+    if version >= 8 {
+        // Skip save_interval(4) + checkpoint_interval(4) + trajectory_samples(4) + bools(4)
+        let mut skip16 = [0u8; 16];
+        f.read_exact(&mut skip16)?;
+        f.read_exact(&mut buf4)?;
+        let sp_sz = u32::from_le_bytes(buf4) as i64;
+        // SimParams blob, then T_w(4), then num_ranks(4), then rank_id(4).
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::Current(sp_sz + 4 + 4 + 4))?;
+        f.read_exact(&mut buf4)?;
+        num_cells_global = i32::from_le_bytes(buf4);
+    }
+    Ok((time, num_cells, version, num_cells_global))
 }
 
 /// Read mean bounding box width and subdomain_padding from a checkpoint.
