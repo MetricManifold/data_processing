@@ -100,6 +100,32 @@ void Simulation::compute_origins() {
 }
 
 // ---------------------------------------------------------------------------
+// PartitionLayout::for_rank — single formula for slab geometry. Used by
+// fresh-init (slice_cells_to_local) and resume (init_from_checkpoint) to
+// keep their slab math in sync.
+// ---------------------------------------------------------------------------
+PartitionLayout PartitionLayout::for_rank(int gpus, int rank, int Ny, int halo_h) {
+    PartitionLayout L{};
+    L.Ny = Ny;
+    if (gpus <= 1) {
+        L.slab_y_lo    = 0;
+        L.slab_y_hi    = Ny;
+        L.S_halo_h     = 0;
+        L.S_ext_height = Ny;
+    } else {
+        L.slab_y_lo    = (int)((long long)rank       * Ny / gpus);
+        L.slab_y_hi    = (int)((long long)(rank + 1) * Ny / gpus);
+        L.S_halo_h     = halo_h;
+        L.S_ext_height = (L.slab_y_hi - L.slab_y_lo) + 2 * halo_h;
+    }
+    return L;
+}
+
+void Simulation::build_layout() {
+    layout = PartitionLayout::for_rank(gpus, rank, params.Ny, HALO_H);
+}
+
+// ---------------------------------------------------------------------------
 // Per-cell float-state registry — see PerCellField doc in sim.cuh.
 // Single source of truth for every per-cell float scalar's lifecycle.
 // ---------------------------------------------------------------------------
@@ -151,21 +177,17 @@ void Simulation::alloc_gpu() {
 
     // ----- Slab partition for S -----
     // For G == 1: slab covers the whole grid (y_lo=0, halo=0, ext_height=Ny).
-    // For G  > 1: slab_y_lo / slab_y_hi were set by slice_cells_to_local.
+    // For G  > 1: slab geometry was set by build_layout (called from
+    //             slice_cells_to_local for fresh init, or
+    //             init_from_checkpoint for resume).
     //             Each rank's S buffer is (slab_height + 2*HALO_H) x Nx
     //             floats. Pixels outside [y_lo - HALO_H, y_hi + HALO_H)
     //             (with periodic wrap) are NOT addressable on this rank;
     //             cells whose tiles extend beyond that window violate the
     //             slab contract and require migration to a neighbour rank.
-    if (gpus <= 1) {
-        cells.S_y_lo       = 0;
-        cells.S_halo_h     = 0;
-        cells.S_ext_height = params.Ny;
-    } else {
-        cells.S_y_lo       = slab_y_lo;
-        cells.S_halo_h     = HALO_H;
-        cells.S_ext_height = (slab_y_hi - slab_y_lo) + 2 * HALO_H;
-    }
+    cells.S_y_lo       = layout.slab_y_lo;
+    cells.S_halo_h     = layout.S_halo_h;
+    cells.S_ext_height = layout.S_ext_height;
     // Halos must not overlap themselves around the periodic wrap. This
     // requires slab_height + 2*HALO_H <= Ny, i.e. ext_height <= Ny.
     // Hits when (Ny / G) is too small relative to HALO_H — for our target
@@ -175,7 +197,7 @@ void Simulation::alloc_gpu() {
             "[FATAL] alloc_gpu: slab ext_height (%d) > Ny (%d). "
             "G=%d may be too high for Ny=%d (slab_h=%d, HALO_H=%d).\n",
             cells.S_ext_height, params.Ny, gpus, params.Ny,
-            slab_y_hi - slab_y_lo, HALO_H);
+            layout.slab_height(), HALO_H);
         std::exit(1);
     }
     const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
@@ -1036,19 +1058,18 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     }
 
     // ---- Multi-GPU slab geometry on resume ----
-    // alloc_gpu() needs slab_y_lo/hi set before it allocates S, so do
-    // this here. Three resume cases:
+    // alloc_gpu() needs the slab geometry set before it allocates S, so
+    // build the layout here. Three resume cases:
     //  (a) gpus == 1: trivial single-GPU.
     //  (b) gpus > 1 with a v8 multi-rank checkpoint matching gpus: each
     //      rank's file already contains only its own slab cells.
     //  (c) gpus > 1 with v7 or v8-single-rank: not supported by the C++
     //      loader (would need cross-rank scatter; use cell_analyze to
     //      consolidate or split first).
+    build_layout();
     if (gpus > 1) {
         if (ver == 8 && v8_num_ranks == gpus) {
             cells_global = v8_n_global;
-            slab_y_lo = (int)((long long)rank       * params.Ny / gpus);
-            slab_y_hi = (int)((long long)(rank + 1) * params.Ny / gpus);
             h_global_id = ck_gid;
         } else {
             std::string layout_desc = (ver == 8)
@@ -1177,7 +1198,7 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     if (gpus > 1) {
         printf("[multi-gpu] rank %d/%d resumed from per-rank checkpoint: "
                "slab y in [%d,%d), %d/%d cells\n",
-               rank, gpus, slab_y_lo, slab_y_hi, n, cells_global);
+               rank, gpus, slab_y_lo(), slab_y_hi(), n, cells_global);
     }
     printf("[SIM] resumed from %s: step=%d, t=%.4f, %d cells, %dx%d, t_end=%.1f\n",
            path.c_str(), step_count, cur_time, n,
@@ -1199,19 +1220,15 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
 void Simulation::slice_cells_to_local() {
     const int n_global = (int)h_cells.size();
     cells_global = n_global;
+    build_layout();
     if (gpus <= 1) {
         cell_offset = 0;
-        slab_y_lo = 0;
-        slab_y_hi = params.Ny;
         h_global_id.resize(n_global);
         for (int i = 0; i < n_global; ++i) h_global_id[i] = i;
         return;
     }
-    // Compute this rank's slab bounds. Boundaries are placed at the
-    // floor of g*Ny/G so the partition is exact and reproducible.
-    slab_y_lo = (int)((long long)rank       * params.Ny / gpus);
-    slab_y_hi = (int)((long long)(rank + 1) * params.Ny / gpus);
-
+    const int y_lo = layout.slab_y_lo;
+    const int y_hi = layout.slab_y_hi;
     std::vector<CellHost> kept;
     kept.reserve(n_global / gpus + 16);
     h_global_id.clear();
@@ -1222,7 +1239,7 @@ void Simulation::slice_cells_to_local() {
         cy = std::fmod(cy, (double)params.Ny);
         if (cy < 0) cy += params.Ny;
         int cy_int = (int)std::floor(cy);
-        if (cy_int >= slab_y_lo && cy_int < slab_y_hi) {
+        if (cy_int >= y_lo && cy_int < y_hi) {
             kept.push_back(h_cells[i]);
             h_global_id.push_back(i);
         }
@@ -1231,7 +1248,7 @@ void Simulation::slice_cells_to_local() {
     h_cells.swap(kept);
     fprintf(stderr,
         "[multi-gpu] rank %d/%d: spatial slab y in [%d,%d), %d/%d cells\n",
-        rank, gpus, slab_y_lo, slab_y_hi, (int)h_cells.size(), n_global);
+        rank, gpus, y_lo, y_hi, (int)h_cells.size(), n_global);
 }
 
 // ---------------------------------------------------------------------------
@@ -1962,7 +1979,7 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
     CK(cudaMemsetAsync(d_mig_counts, 0, 5 * sizeof(int), s));
     launch_classify_migrants(
         cells.origin, cells.num_cells,
-        slab_y_lo, slab_y_hi, params.Ny,
+        slab_y_lo(), slab_y_hi(), params.Ny,
         my_rank, gpus,
         d_n_stay, d_n_up, d_n_down,
         d_stay_idx, d_up_idx, d_down_idx, s);

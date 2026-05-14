@@ -17,6 +17,35 @@ struct SimOverrides {
 };
 
 // ---------------------------------------------------------------------------
+// PartitionLayout — multi-GPU slab geometry (single source of truth).
+//
+// Built once from (gpus, rank, Ny) via PartitionLayout::for_rank. Holds the
+// y-slab bounds plus the halo geometry of the global S field on this rank.
+// Two formulas used to be hand-duplicated in slice_cells_to_local and
+// init_from_checkpoint; the same numbers were also mirrored on CellArrays
+// via S_y_lo/S_halo_h/S_ext_height. This struct collapses both paths to
+// one constructor and one assignment site (alloc_gpu).
+//
+//   for_rank(gpus=1, rank=0, Ny): trivial single-GPU (whole grid, no halo).
+//   for_rank(gpus=G, rank=g, Ny): rank g's slab [floor(g*Ny/G), floor((g+1)*Ny/G))
+//                                  with HALO_H rows on each side.
+//
+// Boundaries use floor so the partition is exact and reproducible across
+// invocations; rounding the same way in two places was the legacy bug
+// risk the layout eliminates.
+// ---------------------------------------------------------------------------
+struct PartitionLayout {
+    int Ny           = 0;   // global domain height (>= slab_y_hi)
+    int slab_y_lo    = 0;   // rank-local slab covers global rows [slab_y_lo, slab_y_hi)
+    int slab_y_hi    = 0;
+    int S_halo_h     = 0;   // halo rows on each side of the slab for global S
+    int S_ext_height = 0;   // (slab_y_hi - slab_y_lo) + 2*S_halo_h
+
+    static PartitionLayout for_rank(int gpus, int rank, int Ny, int halo_h);
+    int slab_height() const { return slab_y_hi - slab_y_lo; }
+};
+
+// ---------------------------------------------------------------------------
 // sim_v3 Simulation — same external API as sim_v2 (CLI surface, checkpoint
 // I/O, trajectory format) but a completely different internal architecture:
 // fixed-T unified phi pool + global S field + COM rebind, no neighbour list.
@@ -109,10 +138,36 @@ struct Simulation {
     int cells_global   = 0;   // total cells across the world
     int cell_offset    = 0;   // first global cell id (B0 only — kept for
                               // single-GPU and contiguous-id slicing)
+    // Slab geometry. Single source of truth: built once from (gpus, rank, Ny)
+    // and applied to CellArrays.S_* by alloc_gpu. Anyone wanting the slab
+    // bounds should read from `layout`, NOT recompute the formula.
+    //
+    // ┌────────────────────┐
+    // │  PartitionLayout   │   ← built by Simulation::build_layout()
+    // │  (gpus, rank, Ny,  │      from (gpus, rank, params.Ny)
+    // │   halo, slab_y_lo, │
+    // │   slab_y_hi, S_*)  │
+    // └─────────┬──────────┘
+    //           │ alloc_gpu copies S_* fields onto CellArrays
+    //           ▼
+    // ┌─────────────────────┐
+    // │     CellArrays      │   ← read-only view used by kernels
+    // │  (S_y_lo, S_halo_h, │
+    // │   S_ext_height)     │
+    // └─────────────────────┘
+    PartitionLayout layout;
+    // Build `layout` from current (gpus, rank, params.Ny). Single
+    // formula; called from both slice_cells_to_local (fresh init) and
+    // init_from_checkpoint (resume). A v8 multi-rank resume hands in
+    // the file-stored num_ranks/rank_id which must equal (gpus, rank);
+    // mismatch is an error caught by the caller.
+    void build_layout();
     // Spatial partition along y. For G==1 these stay 0..Ny / no halo.
     // For G>1 they are set by slice_cells_to_local() before alloc_gpu().
-    int slab_y_lo      = 0;
-    int slab_y_hi      = 0;
+    // Kept as accessor-shaped aliases into `layout` for the small number
+    // of callers that still touch them directly.
+    int slab_y_lo()    const { return layout.slab_y_lo; }
+    int slab_y_hi()    const { return layout.slab_y_hi; }
     // Global cell id of each local cell, length == h_cells.size(). For
     // G=1 this is just [0, n_cells). For G>1 it is the spatial-partition
     // permutation of [0, n_global) and is NOT contiguous. Used for
