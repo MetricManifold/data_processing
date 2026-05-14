@@ -65,15 +65,46 @@ impl<'a, 'b> Panel<'a, 'b> for MsdTPair {
             .chain(pop_pts.iter())
             .map(|p| p.1)
             .collect();
+        // If the filter dropped everything (all-NaN data, all-zero MSD,
+        // wrong τ in trajectory header so x-axis range excluded every
+        // point, etc.) we cannot build a chart at all. Plotters'
+        // build_cartesian_2d will lock up on NaN axis bounds, so bail
+        // explicitly with a clear empty-panel render instead.
+        if all_y.is_empty() {
+            let title = opts.title.clone().unwrap_or_else(|| "MSD/Δt → 4D_eff".into());
+            let _ = ChartBuilder::on(area)
+                .caption(format!("{} (no data)", title), ("sans-serif", 16))
+                .margin(8)
+                .x_label_area_size(30)
+                .y_label_area_size(50)
+                .build_cartesian_2d(0.0..1.0, 0.0..1.0)?
+                .configure_mesh().draw();
+            eprintln!("[msd_t_pair] no plottable points after filter — \
+                       check that trajectory τ matches expected scale \
+                       (num.lag_tau range: {:?})",
+                      num.lag_tau.first().zip(num.lag_tau.last()));
+            return Ok(());
+        }
         let y_lo = all_y.iter().copied().fold(f64::INFINITY, f64::min);
         let y_hi = all_y.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let y_pad = (y_hi - y_lo).max(1e-6) * 0.1;
+        // Even with non-empty data, guard against degenerate ranges
+        // (single point, or values all equal) which produce zero span
+        // and break axis tick generation in plotters.
+        let y_span = (y_hi - y_lo).max(1e-6);
+        let y_pad = y_span * 0.1;
         let y_max = opts.y_range.map(|r| r.1).unwrap_or(y_hi + y_pad);
         let y_min = if opts.y_range.is_some() {
             opts.y_range.unwrap().0
         } else {
             (y_lo - y_pad).max(0.0)
         };
+        // Final sanity: if y_max <= y_min (range provided is degenerate
+        // or padding produced NaN), Plotters will hang on axis math.
+        if !y_max.is_finite() || !y_min.is_finite() || y_max <= y_min {
+            eprintln!("[msd_t_pair] degenerate y-axis range \
+                       [{:?}, {:?}] — skipping panel.", y_min, y_max);
+            return Ok(());
+        }
 
         let title = opts
             .title
