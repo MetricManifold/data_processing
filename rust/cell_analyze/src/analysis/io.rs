@@ -173,7 +173,12 @@ pub fn load_trajectory_subsample(path: &Path, subsample: usize) -> Result<Trajec
                 if let Some((k, v)) = tok.split_once('=') {
                     match k {
                         "v_A" => params.v_a = v.parse().unwrap_or(0.0),
-                        "N" => params.n_cells = v.parse().unwrap_or(0),
+                        // Single-GPU writes `N=`; multi-GPU writes
+                        // `N_global=` (the total across ranks) and
+                        // `N_local=` (this rank's slice). For
+                        // observable computation we want the global
+                        // count.
+                        "N" | "N_global" => params.n_cells = v.parse().unwrap_or(0),
                         "Lx" => params.lx = v.parse().unwrap_or(1600.0),
                         "Ly" => params.ly = v.parse().unwrap_or(1600.0),
                         "Lz" => {

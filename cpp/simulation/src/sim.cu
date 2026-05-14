@@ -213,11 +213,17 @@ void Simulation::alloc_gpu() {
         // the pack buffer footprint tight: 4 buffers × capacity/16 ×
         // ~410 KB/cell ≈ 656 MB per rank at N=12800.
         max_migrants_per_dir = std::max(MAX_MIGRANTS_DEFAULT, cap / 16);
-        CK(cudaMalloc(&d_n_stay,    sizeof(int)));
-        CK(cudaMalloc(&d_n_up,      sizeof(int)));
-        CK(cudaMalloc(&d_n_down,    sizeof(int)));
-        CK(cudaMalloc(&d_n_in_prev, sizeof(int)));
-        CK(cudaMalloc(&d_n_in_next, sizeof(int)));
+        // 5 migration counters in one contiguous buffer so the host can
+        // download them with a single cudaMemcpyAsync per phase (was
+        // 3+2 separate copies; the nsys profile showed cudaMemcpyAsync
+        // was 84% of API time, dominated by these per-rebind syncs).
+        //   layout: [stay, up, down, in_prev, in_next]
+        CK(cudaMalloc(&d_mig_counts, 5 * sizeof(int)));
+        d_n_stay    = d_mig_counts + 0;
+        d_n_up      = d_mig_counts + 1;
+        d_n_down    = d_mig_counts + 2;
+        d_n_in_prev = d_mig_counts + 3;
+        d_n_in_next = d_mig_counts + 4;
         CK(cudaMalloc(&d_stay_idx,  cap * sizeof(int)));
         CK(cudaMalloc(&d_up_idx,    cap * sizeof(int)));
         CK(cudaMalloc(&d_down_idx,  cap * sizeof(int)));
@@ -1791,8 +1797,9 @@ void Simulation::cleanup() {
     cf(d_scripted_cid);
     cf(d_scripted_theta);
     // Migration buffers (multi-GPU only; nullptr for G=1).
-    cf(d_n_stay);    cf(d_n_up);      cf(d_n_down);
-    cf(d_n_in_prev); cf(d_n_in_next);
+    // d_mig_counts is the real allocation; d_n_* are aliases into it.
+    cf(d_mig_counts);
+    d_n_stay = d_n_up = d_n_down = d_n_in_prev = d_n_in_next = nullptr;
     cf(d_stay_idx);  cf(d_up_idx);    cf(d_down_idx);
     auto cfv = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
     cfv(d_pack_up);      cfv(d_pack_down);
@@ -1890,9 +1897,7 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
     const int next_rank = (my_rank + 1) % gpus;
 
     // 1. Zero counters, classify.
-    CK(cudaMemsetAsync(d_n_stay, 0, sizeof(int), s));
-    CK(cudaMemsetAsync(d_n_up,   0, sizeof(int), s));
-    CK(cudaMemsetAsync(d_n_down, 0, sizeof(int), s));
+    CK(cudaMemsetAsync(d_mig_counts, 0, 5 * sizeof(int), s));
     launch_classify_migrants(
         cells.origin, cells.num_cells,
         slab_y_lo, slab_y_hi, params.Ny,
@@ -1900,15 +1905,24 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
         d_n_stay, d_n_up, d_n_down,
         d_stay_idx, d_up_idx, d_down_idx, s);
 
-    // 2. Download counts. Sync needed because we branch on values.
-    int h_n_stay = 0, h_n_up = 0, h_n_down = 0;
-    CK(cudaMemcpyAsync(&h_n_stay, d_n_stay, sizeof(int),
-                       cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(&h_n_up,   d_n_up,   sizeof(int),
-                       cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(&h_n_down, d_n_down, sizeof(int),
+    // 2. NCCL count exchange (device-to-device, no host involvement).
+    //    Issue immediately after classify so we only need one host sync
+    //    afterwards to download all 5 counts at once.
+    mg_group_start();
+    mg_send_recv_i32(world.comms[my_rank], d_n_up,   prev_rank, d_n_in_prev, prev_rank, s);
+    mg_send_recv_i32(world.comms[my_rank], d_n_down, next_rank, d_n_in_next, next_rank, s);
+    mg_group_end();
+
+    // 3. Single host download of all 5 counts (was 3+2 separate copies).
+    int h_counts[5] = {0, 0, 0, 0, 0};
+    CK(cudaMemcpyAsync(h_counts, d_mig_counts, 5 * sizeof(int),
                        cudaMemcpyDeviceToHost, s));
     CK(cudaStreamSynchronize(s));
+    int h_n_stay    = h_counts[0];
+    int h_n_up      = h_counts[1];
+    int h_n_down    = h_counts[2];
+    int h_n_in_prev = h_counts[3];
+    int h_n_in_next = h_counts[4];
 
     if (h_n_up > max_migrants_per_dir ||
         h_n_down > max_migrants_per_dir) {
@@ -1920,20 +1934,6 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
             my_rank, max_migrants_per_dir, h_n_up, h_n_down, cells.capacity);
         std::exit(1);
     }
-
-    // 3. NCCL count exchange. Each rank: send n_up to prev, send n_down
-    //    to next, recv n_in_prev from prev, recv n_in_next from next.
-    mg_group_start();
-    mg_send_recv_i32(world.comms[my_rank], d_n_up,   prev_rank, d_n_in_prev, prev_rank, s);
-    mg_send_recv_i32(world.comms[my_rank], d_n_down, next_rank, d_n_in_next, next_rank, s);
-    mg_group_end();
-
-    int h_n_in_prev = 0, h_n_in_next = 0;
-    CK(cudaMemcpyAsync(&h_n_in_prev, d_n_in_prev, sizeof(int),
-                       cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(&h_n_in_next, d_n_in_next, sizeof(int),
-                       cudaMemcpyDeviceToHost, s));
-    CK(cudaStreamSynchronize(s));
 
     int h_n_in_total = h_n_in_prev + h_n_in_next;
     int new_num_cells = h_n_stay + h_n_in_total;

@@ -78,15 +78,11 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesPair {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
-        // Decimate by max(1, n/2000) — see panels/pair/speed_bursts.rs
-        // for rationale (avoids SVG serializer thrash at ~20k frames).
-        let n_dec = (num.t_tau.len().max(den.t_tau.len()) / 2000).max(1);
         chart
             .draw_series(LineSeries::new(
                 num.t_tau
                     .iter()
-                    .step_by(n_dec)
-                    .zip(num.series.iter().step_by(n_dec))
+                    .zip(num.series.iter())
                     .map(|(&t, &l)| (t, l.min(y_max).max(y_min))),
                 SOFT_ALPHA.stroke_width(1),
             ))?
@@ -96,8 +92,7 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesPair {
             .draw_series(LineSeries::new(
                 den.t_tau
                     .iter()
-                    .step_by(n_dec)
-                    .zip(den.series.iter().step_by(n_dec))
+                    .zip(den.series.iter())
                     .map(|(&t, &l)| (t, l.min(y_max).max(y_min))),
                 CTRL_ALPHA.stroke_width(1),
             ))?

@@ -59,14 +59,11 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesSingle {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
-        // Decimate by max(1, n/2000) — see panels/pair/speed_bursts.rs.
-        let n_dec = (ln.t_tau.len() / 2000).max(1);
         chart
             .draw_series(LineSeries::new(
                 ln.t_tau
                     .iter()
-                    .step_by(n_dec)
-                    .zip(ln.series.iter().step_by(n_dec))
+                    .zip(ln.series.iter())
                     .map(|(&t, &l)| (t, l.min(y_max).max(y_min))),
                 SINGLE_COLOR.stroke_width(1),
             ))?

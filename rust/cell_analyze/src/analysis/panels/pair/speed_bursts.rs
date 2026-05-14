@@ -82,17 +82,11 @@ impl<'a, 'b> Panel<'a, 'b> for SpeedBurstsPair {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
-        // Decimate by max(1, n/2000) to cap SVG segment count. At 20k
-        // trajectory samples Plotters' XML serializer chokes (hours of CPU)
-        // when given the full series; 2000 segments per line is visually
-        // identical at typical figure widths and renders in milliseconds.
-        let n_dec = (num.t_tau.len().max(den.t_tau.len()) / 2000).max(1);
         chart
             .draw_series(LineSeries::new(
                 num.t_tau
                     .iter()
-                    .step_by(n_dec)
-                    .zip(num.speeds.iter().step_by(n_dec))
+                    .zip(num.speeds.iter())
                     .map(|(&t, &s)| (t, s.min(y_max))),
                 SOFT_ALPHA.stroke_width(1),
             ))?
@@ -102,8 +96,7 @@ impl<'a, 'b> Panel<'a, 'b> for SpeedBurstsPair {
             .draw_series(LineSeries::new(
                 den.t_tau
                     .iter()
-                    .step_by(n_dec)
-                    .zip(den.speeds.iter().step_by(n_dec))
+                    .zip(den.speeds.iter())
                     .map(|(&t, &s)| (t, s.min(y_max))),
                 CTRL_ALPHA.stroke_width(1),
             ))?

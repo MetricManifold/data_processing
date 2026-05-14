@@ -139,11 +139,15 @@ struct Simulation {
     // gpus > 1. Used by migrate_cells() (called from the orchestrator at
     // rebind cadence) to move cells between ranks when their rebound COM
     // crosses a slab boundary. All pointers are device memory.
-    int*   d_n_stay        = nullptr;     // single int
-    int*   d_n_up          = nullptr;     // single int
-    int*   d_n_down        = nullptr;     // single int
-    int*   d_n_in_prev     = nullptr;     // single int (recv'd from prev)
-    int*   d_n_in_next     = nullptr;     // single int (recv'd from next)
+    // Migration counters live in one contiguous device buffer so the
+    // host can download all 5 with a single cudaMemcpyAsync per phase.
+    // d_n_* aliases point into d_mig_counts; do not free them separately.
+    int*   d_mig_counts    = nullptr;     // [5] = {stay, up, down, in_prev, in_next}
+    int*   d_n_stay        = nullptr;     // alias into d_mig_counts[0]
+    int*   d_n_up          = nullptr;     // alias into d_mig_counts[1]
+    int*   d_n_down        = nullptr;     // alias into d_mig_counts[2]
+    int*   d_n_in_prev     = nullptr;     // alias into d_mig_counts[3]
+    int*   d_n_in_next     = nullptr;     // alias into d_mig_counts[4]
     int*   d_stay_idx      = nullptr;     // [capacity]
     int*   d_up_idx        = nullptr;     // [capacity]
     int*   d_down_idx      = nullptr;     // [capacity]

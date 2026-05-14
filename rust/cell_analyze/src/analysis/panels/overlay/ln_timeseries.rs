@@ -76,13 +76,10 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesOverlay {
 
         for (i, (label, ts, series, mean)) in all.into_iter().enumerate() {
             let color = PALETTE[i % PALETTE.len()];
-            // Decimate by max(1, n/2000) — see panels/pair/speed_bursts.rs.
-            let n_dec = (ts.len() / 2000).max(1);
             chart
                 .draw_series(LineSeries::new(
                     ts.iter()
-                        .step_by(n_dec)
-                        .zip(series.iter().step_by(n_dec))
+                        .zip(series.iter())
                         .map(|(&t, &l)| (t, l.min(y_max).max(y_min))),
                     color.mix(0.6).stroke_width(1),
                 ))?
