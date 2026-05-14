@@ -367,7 +367,7 @@ class TestSection02_OutputArtefacts:
         out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--seed", "42")
         chk = read_checkpoint(out / "checkpoint.bin")
-        assert chk["version"] in (4, 5, 6, 7), f"unexpected version {chk['version']}"
+        assert chk["version"] in (4, 5, 6, 7, 8), f"unexpected version {chk['version']}"
         assert chk["num_cells"] == 4
         assert chk["params"]["Nx"] == 200
 
@@ -640,11 +640,11 @@ class TestSection07_CheckpointFormat:
     """Test checkpoint I/O: write v6, read v3/v4/v6."""
 
     def test_sim_v2_writes_v6_checkpoints(self, tmp_path):
-        """§7: v2 WRITE: format v7 (current)."""
+        """§7: v2 WRITE: format v8 (current)."""
         out = run_sim(tmp_path, "-n", "4", "-N", "200", "-r", "20",
                       "-t", "0.5", "--seed", "42")
         chk = read_checkpoint(out / "checkpoint.bin")
-        assert chk["version"] == 7, f"v2 should write v7, got {chk['version']}"
+        assert chk["version"] == 8, f"current writes v8, got {chk['version']}"
 
     @requires_baseline()
     def test_sim_v2_reads_baseline_v4_checkpoints(self, baseline_sim, tmp_path):
@@ -660,7 +660,7 @@ class TestSection07_CheckpointFormat:
         sub.mkdir()
         v2_out = run_sim(sub, "-c", str(base_ckpt), "-t", "1.0", "--seed", "42")
         v2_chk = read_checkpoint(v2_out / "checkpoint.bin")
-        assert v2_chk["version"] == 6
+        assert v2_chk["version"] == 8
         assert v2_chk["num_cells"] == 4
 
     def test_sim_v2_roundtrip_v6_checkpoints(self, tmp_path):
@@ -670,7 +670,7 @@ class TestSection07_CheckpointFormat:
         ckpt1 = out1 / "checkpoint.bin"
         out2 = run_sim(tmp_path / "run2", "-c", str(ckpt1), "-t", "1.0", "--seed", "42")
         chk2 = read_checkpoint(out2 / "checkpoint.bin")
-        assert chk2["version"] == 7
+        assert chk2["version"] == 8
         assert chk2["time"] >= 0.99
 
 
