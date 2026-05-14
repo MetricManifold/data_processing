@@ -7,6 +7,35 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Physics coefficient helpers (single source of truth)
+// ---------------------------------------------------------------------------
+// Free `__host__ __device__` templates so both SimParams (double, host)
+// and GPU kernels (float, device) call into one definition. The literal
+// constants `30` and `60` come from the variational derivative of the
+// Cahn-Hilliard + repulsion + advection free energy at Palmieri's
+// scaling; see study/adhesion/manuscript.tex Eq. (S15). Both kernels
+// and SimParams used to recompute these inline, drifting silently if
+// the physics changed.
+//
+// Note: the Rust CPU reference (rust/cpu_ref/src/sim.rs) uses a
+// factor-of-2 different form because it integrates the raw -delta F /
+// delta phi while the GPU integrates -1/2 delta F / delta phi. That
+// split is deliberate (independent oracle) — don't fold them.
+// ---------------------------------------------------------------------------
+template <typename T>
+__host__ __device__ inline T bulk_coeff(T lambda) {
+    return T(30) / (lambda * lambda);
+}
+template <typename T>
+__host__ __device__ inline T interaction_coeff(T kappa, T lambda) {
+    return T(30) * kappa / (lambda * lambda);
+}
+template <typename T>
+__host__ __device__ inline T motility_coeff(T kappa, T xi, T lambda) {
+    return T(60) * kappa / (xi * lambda * lambda);
+}
+
+// ---------------------------------------------------------------------------
 // Simulation parameters
 // ---------------------------------------------------------------------------
 // Scalar physics/numerical knobs in double precision so time accumulation,
@@ -40,11 +69,11 @@ struct SimParams {
     unsigned int polarity_seed = 0;
     bool abp = false;
 
-    __host__ __device__ double bulk_coeff()        const { return 30.0 / (lambda * lambda); }
-    __host__ __device__ double interaction_coeff() const { return 30.0 * kappa / (lambda * lambda); }
+    __host__ __device__ double bulk_coeff()        const { return ::bulk_coeff(lambda); }
+    __host__ __device__ double interaction_coeff() const { return ::interaction_coeff(kappa, lambda); }
     __host__ __device__ double target_area()       const { return M_PI * target_radius * target_radius; }
     __host__ __device__ double volume_coeff()      const { return mu / target_area(); }
-    __host__ __device__ double motility_coeff()    const { return 60.0 * kappa / (xi * lambda * lambda); }
+    __host__ __device__ double motility_coeff()    const { return ::motility_coeff(kappa, xi, lambda); }
     __host__ __device__ double dA()                const { return dx * dy; }
 };
 

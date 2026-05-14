@@ -1229,8 +1229,7 @@ void Simulation::step() {
 
     // Keep cells.phi_in / phi_out in sync with parity, so any direct kernel
     // launch (output, rebind path) reads the right buffer.
-    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+    sync_pool_to_parity();
 
     if (fast_path) {
         if (!step_graph_built[parity]) {
@@ -1249,7 +1248,7 @@ void Simulation::step() {
             step_graph_built[parity] = true;
         }
         CK(cudaGraphLaunch(step_graph[parity], step_stream));
-        parity ^= 1;
+        flip_parity();
     } else {
         // Slow path: direct launches on step_stream so ordering matches the
         // graph path (no cross-stream sync needed).
@@ -1272,17 +1271,13 @@ void Simulation::step() {
         }
         launch_scatter_S(cells, params, step_stream);
         launch_evolve(cells, params, need_full_red, step_stream);
-        parity ^= 1;
-        cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-        cells.phi_out = (parity == 0) ? phi_B : phi_A;
+        flip_parity();
 
         if (will_rebind) {
             launch_rebind(cells,
                           (float)params.subdomain_padding,
                           (float)params.gamma, step_stream);
-            parity ^= 1;
-            cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-            cells.phi_out = (parity == 0) ? phi_B : phi_A;
+            flip_parity();
         }
     }
 
@@ -1329,8 +1324,7 @@ void Simulation::step() {
 // the orchestrator's responsibility to issue them in pairs.
 // ---------------------------------------------------------------------------
 void Simulation::step_pre_reduce() {
-    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+    sync_pool_to_parity();
 
     if (scripted_active) {
         int begin = scripted_cursor;
@@ -1362,17 +1356,13 @@ void Simulation::step_post_reduce() {
     const bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
 
     launch_evolve(cells, params, need_full_red, step_stream);
-    parity ^= 1;
-    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+    flip_parity();
 
     if (will_rebind) {
         launch_rebind(cells,
                       (float)params.subdomain_padding,
                       (float)params.gamma, step_stream);
-        parity ^= 1;
-        cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-        cells.phi_out = (parity == 0) ? phi_B : phi_A;
+        flip_parity();
     }
 
 #ifndef NDEBUG
@@ -2110,9 +2100,7 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
         d_rng_scratch = tmp;
     }
     // Phi parity flip: the new state lives in phi_out, swap it to phi_in.
-    parity ^= 1;
-    cells.phi_in  = (parity == 0) ? phi_A : phi_B;
-    cells.phi_out = (parity == 0) ? phi_B : phi_A;
+    flip_parity();
 
     // 9. Update num_cells and host-side h_global_id. Stays inherit
     //    their old gid via stay_idx; arrivals' gids are read back from

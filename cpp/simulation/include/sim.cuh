@@ -76,6 +76,20 @@ struct Simulation {
     float*          phi_A                  = nullptr;  // phi_pool half 0
     float*          phi_B                  = nullptr;  // phi_pool half 1
 
+    // Owned invariant: phi_in/phi_out aliases inside CellArrays must
+    // always match the current parity (0 -> phi_in=A, phi_out=B; 1 -> swap).
+    // Call `sync_pool_to_parity()` after setting `parity` explicitly,
+    // or `flip_parity()` to advance one step. Five sites used to inline
+    // the 3-line ritual; the method enforces the invariant in one place.
+    void sync_pool_to_parity() {
+        cells.phi_in  = (parity == 0) ? phi_A : phi_B;
+        cells.phi_out = (parity == 0) ? phi_B : phi_A;
+    }
+    void flip_parity() {
+        parity ^= 1;
+        sync_pool_to_parity();
+    }
+
     // ---- Multi-GPU partitioning (single-GPU defaults are: gpus=1, rank=0,
     // device=0, cells_global = cells.num_cells, cell_offset = 0).
     //

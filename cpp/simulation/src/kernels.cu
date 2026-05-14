@@ -294,7 +294,7 @@ __global__ void k_evolve_l1(
     const float Iyn = sbroad[2];
 
     const float invXi  = 1.0f / xi;
-    const float coeffV = 60.0f * kappa * invXi / (lambda_ * lambda_);
+    const float coeffV = motility_coeff(kappa, xi, lambda_);
     const float vx     = coeffV * Ixn + vA * dirx[n];
     const float vy     = coeffV * Iyn + vA * diry[n];
 
@@ -310,8 +310,8 @@ __global__ void k_evolve_l1(
 
     const float piR2 = PI * R * R;
     const float volC = (2.0f * mu / piR2) * (piR2 - Vn);
-    const float dwC  = 30.0f * gam   / (lambda_ * lambda_);
-    const float repC = 30.0f * kappa / (lambda_ * lambda_);
+    const float dwC  = gam * bulk_coeff(lambda_);
+    const float repC = interaction_coeff(kappa, lambda_);
 
     // ----- Pass 2: PDE update + perimeter reduction -----
     // Only writes pixels inside the rect. Pixels outside the rect of
@@ -608,7 +608,7 @@ __global__ void k_rhs_mb(
         const float vA     = v_A_cell[n];
         const float R      = tgt_radius[n];
         const float invXi  = 1.0f / xi;
-        const float coeffV = 60.0f * kappa * invXi / (lambda_ * lambda_);
+        const float coeffV = motility_coeff(kappa, xi, lambda_);
         const float piR2   = PI * R * R;
         const float Vn     = V_in[n];
         const float Ixn    = Ix_in[n];
@@ -618,8 +618,8 @@ __global__ void k_rhs_mb(
         vx_s   = vx;
         vy_s   = vy;
         volC_s = (2.0f * mu / piR2) * (piR2 - Vn);
-        dwC_s  = 30.0f * gam   / (lambda_ * lambda_);
-        repC_s = 30.0f * kappa / (lambda_ * lambda_);
+        dwC_s  = gam * bulk_coeff(lambda_);
+        repC_s = interaction_coeff(kappa, lambda_);
         gam_s  = gam;
         // Only chunk 0 writes the per-cell velocity (avoids redundant writes).
         if (cb == 0) {
@@ -1133,7 +1133,7 @@ __global__ void k_initial_velocity(
         float Vn  = v0;
         float Ixn = v1;
         float Iyn = v2;
-        float coeffV = 60.0f * kappa / (xi * lambda_ * lambda_);
+        float coeffV = motility_coeff(kappa, xi, lambda_);
         V_out[n]    = Vn;
         Cx_out[n]   = v3;
         Cy_out[n]   = v4;
