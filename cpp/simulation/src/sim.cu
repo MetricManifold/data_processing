@@ -1260,15 +1260,38 @@ void Simulation::slice_cells_to_local() {
 // of API overhead. Slow path (rebind, output, scripted, first encounter):
 // direct launches on the same step_stream.
 // ---------------------------------------------------------------------------
+Simulation::StepFlags Simulation::compute_step_flags(int next_step) const {
+    StepFlags f{};
+    f.will_rebind = (next_step % REBIND_EVERY) == 0;
+    f.will_traj   = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
+    f.will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
+    f.will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
+    f.will_vtk    = (vtk_interval > 0 && next_step % vtk_interval == 0);
+    f.need_full_red = f.will_rebind || f.will_traj || f.will_save || f.will_ckpt || f.will_vtk;
+    return f;
+}
+
+void Simulation::apply_scripted_events_for_step() {
+    if (!scripted_active) return;
+    int begin = scripted_cursor;
+    const int total = (int)h_scripted_step.size();
+    while (scripted_cursor < total
+           && h_scripted_step[scripted_cursor] == step_count) {
+        scripted_cursor++;
+    }
+    int count = scripted_cursor - begin;
+    if (count > 0) {
+        launch_apply_scripted(cells,
+                              d_scripted_cid + begin,
+                              d_scripted_theta + begin,
+                              count, step_stream);
+    }
+}
+
 void Simulation::step() {
     int next_step = step_count + 1;
-    const bool will_rebind = (next_step % REBIND_EVERY) == 0;
-    const bool will_traj   = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
-    const bool will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
-    const bool will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
-    const bool will_vtk    = (vtk_interval > 0 && next_step % vtk_interval == 0);
-    const bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
-    const bool fast_path = !scripted_active && !will_rebind && !need_full_red
+    const StepFlags f = compute_step_flags(next_step);
+    const bool fast_path = !scripted_active && !f.will_rebind && !f.need_full_red
                            && (params.v_A != 0.0) && (params.tau > 0.0);
 
     // Keep cells.phi_in / phi_out in sync with parity, so any direct kernel
@@ -1297,27 +1320,15 @@ void Simulation::step() {
         // Slow path: direct launches on step_stream so ordering matches the
         // graph path (no cross-stream sync needed).
         if (scripted_active) {
-            int begin = scripted_cursor;
-            const int total = (int)h_scripted_step.size();
-            while (scripted_cursor < total
-                   && h_scripted_step[scripted_cursor] == step_count) {
-                scripted_cursor++;
-            }
-            int count = scripted_cursor - begin;
-            if (count > 0) {
-                launch_apply_scripted(cells,
-                                      d_scripted_cid + begin,
-                                      d_scripted_theta + begin,
-                                      count, step_stream);
-            }
+            apply_scripted_events_for_step();
         } else {
             launch_polar(cells, params, step_stream);
         }
         launch_scatter_S(cells, params, step_stream);
-        launch_evolve(cells, params, need_full_red, step_stream);
+        launch_evolve(cells, params, f.need_full_red, step_stream);
         flip_parity();
 
-        if (will_rebind) {
+        if (f.will_rebind) {
             launch_rebind(cells,
                           (float)params.subdomain_padding,
                           (float)params.gamma, step_stream);
@@ -1371,19 +1382,7 @@ void Simulation::step_pre_reduce() {
     sync_pool_to_parity();
 
     if (scripted_active) {
-        int begin = scripted_cursor;
-        const int total = (int)h_scripted_step.size();
-        while (scripted_cursor < total
-               && h_scripted_step[scripted_cursor] == step_count) {
-            scripted_cursor++;
-        }
-        int count = scripted_cursor - begin;
-        if (count > 0) {
-            launch_apply_scripted(cells,
-                                  d_scripted_cid + begin,
-                                  d_scripted_theta + begin,
-                                  count, step_stream);
-        }
+        apply_scripted_events_for_step();
     } else {
         launch_polar(cells, params, step_stream);
     }
@@ -1392,17 +1391,12 @@ void Simulation::step_pre_reduce() {
 
 void Simulation::step_post_reduce() {
     int next_step = step_count + 1;
-    const bool will_rebind = (next_step % REBIND_EVERY) == 0;
-    const bool will_traj   = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
-    const bool will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
-    const bool will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
-    const bool will_vtk    = (vtk_interval > 0 && next_step % vtk_interval == 0);
-    const bool need_full_red = will_rebind || will_traj || will_save || will_ckpt || will_vtk;
+    const StepFlags f = compute_step_flags(next_step);
 
-    launch_evolve(cells, params, need_full_red, step_stream);
+    launch_evolve(cells, params, f.need_full_red, step_stream);
     flip_parity();
 
-    if (will_rebind) {
+    if (f.will_rebind) {
         launch_rebind(cells,
                       (float)params.subdomain_padding,
                       (float)params.gamma, step_stream);

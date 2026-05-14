@@ -119,6 +119,24 @@ struct Simulation {
         sync_pool_to_parity();
     }
 
+    // Flags for what side-effects fire on the next step. Used by step()
+    // and step_post_reduce — the predicate was inlined and duplicated;
+    // one helper now keeps the cadence rules in a single place.
+    struct StepFlags {
+        bool will_rebind;
+        bool will_traj;
+        bool will_save;
+        bool will_ckpt;
+        bool will_vtk;
+        bool need_full_red;
+    };
+    StepFlags compute_step_flags(int next_step) const;
+
+    // Advance the scripted-events cursor through events whose step matches
+    // step_count and launch them as a batch. No-op when scripted_active
+    // is false. Called from step() (slow path) and step_pre_reduce().
+    void apply_scripted_events_for_step();
+
     // ---- Multi-GPU partitioning (single-GPU defaults are: gpus=1, rank=0,
     // device=0, cells_global = cells.num_cells, cell_offset = 0).
     //
