@@ -47,6 +47,14 @@ enum Commands {
         /// Number of parallel threads (default: all available).
         #[arg(long)]
         threads: Option<usize>,
+        /// Skip the per-run validation pre-pass. By default `study`
+        /// validates each discovered run (same checks as
+        /// `cell_analyze check`) before computing observables, and
+        /// skips runs that fail. Pass this flag to bypass — useful
+        /// when iterating on the analysis pipeline against runs you
+        /// know are good.
+        #[arg(long)]
+        skip_validation: bool,
     },
     /// Render phase field snapshot(s) from checkpoint, VTK file, or directory of VTK frames.
     Snapshot {
@@ -89,6 +97,12 @@ enum Commands {
         /// Emit a JSON sidecar with all banner metadata next to the PNG.
         #[arg(long)]
         emit_metadata: bool,
+        /// Skip the validation pre-pass on the input directory. By
+        /// default `snapshot` validates the run that contains the input
+        /// checkpoint/VTK before rendering (same checks as
+        /// `cell_analyze check`). Pass this to bypass.
+        #[arg(long)]
+        skip_validation: bool,
     },
     /// List available observables, panels and aggregators (with descriptions).
     List {
@@ -96,11 +110,11 @@ enum Commands {
         #[arg(long, default_value = "all")]
         what: String,
     },
-    /// Validate trajectory/checkpoint integrity AND optionally compute a
-    /// sanity-check pass on observables (msd_palmieri, displacement,
-    /// ln_perimeter) to catch NaN/Inf/empty outputs that would silently
-    /// poison `study` runs. Use `--with-observables` to enable the
-    /// observable pass (default: structural only, fast). Always emits a
+    /// Validate trajectory/checkpoint integrity AND run a sanity-check
+    /// pass on observables (msd_palmieri, displacement, ln_perimeter)
+    /// to catch NaN/Inf/empty outputs that would silently poison
+    /// `study` runs. The observable pass runs by default; use `--fast`
+    /// to skip it for a quick structural-only check. Always emits a
     /// full metadata report. Exits 0 on pass, 1 on any failure.
     Check {
         /// Simulation output directory (must contain trajectory.txt; checkpoint.bin optional)
@@ -117,11 +131,11 @@ enum Commands {
         /// Expected last timestamp (within 1% tolerance; skip if not provided)
         #[arg(long)]
         t_end: Option<f64>,
-        /// Run observable sanity checks (msd_palmieri, displacement,
-        /// ln_perimeter). Adds a few seconds to runtime but catches
-        /// NaN/Inf outputs that the structural pass cannot detect.
+        /// Skip the observable pass (msd_palmieri, displacement,
+        /// ln_perimeter). Saves a few seconds but cannot detect
+        /// NaN/Inf outputs.
         #[arg(long)]
-        with_observables: bool,
+        fast: bool,
         /// Emit JSON report in addition to text
         #[arg(long)]
         json: Option<PathBuf>,
@@ -174,13 +188,34 @@ fn main() -> Result<()> {
             config,
             data_dir,
             threads,
+            skip_validation,
         } => {
             if let Some(n) = threads {
                 rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
             }
-            analysis::studies::run_study(&config, &data_dir)?;
+            analysis::studies::run_study(&config, &data_dir, skip_validation)?;
         }
-        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata } => {
+        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata, skip_validation } => {
+            // Validation pre-pass: if the input is a checkpoint inside a
+            // run directory, validate that directory first. We don't try
+            // to validate VTK paths or movie directories — those have a
+            // different shape and the snapshot path itself handles them.
+            if !skip_validation && !movie {
+                if let Some(run_dir) = input.parent() {
+                    let traj = run_dir.join("trajectory.txt");
+                    if traj.exists() {
+                        use crate::analysis::precheck::{validate_run, print_report, Expectations};
+                        let report = validate_run(run_dir, &Expectations::default(), true)?;
+                        print_report(&report);
+                        if !report.all_pass() {
+                            eprintln!("\nERROR: validation failed for {}. \
+                                       Re-run with --skip-validation to bypass.",
+                                      run_dir.display());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             let is_dir = input.is_dir();
             let _is_vtk = input.extension().map_or(false, |e| e == "vtk");
             // Activate per-cell rendering when user wants colored contours or speed shading
@@ -516,8 +551,8 @@ fn main() -> Result<()> {
                 eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), final_w, final_h);
             }
         }
-        Commands::Check { dir, n_cells, expected_frames, t_start, t_end, with_observables, json } => {
-            let exit_code = run_check(&dir, n_cells, expected_frames, t_start, t_end, with_observables, json.as_deref())?;
+        Commands::Check { dir, n_cells, expected_frames, t_start, t_end, fast, json } => {
+            let exit_code = run_check(&dir, n_cells, expected_frames, t_start, t_end, !fast, json.as_deref())?;
             std::process::exit(exit_code);
         }
         Commands::List { what } => {
@@ -690,7 +725,11 @@ fn list_what(what: &str) {
 }
 
 
-/// Trajectory/checkpoint integrity checker. Returns process exit code.
+
+/// Thin wrapper: delegates the full validation flow to
+/// `analysis::precheck::validate_run`. The same code is invoked by
+/// `study` and `snapshot` as a pre-pass — see the precheck module for
+/// the full check catalog.
 fn run_check(
     dir: &std::path::Path,
     expected_n_cells: Option<usize>,
@@ -700,442 +739,32 @@ fn run_check(
     with_observables: bool,
     json_out: Option<&std::path::Path>,
 ) -> Result<i32> {
-    use std::io::{BufRead, BufReader};
-
-    #[derive(serde::Serialize)]
-    struct CheckResult {
-        name: String,
-        passed: bool,
-        detail: String,
-    }
-
-    let mut results: Vec<CheckResult> = Vec::new();
-    let mut push = |name: &str, passed: bool, detail: String| {
-        results.push(CheckResult { name: name.to_string(), passed, detail });
+    use crate::analysis::precheck::{validate_run, print_report, Expectations};
+    let exp = Expectations {
+        n_cells: expected_n_cells,
+        frames: expected_frames,
+        t_start: expected_t_start,
+        t_end: expected_t_end,
     };
-
-    let traj_path = dir.join("trajectory.txt");
-    if !traj_path.exists() {
-        println!("FAIL: trajectory.txt not found in {}", dir.display());
-        return Ok(1);
-    }
-
-    // Multi-GPU runs: union rank-0 trajectory with sibling rankN/.
-    let mut traj_paths: Vec<PathBuf> = vec![traj_path.clone()];
-    for k in 1.. {
-        let candidate = dir.join(format!("rank{}", k)).join("trajectory.txt");
-        if candidate.exists() {
-            traj_paths.push(candidate);
-        } else {
-            break;
-        }
-    }
-    if traj_paths.len() > 1 {
-        eprintln!("check: detected multi-GPU run, reading {} rank trajectories", traj_paths.len());
-    }
-
-    let mut header_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut timestamps: Vec<f64> = Vec::new();
-    let mut rows_per_t: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    let mut any_nan = false;
-    let mut any_non_numeric = false;
-    let mut row_count: usize = 0;
-
-    for tp in &traj_paths {
-        let f = std::fs::File::open(tp)?;
-        let reader = BufReader::new(f);
-        for line in reader.lines() {
-            let line = match line { Ok(l) => l, Err(_) => continue };
-            let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
-            if trimmed.starts_with('#') {
-                for tok in trimmed.split_whitespace() {
-                    if let Some((k, v)) = tok.split_once('=') {
-                        // Prefer N_global over N when present (multi-GPU rank
-                        // headers report N_local + N_global; single-GPU runs
-                        // emit N only).
-                        let key = if k == "N_global" { "N".to_string() } else { k.to_string() };
-                        header_fields.entry(key).or_insert(v.to_string());
-                    }
-                }
-                continue;
-            }
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() < 4 { continue; }
-            let t = match parts[0].parse::<f64>() {
-                Ok(v) => v,
-                Err(_) => { any_non_numeric = true; continue; }
-            };
-            if !t.is_finite() { any_nan = true; continue; }
-            // Check x,y for NaN
-            for idx in [2usize, 3] {
-                if idx < parts.len() {
-                    match parts[idx].parse::<f64>() {
-                        Ok(v) if !v.is_finite() => any_nan = true,
-                        Err(_) => any_non_numeric = true,
-                        _ => {}
-                    }
-                }
-            }
-            let t_bits = t.to_bits();
-            *rows_per_t.entry(t_bits).or_insert(0) += 1;
-            if rows_per_t[&t_bits] == 1 {
-                timestamps.push(t);
-            }
-            row_count += 1;
-        }
-    }
-    // Sort timestamps so monotonicity check sees a single ordered timeline
-    // (rank files were concatenated, not interleaved).
-    timestamps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Check 1: header present with required keys
-    let required_keys = ["N", "Lx", "Ly", "dim", "tau", "v_A"];
-    let missing: Vec<&str> = required_keys.iter().filter(|k| !header_fields.contains_key(**k)).copied().collect();
-    push("trajectory_header",
-         missing.is_empty(),
-         if missing.is_empty() {
-             format!("all keys present: {}", required_keys.join(", "))
-         } else {
-             format!("MISSING keys: {}", missing.join(", "))
-         });
-
-    // Check 2: no NaN/non-numeric
-    push("trajectory_no_nan", !any_nan && !any_non_numeric,
-         if any_nan { "NaN/Inf found in data".to_string() }
-         else if any_non_numeric { "non-numeric tokens found".to_string() }
-         else { "all values finite".to_string() });
-
-    // Check 3: timestamps strictly increasing
-    let mut monotonic = true;
-    let mut first_bad: Option<(usize, f64, f64)> = None;
-    for i in 1..timestamps.len() {
-        if timestamps[i] <= timestamps[i-1] {
-            monotonic = false;
-            if first_bad.is_none() {
-                first_bad = Some((i, timestamps[i-1], timestamps[i]));
-            }
-        }
-    }
-    push("timestamps_monotonic", monotonic,
-         if monotonic { format!("{} unique timestamps strictly increasing", timestamps.len()) }
-         else { format!("NON-MONOTONIC at frame {}: {:.6} → {:.6}",
-                        first_bad.unwrap().0, first_bad.unwrap().1, first_bad.unwrap().2) });
-
-    // Check 4: rows per timestamp consistent (== N_cells from header)
-    let header_n: Option<usize> = header_fields.get("N").and_then(|v| v.parse().ok());
-    let expected_rows_per_frame = expected_n_cells.or(header_n);
-    let mut bad_frame: Option<(f64, usize)> = None;
-    if let Some(n) = expected_rows_per_frame {
-        for &t in &timestamps {
-            let c = rows_per_t[&t.to_bits()];
-            if c != n {
-                bad_frame = Some((t, c));
-                break;
-            }
-        }
-    }
-    push("rows_per_frame_consistent", bad_frame.is_none(),
-         match (expected_rows_per_frame, bad_frame) {
-             (None, _) => "skipped (no expected N)".to_string(),
-             (Some(n), None) => format!("every frame has {} rows", n),
-             (Some(n), Some((t, c))) => format!("frame t={:.3} has {} rows (expected {})", t, c, n),
-         });
-
-    // Check 5: number of frames matches expected_frames (if provided)
-    if let Some(ef) = expected_frames {
-        let tol = (ef as f64 * 0.02).max(2.0); // 2% tolerance, min 2
-        let diff = (timestamps.len() as f64 - ef as f64).abs();
-        push("frame_count",
-             diff <= tol,
-             format!("got {}, expected {} (tol ±{:.0})", timestamps.len(), ef, tol));
-    } else {
-        push("frame_count", true, format!("{} frames (no expectation)", timestamps.len()));
-    }
-
-    // Check 6: frame interval approximately constant
-    if timestamps.len() >= 3 {
-        let intervals: Vec<f64> = (1..timestamps.len()).map(|i| timestamps[i] - timestamps[i-1]).collect();
-        let mean: f64 = intervals.iter().sum::<f64>() / intervals.len() as f64;
-        let max_dev = intervals.iter().map(|&x| (x - mean).abs()).fold(0.0f64, f64::max);
-        let rel_dev = if mean > 0.0 { max_dev / mean } else { 1.0 };
-        push("frame_interval_uniform",
-             rel_dev < 0.10,
-             format!("mean Δt = {:.3}, max deviation {:.1}%", mean, 100.0 * rel_dev));
-    }
-
-    // Check 7: t_start / t_end match expectations
-    if let Some(ts_exp) = expected_t_start {
-        if let Some(&ts_got) = timestamps.first() {
-            let tol = (ts_exp.abs() * 0.01).max(1.0);
-            push("t_start",
-                 (ts_got - ts_exp).abs() <= tol,
-                 format!("got {:.3}, expected {:.3} (tol ±{:.1})", ts_got, ts_exp, tol));
-        }
-    }
-    if let Some(te_exp) = expected_t_end {
-        if let Some(&te_got) = timestamps.last() {
-            let tol = (te_exp.abs() * 0.01).max(1.0);
-            push("t_end",
-                 (te_got - te_exp).abs() <= tol,
-                 format!("got {:.3}, expected {:.3} (tol ±{:.1})", te_got, te_exp, tol));
-        }
-    }
-
-    // Check 8: checkpoint.bin consistency (optional)
-    // Also capture tau/dt from checkpoint for later cross-check vs trajectory header.
-    let mut ckpt_tau_from_file: Option<f64> = None;
-    let mut ckpt_dt_from_file: Option<f64> = None;
-    let ckpt_path = dir.join("checkpoint.bin");
-    if ckpt_path.exists() {
-        // Full checkpoint load (not just header) so we can read the
-        // SimParams scalars (dt, tau) — these are the source of truth
-        // for the simulation that produced the trajectory.
-        match analysis::checkpoint::load_checkpoint(&ckpt_path) {
-            Ok(ckpt) => {
-                ckpt_tau_from_file = Some(ckpt.params.tau as f64);
-                ckpt_dt_from_file = Some(ckpt.params.dt as f64);
-                let ckpt_ver = ckpt.header.version;
-                let ckpt_t = ckpt.header.time;
-                let ckpt_n_local = ckpt.header.num_cells;
-                let ckpt_n_global = ckpt.header.num_cells_global;
-                let mut ok = true;
-                let mut msgs: Vec<String> = Vec::new();
-                let ckpt_n_for_check = if ckpt_ver >= 8 { ckpt_n_global } else { ckpt_n_local };
-                if ckpt_ver >= 8 && ckpt_n_local != ckpt_n_global {
-                    msgs.push(format!("v{} step_t={:.3} N={} (local={}, multi-rank)",
-                                      ckpt_ver, ckpt_t, ckpt_n_global, ckpt_n_local));
-                } else {
-                    msgs.push(format!("v{} step_t={:.3} N={}", ckpt_ver, ckpt_t, ckpt_n_local));
-                }
-                if let Some(&last_t) = timestamps.last() {
-                    let tol = (ckpt_t.abs() * 0.01).max(1.0);
-                    if (ckpt_t - last_t).abs() > tol {
-                        ok = false;
-                        msgs.push(format!("checkpoint t={:.3} disagrees with last trajectory t={:.3}", ckpt_t, last_t));
-                    }
-                }
-                if let Some(n) = expected_rows_per_frame {
-                    if ckpt_n_for_check as usize != n {
-                        ok = false;
-                        msgs.push(format!("checkpoint N={} disagrees with expected {}", ckpt_n_for_check, n));
-                    }
-                }
-                push("checkpoint_consistency", ok, msgs.join("; "));
-            }
-            Err(e) => {
-                push("checkpoint_consistency", false, format!("failed to parse checkpoint: {}", e));
-            }
-        }
-    } else {
-        push("checkpoint_consistency", true, "no checkpoint.bin (skipped)".to_string());
-    }
-
-    // Check 9: trajectory header τ vs checkpoint τ (catches the
-    // submission-bug where a chain was launched with the wrong --tau:
-    // the trajectory carries τ-from-CLI while the checkpoint has the
-    // original τ-from-params.).
-    let traj_tau: Option<f64> = header_fields.get("tau").and_then(|v| v.parse().ok());
-    let traj_dt:  Option<f64> = header_fields.get("dt").and_then(|v| v.parse().ok());
-    if let (Some(tt), Some(ct)) = (traj_tau, ckpt_tau_from_file) {
-        let rel = ((tt - ct).abs() / ct.max(1e-9)) * 100.0;
-        push("tau_traj_vs_ckpt",
-             rel < 0.1,
-             if rel < 0.1 {
-                 format!("traj τ={:.4} matches ckpt τ={:.4}", tt, ct)
-             } else {
-                 format!("MISMATCH: traj τ={:.4} vs ckpt τ={:.4} ({:.1}% diff) — \
-                          likely --tau passed wrong on a chain step",
-                         tt, ct, rel)
-             });
-    }
-    if let (Some(td), Some(cd)) = (traj_dt, ckpt_dt_from_file) {
-        let rel = ((td - cd).abs() / cd.max(1e-9)) * 100.0;
-        push("dt_traj_vs_ckpt",
-             rel < 0.1,
-             if rel < 0.1 {
-                 format!("traj dt={:.6} matches ckpt dt={:.6}", td, cd)
-             } else {
-                 format!("MISMATCH: traj dt={:.6} vs ckpt dt={:.6} ({:.1}% diff)",
-                         td, cd, rel)
-             });
-    }
-
-    // Always emit a metadata banner so the user sees exactly what the
-    // analyzer believes about this run. Helps catch a wrong-τ
-    // submission bug at a glance.
-    let meta_line = {
-        let traj_n = header_fields.get("N").map(|s| s.as_str()).unwrap_or("?");
-        let traj_va = header_fields.get("v_A").map(|s| s.as_str()).unwrap_or("?");
-        let traj_lx = header_fields.get("Lx").map(|s| s.as_str()).unwrap_or("?");
-        let traj_ly = header_fields.get("Ly").map(|s| s.as_str()).unwrap_or("?");
-        format!("traj: v_A={} τ={} dt={} N={} Lx={} Ly={}",
-                traj_va,
-                traj_tau.map(|v| format!("{:.4}", v)).unwrap_or_else(|| "?".into()),
-                traj_dt.map(|v| format!("{:.6}", v)).unwrap_or_else(|| "?".into()),
-                traj_n, traj_lx, traj_ly)
-    };
-    push("metadata", true, meta_line);
-    if let (Some(ct), Some(cd)) = (ckpt_tau_from_file, ckpt_dt_from_file) {
-        push("ckpt_metadata", true,
-             format!("ckpt: τ={:.4} dt={:.6}", ct, cd));
-    }
-
-    // Check 10 (optional): run a small set of standard observables and
-    // verify their outputs aren't NaN/Inf/empty. Catches silent
-    // misparses that produce garbage downstream (the kind of bug
-    // structural checks miss). Only runs when --with-observables is set
-    // because it loads positions and does some compute.
-    if with_observables {
-        if let Err(e) = run_observable_pass(&traj_paths[0], &mut push) {
-            push("observable_pass", false, format!("error: {}", e));
-        }
-    }
-
-    // Report
-    let all_pass = results.iter().all(|r| r.passed);
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.passed).count();
-    println!("=== cell_analyze check: {} ===", dir.display());
-    for r in &results {
-        let mark = if r.passed { "PASS" } else { "FAIL" };
-        println!("  [{}] {:<28} {}", mark, r.name, r.detail);
-    }
-    println!("--- rows parsed: {} ---", row_count);
-    println!("=== {} / {} checks passed ===", passed, total);
+    let report = validate_run(dir, &exp, with_observables)?;
+    print_report(&report);
 
     if let Some(p) = json_out {
         let json = serde_json::to_string_pretty(&serde_json::json!({
-            "dir": dir.display().to_string(),
-            "all_pass": all_pass,
-            "passed": passed,
-            "total": total,
-            "checks": results.iter().map(|r| serde_json::json!({
+            "dir": report.dir.display().to_string(),
+            "all_pass": report.all_pass(),
+            "passed": report.passed_count(),
+            "total": report.total(),
+            "checks": report.findings.iter().map(|r| serde_json::json!({
                 "name": r.name, "passed": r.passed, "detail": r.detail
             })).collect::<Vec<_>>(),
         }))?;
         std::fs::write(p, json)?;
     }
 
-    Ok(if all_pass { 0 } else { 1 })
+    Ok(if report.all_pass() { 0 } else { 1 })
 }
 
-/// Compute msd_palmieri + displacement_velocities + ln_perimeter on the
-/// run and verify outputs aren't NaN/Inf/empty. This is the diagnostic
-/// counterpart to `study`: it executes the same code path but flags
-/// scientific-content bugs (garbage observables) instead of producing
-/// figures. Caller passes a `push` callback to record per-check results.
-fn run_observable_pass(
-    traj_path: &std::path::Path,
-    push: &mut dyn FnMut(&str, bool, String),
-) -> Result<()> {
-    use crate::analysis::io::{load_trajectory, unwrap_trajectory};
-    use crate::analysis::observable::{Context, Observable, RunParams};
-    use crate::analysis::observables::msd_palmieri::MsdPalmieri;
-    use crate::analysis::observables::displacement_velocities::DisplacementVelocities;
-    use crate::analysis::observables::ln_perimeter::LnPerimeter;
-    use std::sync::Arc;
-
-    let traj = load_trajectory(traj_path)
-        .with_context(|| format!("loading {}", traj_path.display()))?;
-    let tau = traj.params.tau.unwrap_or(10000.0);
-    let positions = Arc::new(unwrap_trajectory(&traj));
-    if positions.n_times < 4 {
-        push("observable_pass", false,
-             format!("trajectory has only {} time points — observables need ≥4",
-                     positions.n_times));
-        return Ok(());
-    }
-    let ctx = Context {
-        positions,
-        trajectory: Some(Arc::new(traj)),
-        checkpoint: None,
-        params: RunParams {
-            tau,
-            ..Default::default()
-        },
-    };
-
-    // msd_palmieri — D_eff, MSD/Δt curves
-    {
-        match MsdPalmieri.compute(&ctx) {
-            Ok(out) => {
-                let n_nan = out.msd_t_cell.iter().filter(|x| !x.is_finite()).count()
-                          + out.msd_t_pop.iter().filter(|x| !x.is_finite()).count();
-                let d_eff_finite = out.d_eff_cell.is_finite() && out.d_eff_pop.is_finite();
-                let ok = !out.lag_tau.is_empty() && n_nan == 0 && d_eff_finite;
-                push("obs:msd_palmieri", ok,
-                     if ok {
-                         format!("{} lags, D_eff_c0={:.4e}, D_eff_pop={:.4e}",
-                                 out.lag_tau.len(), out.d_eff_cell, out.d_eff_pop)
-                     } else if out.lag_tau.is_empty() {
-                         "empty output (τ ≫ trajectory duration?)".into()
-                     } else if !d_eff_finite {
-                         format!("D_eff non-finite: cell={}, pop={}",
-                                 out.d_eff_cell, out.d_eff_pop)
-                     } else {
-                         format!("{} NaN/Inf entries in MSD curves", n_nan)
-                     });
-            }
-            Err(e) => push("obs:msd_palmieri", false, format!("compute failed: {}", e)),
-        }
-    }
-
-    // displacement_velocities — per-frame speeds, finite check
-    {
-        match DisplacementVelocities.compute(&ctx) {
-            Ok(out) => {
-                let mean_speed = if out.speeds.is_empty() {
-                    f64::NAN
-                } else {
-                    out.speeds.iter().sum::<f64>() / out.speeds.len() as f64
-                };
-                let n_nan = out.speeds.iter().filter(|x| !x.is_finite()).count();
-                let ok = !out.speeds.is_empty() && n_nan == 0 && mean_speed.is_finite();
-                push("obs:displacement_velocities", ok,
-                     if ok {
-                         format!("{} samples, ⟨|v|⟩={:.4e}",
-                                 out.speeds.len(), mean_speed)
-                     } else if out.speeds.is_empty() {
-                         "empty output".into()
-                     } else {
-                         format!("{} NaN/Inf samples, mean={}", n_nan, mean_speed)
-                     });
-            }
-            Err(e) => push("obs:displacement_velocities", false,
-                           format!("compute failed: {}", e)),
-        }
-    }
-
-    // ln_perimeter — geometric shape index for tagged cell
-    {
-        match LnPerimeter.compute(&ctx) {
-            Ok(out) => {
-                let n_nan = out.series.iter().filter(|x| !x.is_finite()).count();
-                let mean = if out.series.is_empty() {
-                    f64::NAN
-                } else {
-                    out.series.iter().sum::<f64>() / out.series.len() as f64
-                };
-                let ok = !out.series.is_empty() && n_nan == 0 && mean.is_finite() && mean > 1e-6;
-                push("obs:ln_perimeter", ok,
-                     if ok {
-                         format!("{} samples, ⟨L_n⟩={:.4}",
-                                 out.series.len(), mean)
-                     } else if out.series.is_empty() {
-                         "empty output".into()
-                     } else if mean <= 1e-6 {
-                         "all-zero output (perimeter data missing?)".into()
-                     } else {
-                         format!("{} NaN/Inf samples", n_nan)
-                     });
-            }
-            Err(e) => push("obs:ln_perimeter", false, format!("compute failed: {}", e)),
-        }
-    }
-
-    Ok(())
-}
 
 // ============================================================================
 // Cell label rendering for snapshot --label-cells

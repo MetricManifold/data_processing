@@ -476,7 +476,7 @@ fn observables_for_request(requested: &[String]) -> Result<Vec<Box<dyn ErasedObs
 // ---------------------------------------------------------------------------
 // run_study (top-level)
 // ---------------------------------------------------------------------------
-pub fn run_study(toml_path: &Path, base_dir: &Path) -> Result<()> {
+pub fn run_study(toml_path: &Path, base_dir: &Path, skip_validation: bool) -> Result<()> {
     let raw = std::fs::read_to_string(toml_path)
         .with_context(|| format!("read TOML {}", toml_path.display()))?;
     let cfg: StudyToml = toml::from_str(&raw).with_context(|| "parse TOML")?;
@@ -500,6 +500,51 @@ pub fn run_study(toml_path: &Path, base_dir: &Path) -> Result<()> {
         ));
     }
 
+    // 1b. Validation pre-pass: each run gets the same checks as
+    // `cell_analyze check --with-observables`. Runs that fail the
+    // structural or observable checks are dropped from the study with
+    // a clear warning; a fully empty result aborts. Pass
+    // `--skip-validation` to bypass entirely. The pre-pass also
+    // pre-loads each run's trajectory so we don't pay the parse cost
+    // twice.
+    let validated: Vec<(crate::analysis::discovery::RunSpec, Option<std::sync::Arc<crate::analysis::io::Trajectory>>)> = if skip_validation {
+        eprintln!("  (skipping validation pre-pass)");
+        specs.into_iter().map(|s| (s, None)).collect()
+    } else {
+        use crate::analysis::precheck::{validate_run, print_report, Expectations};
+        eprintln!("Validating runs...");
+        let mut kept = Vec::new();
+        let mut dropped = 0usize;
+        for spec in specs {
+            let report = match validate_run(&spec.directory, &Expectations::default(), true) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [SKIP] {} — validation crashed: {}",
+                              spec.directory.display(), e);
+                    dropped += 1;
+                    continue;
+                }
+            };
+            if !report.all_pass() {
+                eprintln!("  [SKIP] {} — failed validation:", spec.directory.display());
+                print_report(&report);
+                dropped += 1;
+                continue;
+            }
+            // Reuse the pre-loaded trajectory.
+            kept.push((spec, report.trajectory));
+        }
+        if dropped > 0 {
+            eprintln!("  dropped {} run(s); kept {}", dropped, kept.len());
+        }
+        if kept.is_empty() {
+            return Err(anyhow!(
+                "all runs failed validation; re-run with --skip-validation to bypass"
+            ));
+        }
+        kept
+    };
+
     // 2. Per-run analysis (parallel).
     let observables = observables_for_request(&cfg.observables.compute)?;
     let params = RunParams {
@@ -520,9 +565,9 @@ pub fn run_study(toml_path: &Path, base_dir: &Path) -> Result<()> {
     };
 
     eprintln!("Analyzing runs...");
-    let runs: Vec<RunAnalysis> = specs
+    let runs: Vec<RunAnalysis> = validated
         .par_iter()
-        .map(|spec| analyze_run(spec, &plan))
+        .map(|(spec, prevalidated)| analyze_run(spec, &plan, prevalidated.clone()))
         .collect::<Result<Vec<_>>>()?;
     eprintln!("  done ({} runs analyzed)", runs.len());
 
@@ -1248,7 +1293,7 @@ panels = [
         fs::write(&toml_path, toml_text).unwrap();
 
         // 3. Run the study.
-        run_study(&toml_path, &root).expect("run_study");
+        run_study(&toml_path, &root, true).expect("run_study");
 
         // 4. Verify the figure exists.
         let svg = root.join("phase3a_results").join("phase3a_msd_vs_d.svg");

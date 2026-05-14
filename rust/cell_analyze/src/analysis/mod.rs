@@ -18,6 +18,7 @@ pub mod checkpoint;
 pub mod discovery;
 pub mod io;
 pub mod merge_checkpoint;
+pub mod precheck;
 pub mod metadata;
 pub mod observable;
 pub mod observables;

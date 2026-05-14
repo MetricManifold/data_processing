@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::analysis::checkpoint::{load_checkpoint, Checkpoint};
-use crate::analysis::io::{load_trajectory_subsample, unwrap_trajectory};
+use crate::analysis::io::{load_trajectory_subsample, unwrap_trajectory, Trajectory};
 
 use super::discovery::{RunSpec, ScalarValue};
 use super::observable::{Context, ObservableBag, Requirements, RunParams};
@@ -96,16 +96,32 @@ pub struct AnalyzePlan<'a> {
 /// Loads only what's needed: the unwrapped positions are always loaded
 /// (most observables need them); the raw trajectory and checkpoint are
 /// loaded only if some observable's `requires()` says so.
-pub fn analyze_run(spec: &RunSpec, plan: &AnalyzePlan<'_>) -> Result<RunAnalysis> {
+///
+/// `prevalidated` lets callers pass a [`Trajectory`] that was already
+/// parsed by the validation pre-pass — used by `study` to avoid loading
+/// the trajectory twice. Only consumed when `plan.subsample <= 1`
+/// (subsampled loads need a fresh parse).
+pub fn analyze_run(
+    spec: &RunSpec,
+    plan: &AnalyzePlan<'_>,
+    prevalidated: Option<Arc<Trajectory>>,
+) -> Result<RunAnalysis> {
     // 1. Compute the union of requirements.
     let needed = plan
         .observables
         .iter()
         .fold(Requirements::POSITIONS, |acc, o| acc | o.requires());
 
-    // 2. Load only what's needed.
-    let traj = load_trajectory_subsample(&spec.trajectory, plan.subsample)
-        .with_context(|| format!("load trajectory {}", spec.trajectory.display()))?;
+    // 2. Load only what's needed. Reuse the pre-validated trajectory
+    //    when present and the caller didn't ask for subsampling.
+    let traj_arc: Arc<Trajectory> = match prevalidated {
+        Some(t) if plan.subsample <= 1 => t,
+        _ => Arc::new(
+            load_trajectory_subsample(&spec.trajectory, plan.subsample)
+                .with_context(|| format!("load trajectory {}", spec.trajectory.display()))?,
+        ),
+    };
+    let traj: &Trajectory = &traj_arc;
     let n_cells = traj.params.n_cells;
     let lx = traj.params.lx;
     let ly = traj.params.ly;
@@ -117,9 +133,9 @@ pub fn analyze_run(spec: &RunSpec, plan: &AnalyzePlan<'_>) -> Result<RunAnalysis
     let time_end = traj.frames.last().map(|(t, _)| *t);
     let dt_from_traj = infer_dt_from_frames(&traj.frames);
     let frame_count = traj.frames.len();
-    let positions = Arc::new(unwrap_trajectory(&traj));
+    let positions = Arc::new(unwrap_trajectory(traj));
     let trajectory = if needed.contains(Requirements::TRAJECTORY) {
-        Some(Arc::new(traj))
+        Some(traj_arc.clone())
     } else {
         None
     };
@@ -254,7 +270,7 @@ mod tests {
             params: RunParams::default(),
             subsample: 1,
         };
-        let res = analyze_run(&spec, &plan).expect("analyze_run");
+        let res = analyze_run(&spec, &plan, None).expect("analyze_run");
         let msd = res.bag.get::<Msd>().expect("msd missing");
         assert!(!msd.lag_times.is_empty(), "got msd lag times");
         // Cell 0 drifts at v=0.1, so MSD at lag 1 ≈ 0.01.
