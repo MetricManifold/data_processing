@@ -737,7 +737,23 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
                 ver, sp_sz, sizeof(SimParams));
         fclose(f); return false;
     } else {
-        // Legacy v3/v4/v5: SimParams was a packed f32 layout. Decode by hand.
+        // Legacy v3/v4/v5: SimParams was a packed f32 layout. Two
+        // known sub-variants live in the wild; we key off sp_sz:
+        //
+        //   sp_sz == 72 (or 76 with abp): old pre-cutover baseline.
+        //     Nx Ny dx dy dt t_end λ γ κ R μ v_A ξ τ halo
+        //     offsets: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 60
+        //
+        //   sp_sz == 92: v4 produced by the roihu binary (May 2026).
+        //     Nx Ny dx dy dt t_end N_cells λ γ κ R μ v_A ξ τ halo print_int sub_pad ... gamma_soft
+        //     offsets: 0 4 8 12 16 20  24    28 32 36 40 44 48 52 56 60 64 68 ... 84
+        //
+        // The v4 layout inserts an int32 cell-count N at @24 that
+        // shifts all the f32 physics scalars (λ..τ) by +4. `halo`
+        // sits at @60 in both layouts (post-cutover dropped a slot
+        // after τ so halo lines up again). Mis-reading this was the
+        // root cause of the τ=1500 silent corruption observed in
+        // FSS pipeline runs resumed from May-6 roihu equilibrations.
         std::vector<uint8_t> sp(sp_sz);
         fread(sp.data(), 1, sp_sz, f);
         auto u_i32 = [&](size_t off) {
@@ -747,25 +763,48 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
             float v; std::memcpy(&v, sp.data() + off, 4); return v;
         };
         params = SimParams{};
-        params.Nx            = u_i32(0);
-        params.Ny            = u_i32(4);
-        params.dx            = u_f32(8);
-        params.dy            = u_f32(12);
-        params.dt            = u_f32(16);
-        params.t_end         = u_f32(20);
-        params.lambda        = u_f32(24);
-        params.gamma         = u_f32(28);
-        params.kappa         = u_f32(32);
-        params.target_radius = u_f32(36);
-        params.mu            = u_f32(40);
-        params.v_A           = u_f32(44);
-        params.xi            = u_f32(48);
-        params.tau           = u_f32(52);
+        params.Nx    = u_i32(0);
+        params.Ny    = u_i32(4);
+        params.dx    = u_f32(8);
+        params.dy    = u_f32(12);
+        params.dt    = u_f32(16);
+        params.t_end = u_f32(20);
+        // Physics scalars: shift by +4 for v4 (sp_sz=92) because the
+        // writer inserted an int32 N at offset 24.
+        const bool is_v4_roihu = (sp_sz == 92);
+        const size_t shift = is_v4_roihu ? 4 : 0;
+        params.lambda        = u_f32(24 + shift);
+        params.gamma         = u_f32(28 + shift);
+        params.kappa         = u_f32(32 + shift);
+        params.target_radius = u_f32(36 + shift);
+        params.mu            = u_f32(40 + shift);
+        params.v_A           = u_f32(44 + shift);
+        params.xi            = u_f32(48 + shift);
+        params.tau           = u_f32(52 + shift);
+        // halo sits at @60 in both layouts (after-τ slot lines up
+        // again because v4 dropped a different field elsewhere).
         params.halo          = u_i32(60);
-        // Older formats stored subdomain_padding at offset 68; ignored on load.
-        if (sp_sz >= 76) params.abp = (u_i32(72) == 1);
-        params.print_interval     = 100;
+        if (is_v4_roihu) {
+            // v4 carries print_interval explicitly.
+            if (sp_sz >= 68) params.print_interval = u_i32(64);
+        } else if (sp_sz >= 76) {
+            // pre-cutover baseline: abp at @72.
+            params.abp = (u_i32(72) == 1);
+        }
+        // subdomain_padding is set to current default either way — was
+        // a dead/stale field in both legacy formats.
+        params.subdomain_padding = SimParams{}.subdomain_padding;
+        if (params.print_interval == 0) params.print_interval = 100;
         params.trajectory_samples = 0;
+        // Log the choice — silent legacy parsing has caused real
+        // physics corruption; keep this prominent in the resume log.
+        fprintf(stderr,
+                "[ckpt] legacy v%u SimParams: sp_sz=%u → %s layout "
+                "(τ=%.1f, ξ=%.1f, λ=%.1f, γ=%.2f, halo=%d)\n",
+                ver, sp_sz,
+                (is_v4_roihu ? "v4-roihu (shifted)" : "baseline-72"),
+                params.tau, params.xi, params.lambda, params.gamma,
+                params.halo);
     }
 
     step_count = cs;
