@@ -188,6 +188,36 @@ struct Simulation {
     float* d_polar_x_scratch    = nullptr;
     float* d_polar_y_scratch    = nullptr;
     void*  d_rng_scratch        = nullptr;  // curandState array
+
+    // Per-cell float-state registry.
+    //
+    // Every per-cell float scalar that is BOTH state (carries across
+    // steps, not a per-step reduction output) AND uniformly-shaped
+    // (one f32 per cell, sized to capacity) lives here. The registry
+    // declares each field once and the lifecycle code (alloc, free,
+    // migration scratch, swap, sidecar save/load) iterates it.
+    //
+    // To add a new per-cell float field:
+    //   1. Add the device pointer to `CellArrays` (types.cuh).
+    //   2. Add a scratch pointer above (if it needs migration support).
+    //   3. Add one row to `per_cell_float_state()` (sim.cu).
+    // No other site needs editing. Adding the previous 6 fields took
+    // ~10 site edits each; now it takes 1.
+    //
+    // Notes:
+    //   - sidecar_magic == 0  -> field is not serialized (derived state,
+    //                            e.g. polar_x/polar_y rebuilt from theta).
+    //   - scratch_ptr == nullptr -> field has no migration scratch.
+    //                               Currently every registered field has
+    //                               one, but the API allows G=1-only
+    //                               fields without the cost.
+    struct PerCellField {
+        const char* name;
+        uint32_t    sidecar_magic;   // ckpt::MAGIC_* or 0
+        float**     dev_ptr;         // &CellArrays.<field>
+        float**     scratch_ptr;     // &Simulation.<field>_scratch, or nullptr
+    };
+    std::vector<PerCellField> per_cell_float_state();
     // Per-cell global ids in device memory. Two persistent buffers sized to
     // capacity (allocated once in alloc_gpu, freed in cleanup). Replaces
     // per-migration cudaMallocAsync/Free which the nsys profile showed

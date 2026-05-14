@@ -100,6 +100,21 @@ void Simulation::compute_origins() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-cell float-state registry — see PerCellField doc in sim.cuh.
+// Single source of truth for every per-cell float scalar's lifecycle.
+// ---------------------------------------------------------------------------
+std::vector<Simulation::PerCellField> Simulation::per_cell_float_state() {
+    return {
+        {"polar_theta", ckpt::MAGIC_POLR, &cells.polar_theta, &d_polar_theta_scratch},
+        {"polar_x",     0,                &cells.polar_x,     &d_polar_x_scratch},
+        {"polar_y",     0,                &cells.polar_y,     &d_polar_y_scratch},
+        {"gamma",       ckpt::MAGIC_GAMA, &cells.gamma_cell,  &d_gamma_scratch},
+        {"v_A",         ckpt::MAGIC_VA_A, &cells.v_A_cell,    &d_v_A_scratch},
+        {"tgt_radius",  ckpt::MAGIC_RADI, &cells.tgt_radius,  &d_tgt_R_scratch},
+    };
+}
+
+// ---------------------------------------------------------------------------
 // GPU allocation. Per-cell arrays are allocated to capacity, not to the
 // initial num_cells, so that cell migration between ranks (at rebind
 // boundaries) can grow num_cells without realloc. For G=1, capacity ==
@@ -188,13 +203,9 @@ void Simulation::alloc_gpu() {
     af(cells.velocities_x, cap);
     af(cells.velocities_y, cap);
 
-    af(cells.polar_theta,  cap);
-    af(cells.polar_x,      cap);
-    af(cells.polar_y,      cap);
-
-    af(cells.gamma_cell,   cap);
-    af(cells.v_A_cell,     cap);
-    af(cells.tgt_radius,   cap);
+    for (auto& f : per_cell_float_state()) {
+        af(*f.dev_ptr, cap);
+    }
 
     CK(cudaMalloc(&cells.rng_states, cap * sizeof(curandState)));
 
@@ -241,12 +252,11 @@ void Simulation::alloc_gpu() {
         // outputs that the next step recomputes from scratch anyway.
         CK(cudaMalloc(&d_origin_scratch,      2 * cap * sizeof(int)));
         CK(cudaMalloc(&d_rect_scratch,        4 * cap * sizeof(int)));
-        CK(cudaMalloc(&d_gamma_scratch,       cap * sizeof(float)));
-        CK(cudaMalloc(&d_v_A_scratch,         cap * sizeof(float)));
-        CK(cudaMalloc(&d_tgt_R_scratch,       cap * sizeof(float)));
-        CK(cudaMalloc(&d_polar_theta_scratch, cap * sizeof(float)));
-        CK(cudaMalloc(&d_polar_x_scratch,     cap * sizeof(float)));
-        CK(cudaMalloc(&d_polar_y_scratch,     cap * sizeof(float)));
+        for (auto& f : per_cell_float_state()) {
+            if (f.scratch_ptr) {
+                CK(cudaMalloc(f.scratch_ptr, cap * sizeof(float)));
+            }
+        }
         CK(cudaMalloc(&d_rng_scratch,         cap * sizeof(curandState)));
         // Persistent global-id buffers (replaces per-migration cudaMallocAsync).
         CK(cudaMalloc(&d_gid_src,             cap * sizeof(int)));
@@ -1794,10 +1804,9 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         fwrite(&sh, sizeof(sh), 1, f);
         fwrite(h.data(), sizeof(float), n, f);
     };
-    write_per_cell(ckpt::MAGIC_GAMA, cells.gamma_cell);
-    write_per_cell(ckpt::MAGIC_RADI, cells.tgt_radius);
-    write_per_cell(ckpt::MAGIC_VA_A, cells.v_A_cell);
-    write_per_cell(ckpt::MAGIC_POLR, cells.polar_theta);
+    for (auto& fld : per_cell_float_state()) {
+        if (fld.sidecar_magic != 0) write_per_cell(fld.sidecar_magic, *fld.dev_ptr);
+    }
 
     // C2: RNGS sidecar — per-cell curandState bytes so resume preserves
     // the random-stream continuity. Without this, chained jobs replay the
@@ -1845,8 +1854,10 @@ void Simulation::cleanup() {
     cf(cells.Cxx); cf(cells.Cyy);
     cf(cells.perimeters);
     cf(cells.velocities_x); cf(cells.velocities_y);
-    cf(cells.polar_theta); cf(cells.polar_x); cf(cells.polar_y);
-    cf(cells.gamma_cell); cf(cells.v_A_cell); cf(cells.tgt_radius);
+    for (auto& f : per_cell_float_state()) {
+        cf(*f.dev_ptr);
+        if (f.scratch_ptr) cf(*f.scratch_ptr);
+    }
     cf(cells.rng_states);
     cf(d_scripted_cid);
     cf(d_scripted_theta);
@@ -1859,9 +1870,6 @@ void Simulation::cleanup() {
     cfv(d_pack_up);      cfv(d_pack_down);
     cfv(d_pack_in_prev); cfv(d_pack_in_next);
     cf(d_origin_scratch); cf(d_rect_scratch);
-    cf(d_gamma_scratch);  cf(d_v_A_scratch); cf(d_tgt_R_scratch);
-    cf(d_polar_theta_scratch);
-    cf(d_polar_x_scratch); cf(d_polar_y_scratch);
     cfv(d_rng_scratch);
     cf(d_gid_src); cf(d_gid_arr);
 }
@@ -2088,12 +2096,9 @@ int Simulation::migrate_cells(MgWorld& world, int my_rank) {
     //    compacted+arrived tiles (currently in phi_out) become phi_in.
     std::swap(cells.origin,       d_origin_scratch);
     std::swap(cells.rect,         d_rect_scratch);
-    std::swap(cells.gamma_cell,   d_gamma_scratch);
-    std::swap(cells.v_A_cell,     d_v_A_scratch);
-    std::swap(cells.tgt_radius,   d_tgt_R_scratch);
-    std::swap(cells.polar_theta,  d_polar_theta_scratch);
-    std::swap(cells.polar_x,      d_polar_x_scratch);
-    std::swap(cells.polar_y,      d_polar_y_scratch);
+    for (auto& f : per_cell_float_state()) {
+        if (f.scratch_ptr) std::swap(*f.dev_ptr, *f.scratch_ptr);
+    }
     {
         // rng_states is void* in CellArrays; do an unstructured swap.
         void* tmp = cells.rng_states;
