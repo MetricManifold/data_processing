@@ -303,87 +303,11 @@ int main(int argc, char** argv) {
     // ---- Optional: load scripted (pre-determined) tumble events.
     // File format mirrors cpu_ref's --events output:
     //   `# t cid [old_theta] new_theta`  (3- or 4-col; '#' lines ignored).
-    // Each event's `t` is converted to the step_count value at which
-    // Simulation::step() should fire it: step_count_at_start = round(t/dt) - 1.
+    // The parser + device upload + invariant maintenance all live on
+    // Simulation now (load_scripted_events). Earlier this was inlined
+    // and poked 7 public Simulation fields by hand.
     if (!scripted_events_path.empty()) {
-        std::ifstream f(scripted_events_path);
-        if (!f) {
-            fprintf(stderr, "Error: cannot open --scripted-events file '%s'\n",
-                    scripted_events_path.c_str());
-            return 1;
-        }
-        std::string line;
-        const int N = sim.cells.num_cells;
-        const double dt = sim.params.dt;
-        // start_t = current cur_time at end of init (== ckpt.t for resume,
-        // 0 for fresh). Events at t <= start_t are rejected.
-        const double start_t = sim.cur_time;
-        const int    start_step = sim.step_count;
-        struct Evt { int step_at_start; int cid; float theta; };
-        std::vector<Evt> evs;
-        int lineno = 0;
-        while (std::getline(f, line)) {
-            ++lineno;
-            // strip leading whitespace
-            size_t p0 = line.find_first_not_of(" \t\r\n");
-            if (p0 == std::string::npos) continue;
-            if (line[p0] == '#') continue;
-            std::istringstream is(line);
-            std::vector<double> toks;
-            double v;
-            while (is >> v) toks.push_back(v);
-            double t, new_theta; int cid;
-            if (toks.size() == 3) {
-                t = toks[0]; cid = (int)toks[1]; new_theta = toks[2];
-            } else if (toks.size() == 4) {
-                t = toks[0]; cid = (int)toks[1]; new_theta = toks[3];
-            } else {
-                fprintf(stderr,
-                    "Error: %s line %d: expected 3 or 4 cols, got %zu\n",
-                    scripted_events_path.c_str(), lineno, toks.size());
-                return 1;
-            }
-            if (cid < 0 || cid >= N) {
-                fprintf(stderr,
-                    "Error: %s line %d: cid %d out of range (n_cells=%d)\n",
-                    scripted_events_path.c_str(), lineno, cid, N);
-                return 1;
-            }
-            if (t <= start_t) {
-                fprintf(stderr,
-                    "Error: %s line %d: t=%.6f <= start_t=%.6f\n",
-                    scripted_events_path.c_str(), lineno, t, start_t);
-                return 1;
-            }
-            int step_idx = (int)std::llround((t - start_t) / dt);
-            int step_at_start = start_step + step_idx - 1;
-            evs.push_back({step_at_start, cid, (float)new_theta});
-        }
-        std::sort(evs.begin(), evs.end(), [](const Evt& a, const Evt& b) {
-            if (a.step_at_start != b.step_at_start) return a.step_at_start < b.step_at_start;
-            return a.cid < b.cid;
-        });
-        // Hand off to sim.
-        sim.scripted_active = !evs.empty();
-        sim.scripted_cursor = 0;
-        sim.h_scripted_step.reserve(evs.size());
-        sim.h_scripted_cid.reserve(evs.size());
-        sim.h_scripted_theta.reserve(evs.size());
-        for (const auto& e : evs) {
-            sim.h_scripted_step.push_back(e.step_at_start);
-            sim.h_scripted_cid.push_back(e.cid);
-            sim.h_scripted_theta.push_back(e.theta);
-        }
-        if (!evs.empty()) {
-            cudaMalloc(&sim.d_scripted_cid,   evs.size() * sizeof(int));
-            cudaMalloc(&sim.d_scripted_theta, evs.size() * sizeof(float));
-            cudaMemcpy(sim.d_scripted_cid,   sim.h_scripted_cid.data(),
-                       evs.size() * sizeof(int),   cudaMemcpyHostToDevice);
-            cudaMemcpy(sim.d_scripted_theta, sim.h_scripted_theta.data(),
-                       evs.size() * sizeof(float), cudaMemcpyHostToDevice);
-        }
-        printf("[scripted] %zu events loaded from %s (PRNG tumble path disabled)\n",
-               evs.size(), scripted_events_path.c_str());
+        if (!sim.load_scripted_events(scripted_events_path)) return 1;
     }
 
     sim.run();

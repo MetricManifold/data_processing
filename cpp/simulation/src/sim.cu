@@ -21,7 +21,9 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <random>
+#include <sstream>
 
 #define CK(call) do {                                                      \
     cudaError_t e = (call);                                                \
@@ -551,43 +553,55 @@ void Simulation::apply_v_A_disorder() {
 // ---------------------------------------------------------------------------
 // finalize_init — RNG, initial scatter+velocity reduction, sync.
 // ---------------------------------------------------------------------------
-void Simulation::finalize_init() {
-    unsigned long polar_seed = params.polarity_seed
-                                 ? params.polarity_seed
-                                 : (params.seed ? params.seed : 1234u);
+// ---------------------------------------------------------------------------
+// finalize_init — three single-purpose steps, sequenced.
+// ---------------------------------------------------------------------------
+void Simulation::seed_rng_if_fresh() {
     // Preserve random-stream continuity on resume: only initialize the
     // per-cell curandStates here when they were NOT restored from the
     // checkpoint's RNGS sidecar. (Without this guard, a chained run with
     // the same polarity_seed re-seeds each cell back to offset 0 and
     // replays the same tumble decisions across resume.)
-    if (!rng_restored_from_ckpt) {
-        launch_rng_init(cells, polar_seed);
-    }
+    if (rng_restored_from_ckpt) return;
+    const unsigned long polar_seed = params.polarity_seed
+                                     ? params.polarity_seed
+                                     : (params.seed ? params.seed : 1234u);
+    launch_rng_init(cells, polar_seed);
+}
+
+void Simulation::compute_initial_velocities() {
     launch_initial_velocity(cells, params);
+}
+
+void Simulation::setup_step_stream() {
+    if (step_stream) return;  // idempotent — only runs once per Simulation
     // Dedicated stream for the captured step pipeline. Non-blocking so it
     // doesn't serialize against the default stream used by I/O paths.
-    if (!step_stream) {
-        CK(cudaStreamCreateWithFlags(&step_stream, cudaStreamNonBlocking));
-        // Mirror the L2 access-policy-window onto step_stream so the
-        // S-field benefits from persistence on the captured/replayed
-        // kernels too. We size the window at min(S_bytes, carveout) so
-        // even oversize S gets the leading slice pinned.
-        int max_persist_bytes = 0;
-        cudaDeviceGetAttribute(&max_persist_bytes,
-                               cudaDevAttrMaxPersistingL2CacheSize, 0);
-        if (max_persist_bytes > 0) {
-            const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
-            const size_t window_bytes = std::min((size_t)max_persist_bytes, S_bytes);
-            cudaStreamAttrValue attr = {};
-            attr.accessPolicyWindow.base_ptr  = cells.S;
-            attr.accessPolicyWindow.num_bytes = window_bytes;
-            attr.accessPolicyWindow.hitRatio  = 1.0f;
-            attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-            attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-            cudaStreamSetAttribute(step_stream,
-                                   cudaStreamAttributeAccessPolicyWindow, &attr);
-        }
-    }
+    CK(cudaStreamCreateWithFlags(&step_stream, cudaStreamNonBlocking));
+    // Mirror the L2 access-policy-window onto step_stream so the
+    // S-field benefits from persistence on the captured/replayed
+    // kernels too. We size the window at min(S_bytes, carveout) so
+    // even oversize S gets the leading slice pinned.
+    int max_persist_bytes = 0;
+    cudaDeviceGetAttribute(&max_persist_bytes,
+                           cudaDevAttrMaxPersistingL2CacheSize, 0);
+    if (max_persist_bytes <= 0) return;
+    const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
+    const size_t window_bytes = std::min((size_t)max_persist_bytes, S_bytes);
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr  = cells.S;
+    attr.accessPolicyWindow.num_bytes = window_bytes;
+    attr.accessPolicyWindow.hitRatio  = 1.0f;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(step_stream,
+                           cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
+void Simulation::finalize_init() {
+    seed_rng_if_fresh();
+    compute_initial_velocities();
+    setup_step_stream();
     CK(cudaDeviceSynchronize());
 }
 
@@ -1249,6 +1263,98 @@ void Simulation::slice_cells_to_local() {
     fprintf(stderr,
         "[multi-gpu] rank %d/%d: spatial slab y in [%d,%d), %d/%d cells\n",
         rank, gpus, y_lo, y_hi, (int)h_cells.size(), n_global);
+}
+
+// ---------------------------------------------------------------------------
+// load_scripted_events — owns the invariant that scripted_active is true
+// iff the host/device event arrays are populated and sorted by step_count.
+// Replaces the inline parser in main.cu which had to poke 7 public fields
+// in the right order; getting any of them out of sync (e.g. forgetting
+// cudaMalloc) was a silent-failure bug.
+//
+// File format (cpu_ref --events): `# t cid [old_theta] new_theta` per line.
+// `t` is converted to step_count using sim.cur_time + sim.params.dt; events
+// with t <= cur_time are rejected.
+// ---------------------------------------------------------------------------
+bool Simulation::load_scripted_events(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) {
+        fprintf(stderr, "Error: cannot open --scripted-events file '%s'\n",
+                path.c_str());
+        return false;
+    }
+    const int N = cells.num_cells;
+    const double dt = params.dt;
+    const double start_t = cur_time;
+    const int    start_step = step_count;
+    struct Evt { int step_at_start; int cid; float theta; };
+    std::vector<Evt> evs;
+    std::string line;
+    int lineno = 0;
+    while (std::getline(f, line)) {
+        ++lineno;
+        size_t p0 = line.find_first_not_of(" \t\r\n");
+        if (p0 == std::string::npos) continue;
+        if (line[p0] == '#') continue;
+        std::istringstream is(line);
+        std::vector<double> toks;
+        double v;
+        while (is >> v) toks.push_back(v);
+        double t, new_theta; int cid;
+        if (toks.size() == 3) {
+            t = toks[0]; cid = (int)toks[1]; new_theta = toks[2];
+        } else if (toks.size() == 4) {
+            t = toks[0]; cid = (int)toks[1]; new_theta = toks[3];
+        } else {
+            fprintf(stderr,
+                "Error: %s line %d: expected 3 or 4 cols, got %zu\n",
+                path.c_str(), lineno, toks.size());
+            return false;
+        }
+        if (cid < 0 || cid >= N) {
+            fprintf(stderr,
+                "Error: %s line %d: cid %d out of range (n_cells=%d)\n",
+                path.c_str(), lineno, cid, N);
+            return false;
+        }
+        if (t <= start_t) {
+            fprintf(stderr,
+                "Error: %s line %d: t=%.6f <= start_t=%.6f\n",
+                path.c_str(), lineno, t, start_t);
+            return false;
+        }
+        int step_idx = (int)std::llround((t - start_t) / dt);
+        int step_at_start = start_step + step_idx - 1;
+        evs.push_back({step_at_start, cid, (float)new_theta});
+    }
+    std::sort(evs.begin(), evs.end(), [](const Evt& a, const Evt& b) {
+        if (a.step_at_start != b.step_at_start) return a.step_at_start < b.step_at_start;
+        return a.cid < b.cid;
+    });
+    scripted_active = !evs.empty();
+    scripted_cursor = 0;
+    h_scripted_step.clear();
+    h_scripted_cid.clear();
+    h_scripted_theta.clear();
+    h_scripted_step.reserve(evs.size());
+    h_scripted_cid.reserve(evs.size());
+    h_scripted_theta.reserve(evs.size());
+    for (const auto& e : evs) {
+        h_scripted_step.push_back(e.step_at_start);
+        h_scripted_cid.push_back(e.cid);
+        h_scripted_theta.push_back(e.theta);
+    }
+    if (!evs.empty()) {
+        CK(cudaMalloc(&d_scripted_cid,   evs.size() * sizeof(int)));
+        CK(cudaMalloc(&d_scripted_theta, evs.size() * sizeof(float)));
+        CK(cudaMemcpy(d_scripted_cid,   h_scripted_cid.data(),
+                      evs.size() * sizeof(int),   cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_scripted_theta, h_scripted_theta.data(),
+                      evs.size() * sizeof(float), cudaMemcpyHostToDevice));
+    }
+    printf("[scripted] %zu events loaded from %s (PRNG tumble path disabled)\n",
+           evs.size(), path.c_str());
+    return true;
 }
 
 // ---------------------------------------------------------------------------

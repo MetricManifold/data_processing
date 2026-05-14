@@ -92,6 +92,13 @@ struct Simulation {
     // to preserve the random-stream continuity across resume.
     bool   rng_restored_from_ckpt = false;
 
+    // Load scripted events from `path` (cpu_ref --events format) and
+    // populate scripted_active / cursor / host vectors / device mirrors.
+    // Must be called AFTER init() or init_from_checkpoint(), since events
+    // are validated against the current cell count and `start_t`.
+    // Returns false (and prints to stderr) on parse error.
+    bool load_scripted_events(const std::string& path);
+
     // ---- CUDA Graph capture for the hot step pipeline.
     // step_stream is a non-default stream so launches can be captured.
     // step_graph[parity] is the cached executable graph for the
@@ -211,7 +218,16 @@ struct Simulation {
     void upload_initial_state();
     void apply_gamma_spec();
     void apply_v_A_disorder();
+    // finalize_init = setup_step_stream + seed_rng_if_fresh
+    //                + compute_initial_velocities + cudaDeviceSynchronize.
+    // The three sub-steps were inlined; splitting them keeps each
+    // function single-purpose. setup_step_stream is one-time infra
+    // (created once per Simulation lifetime, even across re-init);
+    // the other two are state that may need to re-run after migration.
     void finalize_init();
+    void setup_step_stream();
+    void seed_rng_if_fresh();
+    void compute_initial_velocities();
     void step();
     // Multi-GPU step decomposition. The orchestrator drives:
     //   for each rank g: sim[g].step_pre_reduce()
