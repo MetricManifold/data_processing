@@ -1522,6 +1522,18 @@ void Simulation::print_status() {
     CK(cudaMemcpy(vols.data(), cells.volumes, n * sizeof(float), cudaMemcpyDeviceToHost));
     double avg = 0; for (float v : vols) avg += v; avg /= n;
     double tgt = params.target_area();
+    // Free NaN tripwire: avg already computed; if it's not finite,
+    // physics has gone off the rails (typical cause: a kernel produced
+    // Inf/NaN values that propagated through the reduction). Abort
+    // immediately so we don't burn cluster hours producing garbage
+    // trajectories. Exit code 2 distinguishes from normal failures.
+    if (!std::isfinite(avg)) {
+        fprintf(stderr,
+                "[FATAL] non-finite avg_vol=%g at step=%d t=%.4f — "
+                "aborting before more garbage data is written\n",
+                avg, step_count, cur_time);
+        std::exit(2);
+    }
     printf("step=%d t=%.2f avg_vol=%.1f (target=%.1f, err=%.2f%%)\n",
            step_count, cur_time, avg, tgt, 100.0 * (avg - tgt) / tgt);
 #ifdef CELL_SIM_BBOX_TELEMETRY
@@ -1584,6 +1596,18 @@ void Simulation::write_trajectory() {
         double invV = 1.0 / V[i];
         double cx_g = wrap_d(h_or[2*i + 0] + Cx[i] * invV, Nx);
         double cy_g = wrap_d(h_or[2*i + 1] + Cy[i] * invV, Ny);
+        // Free NaN tripwire: cx_g/cy_g already computed on host. If
+        // either is non-finite, the cell's reductions are corrupted
+        // (typical: NaN propagating from a previous step's RHS). Abort
+        // before we write a garbage trajectory row.
+        if (!std::isfinite(cx_g) || !std::isfinite(cy_g)) {
+            fprintf(stderr,
+                    "[FATAL] non-finite centroid for cell %d at step=%d "
+                    "t=%.4f: cx=%g cy=%g — aborting\n",
+                    i, step_count, cur_time, cx_g, cy_g);
+            fflush(traj_fp);
+            std::exit(2);
+        }
         float theta = atan2f(py[i], px[i]);
         double perim = per[i] * dA;
         double Ln = perim / (2.0 * M_PI * tgt_r);
