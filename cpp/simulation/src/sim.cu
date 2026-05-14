@@ -704,42 +704,251 @@ bool peek_v8_rank_header(const std::string& path,
     fclose(f);
     return true;
 }
-}  // namespace
 
-bool Simulation::init_from_checkpoint(const std::string& path_in,
-                                      const SimParams& cli,
-                                      const SimOverrides& ov) {
-    // ---- v8 multi-rank dispatch ----
-    // If the supplied checkpoint is v8 with num_ranks > 1, each rank
-    // resolves to its own per-rank file. Rank 0 stays at the supplied
-    // path; rank K (K>0) opens <dirname(path)>/rank{K}/checkpoint.bin.
-    // We also validate that the requested --gpus matches the checkpoint
-    // layout, since this C++ loader only supports same-G resumes.
-    std::string path = path_in;
-    {
-        int32_t ck_num_ranks = 1, ck_rank_id = 0, ck_n_global = 0;
-        if (peek_v8_rank_header(path_in, ck_num_ranks, ck_rank_id, ck_n_global) &&
-            ck_num_ranks > 1) {
-            if (gpus != ck_num_ranks) {
-                fprintf(stderr,
-                    "[ckpt] checkpoint was saved with --gpus %d but you "
-                    "requested --gpus %d. Use `cell_analyze merge-ckpt %s` "
-                    "to consolidate into a single-rank checkpoint, then "
-                    "resume with any --gpus value.\n",
-                    ck_num_ranks, gpus, path_in.c_str());
-                return false;
+// ----------------------------------------------------------------------------
+// CheckpointPayload — pure-data result of read_checkpoint.
+// Holds everything we read from disk. No GPU pointers, no Simulation state.
+// apply_checkpoint() consumes this to populate the Simulation.
+// ----------------------------------------------------------------------------
+struct CheckpointPayload {
+    uint32_t version = 0;
+    SimParams params{};       // decoded; subdomain_padding already reset
+    int32_t   step_count = 0;
+    double    cur_time   = 0.0;
+    int32_t   num_cells  = 0;
+    // v8 multi-rank trailer (defaults match single-rank for v3..v7).
+    int32_t   v8_num_ranks = 1;
+    int32_t   v8_rank_id   = 0;
+    int32_t   v8_n_global  = 0;
+    // Per-cell records (size = num_cells).
+    std::vector<float>              cx, cy, vx, vy, vol;
+    std::vector<int>                ox, oy;
+    std::vector<int>                gid;       // global ids; local index for pre-v8
+    std::vector<std::vector<float>> phi_tiles; // each TILE_AREA floats
+    // Optional sidecars (empty if absent on disk).
+    std::vector<float>   per_vA, per_gamma, per_radius, per_polar_theta;
+    std::vector<uint8_t> per_rng_bytes;
+};
+
+// Resolve `path_in` to a per-rank file. For v8 multi-rank checkpoints with
+// num_ranks > 1, rank K>0 reads <dir>/rank{K}/<basename>. Validates that
+// --gpus matches the checkpoint layout (same-G resumes only in C++).
+bool resolve_checkpoint_path(const std::string& path_in,
+                             int gpus, int rank,
+                             std::string& out_path) {
+    out_path = path_in;
+    int32_t ck_num_ranks = 1, ck_rank_id = 0, ck_n_global = 0;
+    if (!peek_v8_rank_header(path_in, ck_num_ranks, ck_rank_id, ck_n_global) ||
+        ck_num_ranks <= 1) {
+        return true;  // not a multi-rank checkpoint; nothing to redirect
+    }
+    if (gpus != ck_num_ranks) {
+        fprintf(stderr,
+            "[ckpt] checkpoint was saved with --gpus %d but you "
+            "requested --gpus %d. Use `cell_analyze merge-ckpt %s` "
+            "to consolidate into a single-rank checkpoint, then "
+            "resume with any --gpus value.\n",
+            ck_num_ranks, gpus, path_in.c_str());
+        return false;
+    }
+    if (rank > 0) {
+        size_t slash = path_in.find_last_of('/');
+        std::string dir  = (slash == std::string::npos) ? "." : path_in.substr(0, slash);
+        std::string base = (slash == std::string::npos) ? path_in : path_in.substr(slash + 1);
+        out_path = dir + "/rank" + std::to_string(rank) + "/" + base;
+    }
+    return true;
+}
+
+// Decode the SimParams blob according to its on-disk variant.
+// v6/v7/v8: native layout, blit straight into the struct.
+// v3/v4/v5: packed f32 layout with two sub-variants keyed by sp_sz.
+// Returns false if the v7/v8 SimParams size doesn't match this build's
+// sizeof(SimParams) — that's a hard incompatibility we can't recover from.
+bool decode_simparams(FILE* f, uint32_t ver, uint32_t sp_sz, SimParams& params) {
+    if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7 || ver == 8)) {
+        fread(&params, sp_sz, 1, f);
+        // subdomain_padding was a dead field in v6/v7 ckpts; reset to
+        // current default so resumed runs use a sane adaptive-rect K.
+        // CLI override below still wins.
+        params.subdomain_padding = SimParams{}.subdomain_padding;
+        return true;
+    }
+    if (ver == 7 || ver == 8) {
+        fprintf(stderr, "v%u checkpoint with foreign SimParams (sp=%u, ours=%zu)\n",
+                ver, sp_sz, sizeof(SimParams));
+        return false;
+    }
+    // Legacy v3/v4/v5: SimParams was a packed f32 layout. Two known
+    // sub-variants live in the wild; we key off sp_sz:
+    //
+    //   sp_sz == 72 (or 76 with abp): old pre-cutover baseline.
+    //     Nx Ny dx dy dt t_end λ γ κ R μ v_A ξ τ halo
+    //     offsets: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 60
+    //
+    //   sp_sz == 92: v4 produced by the roihu binary (May 2026).
+    //     Nx Ny dx dy dt t_end N_cells λ γ κ R μ v_A ξ τ halo print_int sub_pad ... gamma_soft
+    //     offsets: 0 4 8 12 16 20  24    28 32 36 40 44 48 52 56 60 64 68 ... 84
+    //
+    // The v4 layout inserts an int32 cell-count N at @24 that shifts all
+    // the f32 physics scalars (λ..τ) by +4. `halo` sits at @60 in both
+    // layouts. Mis-reading this caused the τ=1500 silent corruption in
+    // FSS pipeline runs resumed from May-6 roihu equilibrations.
+    std::vector<uint8_t> sp(sp_sz);
+    fread(sp.data(), 1, sp_sz, f);
+    auto u_i32 = [&](size_t off) {
+        int32_t v; std::memcpy(&v, sp.data() + off, 4); return v;
+    };
+    auto u_f32 = [&](size_t off) {
+        float v; std::memcpy(&v, sp.data() + off, 4); return v;
+    };
+    params = SimParams{};
+    params.Nx    = u_i32(0);
+    params.Ny    = u_i32(4);
+    params.dx    = u_f32(8);
+    params.dy    = u_f32(12);
+    params.dt    = u_f32(16);
+    params.t_end = u_f32(20);
+    const bool is_v4_roihu = (sp_sz == 92);
+    const size_t shift = is_v4_roihu ? 4 : 0;
+    params.lambda        = u_f32(24 + shift);
+    params.gamma         = u_f32(28 + shift);
+    params.kappa         = u_f32(32 + shift);
+    params.target_radius = u_f32(36 + shift);
+    params.mu            = u_f32(40 + shift);
+    params.v_A           = u_f32(44 + shift);
+    params.xi            = u_f32(48 + shift);
+    params.tau           = u_f32(52 + shift);
+    params.halo          = u_i32(60);
+    if (is_v4_roihu) {
+        if (sp_sz >= 68) params.print_interval = u_i32(64);
+    } else if (sp_sz >= 76) {
+        params.abp = (u_i32(72) == 1);
+    }
+    params.subdomain_padding = SimParams{}.subdomain_padding;
+    if (params.print_interval == 0) params.print_interval = 100;
+    params.trajectory_samples = 0;
+    fprintf(stderr,
+            "[ckpt] legacy v%u SimParams: sp_sz=%u → %s layout "
+            "(τ=%.1f, ξ=%.1f, λ=%.1f, γ=%.2f, halo=%d)\n",
+            ver, sp_sz,
+            (is_v4_roihu ? "v4-roihu (shifted)" : "baseline-72"),
+            params.tau, params.xi, params.lambda, params.gamma,
+            params.halo);
+    return true;
+}
+
+// Read per-cell records into the payload. Handles v7/v8 native (uniform
+// TILE_T tiles) and legacy v3-v6 (variable W/H tiles, re-tile centred).
+void decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
+                         CheckpointPayload& p) {
+    const int nc = p.num_cells;
+    p.cx.resize(nc); p.cy.resize(nc); p.vx.resize(nc); p.vy.resize(nc); p.vol.resize(nc);
+    p.ox.resize(nc); p.oy.resize(nc);
+    p.gid.resize(nc);
+    p.phi_tiles.resize(nc);
+    for (int i = 0; i < nc; ++i) p.gid[i] = i;
+
+    if (ver == 7 || ver == 8) {
+        const size_t Tin_area = (size_t)Tin * Tin;
+        for (int i = 0; i < nc; ++i) {
+            ckpt::CellRecordHeader rec{};
+            fread(&rec, sizeof(rec), 1, f);
+            if (ver == 8) p.gid[i] = rec.cell_id;
+            p.cx[i] = rec.cx;  p.cy[i] = rec.cy;
+            p.vx[i] = rec.vx;  p.vy[i] = rec.vy;
+            p.vol[i] = rec.volume;
+            p.ox[i] = rec.origin_x;  p.oy[i] = rec.origin_y;
+            p.phi_tiles[i].assign(TILE_AREA, 0.0f);
+            if (Tin == TILE_T) {
+                fread(p.phi_tiles[i].data(), sizeof(float), TILE_AREA, f);
+            } else {
+                std::vector<float> tile_in(Tin_area);
+                fread(tile_in.data(), sizeof(float), Tin_area, f);
+                int dx = (TILE_T - Tin) / 2;
+                int dy = (TILE_T - Tin) / 2;
+                p.ox[i] = rec.origin_x - dx;
+                p.oy[i] = rec.origin_y - dy;
+                for (int ly = 0; ly < Tin; ++ly) {
+                    int dst_y = ly + dy;
+                    if (dst_y < 0 || dst_y >= TILE_T) continue;
+                    for (int lx = 0; lx < Tin; ++lx) {
+                        int dst_x = lx + dx;
+                        if (dst_x < 0 || dst_x >= TILE_T) continue;
+                        p.phi_tiles[i][dst_y * TILE_T + dst_x] = tile_in[ly * Tin + lx];
+                    }
+                }
             }
-            if (rank > 0) {
-                // Redirect to /<dir>/rank{K}/<basename(path_in)>.
-                std::string p = path_in;
-                size_t slash = p.find_last_of('/');
-                std::string dir = (slash == std::string::npos) ? "." : p.substr(0, slash);
-                std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
-                path = dir + "/rank" + std::to_string(rank) + "/" + base;
+        }
+        return;
+    }
+    // Legacy v3-v6: variable W/H tiles. Re-tile each cell into a
+    // centred TILE_T x TILE_T buffer.
+    for (int i = 0; i < nc; ++i) {
+        int32_t cid;
+        int32_t x0, y0, x1, y1;
+        fread(&cid, 4, 1, f);
+        fread(&x0, 4, 1, f); fread(&y0, 4, 1, f);
+        fread(&x1, 4, 1, f); fread(&y1, 4, 1, f);
+        fread(&p.cx[i],  4, 1, f); fread(&p.cy[i],  4, 1, f);
+        fread(&p.vx[i],  4, 1, f); fread(&p.vy[i],  4, 1, f);
+        fread(&p.vol[i], 4, 1, f);
+
+        int w = (x1 - x0) + 2 * halo;
+        int h = (y1 - y0) + 2 * halo;
+        int ox_legacy = x0 - halo;
+        int oy_legacy = y0 - halo;
+        std::vector<float> tile_legacy((size_t)w * h);
+        fread(tile_legacy.data(), sizeof(float), (size_t)w * h, f);
+
+        int dx = (TILE_T - w) / 2;
+        int dy = (TILE_T - h) / 2;
+        p.ox[i] = ox_legacy - dx;
+        p.oy[i] = oy_legacy - dy;
+        p.phi_tiles[i].assign(TILE_AREA, 0.0f);
+        for (int ly = 0; ly < h; ++ly) {
+            int dst_y = ly + dy;
+            if (dst_y < 0 || dst_y >= TILE_T) continue;
+            for (int lx = 0; lx < w; ++lx) {
+                int dst_x = lx + dx;
+                if (dst_x < 0 || dst_x >= TILE_T) continue;
+                p.phi_tiles[i][dst_y * TILE_T + dst_x] = tile_legacy[ly * w + lx];
             }
         }
     }
+}
 
+// Read magic-tagged per-cell sidecar blocks (VA_A/GAMA/RADI/POLR/RNGS) into
+// the payload. Stops at the first unrecognized magic (or EOF) and rewinds
+// so callers don't lose position.
+void decode_sidecars(FILE* f, CheckpointPayload& p) {
+    while (true) {
+        long pos = ftell(f);
+        ckpt::SidecarBlockHeader sh{};
+        if (fread(&sh, sizeof(sh), 1, f) != 1) break;
+        if (sh.magic == ckpt::MAGIC_VA_A || sh.magic == ckpt::MAGIC_GAMA ||
+            sh.magic == ckpt::MAGIC_RADI || sh.magic == ckpt::MAGIC_POLR) {
+            std::vector<float> data(sh.count);
+            fread(data.data(), sizeof(float), sh.count, f);
+            if      (sh.magic == ckpt::MAGIC_VA_A) p.per_vA          = std::move(data);
+            else if (sh.magic == ckpt::MAGIC_GAMA) p.per_gamma       = std::move(data);
+            else if (sh.magic == ckpt::MAGIC_RADI) p.per_radius      = std::move(data);
+            else                                   p.per_polar_theta = std::move(data);
+        } else if (sh.magic == ckpt::MAGIC_RNGS) {
+            const size_t payload = (size_t)sh.count * sizeof(curandState);
+            p.per_rng_bytes.assign(payload, 0);
+            if (payload > 0) fread(p.per_rng_bytes.data(), 1, payload, f);
+        } else {
+            fseek(f, pos, SEEK_SET);
+            break;
+        }
+    }
+}
+
+// Top-level pure file I/O: read whatever is on disk into a CheckpointPayload.
+// Touches NO Simulation state. Returns false on missing file, bad magic, or
+// unrecoverable SimParams layout mismatch.
+bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) {
         fprintf(stderr, "Failed to open checkpoint %s\n", path.c_str());
@@ -753,15 +962,11 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
         fprintf(stderr, "Not a cell_sim checkpoint (magic=0x%08x)\n", magic);
         fclose(f); return false;
     }
+    out.version = ver;
 
     int32_t cs = 0; double ct_f64 = 0.0; int32_t nc = 0;
     int32_t si = 0, ci2 = 0, ts = 0; uint8_t bools[4]{}; uint32_t sp_sz = 0;
-
     if (ver >= 5) {
-        // v5+: read the rest of FixedPrefix as one POD. The on-disk
-        // layout is defined by ckpt::FixedPrefix; a layout drift here
-        // would be a static_assert failure at compile time, not a silent
-        // miscount at runtime.
         ckpt::FixedPrefix prefix{};
         prefix.magic   = magic;
         prefix.version = ver;
@@ -776,8 +981,7 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
         std::memcpy(bools, prefix.bools, 4);
         sp_sz  = prefix.sp_sz;
     } else {
-        // v3/v4: cur_time was f32 (4 bytes), so the prefix is 4 bytes
-        // shorter. Read scalars individually to honour the legacy layout.
+        // v3/v4: cur_time was f32 (4 bytes), 4-byte-shorter prefix.
         fread(&cs, 4, 1, f);
         float ct_f32 = 0.0f;
         fread(&ct_f32, 4, 1, f);
@@ -789,92 +993,72 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
         fread(bools, 1, 4, f);
         fread(&sp_sz, 4, 1, f);
     }
+    (void)si; (void)ci2; (void)ts; (void)bools;
 
-    if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7 || ver == 8)) {
-        fread(&params, sp_sz, 1, f);
-        // subdomain_padding was a dead field in v6/v7 ckpts; reset to
-        // current default so resumed runs use a sane adaptive-rect K.
-        // CLI override below still wins.
-        params.subdomain_padding = SimParams{}.subdomain_padding;
-    } else if (ver == 7 || ver == 8) {
-        fprintf(stderr, "v%u checkpoint with foreign SimParams (sp=%u, ours=%zu)\n",
-                ver, sp_sz, sizeof(SimParams));
+    if (!decode_simparams(f, ver, sp_sz, out.params)) {
         fclose(f); return false;
-    } else {
-        // Legacy v3/v4/v5: SimParams was a packed f32 layout. Two
-        // known sub-variants live in the wild; we key off sp_sz:
-        //
-        //   sp_sz == 72 (or 76 with abp): old pre-cutover baseline.
-        //     Nx Ny dx dy dt t_end λ γ κ R μ v_A ξ τ halo
-        //     offsets: 0 4 8 12 16 20 24 28 32 36 40 44 48 52 60
-        //
-        //   sp_sz == 92: v4 produced by the roihu binary (May 2026).
-        //     Nx Ny dx dy dt t_end N_cells λ γ κ R μ v_A ξ τ halo print_int sub_pad ... gamma_soft
-        //     offsets: 0 4 8 12 16 20  24    28 32 36 40 44 48 52 56 60 64 68 ... 84
-        //
-        // The v4 layout inserts an int32 cell-count N at @24 that
-        // shifts all the f32 physics scalars (λ..τ) by +4. `halo`
-        // sits at @60 in both layouts (post-cutover dropped a slot
-        // after τ so halo lines up again). Mis-reading this was the
-        // root cause of the τ=1500 silent corruption observed in
-        // FSS pipeline runs resumed from May-6 roihu equilibrations.
-        std::vector<uint8_t> sp(sp_sz);
-        fread(sp.data(), 1, sp_sz, f);
-        auto u_i32 = [&](size_t off) {
-            int32_t v; std::memcpy(&v, sp.data() + off, 4); return v;
-        };
-        auto u_f32 = [&](size_t off) {
-            float v; std::memcpy(&v, sp.data() + off, 4); return v;
-        };
-        params = SimParams{};
-        params.Nx    = u_i32(0);
-        params.Ny    = u_i32(4);
-        params.dx    = u_f32(8);
-        params.dy    = u_f32(12);
-        params.dt    = u_f32(16);
-        params.t_end = u_f32(20);
-        // Physics scalars: shift by +4 for v4 (sp_sz=92) because the
-        // writer inserted an int32 N at offset 24.
-        const bool is_v4_roihu = (sp_sz == 92);
-        const size_t shift = is_v4_roihu ? 4 : 0;
-        params.lambda        = u_f32(24 + shift);
-        params.gamma         = u_f32(28 + shift);
-        params.kappa         = u_f32(32 + shift);
-        params.target_radius = u_f32(36 + shift);
-        params.mu            = u_f32(40 + shift);
-        params.v_A           = u_f32(44 + shift);
-        params.xi            = u_f32(48 + shift);
-        params.tau           = u_f32(52 + shift);
-        // halo sits at @60 in both layouts (after-τ slot lines up
-        // again because v4 dropped a different field elsewhere).
-        params.halo          = u_i32(60);
-        if (is_v4_roihu) {
-            // v4 carries print_interval explicitly.
-            if (sp_sz >= 68) params.print_interval = u_i32(64);
-        } else if (sp_sz >= 76) {
-            // pre-cutover baseline: abp at @72.
-            params.abp = (u_i32(72) == 1);
-        }
-        // subdomain_padding is set to current default either way — was
-        // a dead/stale field in both legacy formats.
-        params.subdomain_padding = SimParams{}.subdomain_padding;
-        if (params.print_interval == 0) params.print_interval = 100;
-        params.trajectory_samples = 0;
-        // Log the choice — silent legacy parsing has caused real
-        // physics corruption; keep this prominent in the resume log.
-        fprintf(stderr,
-                "[ckpt] legacy v%u SimParams: sp_sz=%u → %s layout "
-                "(τ=%.1f, ξ=%.1f, λ=%.1f, γ=%.2f, halo=%d)\n",
-                ver, sp_sz,
-                (is_v4_roihu ? "v4-roihu (shifted)" : "baseline-72"),
-                params.tau, params.xi, params.lambda, params.gamma,
-                params.halo);
     }
+    out.step_count = cs;
+    out.cur_time   = ct_f64;
+    out.num_cells  = nc;
+    out.v8_n_global = nc;  // sensible default; v8 reader overrides below
 
-    step_count = cs;
-    cur_time   = ct_f64;
+    int Tin = TILE_T;
+    int halo_legacy = out.params.halo;
+    if (ver == 7 || ver == 8) {
+        int32_t T_in = 0;
+        fread(&T_in, 4, 1, f);
+        Tin = T_in;
+        if (Tin != TILE_T) {
+            fprintf(stderr, "[ckpt] v%u TILE_T re-tile: file=%d build=%d\n",
+                    ver, Tin, TILE_T);
+        }
+        if (ver == 8) {
+            ckpt::RankTrailer trailer{};
+            fread(&trailer, sizeof(trailer), 1, f);
+            out.v8_num_ranks = trailer.num_ranks;
+            out.v8_rank_id   = trailer.rank_id;
+            out.v8_n_global  = trailer.num_cells_global;
+        }
+    }
+    decode_cell_records(f, ver, Tin, halo_legacy, out);
+    if (ver < 7) {
+        // Legacy format had no halo concept after re-tile; record 0.
+        out.params.halo = 0;
+    }
+    decode_sidecars(f, out);
+    fclose(f);
+    return true;
+}
+}  // namespace
 
-    // Apply CLI overrides on top of the loaded params.
+// ---------------------------------------------------------------------------
+// init_from_checkpoint — thin orchestrator.
+//
+// 1. resolve path (v8 multi-rank dispatch)
+// 2. read_checkpoint(path) — pure file I/O, returns a CheckpointPayload
+// 3. adopt payload into this Simulation (params, step_count, cur_time, h_cells)
+// 4. apply CLI overrides, recompute traj cadence, build slab layout
+// 5. alloc_gpu, resolve per-cell scalar policy (gamma_spec, v_A_sigma, sidecars)
+// 6. upload to GPU, restore RNG if RNGS sidecar present
+// 7. finalize_init
+// ---------------------------------------------------------------------------
+bool Simulation::init_from_checkpoint(const std::string& path_in,
+                                      const SimParams& cli,
+                                      const SimOverrides& ov) {
+    std::string path;
+    if (!resolve_checkpoint_path(path_in, gpus, rank, path)) return false;
+
+    CheckpointPayload payload;
+    if (!read_checkpoint(path, payload)) return false;
+
+    // ---- Adopt the payload into Simulation state ----
+    params      = payload.params;
+    step_count  = payload.step_count;
+    cur_time    = payload.cur_time;
+    const int nc = payload.num_cells;
+
+    // ---- CLI overrides on top of the loaded params ----
     if (ov.t_end)              params.t_end = cli.t_end;
     if (ov.dt)                 params.dt = cli.dt;
     if (ov.v_A)                params.v_A = cli.v_A;
@@ -918,151 +1102,13 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
         if (traj_every < 1) traj_every = 1;
     }
 
-    // ----- Per-cell load -----
+    // ---- Build host cell vector from payload ----
     h_cells.resize(nc);
-    std::vector<float> ck_cx(nc), ck_cy(nc), ck_vx(nc), ck_vy(nc), ck_vol(nc);
-    std::vector<int>   ck_ox(nc), ck_oy(nc);
-    std::vector<std::vector<float>> ck_phi(nc);
-    // v8 multi-rank info (default to single-rank values for v3..v7).
-    int32_t v8_num_ranks = 1, v8_rank_id = 0, v8_n_global = nc;
-    // Per-cell global ids; populated on v8 reads (otherwise = local index).
-    std::vector<int> ck_gid(nc);
-    for (int i = 0; i < nc; ++i) ck_gid[i] = i;
-
-    if (ver == 7 || ver == 8) {
-        // Native v7/v8 format: uniform tiles of size T_in. T_in usually
-        // matches the build's TILE_T but we accept any size and re-tile
-        // (centred) into TILE_T x TILE_T buffers.
-        int32_t T_in = 0;
-        fread(&T_in, 4, 1, f);
-        const int Tin = T_in;
-        const size_t Tin_area = (size_t)Tin * Tin;
-        if (Tin != TILE_T) {
-            fprintf(stderr, "[ckpt] v%u TILE_T re-tile: file=%d build=%d\n",
-                    ver, Tin, TILE_T);
-        }
-        if (ver == 8) {
-            ckpt::RankTrailer trailer{};
-            fread(&trailer, sizeof(trailer), 1, f);
-            v8_num_ranks = trailer.num_ranks;
-            v8_rank_id   = trailer.rank_id;
-            v8_n_global  = trailer.num_cells_global;
-        }
-        for (int i = 0; i < nc; i++) {
-            ckpt::CellRecordHeader rec{};
-            fread(&rec, sizeof(rec), 1, f);
-            if (ver == 8) ck_gid[i] = rec.cell_id;
-            ck_cx[i]  = rec.cx;
-            ck_cy[i]  = rec.cy;
-            ck_vx[i]  = rec.vx;
-            ck_vy[i]  = rec.vy;
-            ck_vol[i] = rec.volume;
-            ck_ox[i]  = rec.origin_x;
-            ck_oy[i]  = rec.origin_y;
-            ck_phi[i].assign(TILE_AREA, 0.0f);
-            if (Tin == TILE_T) {
-                fread(ck_phi[i].data(), sizeof(float), TILE_AREA, f);
-            } else {
-                std::vector<float> tile_in(Tin_area);
-                fread(tile_in.data(), sizeof(float), Tin_area, f);
-                // Centre Tin x Tin inside TILE_T x TILE_T (or crop if larger).
-                int dx = (TILE_T - Tin) / 2;
-                int dy = (TILE_T - Tin) / 2;
-                ck_ox[i] = rec.origin_x - dx;
-                ck_oy[i] = rec.origin_y - dy;
-                for (int ly = 0; ly < Tin; ly++) {
-                    int dst_y = ly + dy;
-                    if (dst_y < 0 || dst_y >= TILE_T) continue;
-                    for (int lx = 0; lx < Tin; lx++) {
-                        int dst_x = lx + dx;
-                        if (dst_x < 0 || dst_x >= TILE_T) continue;
-                        ck_phi[i][dst_y * TILE_T + dst_x] = tile_in[ly * Tin + lx];
-                    }
-                }
-            }
-            h_cells[i] = {ck_cx[i], ck_cy[i],
-                          params.target_radius, params.gamma, params.v_A,
-                          ck_ox[i], ck_oy[i]};
-        }
-    } else {
-        // Legacy v3-v6: variable W/H tiles. Re-tile each cell into a
-        // centred TILE_T x TILE_T buffer.
-        int halo = params.halo;
-        for (int i = 0; i < nc; i++) {
-            int32_t cid;
-            int32_t x0, y0, x1, y1;
-            fread(&cid, 4, 1, f);
-            fread(&x0, 4, 1, f); fread(&y0, 4, 1, f);
-            fread(&x1, 4, 1, f); fread(&y1, 4, 1, f);
-            fread(&ck_cx[i],  4, 1, f); fread(&ck_cy[i],  4, 1, f);
-            fread(&ck_vx[i],  4, 1, f); fread(&ck_vy[i],  4, 1, f);
-            fread(&ck_vol[i], 4, 1, f);
-
-            int w = (x1 - x0) + 2 * halo;
-            int h = (y1 - y0) + 2 * halo;
-            int ox_legacy = x0 - halo;
-            int oy_legacy = y0 - halo;
-
-            std::vector<float> tile_legacy((size_t)w * h);
-            fread(tile_legacy.data(), sizeof(float), (size_t)w * h, f);
-
-            // Re-tile: place legacy tile centred inside TILE_T x TILE_T,
-            // adjust origin so that same global pixel still maps to same
-            // local coord. New origin = legacy_origin - centring_offset.
-            int dx = (TILE_T - w) / 2;
-            int dy = (TILE_T - h) / 2;
-            int ox_new = ox_legacy - dx;
-            int oy_new = oy_legacy - dy;
-
-            ck_ox[i] = ox_new;
-            ck_oy[i] = oy_new;
-            ck_phi[i].assign(TILE_AREA, 0.0f);
-            for (int ly = 0; ly < h; ly++) {
-                int dst_y = ly + dy;
-                if (dst_y < 0 || dst_y >= TILE_T) continue;
-                for (int lx = 0; lx < w; lx++) {
-                    int dst_x = lx + dx;
-                    if (dst_x < 0 || dst_x >= TILE_T) continue;
-                    ck_phi[i][dst_y * TILE_T + dst_x] = tile_legacy[ly * w + lx];
-                }
-            }
-            h_cells[i] = {ck_cx[i], ck_cy[i],
-                          params.target_radius, params.gamma, params.v_A,
-                          ox_new, oy_new};
-        }
-        // No halo concept in the current format; record 0 for round-trip.
-        params.halo = 0;
+    for (int i = 0; i < nc; ++i) {
+        h_cells[i] = {payload.cx[i], payload.cy[i],
+                      params.target_radius, params.gamma, params.v_A,
+                      payload.ox[i], payload.oy[i]};
     }
-
-    // Optional per-cell magic-tagged sidecar arrays (VA_A, GAMA, RADI, POLR, RNGS).
-    std::vector<float> per_vA, per_gamma, per_radius, per_polar_theta;
-    std::vector<uint8_t> per_rng_bytes;  // raw curandState blob, empty if absent
-    while (true) {
-        long pos = ftell(f);
-        ckpt::SidecarBlockHeader sh{};
-        if (fread(&sh, sizeof(sh), 1, f) != 1) break;
-        if (sh.magic == ckpt::MAGIC_VA_A || sh.magic == ckpt::MAGIC_GAMA ||
-            sh.magic == ckpt::MAGIC_RADI || sh.magic == ckpt::MAGIC_POLR) {
-            std::vector<float> data(sh.count);
-            fread(data.data(), sizeof(float), sh.count, f);
-            if      (sh.magic == ckpt::MAGIC_VA_A) per_vA          = std::move(data);
-            else if (sh.magic == ckpt::MAGIC_GAMA) per_gamma       = std::move(data);
-            else if (sh.magic == ckpt::MAGIC_RADI) per_radius      = std::move(data);
-            else                                   per_polar_theta = std::move(data);
-        } else if (sh.magic == ckpt::MAGIC_RNGS) {
-            // Raw curandState bytes: count cells, sizeof(curandState) per cell.
-            // Size is implicit in the build's curand type; if a future build
-            // changes the curand variant, the load will read the wrong byte
-            // count. Mismatch is rejected by comparing payload size.
-            const size_t payload = (size_t)sh.count * sizeof(curandState);
-            per_rng_bytes.assign(payload, 0);
-            if (payload > 0) fread(per_rng_bytes.data(), 1, payload, f);
-        } else {
-            fseek(f, pos, SEEK_SET);
-            break;
-        }
-    }
-    fclose(f);
 
     if (params.Nx < TILE_T || params.Ny < TILE_T) {
         fprintf(stderr,
@@ -1071,63 +1117,52 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
         std::exit(1);
     }
 
-    // ---- Multi-GPU slab geometry on resume ----
+    // ---- Multi-GPU slab geometry ----
     // alloc_gpu() needs the slab geometry set before it allocates S, so
     // build the layout here. Three resume cases:
     //  (a) gpus == 1: trivial single-GPU.
     //  (b) gpus > 1 with a v8 multi-rank checkpoint matching gpus: each
     //      rank's file already contains only its own slab cells.
     //  (c) gpus > 1 with v7 or v8-single-rank: not supported by the C++
-    //      loader (would need cross-rank scatter; use cell_analyze to
-    //      consolidate or split first).
+    //      loader; use cell_analyze to consolidate or split first.
     build_layout();
     if (gpus > 1) {
-        if (ver == 8 && v8_num_ranks == gpus) {
-            cells_global = v8_n_global;
-            h_global_id = ck_gid;
+        if (payload.version == 8 && payload.v8_num_ranks == gpus) {
+            cells_global = payload.v8_n_global;
+            h_global_id  = payload.gid;
         } else {
-            std::string layout_desc = (ver == 8)
-                ? (std::to_string(v8_num_ranks) + "-rank")
+            std::string layout_desc = (payload.version == 8)
+                ? (std::to_string(payload.v8_num_ranks) + "-rank")
                 : "single-rank";
             fprintf(stderr,
                 "[ckpt] cannot resume a v%u %s checkpoint with --gpus %d. "
                 "Save with the same --gpus, or use `cell_analyze merge-ckpt`/"
                 "`split-ckpt` to consolidate or repartition the per-rank "
                 "files first.\n",
-                ver, layout_desc.c_str(), gpus);
+                payload.version, layout_desc.c_str(), gpus);
             return false;
         }
     } else {
-        // gpus == 1: keep slab covering the full grid (already the default).
         cells_global = nc;
-        h_global_id = ck_gid;
+        h_global_id  = payload.gid;
     }
 
     alloc_gpu();
     const int n = cells.num_cells;
 
-    // Resolve per-cell scalars: CLI overrides > sidecar arrays > params.
-    bool user_set_gamma = !gamma_spec.empty();
-    if (user_set_gamma) {
-        apply_gamma_spec();      // writes into h_cells[i].gamma
-        per_gamma.clear();
+    // ---- Resolve per-cell scalars: CLI > sidecar > params ----
+    if (!gamma_spec.empty()) {
+        apply_gamma_spec();           // writes into h_cells[i].gamma
+        payload.per_gamma.clear();
     }
-    // v_A handling on resume:
-    //  * If `--v-A-sigma` was passed (v_A_sigma > 0), the user is
-    //    explicitly resetting disorder — drop sidecar and regenerate
-    //    later via apply_v_A_disorder().
-    //  * Otherwise keep the sidecar as-is. CLI `--v-A` only updates
-    //    params.v_A (used for fresh cells without sidecar entries).
-    //    This preserves Griffiths disorder across resumes.
-    bool user_set_sigma = (v_A_sigma > 0.0);
-    if (user_set_sigma) per_vA.clear();
+    if (v_A_sigma > 0.0) payload.per_vA.clear();
     // Guard the "all-zero sidecar" case: equilibrations with v_A=0 still
     // emit a VA_A sidecar (all zeros). Resuming with --v-A>0 must use the
     // CLI value, not the zero sidecar.
-    if (ov.v_A && !per_vA.empty() && cli.v_A > 0.0) {
+    if (ov.v_A && !payload.per_vA.empty() && cli.v_A > 0.0) {
         double sum = 0.0;
-        for (float v : per_vA) sum += std::fabs(v);
-        if (sum <= 1e-12) per_vA.clear();
+        for (float v : payload.per_vA) sum += std::fabs(v);
+        if (sum <= 1e-12) payload.per_vA.clear();
     }
 
     // Polarity RNG for legacy resumes that lack a POLR block.
@@ -1136,23 +1171,22 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     std::vector<int>   h_origin(2 * n);
     std::vector<float> h_g(n), h_vA(n), h_tr(n);
     std::vector<float> h_th(n), h_px(n), h_py(n);
-
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; ++i) {
         auto& c = h_cells[i];
-        double g  = (i < (int)per_gamma.size())  ? (double)per_gamma[i]  : c.gamma;
-        double R  = (i < (int)per_radius.size()) ? (double)per_radius[i] : c.radius;
-        double vA = (i < (int)per_vA.size())     ? (double)per_vA[i]     : c.v_A;
+        double g  = (i < (int)payload.per_gamma.size())  ? (double)payload.per_gamma[i]  : c.gamma;
+        double R  = (i < (int)payload.per_radius.size()) ? (double)payload.per_radius[i] : c.radius;
+        double vA = (i < (int)payload.per_vA.size())     ? (double)payload.per_vA[i]     : c.v_A;
         c.gamma = g; c.radius = R; c.v_A = vA;
 
-        h_origin[2*i + 0] = ck_ox[i];
-        h_origin[2*i + 1] = ck_oy[i];
+        h_origin[2*i + 0] = payload.ox[i];
+        h_origin[2*i + 1] = payload.oy[i];
         h_g [i] = (float)g;
         h_vA[i] = (float)vA;
         h_tr[i] = (float)R;
 
         float theta;
-        if (i < (int)per_polar_theta.size()) {
-            theta = per_polar_theta[i];
+        if (i < (int)payload.per_polar_theta.size()) {
+            theta = payload.per_polar_theta[i];
         } else {
             theta = (float)(rand() % 10000) / 10000.0f * 2.0f * (float)M_PI;
         }
@@ -1172,7 +1206,7 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     // Initial rect on resume: full minus 1px halo. First rebind shrinks it.
     {
         std::vector<int> h_rect(4 * n);
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n; ++i) {
             h_rect[4*i + 0] = 1;
             h_rect[4*i + 1] = 1;
             h_rect[4*i + 2] = TILE_T - 2;
@@ -1181,30 +1215,30 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
         CK(cudaMemcpy(cells.rect, h_rect.data(), 4*n*sizeof(int), cudaMemcpyHostToDevice));
     }
 
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; ++i) {
         CK(cudaMemcpy(cells.phi_in + (size_t)i * TILE_AREA,
-                      ck_phi[i].data(), TILE_AREA * sizeof(float),
+                      payload.phi_tiles[i].data(), TILE_AREA * sizeof(float),
                       cudaMemcpyHostToDevice));
     }
-    CK(cudaMemcpy(cells.velocities_x, ck_vx.data(), n*sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(cells.velocities_y, ck_vy.data(), n*sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(cells.velocities_x, payload.vx.data(), n*sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(cells.velocities_y, payload.vy.data(), n*sizeof(float), cudaMemcpyHostToDevice));
 
     // Restore per-cell curandState from the RNGS sidecar (when present and
     // sized as expected). A user-supplied --polarity-seed on resume defeats
     // the restore so they get a fresh independent stream. Without restore,
     // finalize_init() re-seeds and the resumed run replays correlated RNG.
     if (!ov.polarity_seed &&
-        !per_rng_bytes.empty() &&
-        per_rng_bytes.size() == (size_t)n * sizeof(curandState)) {
-        CK(cudaMemcpy(cells.rng_states, per_rng_bytes.data(),
-                      per_rng_bytes.size(), cudaMemcpyHostToDevice));
+        !payload.per_rng_bytes.empty() &&
+        payload.per_rng_bytes.size() == (size_t)n * sizeof(curandState)) {
+        CK(cudaMemcpy(cells.rng_states, payload.per_rng_bytes.data(),
+                      payload.per_rng_bytes.size(), cudaMemcpyHostToDevice));
         rng_restored_from_ckpt = true;
         printf("[SIM] restored RNG state for %d cells from checkpoint\n", n);
-    } else if (!per_rng_bytes.empty()) {
+    } else if (!payload.per_rng_bytes.empty()) {
         fprintf(stderr,
                 "[SIM] WARNING: RNGS sidecar present (%zu bytes) but ignored "
                 "(--polarity-seed override or size mismatch; expected %zu).\n",
-                per_rng_bytes.size(), (size_t)n * sizeof(curandState));
+                payload.per_rng_bytes.size(), (size_t)n * sizeof(curandState));
     }
 
     finalize_init();
