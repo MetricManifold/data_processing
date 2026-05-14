@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------------------
 // checkpoint_format.cuh — single source of truth for the binary checkpoint
-// header. C++ side mirrors rust/cell_data/src/checkpoint_format.rs (when it
-// exists). Bump CKPT_VERSION_CURRENT here and only here when changing format.
+// layout.  Writer (save_checkpoint), reader (init_from_checkpoint), and
+// peek (peek_v8_rank_header) all read/write through the POD records below.
+// Bump VERSION_CURRENT here and only here when changing format.
 // ---------------------------------------------------------------------------
 #pragma once
 #include <cstdint>
@@ -13,34 +14,67 @@ constexpr uint32_t VERSION_CURRENT = 8;
 constexpr uint32_t VERSION_MIN     = 3;
 
 // Sidecar block magics (appear after per-cell records, in any order).
-constexpr uint32_t MAGIC_VA_A = 0x56415F41;  // 'VA_A'
-constexpr uint32_t MAGIC_GAMA = 0x47414D41;  // 'GAMA'
-constexpr uint32_t MAGIC_RADI = 0x52414449;  // 'RADI'
-constexpr uint32_t MAGIC_POLR = 0x504F4C52;  // 'POLR'
-constexpr uint32_t MAGIC_RNGS = 0x53474E52;  // 'RNGS'
+constexpr uint32_t MAGIC_VA_A = 0x56415F41;  // 'VA_A' — per-cell v_A
+constexpr uint32_t MAGIC_GAMA = 0x47414D41;  // 'GAMA' — per-cell gamma
+constexpr uint32_t MAGIC_RADI = 0x52414449;  // 'RADI' — per-cell target radius
+constexpr uint32_t MAGIC_POLR = 0x504F4C52;  // 'POLR' — per-cell polarity theta
+constexpr uint32_t MAGIC_RNGS = 0x53474E52;  // 'RNGS' — per-cell curandState blob
 
-// v8 layout (all little-endian, packed):
-//   magic(u32)=MAGIC, version(u32)=8,
-//   step(i32), cur_time(f64),
-//   num_cells_local(i32), save_interval(i32), reserved(i32),
-//   trajectory_samples(i32),
-//   bools[4](u8),
-//   sp_sz(u32), SimParams(sp_sz bytes),
-//   tile_t(i32),
-//   num_ranks(i32), rank_id(i32), num_cells_global(i32),     <-- NEW in v8
-//   per local cell:
-//     cell_id(i32) = GLOBAL id,
-//     origin_x(i32), origin_y(i32),
-//     cx(f32), cy(f32), vx(f32), vy(f32), volume(f32),
-//     phi[tile_t*tile_t](f32)
-//   sidecar arrays: VA_A, GAMA, RADI, POLR, RNGS (each: magic, count, data)
-//
-// v7 is identical except the three NEW i32s are absent and `cell_id` is the
-// local array index (not stable across rank counts).
-//
-// For G=1 runs, v8 still writes num_ranks=1, rank_id=0, num_cells_global=N.
-// This makes v8 self-describing for any rank count and lets a multi-rank
-// run be reassembled from the per-rank files alone (each cell carries its
-// global id, so cross-rank join is unambiguous).
+// ---------------------------------------------------------------------------
+// On-disk records. Packed and little-endian (every supported host platform
+// writes LE natively). The structs ARE the schema: writer/reader/peek all
+// fread/fwrite these as units, so layout drift is a compile error rather
+// than a silent miscount.
+// ---------------------------------------------------------------------------
+#pragma pack(push, 1)
+
+// File bytes 0..39. SimParams blob (sp_sz bytes) follows, then tile_t (i32),
+// then RankTrailer (v8+ only), then per-cell records, then sidecar blocks.
+struct FixedPrefix {
+    uint32_t magic;               // = MAGIC
+    uint32_t version;             // >= VERSION_MIN, <= VERSION_CURRENT
+    int32_t  step;
+    double   cur_time;            // v5+; v3-v4 used f32 — legacy reader handles
+    int32_t  num_cells_local;
+    int32_t  save_interval;
+    int32_t  reserved;
+    int32_t  trajectory_samples;
+    uint8_t  bools[4];
+    uint32_t sp_sz;
+};
+
+// v8+ only.  Lets per-rank files of a multi-GPU run be merged unambiguously.
+struct RankTrailer {
+    int32_t num_ranks;
+    int32_t rank_id;
+    int32_t num_cells_global;
+};
+
+// One per cell.  Followed by tile_t*tile_t f32s of phi data.
+struct CellRecordHeader {
+    int32_t cell_id;              // global id in v8+, local index pre-v8
+    int32_t origin_x;
+    int32_t origin_y;
+    float   cx;
+    float   cy;
+    float   vx;
+    float   vy;
+    float   volume;
+};
+
+// Each sidecar block starts with this, followed by count*dtype-sized values.
+// dtype is implied by magic (float for VA_A/GAMA/RADI/POLR, curandState bytes
+// for RNGS).
+struct SidecarBlockHeader {
+    uint32_t magic;
+    int32_t  count;
+};
+
+#pragma pack(pop)
+
+static_assert(sizeof(FixedPrefix)       == 44, "FixedPrefix layout drift");
+static_assert(sizeof(RankTrailer)       == 12, "RankTrailer layout drift");
+static_assert(sizeof(CellRecordHeader)  == 32, "CellRecordHeader layout drift");
+static_assert(sizeof(SidecarBlockHeader) == 8, "SidecarBlockHeader layout drift");
 
 }  // namespace ckpt

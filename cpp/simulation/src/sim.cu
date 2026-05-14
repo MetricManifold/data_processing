@@ -11,6 +11,7 @@
 //   * Writes: v7 only.
 
 #include "sim.cuh"
+#include "checkpoint_format.cuh"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cstdlib>
@@ -638,23 +639,22 @@ bool peek_v8_rank_header(const std::string& path,
     num_ranks = 1; rank_id = 0; num_cells_global = 0;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
-    uint32_t magic = 0, ver = 0;
-    if (fread(&magic, 4, 1, f) != 1 || fread(&ver, 4, 1, f) != 1 ||
-        magic != 0x43454C4C || ver < 8) {
+    ckpt::FixedPrefix prefix{};
+    if (fread(&prefix, sizeof(prefix), 1, f) != 1 ||
+        prefix.magic != ckpt::MAGIC || prefix.version < 8) {
         fclose(f); return false;
     }
-    // After magic+ver (8 bytes), skip: step(4)+cur_time(8)+nc(4)+si(4)
-    //   +reserved(4)+ts(4)+bools(4) = 32 bytes. Now at sp_sz.
-    if (fseek(f, 32, SEEK_CUR) != 0) { fclose(f); return false; }
-    uint32_t sp_sz = 0;
-    if (fread(&sp_sz, 4, 1, f) != 1) { fclose(f); return false; }
-    // Skip SimParams blob + T_w(4). Now at the v8 trailer (3 i32s).
-    if (fseek(f, (long)sp_sz + 4, SEEK_CUR) != 0) { fclose(f); return false; }
-    if (fread(&num_ranks,        4, 1, f) != 1 ||
-        fread(&rank_id,          4, 1, f) != 1 ||
-        fread(&num_cells_global, 4, 1, f) != 1) {
+    // Skip SimParams blob + tile_t(4). Now at the v8 trailer.
+    if (fseek(f, (long)prefix.sp_sz + (long)sizeof(int32_t), SEEK_CUR) != 0) {
         fclose(f); return false;
     }
+    ckpt::RankTrailer trailer{};
+    if (fread(&trailer, sizeof(trailer), 1, f) != 1) {
+        fclose(f); return false;
+    }
+    num_ranks        = trailer.num_ranks;
+    rank_id          = trailer.rank_id;
+    num_cells_global = trailer.num_cells_global;
     fclose(f);
     return true;
 }
@@ -703,7 +703,7 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     uint32_t magic = 0, ver = 0;
     fread(&magic, 4, 1, f);
     fread(&ver,   4, 1, f);
-    if (magic != 0x43454C4C) {
+    if (magic != ckpt::MAGIC) {
         fprintf(stderr, "Not a cell_sim checkpoint (magic=0x%08x)\n", magic);
         fclose(f); return false;
     }
@@ -711,20 +711,38 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     int32_t cs = 0; double ct_f64 = 0.0; int32_t nc = 0;
     int32_t si = 0, ci2 = 0, ts = 0; uint8_t bools[4]{}; uint32_t sp_sz = 0;
 
-    fread(&cs, 4, 1, f);
     if (ver >= 5) {
-        fread(&ct_f64, 8, 1, f);
+        // v5+: read the rest of FixedPrefix as one POD. The on-disk
+        // layout is defined by ckpt::FixedPrefix; a layout drift here
+        // would be a static_assert failure at compile time, not a silent
+        // miscount at runtime.
+        ckpt::FixedPrefix prefix{};
+        prefix.magic   = magic;
+        prefix.version = ver;
+        const size_t tail_bytes = sizeof(prefix) - 8;
+        fread(reinterpret_cast<uint8_t*>(&prefix) + 8, tail_bytes, 1, f);
+        cs     = prefix.step;
+        ct_f64 = prefix.cur_time;
+        nc     = prefix.num_cells_local;
+        si     = prefix.save_interval;
+        ci2    = prefix.reserved;
+        ts     = prefix.trajectory_samples;
+        std::memcpy(bools, prefix.bools, 4);
+        sp_sz  = prefix.sp_sz;
     } else {
+        // v3/v4: cur_time was f32 (4 bytes), so the prefix is 4 bytes
+        // shorter. Read scalars individually to honour the legacy layout.
+        fread(&cs, 4, 1, f);
         float ct_f32 = 0.0f;
         fread(&ct_f32, 4, 1, f);
         ct_f64 = ct_f32;
+        fread(&nc, 4, 1, f);
+        fread(&si, 4, 1, f);
+        fread(&ci2, 4, 1, f);
+        fread(&ts, 4, 1, f);
+        fread(bools, 1, 4, f);
+        fread(&sp_sz, 4, 1, f);
     }
-    fread(&nc, 4, 1, f);
-    fread(&si, 4, 1, f);
-    fread(&ci2, 4, 1, f);
-    fread(&ts, 4, 1, f);
-    fread(bools, 1, 4, f);
-    fread(&sp_sz, 4, 1, f);
 
     if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7 || ver == 8)) {
         fread(&params, sp_sz, 1, f);
@@ -878,19 +896,23 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
                     ver, Tin, TILE_T);
         }
         if (ver == 8) {
-            fread(&v8_num_ranks, 4, 1, f);
-            fread(&v8_rank_id,   4, 1, f);
-            fread(&v8_n_global,  4, 1, f);
+            ckpt::RankTrailer trailer{};
+            fread(&trailer, sizeof(trailer), 1, f);
+            v8_num_ranks = trailer.num_ranks;
+            v8_rank_id   = trailer.rank_id;
+            v8_n_global  = trailer.num_cells_global;
         }
         for (int i = 0; i < nc; i++) {
-            int32_t cid; fread(&cid, 4, 1, f);
-            if (ver == 8) ck_gid[i] = cid;
-            int32_t ox, oy;
-            fread(&ox, 4, 1, f); fread(&oy, 4, 1, f);
-            fread(&ck_cx[i],  4, 1, f); fread(&ck_cy[i],  4, 1, f);
-            fread(&ck_vx[i],  4, 1, f); fread(&ck_vy[i],  4, 1, f);
-            fread(&ck_vol[i], 4, 1, f);
-            ck_ox[i] = ox; ck_oy[i] = oy;
+            ckpt::CellRecordHeader rec{};
+            fread(&rec, sizeof(rec), 1, f);
+            if (ver == 8) ck_gid[i] = rec.cell_id;
+            ck_cx[i]  = rec.cx;
+            ck_cy[i]  = rec.cy;
+            ck_vx[i]  = rec.vx;
+            ck_vy[i]  = rec.vy;
+            ck_vol[i] = rec.volume;
+            ck_ox[i]  = rec.origin_x;
+            ck_oy[i]  = rec.origin_y;
             ck_phi[i].assign(TILE_AREA, 0.0f);
             if (Tin == TILE_T) {
                 fread(ck_phi[i].data(), sizeof(float), TILE_AREA, f);
@@ -900,8 +922,8 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
                 // Centre Tin x Tin inside TILE_T x TILE_T (or crop if larger).
                 int dx = (TILE_T - Tin) / 2;
                 int dy = (TILE_T - Tin) / 2;
-                ck_ox[i] = ox - dx;
-                ck_oy[i] = oy - dy;
+                ck_ox[i] = rec.origin_x - dx;
+                ck_oy[i] = rec.origin_y - dy;
                 for (int ly = 0; ly < Tin; ly++) {
                     int dst_y = ly + dy;
                     if (dst_y < 0 || dst_y >= TILE_T) continue;
@@ -971,27 +993,22 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     std::vector<uint8_t> per_rng_bytes;  // raw curandState blob, empty if absent
     while (true) {
         long pos = ftell(f);
-        uint32_t m;
-        if (fread(&m, 4, 1, f) != 1) break;
-        int32_t count = 0;
-        if (m == 0x56415F41 /* 'VA_A' */ ||
-            m == 0x47414D41 /* 'GAMA' */ ||
-            m == 0x52414449 /* 'RADI' */ ||
-            m == 0x504F4C52 /* 'POLR' */) {
-            fread(&count, 4, 1, f);
-            std::vector<float> data(count);
-            fread(data.data(), sizeof(float), count, f);
-            if      (m == 0x56415F41) per_vA          = std::move(data);
-            else if (m == 0x47414D41) per_gamma       = std::move(data);
-            else if (m == 0x52414449) per_radius      = std::move(data);
-            else                      per_polar_theta = std::move(data);
-        } else if (m == 0x53474E52 /* 'RNGS' */) {
+        ckpt::SidecarBlockHeader sh{};
+        if (fread(&sh, sizeof(sh), 1, f) != 1) break;
+        if (sh.magic == ckpt::MAGIC_VA_A || sh.magic == ckpt::MAGIC_GAMA ||
+            sh.magic == ckpt::MAGIC_RADI || sh.magic == ckpt::MAGIC_POLR) {
+            std::vector<float> data(sh.count);
+            fread(data.data(), sizeof(float), sh.count, f);
+            if      (sh.magic == ckpt::MAGIC_VA_A) per_vA          = std::move(data);
+            else if (sh.magic == ckpt::MAGIC_GAMA) per_gamma       = std::move(data);
+            else if (sh.magic == ckpt::MAGIC_RADI) per_radius      = std::move(data);
+            else                                   per_polar_theta = std::move(data);
+        } else if (sh.magic == ckpt::MAGIC_RNGS) {
             // Raw curandState bytes: count cells, sizeof(curandState) per cell.
             // Size is implicit in the build's curand type; if a future build
             // changes the curand variant, the load will read the wrong byte
             // count. Mismatch is rejected by comparing payload size.
-            fread(&count, 4, 1, f);
-            const size_t payload = (size_t)count * sizeof(curandState);
+            const size_t payload = (size_t)sh.count * sizeof(curandState);
             per_rng_bytes.assign(payload, 0);
             if (payload > 0) fread(per_rng_bytes.data(), 1, payload, f);
         } else {
@@ -1679,18 +1696,12 @@ void Simulation::write_vtk() {
 }
 
 // ---------------------------------------------------------------------------
-// save_checkpoint — v7 native format.
-// Layout (all little-endian):
-//   magic(u32)=0x43454C4C, version(u32)=7,
-//   step(i32), cur_time(f64),
-//   N(i32), save_interval(i32), reserved(i32), trajectory_samples(i32),
-//   bools[4](u8), sp_sz(u32), SimParams(sp_sz bytes),
-//   T(i32),
-//   per cell:
-//     cell_id(i32), origin_x(i32), origin_y(i32),
-//     cx(f32), cy(f32), vx(f32), vy(f32), volume(f32),
-//     phi[TILE_AREA](f32)
-//   sidecar arrays: GAMA, RADI, VA_A, POLR (each: magic(u32), N(i32), data[N](f32))
+// save_checkpoint — writes the current v8 format.
+//
+// Schema and POD records live in include/checkpoint_format.cuh. Bump
+// ckpt::VERSION_CURRENT there to start a new version and add a branch
+// here + in init_from_checkpoint.
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 void Simulation::save_checkpoint(const std::string& dir, const std::string& tag) {
     CK(cudaDeviceSynchronize());
@@ -1719,40 +1730,31 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     FILE* f = fopen(fn_tmp, "wb");
     if (!f) { fprintf(stderr, "Failed to open %s\n", fn_tmp); return; }
 
-    uint32_t magic = 0x43454C4C;
-    uint32_t ver = 8;
-    int32_t cs = step_count;
-    double  ct = cur_time;
-    int32_t nc = n;
-    int32_t si = params.save_interval;
-    int32_t reserved = 0;
-    int32_t ts = params.trajectory_samples;
-    uint8_t bools[4] = {0, 0, 0, 0};
     uint32_t sp_sz = sizeof(SimParams);
     int32_t T_w = TILE_T;
     // v8 multi-rank header: every checkpoint carries (num_ranks, rank_id,
     // num_cells_global). Single-GPU runs write (1, 0, nc). Multi-rank
     // runs write the per-rank coordinates, and each cell record uses its
     // GLOBAL id so the per-rank files can be merged unambiguously.
-    int32_t v8_num_ranks  = (gpus > 1) ? gpus : 1;
-    int32_t v8_rank_id    = (gpus > 1) ? rank : 0;
-    int32_t v8_n_global   = (gpus > 1) ? cells_global : nc;
-
-    fwrite(&magic, 4, 1, f);
-    fwrite(&ver,   4, 1, f);
-    fwrite(&cs,    4, 1, f);
-    fwrite(&ct,    8, 1, f);
-    fwrite(&nc,    4, 1, f);
-    fwrite(&si,    4, 1, f);
-    fwrite(&reserved, 4, 1, f);
-    fwrite(&ts,    4, 1, f);
-    fwrite(bools,  1, 4, f);
-    fwrite(&sp_sz, 4, 1, f);
+    ckpt::FixedPrefix prefix{};
+    prefix.magic              = ckpt::MAGIC;
+    prefix.version            = ckpt::VERSION_CURRENT;
+    prefix.step               = step_count;
+    prefix.cur_time           = cur_time;
+    prefix.num_cells_local    = n;
+    prefix.save_interval      = params.save_interval;
+    prefix.reserved           = 0;
+    prefix.trajectory_samples = params.trajectory_samples;
+    prefix.sp_sz              = sp_sz;
+    fwrite(&prefix, sizeof(prefix), 1, f);
     fwrite(&params, sp_sz, 1, f);
-    fwrite(&T_w,   4, 1, f);
-    fwrite(&v8_num_ranks, 4, 1, f);
-    fwrite(&v8_rank_id,   4, 1, f);
-    fwrite(&v8_n_global,  4, 1, f);
+    fwrite(&T_w, sizeof(T_w), 1, f);
+
+    ckpt::RankTrailer trailer{};
+    trailer.num_ranks        = (gpus > 1) ? gpus : 1;
+    trailer.rank_id          = (gpus > 1) ? rank : 0;
+    trailer.num_cells_global = (gpus > 1) ? cells_global : n;
+    fwrite(&trailer, sizeof(trailer), 1, f);
 
     auto wrap_d = [](double v, int L) {
         double m = std::fmod(v, (double)L);
@@ -1768,14 +1770,16 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         float cy = (float)wrap_d(h_or[2*i + 1] + Cy[i] * invV, Ny);
         float vol = V[i] * (float)params.dA();
 
-        int32_t cid = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
-        int32_t ox = h_or[2*i + 0];
-        int32_t oy = h_or[2*i + 1];
-        fwrite(&cid, 4, 1, f);
-        fwrite(&ox,  4, 1, f); fwrite(&oy, 4, 1, f);
-        fwrite(&cx,  4, 1, f); fwrite(&cy, 4, 1, f);
-        fwrite(&vx[i], 4, 1, f); fwrite(&vy[i], 4, 1, f);
-        fwrite(&vol, 4, 1, f);
+        ckpt::CellRecordHeader rec{};
+        rec.cell_id  = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
+        rec.origin_x = h_or[2*i + 0];
+        rec.origin_y = h_or[2*i + 1];
+        rec.cx       = cx;
+        rec.cy       = cy;
+        rec.vx       = vx[i];
+        rec.vy       = vy[i];
+        rec.volume   = vol;
+        fwrite(&rec, sizeof(rec), 1, f);
 
         CK(cudaMemcpy(tile.data(),
                       cells.phi_in + (size_t)i * TILE_AREA,
@@ -1786,15 +1790,14 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     auto write_per_cell = [&](uint32_t m, const float* dev_ptr) {
         std::vector<float> h(n);
         CK(cudaMemcpy(h.data(), dev_ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
-        fwrite(&m, 4, 1, f);
-        int32_t count = n;
-        fwrite(&count, 4, 1, f);
+        ckpt::SidecarBlockHeader sh{m, n};
+        fwrite(&sh, sizeof(sh), 1, f);
         fwrite(h.data(), sizeof(float), n, f);
     };
-    write_per_cell(0x47414D41 /* 'GAMA' */, cells.gamma_cell);
-    write_per_cell(0x52414449 /* 'RADI' */, cells.tgt_radius);
-    write_per_cell(0x56415F41 /* 'VA_A' */, cells.v_A_cell);
-    write_per_cell(0x504F4C52 /* 'POLR' */, cells.polar_theta);
+    write_per_cell(ckpt::MAGIC_GAMA, cells.gamma_cell);
+    write_per_cell(ckpt::MAGIC_RADI, cells.tgt_radius);
+    write_per_cell(ckpt::MAGIC_VA_A, cells.v_A_cell);
+    write_per_cell(ckpt::MAGIC_POLR, cells.polar_theta);
 
     // C2: RNGS sidecar — per-cell curandState bytes so resume preserves
     // the random-stream continuity. Without this, chained jobs replay the
@@ -1803,10 +1806,8 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         const size_t bytes = (size_t)n * sizeof(curandState);
         std::vector<uint8_t> h_rng(bytes);
         CK(cudaMemcpy(h_rng.data(), cells.rng_states, bytes, cudaMemcpyDeviceToHost));
-        uint32_t mrng = 0x53474E52; // 'RNGS' little-endian
-        int32_t  cnt  = n;
-        fwrite(&mrng, 4, 1, f);
-        fwrite(&cnt,  4, 1, f);
+        ckpt::SidecarBlockHeader sh{ckpt::MAGIC_RNGS, n};
+        fwrite(&sh, sizeof(sh), 1, f);
         fwrite(h_rng.data(), 1, bytes, f);
     }
 
@@ -1820,7 +1821,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         fprintf(stderr, "Failed to rename %s -> %s: %s\n", fn_tmp, fn, e.what());
         return;
     }
-    printf("Saved checkpoint: step=%d, t=%.4f, cells=%d (%s)\n", cs, ct, n, fn);
+    printf("Saved checkpoint: step=%d, t=%.4f, cells=%d (%s)\n", step_count, cur_time, n, fn);
 }
 
 // ---------------------------------------------------------------------------
