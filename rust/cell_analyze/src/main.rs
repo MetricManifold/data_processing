@@ -96,7 +96,12 @@ enum Commands {
         #[arg(long, default_value = "all")]
         what: String,
     },
-    /// Validate trajectory/checkpoint integrity. Exits 0 on pass, 1 on any failure.
+    /// Validate trajectory/checkpoint integrity AND optionally compute a
+    /// sanity-check pass on observables (msd_palmieri, displacement,
+    /// ln_perimeter) to catch NaN/Inf/empty outputs that would silently
+    /// poison `study` runs. Use `--with-observables` to enable the
+    /// observable pass (default: structural only, fast). Always emits a
+    /// full metadata report. Exits 0 on pass, 1 on any failure.
     Check {
         /// Simulation output directory (must contain trajectory.txt; checkpoint.bin optional)
         dir: PathBuf,
@@ -112,6 +117,11 @@ enum Commands {
         /// Expected last timestamp (within 1% tolerance; skip if not provided)
         #[arg(long)]
         t_end: Option<f64>,
+        /// Run observable sanity checks (msd_palmieri, displacement,
+        /// ln_perimeter). Adds a few seconds to runtime but catches
+        /// NaN/Inf outputs that the structural pass cannot detect.
+        #[arg(long)]
+        with_observables: bool,
         /// Emit JSON report in addition to text
         #[arg(long)]
         json: Option<PathBuf>,
@@ -506,8 +516,8 @@ fn main() -> Result<()> {
                 eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), final_w, final_h);
             }
         }
-        Commands::Check { dir, n_cells, expected_frames, t_start, t_end, json } => {
-            let exit_code = run_check(&dir, n_cells, expected_frames, t_start, t_end, json.as_deref())?;
+        Commands::Check { dir, n_cells, expected_frames, t_start, t_end, with_observables, json } => {
+            let exit_code = run_check(&dir, n_cells, expected_frames, t_start, t_end, with_observables, json.as_deref())?;
             std::process::exit(exit_code);
         }
         Commands::List { what } => {
@@ -687,6 +697,7 @@ fn run_check(
     expected_frames: Option<usize>,
     expected_t_start: Option<f64>,
     expected_t_end: Option<f64>,
+    with_observables: bool,
     json_out: Option<&std::path::Path>,
 ) -> Result<i32> {
     use std::io::{BufRead, BufReader};
@@ -872,14 +883,24 @@ fn run_check(
     }
 
     // Check 8: checkpoint.bin consistency (optional)
+    // Also capture tau/dt from checkpoint for later cross-check vs trajectory header.
+    let mut ckpt_tau_from_file: Option<f64> = None;
+    let mut ckpt_dt_from_file: Option<f64> = None;
     let ckpt_path = dir.join("checkpoint.bin");
     if ckpt_path.exists() {
-        match analysis::checkpoint::load_checkpoint_header_only(&ckpt_path) {
-            Ok((ckpt_t, ckpt_n_local, ckpt_ver, ckpt_n_global)) => {
+        // Full checkpoint load (not just header) so we can read the
+        // SimParams scalars (dt, tau) — these are the source of truth
+        // for the simulation that produced the trajectory.
+        match analysis::checkpoint::load_checkpoint(&ckpt_path) {
+            Ok(ckpt) => {
+                ckpt_tau_from_file = Some(ckpt.params.tau as f64);
+                ckpt_dt_from_file = Some(ckpt.params.dt as f64);
+                let ckpt_ver = ckpt.header.version;
+                let ckpt_t = ckpt.header.time;
+                let ckpt_n_local = ckpt.header.num_cells;
+                let ckpt_n_global = ckpt.header.num_cells_global;
                 let mut ok = true;
                 let mut msgs: Vec<String> = Vec::new();
-                // For v8 multi-rank, the N a user expects is the global
-                // count; the local count is just rank 0's slab.
                 let ckpt_n_for_check = if ckpt_ver >= 8 { ckpt_n_global } else { ckpt_n_local };
                 if ckpt_ver >= 8 && ckpt_n_local != ckpt_n_global {
                     msgs.push(format!("v{} step_t={:.3} N={} (local={}, multi-rank)",
@@ -910,6 +931,67 @@ fn run_check(
         push("checkpoint_consistency", true, "no checkpoint.bin (skipped)".to_string());
     }
 
+    // Check 9: trajectory header τ vs checkpoint τ (catches the
+    // submission-bug where a chain was launched with the wrong --tau:
+    // the trajectory carries τ-from-CLI while the checkpoint has the
+    // original τ-from-params.).
+    let traj_tau: Option<f64> = header_fields.get("tau").and_then(|v| v.parse().ok());
+    let traj_dt:  Option<f64> = header_fields.get("dt").and_then(|v| v.parse().ok());
+    if let (Some(tt), Some(ct)) = (traj_tau, ckpt_tau_from_file) {
+        let rel = ((tt - ct).abs() / ct.max(1e-9)) * 100.0;
+        push("tau_traj_vs_ckpt",
+             rel < 0.1,
+             if rel < 0.1 {
+                 format!("traj τ={:.4} matches ckpt τ={:.4}", tt, ct)
+             } else {
+                 format!("MISMATCH: traj τ={:.4} vs ckpt τ={:.4} ({:.1}% diff) — \
+                          likely --tau passed wrong on a chain step",
+                         tt, ct, rel)
+             });
+    }
+    if let (Some(td), Some(cd)) = (traj_dt, ckpt_dt_from_file) {
+        let rel = ((td - cd).abs() / cd.max(1e-9)) * 100.0;
+        push("dt_traj_vs_ckpt",
+             rel < 0.1,
+             if rel < 0.1 {
+                 format!("traj dt={:.6} matches ckpt dt={:.6}", td, cd)
+             } else {
+                 format!("MISMATCH: traj dt={:.6} vs ckpt dt={:.6} ({:.1}% diff)",
+                         td, cd, rel)
+             });
+    }
+
+    // Always emit a metadata banner so the user sees exactly what the
+    // analyzer believes about this run. Helps catch a wrong-τ
+    // submission bug at a glance.
+    let meta_line = {
+        let traj_n = header_fields.get("N").map(|s| s.as_str()).unwrap_or("?");
+        let traj_va = header_fields.get("v_A").map(|s| s.as_str()).unwrap_or("?");
+        let traj_lx = header_fields.get("Lx").map(|s| s.as_str()).unwrap_or("?");
+        let traj_ly = header_fields.get("Ly").map(|s| s.as_str()).unwrap_or("?");
+        format!("traj: v_A={} τ={} dt={} N={} Lx={} Ly={}",
+                traj_va,
+                traj_tau.map(|v| format!("{:.4}", v)).unwrap_or_else(|| "?".into()),
+                traj_dt.map(|v| format!("{:.6}", v)).unwrap_or_else(|| "?".into()),
+                traj_n, traj_lx, traj_ly)
+    };
+    push("metadata", true, meta_line);
+    if let (Some(ct), Some(cd)) = (ckpt_tau_from_file, ckpt_dt_from_file) {
+        push("ckpt_metadata", true,
+             format!("ckpt: τ={:.4} dt={:.6}", ct, cd));
+    }
+
+    // Check 10 (optional): run a small set of standard observables and
+    // verify their outputs aren't NaN/Inf/empty. Catches silent
+    // misparses that produce garbage downstream (the kind of bug
+    // structural checks miss). Only runs when --with-observables is set
+    // because it loads positions and does some compute.
+    if with_observables {
+        if let Err(e) = run_observable_pass(&traj_paths[0], &mut push) {
+            push("observable_pass", false, format!("error: {}", e));
+        }
+    }
+
     // Report
     let all_pass = results.iter().all(|r| r.passed);
     let total = results.len();
@@ -936,6 +1018,123 @@ fn run_check(
     }
 
     Ok(if all_pass { 0 } else { 1 })
+}
+
+/// Compute msd_palmieri + displacement_velocities + ln_perimeter on the
+/// run and verify outputs aren't NaN/Inf/empty. This is the diagnostic
+/// counterpart to `study`: it executes the same code path but flags
+/// scientific-content bugs (garbage observables) instead of producing
+/// figures. Caller passes a `push` callback to record per-check results.
+fn run_observable_pass(
+    traj_path: &std::path::Path,
+    push: &mut dyn FnMut(&str, bool, String),
+) -> Result<()> {
+    use crate::analysis::io::{load_trajectory, unwrap_trajectory};
+    use crate::analysis::observable::{Context, Observable, RunParams};
+    use crate::analysis::observables::msd_palmieri::MsdPalmieri;
+    use crate::analysis::observables::displacement_velocities::DisplacementVelocities;
+    use crate::analysis::observables::ln_perimeter::LnPerimeter;
+    use std::sync::Arc;
+
+    let traj = load_trajectory(traj_path)
+        .with_context(|| format!("loading {}", traj_path.display()))?;
+    let tau = traj.params.tau.unwrap_or(10000.0);
+    let positions = Arc::new(unwrap_trajectory(&traj));
+    if positions.n_times < 4 {
+        push("observable_pass", false,
+             format!("trajectory has only {} time points — observables need ≥4",
+                     positions.n_times));
+        return Ok(());
+    }
+    let ctx = Context {
+        positions,
+        trajectory: Some(Arc::new(traj)),
+        checkpoint: None,
+        params: RunParams {
+            tau,
+            ..Default::default()
+        },
+    };
+
+    // msd_palmieri — D_eff, MSD/Δt curves
+    {
+        match MsdPalmieri.compute(&ctx) {
+            Ok(out) => {
+                let n_nan = out.msd_t_cell.iter().filter(|x| !x.is_finite()).count()
+                          + out.msd_t_pop.iter().filter(|x| !x.is_finite()).count();
+                let d_eff_finite = out.d_eff_cell.is_finite() && out.d_eff_pop.is_finite();
+                let ok = !out.lag_tau.is_empty() && n_nan == 0 && d_eff_finite;
+                push("obs:msd_palmieri", ok,
+                     if ok {
+                         format!("{} lags, D_eff_c0={:.4e}, D_eff_pop={:.4e}",
+                                 out.lag_tau.len(), out.d_eff_cell, out.d_eff_pop)
+                     } else if out.lag_tau.is_empty() {
+                         "empty output (τ ≫ trajectory duration?)".into()
+                     } else if !d_eff_finite {
+                         format!("D_eff non-finite: cell={}, pop={}",
+                                 out.d_eff_cell, out.d_eff_pop)
+                     } else {
+                         format!("{} NaN/Inf entries in MSD curves", n_nan)
+                     });
+            }
+            Err(e) => push("obs:msd_palmieri", false, format!("compute failed: {}", e)),
+        }
+    }
+
+    // displacement_velocities — per-frame speeds, finite check
+    {
+        match DisplacementVelocities.compute(&ctx) {
+            Ok(out) => {
+                let mean_speed = if out.speeds.is_empty() {
+                    f64::NAN
+                } else {
+                    out.speeds.iter().sum::<f64>() / out.speeds.len() as f64
+                };
+                let n_nan = out.speeds.iter().filter(|x| !x.is_finite()).count();
+                let ok = !out.speeds.is_empty() && n_nan == 0 && mean_speed.is_finite();
+                push("obs:displacement_velocities", ok,
+                     if ok {
+                         format!("{} samples, ⟨|v|⟩={:.4e}",
+                                 out.speeds.len(), mean_speed)
+                     } else if out.speeds.is_empty() {
+                         "empty output".into()
+                     } else {
+                         format!("{} NaN/Inf samples, mean={}", n_nan, mean_speed)
+                     });
+            }
+            Err(e) => push("obs:displacement_velocities", false,
+                           format!("compute failed: {}", e)),
+        }
+    }
+
+    // ln_perimeter — geometric shape index for tagged cell
+    {
+        match LnPerimeter.compute(&ctx) {
+            Ok(out) => {
+                let n_nan = out.series.iter().filter(|x| !x.is_finite()).count();
+                let mean = if out.series.is_empty() {
+                    f64::NAN
+                } else {
+                    out.series.iter().sum::<f64>() / out.series.len() as f64
+                };
+                let ok = !out.series.is_empty() && n_nan == 0 && mean.is_finite() && mean > 1e-6;
+                push("obs:ln_perimeter", ok,
+                     if ok {
+                         format!("{} samples, ⟨L_n⟩={:.4}",
+                                 out.series.len(), mean)
+                     } else if out.series.is_empty() {
+                         "empty output".into()
+                     } else if mean <= 1e-6 {
+                         "all-zero output (perimeter data missing?)".into()
+                     } else {
+                         format!("{} NaN/Inf samples", n_nan)
+                     });
+            }
+            Err(e) => push("obs:ln_perimeter", false, format!("compute failed: {}", e)),
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
