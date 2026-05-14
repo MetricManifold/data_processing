@@ -34,13 +34,14 @@ RADIUS = 49.0
 
 
 def _read_v7_final_phi(path):
-    """Read a v7 (sim_v3) checkpoint and paint cells onto a periodic
-    (Ny, Nx) grid. Returns the (Ny, Nx) sum-of-phi field. Minimal v7-only
-    parser; mirrors `cpu_truth_pkg/read_ckpt.py`."""
+    """Read a v7 or v8 checkpoint and paint cells onto a periodic
+    (Ny, Nx) grid. Returns the (Ny, Nx) sum-of-phi field. v7 and v8 share
+    the per-cell record layout; v8 adds a 12-byte rank trailer after the
+    tile_t header field. Function name kept for historical reasons."""
     with open(path, "rb") as f:
         magic, version, step = struct.unpack("<III", f.read(12))
         assert magic == 0x43454C4C, f"bad magic {hex(magic)}"
-        assert version == 7, f"expected v7, got v{version}"
+        assert version in (7, 8), f"expected v7 or v8, got v{version}"
         time_val = struct.unpack("<d", f.read(8))[0]  # noqa: F841
         n = struct.unpack("<i", f.read(4))[0]
         f.read(16)  # 4 i32 runtime opts
@@ -49,6 +50,9 @@ def _read_v7_final_phi(path):
         Nx = struct.unpack_from("<i", sp_buf, 0)[0]
         Ny = struct.unpack_from("<i", sp_buf, 4)[0]
         T = struct.unpack("<i", f.read(4))[0]
+        if version >= 8:
+            # v8 RankTrailer: num_ranks, rank_id, num_cells_global (3 i32)
+            f.read(12)
         phi_full = np.zeros((Ny, Nx), dtype=np.float64)
         for _ in range(n):
             f.read(4)                              # cid
