@@ -275,6 +275,33 @@ pub fn validate_run(
                 ckpt_tau_from_file = Some(ckpt.params.tau as f64);
                 ckpt_dt_from_file = Some(ckpt.params.dt as f64);
                 report_checkpoint(&ckpt, &timestamps, expected_rows_per_frame, &mut push);
+                // Multi-rank: header.num_cells_global is set at init and
+                // does NOT decrement when cells are dropped by a migration
+                // bug. The only truth is sum(per-rank num_cells). If they
+                // disagree, cells were silently lost.
+                if ckpt.header.version >= 8 && ckpt.header.num_ranks > 1 {
+                    match crate::analysis::merge_checkpoint::peek_rank_counts(&ckpt_path) {
+                        Ok(ranks) => {
+                            let sum: i64 = ranks.iter()
+                                .map(|r| r.num_cells as i64).sum();
+                            let expected = ckpt.header.num_cells_global as i64;
+                            let per_rank: Vec<String> = ranks.iter()
+                                .map(|r| format!("r{}={}", r.rank_id, r.num_cells))
+                                .collect();
+                            let ok = sum == expected;
+                            let msg = if ok {
+                                format!("sum={} matches n_global={} ({})",
+                                        sum, expected, per_rank.join(" "))
+                            } else {
+                                format!("sum={} != n_global={} — cells lost during migration ({})",
+                                        sum, expected, per_rank.join(" "))
+                            };
+                            push("checkpoint_rank_sum", ok, msg);
+                        }
+                        Err(e) => push("checkpoint_rank_sum", false,
+                                       format!("failed to peek rank files: {}", e)),
+                    }
+                }
             }
             Err(e) => push("checkpoint_consistency", false,
                            format!("failed to parse checkpoint: {}", e)),

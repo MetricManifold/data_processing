@@ -101,13 +101,24 @@ struct Simulation {
 
     // ---- CUDA Graph capture for the hot step pipeline.
     // step_stream is a non-default stream so launches can be captured.
-    // step_graph[parity] is the cached executable graph for the
+    // step_graph[parity] is the cached executable graph for the single-GPU
     // "regular fast" step (polar + scatter + fast-reduce + RHS) with the
-    // pool half-pointers baked in by parity. Output / rebind / scripted
-    // / first-step paths fall back to direct launches on the same stream.
+    // pool half-pointers baked in by parity.
+    //
+    // mg_step_graph[parity] is the analogous cache for the multi-GPU fast
+    // step: it captures polar + scatter + (NCCL halo Send/Recv pairs) +
+    // halo_add + zero + fast-reduce + RHS in one launch. NCCL 2.18+
+    // supports kernel capture, and our build (2.29.7) is well above that.
+    // Both graphs are invalidated and rebuilt at every migration round
+    // because pointers and per-cell counts may shift.
+    //
+    // Output / rebind / scripted / first-step paths fall back to direct
+    // launches on the same stream.
     cudaStream_t    step_stream            = nullptr;
     cudaGraphExec_t step_graph[2]          = {nullptr, nullptr};
     bool            step_graph_built[2]    = {false, false};
+    cudaGraphExec_t mg_step_graph[2]       = {nullptr, nullptr};
+    bool            mg_step_graph_built[2] = {false, false};
     int             parity                 = 0;
     float*          phi_A                  = nullptr;  // phi_pool half 0
     float*          phi_B                  = nullptr;  // phi_pool half 1
@@ -236,6 +247,38 @@ struct Simulation {
     // of these — it remains the hot path for --gpus 1.
     void step_pre_reduce();
     void step_post_reduce();
+
+    // ---- Multi-GPU per-step pieces, factored out so the orchestrator can
+    // either issue them directly (slow path) or capture them into a CUDA
+    // graph (fast path).
+    //
+    // launch_halo_exchange enqueues the per-rank halo NCCL pairs plus the
+    // two halo_add kernels onto step_stream. Handles G=2 and G>=3 routing.
+    // All NCCL calls happen inside an mg_group_start/end pair so they are
+    // capturable into the surrounding cudaStreamBeginCapture region.
+    void launch_halo_exchange(struct MgWorld& world, int my_rank,
+                              int prev_rank, int next_rank,
+                              float* my_top_band, float* my_bot_band,
+                              float* halo_top_recv, float* halo_bot_recv,
+                              size_t halo_band_floats);
+
+    // Returns true if the next step is eligible for the multi-GPU graph
+    // fast path (no rebind, no full reduce, no scripted events). The
+    // orchestrator decides which path to take before issuing the step.
+    bool mg_step_is_fast_path() const;
+
+    // Drop any cached mg_step_graph[]. Called after migration because
+    // pointers / per-cell counts may have shifted.
+    void invalidate_mg_step_graph();
+
+    // Issue the multi-GPU fast-step kernel sequence (polar + scatter +
+    // halo + zero + fast-reduce + RHS) onto step_stream. Used both as
+    // the inner work for graph capture and as the slow-path equivalent.
+    void launch_mg_fast_step_kernels(struct MgWorld& world, int my_rank,
+                                     int prev_rank, int next_rank,
+                                     float* my_top_band, float* my_bot_band,
+                                     float* halo_top_recv, float* halo_bot_recv,
+                                     size_t halo_band_floats);
 
     // ---- Migration state (multi-GPU only). Allocated by alloc_gpu when
     // gpus > 1. Used by migrate_cells() (called from the orchestrator at

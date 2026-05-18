@@ -178,6 +178,64 @@ fn parse_rank_file(path: &Path) -> Result<RankFile> {
     })
 }
 
+/// Per-rank header summary used by validators. Avoids loading per-cell
+/// tile data — only reads the fixed-size header + v8 trailer (< 300 bytes
+/// per file). Returned in rank-id order.
+pub struct RankCounts {
+    pub path: PathBuf,
+    pub rank_id: i32,
+    pub num_ranks: i32,
+    pub num_cells: i32,
+    pub num_cells_global: i32,
+}
+
+/// Cheap header-only peek across all rank siblings of `input` (which may be
+/// a rank-0 `checkpoint.bin` or its containing directory). Each file is
+/// read up to and including the v8 trailer, then closed. Errors out for
+/// non-v8 files since this is the only multi-rank format that exposes
+/// `num_cells_global`.
+pub fn peek_rank_counts(input: &Path) -> Result<Vec<RankCounts>> {
+    let paths = discover_rank_files(input)?;
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let mut f = std::fs::File::open(&p)
+            .with_context(|| format!("opening {}", p.display()))?;
+        // Read the fixed prefix (44 bytes) so we know sp_sz, then slurp
+        // through the v8 trailer in a single follow-up read.
+        let mut prefix = [0u8; 44];
+        f.read_exact(&mut prefix)
+            .with_context(|| format!("reading header of {}", p.display()))?;
+        let magic = read_u32(&prefix, 0);
+        if magic != MAGIC {
+            bail!("{}: bad magic 0x{:08x}", p.display(), magic);
+        }
+        let version = read_u32(&prefix, 4);
+        if version != VERSION_V8 {
+            bail!(
+                "{}: peek_rank_counts only supports v8 (got v{})",
+                p.display(), version
+            );
+        }
+        let num_cells = read_i32(&prefix, 20);
+        let sp_sz = read_u32(&prefix, 40) as usize;
+        // SimParams payload + tile_t(4) + num_ranks(4) + rank_id(4) + n_global(4)
+        let mut rest = vec![0u8; sp_sz + 16];
+        f.read_exact(&mut rest)
+            .with_context(|| format!("reading v8 trailer of {}", p.display()))?;
+        let num_ranks = read_i32(&rest, sp_sz + 4);
+        let rank_id = read_i32(&rest, sp_sz + 8);
+        let num_cells_global = read_i32(&rest, sp_sz + 12);
+        out.push(RankCounts {
+            path: p,
+            rank_id,
+            num_ranks,
+            num_cells,
+            num_cells_global,
+        });
+    }
+    Ok(out)
+}
+
 /// Find all rank files under `input_dir`. Looks for
 /// `<dir>/checkpoint.bin` (rank 0) and `<dir>/rankK/checkpoint.bin` for
 /// K = 1..num_ranks-1. Returns paths in rank order. Requires that rank 0

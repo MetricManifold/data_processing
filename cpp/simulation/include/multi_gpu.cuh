@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 
 // Opaque per-rank communicator handle. Real definition lives in
 // src/multi_gpu.cu when ENABLE_MULTI_GPU=ON; otherwise treated as void*.
@@ -70,6 +71,12 @@ void mg_finalize_world(MgWorld& w);
 // driving multiple ranks from a single host thread, otherwise NCCL will
 // deadlock waiting for peers.
 void mg_allreduce_sum_f32(MgComm* comm, float* buf, std::size_t n_floats,
+                          cudaStream_t stream);
+
+// Element-wise in-place AllReduce(SUM) on an int32 buffer. Used by the
+// cell-loss audit hook (CELL_SIM_AUDIT_CELLS=1) to verify that the total
+// cell count across ranks stays equal to cells_global. Off the hot path.
+void mg_allreduce_sum_i32(MgComm* comm, int32_t* buf, std::size_t n_ints,
                           cudaStream_t stream);
 
 // Send `n_floats` from `src` (this rank, device memory) to `peer_rank`,

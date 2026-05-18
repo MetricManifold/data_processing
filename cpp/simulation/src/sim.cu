@@ -12,6 +12,7 @@
 
 #include "sim.cuh"
 #include "checkpoint_format.cuh"
+#include "multi_gpu.cuh"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cstdlib>
@@ -1563,6 +1564,97 @@ void Simulation::step_post_reduce() {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-GPU step pieces, factored out so the orchestrator can issue them
+// directly or capture them into a CUDA graph.
+// ---------------------------------------------------------------------------
+void Simulation::launch_halo_exchange(MgWorld& world, int my_rank,
+                                      int prev_rank, int next_rank,
+                                      float* my_top_band, float* my_bot_band,
+                                      float* halo_top_recv, float* halo_bot_recv,
+                                      size_t halo_band_floats) {
+    if (gpus < 2) return;
+    cudaStream_t s = step_stream;
+    if (gpus == 2) {
+        // For G=2, prev == next; NCCL pair-by-order requires a 4-issue
+        // ordering (Send_top, Recv_top, Send_bot, Recv_bot) so the two
+        // boundaries are disambiguated. See orchestrator comments for the
+        // full derivation. After the exchange, halo_top_recv holds peer's
+        // top band — which is OUR bot boundary — so it adds into my_bot.
+        mg_group_start();
+        mg_send_bytes(world.comms[my_rank], my_top_band, prev_rank,
+                      halo_band_floats * sizeof(float), s);
+        mg_recv_bytes(world.comms[my_rank], halo_top_recv, prev_rank,
+                      halo_band_floats * sizeof(float), s);
+        mg_send_bytes(world.comms[my_rank], my_bot_band, next_rank,
+                      halo_band_floats * sizeof(float), s);
+        mg_recv_bytes(world.comms[my_rank], halo_bot_recv, next_rank,
+                      halo_band_floats * sizeof(float), s);
+        mg_group_end();
+        launch_halo_add(my_bot_band, halo_top_recv, halo_band_floats, s);
+        launch_halo_add(my_top_band, halo_bot_recv, halo_band_floats, s);
+    } else {
+        // G >= 3: standard pair-by-peer routing.
+        mg_group_start();
+        mg_send_recv_f32(world.comms[my_rank],
+                         my_top_band, prev_rank,
+                         halo_top_recv, prev_rank,
+                         halo_band_floats, s);
+        mg_send_recv_f32(world.comms[my_rank],
+                         my_bot_band, next_rank,
+                         halo_bot_recv, next_rank,
+                         halo_band_floats, s);
+        mg_group_end();
+        launch_halo_add(my_top_band, halo_top_recv, halo_band_floats, s);
+        launch_halo_add(my_bot_band, halo_bot_recv, halo_band_floats, s);
+    }
+}
+
+bool Simulation::mg_step_is_fast_path() const {
+    if (scripted_active) return false;
+    int next_step = step_count + 1;
+    if ((next_step % REBIND_EVERY) == 0) return false;
+    if (traj_fp && traj_every > 0 && (next_step % traj_every) == 0) return false;
+    if (params.save_interval > 0 && (next_step % params.save_interval) == 0) return false;
+    if (checkpoint_interval  > 0 && (next_step % checkpoint_interval)  == 0) return false;
+    if (vtk_interval         > 0 && (next_step % vtk_interval)         == 0) return false;
+    return true;
+}
+
+void Simulation::invalidate_mg_step_graph() {
+    for (int i = 0; i < 2; ++i) {
+        if (mg_step_graph[i]) {
+            cudaGraphExecDestroy(mg_step_graph[i]);
+            mg_step_graph[i] = nullptr;
+        }
+        mg_step_graph_built[i] = false;
+    }
+}
+
+void Simulation::launch_mg_fast_step_kernels(MgWorld& world, int my_rank,
+                                             int prev_rank, int next_rank,
+                                             float* my_top_band, float* my_bot_band,
+                                             float* halo_top_recv, float* halo_bot_recv,
+                                             size_t halo_band_floats) {
+    // Fast path only: no scripted events (polar runs normally), no rebind,
+    // no full reduction. Pointer state is owned by the parity invariant
+    // (sync_pool_to_parity has already been called by the caller before
+    // we get here — graph capture freezes the pointers seen at this point).
+    launch_polar(cells, params, step_stream);
+    launch_scatter_S(cells, params, step_stream);
+    if (gpus > 1) {
+        launch_halo_exchange(world, my_rank, prev_rank, next_rank,
+                             my_top_band, my_bot_band,
+                             halo_top_recv, halo_bot_recv,
+                             halo_band_floats);
+    }
+    launch_evolve(cells, params, /*need_full_reduce=*/false, step_stream);
+    // NOTE: flip_parity is done by the caller, *outside* the captured
+    // region. That keeps host-side parity state consistent across graph
+    // launches and avoids re-capturing the graph on every parity flip
+    // (we already key the graph cache on parity).
+}
+
+// ---------------------------------------------------------------------------
 // run loop
 // ---------------------------------------------------------------------------
 #ifdef ENABLE_VISUALIZER
@@ -1989,8 +2081,10 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
 // ---------------------------------------------------------------------------
 void Simulation::cleanup() {
     for (int i = 0; i < 2; ++i) {
-        if (step_graph[i]) { cudaGraphExecDestroy(step_graph[i]); step_graph[i] = nullptr; }
-        step_graph_built[i] = false;
+        if (step_graph[i])    { cudaGraphExecDestroy(step_graph[i]);    step_graph[i] = nullptr; }
+        if (mg_step_graph[i]) { cudaGraphExecDestroy(mg_step_graph[i]); mg_step_graph[i] = nullptr; }
+        step_graph_built[i]    = false;
+        mg_step_graph_built[i] = false;
     }
     if (step_stream) { cudaStreamDestroy(step_stream); step_stream = nullptr; }
     auto cf = [](auto& p) { if (p) { cudaFree(p); p = nullptr; } };
@@ -2291,6 +2385,30 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
     MgWorld world;
     if (!mg_init_world(args.gpus, world)) return 1;
 
+    // ---- Single source of truth for seeds across ranks ----
+    // Each rank's Simulation::init() will draw a random_device seed if
+    // params.seed == 0. Letting that happen per-rank produces different
+    // populations on each rank → place_cells generates different cell
+    // layouts → slice_cells_to_local keeps a random subset, and the
+    // summed counts drift below N (this was the 5/3200 loss bug in
+    // eq_3200_va015_v2). Resolve once here so every rank gets identical
+    // seeds and therefore identical h_cells before slicing.
+    SimParams seeded_params = args.params;
+    if (args.ckpt_path.empty()) {
+        if (seeded_params.seed == 0) {
+            std::random_device rd;
+            unsigned s = rd();
+            if (s == 0) s = 0xC0FFEEu;
+            seeded_params.seed = s;
+        }
+        if (seeded_params.polarity_seed == 0) {
+            std::random_device rd;
+            unsigned s = rd();
+            if (s == 0) s = 0xDECAFBADu;
+            seeded_params.polarity_seed = s;
+        }
+    }
+
     // ---- Per-rank Simulation construction & init ----
     std::vector<std::unique_ptr<Simulation>> sims;
     sims.reserve(args.gpus);
@@ -2334,7 +2452,7 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                        args.params.v_A, args.params.xi, args.params.tau,
                        args.params.dt, args.params.t_end);
             }
-            sim->init(args.params, args.ncells_global);
+            sim->init(seeded_params, args.ncells_global);
         }
         sims.push_back(std::move(sim));
     }
@@ -2445,139 +2563,57 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 start_barrier.wait();
                 if (shutdown.load(std::memory_order_acquire)) break;
 
-                sims[g]->step_pre_reduce();
-
-                if (args.gpus == 1) {
-                    // No allreduce, no halo: single-rank slab is the whole
-                    // grid. step_pre_reduce + step_post_reduce drives the
-                    // sim like the single-GPU path.
-                } else {
-                    // Halo exchange.
-                    //
-                    // For G >= 3, prev_rank != next_rank. NCCL pairs sends
-                    // and recvs PER PEER in issue order. Each rank issues:
-                    //   op 1: send my top_band → prev,  recv from prev → halo_top_recv
-                    //   op 2: send my bot_band → next,  recv from next → halo_bot_recv
-                    // My op-1 recv from prev pairs with prev's first send
-                    // to its `next` (= me): prev's `bot_band`. That holds
-                    // contributions to global rows [y_hi_prev - H, y_hi_prev + H)
-                    // = [y_lo - H, y_lo + H) — exactly my top_band's rows.
-                    // Symmetrically halo_bot_recv = next's top_band, same
-                    // rows as my bot_band. Add gives global S. ✓
-                    //
-                    // For G == 2, prev_rank == next_rank (the only other
-                    // rank). NCCL pairing is per-(rank,peer)-pair only,
-                    // and BOTH op 1's send and op 2's send go to the same
-                    // peer. So my 1st send (top) pairs with peer's 1st
-                    // recv (its halo_top_recv) — that's prev's TOP band,
-                    // not its bot band. Different global rows; the protocol
-                    // breaks.
-                    //
-                    // Fix for G==2: pack BOTH bands into a single buffer
-                    // [top | bot] of size 4H·Nx, do ONE send/recv pair,
-                    // and split on the recv side. This disambiguates the
-                    // two boundaries by buffer offset rather than by
-                    // peer/op pairing.
-                    if (args.gpus == 2) {
-                        // Bands are contiguous in the S buffer:
-                        //   top_band = S[0 .. 2H·Nx)
-                        //   bot_band = S[slab_h·Nx .. (slab_h+2H)·Nx)
-                        // We can't send them as one chunk because they're
-                        // not adjacent. We DO send them as two consecutive
-                        // chunks into a peer buffer of size 4H·Nx, then
-                        // unpack. For now: send them as a single
-                        // contiguous "combined" staging buffer using two
-                        // sequential cudaMemcpyAsync into a packed staging
-                        // area on the SEND side, NCCL one-shot, then split.
-                        //
-                        // Simpler path: do TWO send/recvs but to two
-                        // different peer "logical" channels. NCCL has no
-                        // tags, so the trick is to use TWO sub-communicators
-                        // — one for top boundaries, one for bot. That's
-                        // structural overhead we don't have today.
-                        //
-                        // Pragmatic fix: pack [top|bot] into a single 4H·Nx
-                        // staging buffer per rank, send/recv that, then
-                        // split. Use halo_top_recv/halo_bot_recv as the
-                        // single combined buffer (their combined size is
-                        // 2 × 2H·Nx = 4H·Nx — and they happen to be
-                        // allocated contiguously in memory if cudaMalloc
-                        // happened to put them next to each other, which
-                        // we cannot rely on). Allocate a dedicated combined
-                        // buffer at world setup time? Simpler: send twice,
-                        // recv twice, but ROUTE the recvs explicitly using
-                        // ncclSend/ncclRecv with an awareness that NCCL
-                        // pairs by issuance order across same-peer pairs.
-                        //
-                        // The simplest deterministic fix: BOTH ranks issue
-                        // the SAME op order, so NCCL's pairing collapses
-                        // to "my k-th send/recv pairs with peer's k-th
-                        // send/recv on the same channel." If both ranks
-                        // do (Send_top, Recv_top, Send_bot, Recv_bot)
-                        // [in this order, NOT interleaved as send_recv
-                        // pairs], then:
-                        //   my Send_top (op 1) pairs with peer's Recv_top
-                        //   (op 2). So peer's halo_top_recv gets my top.
-                        //   my Recv_top (op 2) pairs with peer's Send_top
-                        //   (op 1). So my halo_top_recv gets peer's top.
-                        // top vs bot stays straight because of the
-                        // 4-issue ordering. The problem with the
-                        // mg_send_recv_f32 helper is it issues
-                        // Send-then-Recv inline; for G==2 we need to
-                        // separate them.
-                        mg_group_start();
-                        mg_send_bytes(world.comms[g],
-                                      my_top_band, prev_rank,
-                                      halo_band_floats * sizeof(float),
-                                      sims[g]->step_stream);
-                        mg_recv_bytes(world.comms[g],
-                                      halo_top_recv[g], prev_rank,
-                                      halo_band_floats * sizeof(float),
-                                      sims[g]->step_stream);
-                        mg_send_bytes(world.comms[g],
-                                      my_bot_band, next_rank,
-                                      halo_band_floats * sizeof(float),
-                                      sims[g]->step_stream);
-                        mg_recv_bytes(world.comms[g],
-                                      halo_bot_recv[g], next_rank,
-                                      halo_band_floats * sizeof(float),
-                                      sims[g]->step_stream);
-                        mg_group_end();
-                        // After: halo_top_recv = peer's top_band, which
-                        // is at global [y_lo_peer - H, y_lo_peer + H).
-                        // For G=2, peer's y_lo == my y_hi (mod Ny), so
-                        // peer's top boundary IS my bot boundary.
-                        // Therefore halo_top_recv adds into my BOT band,
-                        // and halo_bot_recv adds into my TOP band (because
-                        // peer's bot is at peer's y_hi, which is my y_lo
-                        // via wrap).
-                        launch_halo_add(my_bot_band, halo_top_recv[g],
-                                        halo_band_floats, sims[g]->step_stream);
-                        launch_halo_add(my_top_band, halo_bot_recv[g],
-                                        halo_band_floats, sims[g]->step_stream);
-                    } else {
-                        // G >= 3: distinct prev/next; the standard
-                        // send-recv pairing protocol works.
-                        mg_group_start();
-                        mg_send_recv_f32(world.comms[g],
-                                         my_top_band, prev_rank,
-                                         halo_top_recv[g], prev_rank,
-                                         halo_band_floats,
-                                         sims[g]->step_stream);
-                        mg_send_recv_f32(world.comms[g],
-                                         my_bot_band, next_rank,
-                                         halo_bot_recv[g], next_rank,
-                                         halo_band_floats,
-                                         sims[g]->step_stream);
-                        mg_group_end();
-                        launch_halo_add(my_top_band, halo_top_recv[g],
-                                        halo_band_floats, sims[g]->step_stream);
-                        launch_halo_add(my_bot_band, halo_bot_recv[g],
-                                        halo_band_floats, sims[g]->step_stream);
+                // ---- Per-step body ----
+                // Fast path: capture polar + scatter + halo + evolve into
+                // a CUDA graph keyed on parity. Eligible when next step
+                // doesn't hit rebind, full-reduce, scripted events. The
+                // captured region runs entirely on step_stream; flip_parity
+                // and step_count/cur_time updates happen on the host
+                // *after* the graph launch to keep host-side state
+                // consistent and avoid re-capturing on every parity flip.
+                //
+                // Slow path: original direct-launch sequence below
+                // (step_pre_reduce → halo → step_post_reduce). Used for
+                // rebind steps, output steps, and scripted events. The
+                // graph is invalidated after migration since pointers
+                // and per-cell counts may have shifted.
+                Simulation& sim = *sims[g];
+                const bool fast = (args.gpus > 1) && sim.mg_step_is_fast_path();
+                if (fast) {
+                    int p = sim.parity;
+                    sim.sync_pool_to_parity();
+                    if (!sim.mg_step_graph_built[p]) {
+                        cudaGraph_t graph = nullptr;
+                        CK(cudaStreamBeginCapture(
+                            sim.step_stream,
+                            cudaStreamCaptureModeThreadLocal));
+                        sim.launch_mg_fast_step_kernels(
+                            world, g, prev_rank, next_rank,
+                            my_top_band, my_bot_band,
+                            halo_top_recv[g], halo_bot_recv[g],
+                            halo_band_floats);
+                        CK(cudaStreamEndCapture(sim.step_stream, &graph));
+                        CK(cudaGraphInstantiate(
+                            &sim.mg_step_graph[p], graph, nullptr, nullptr, 0));
+                        cudaGraphDestroy(graph);
+                        sim.mg_step_graph_built[p] = true;
                     }
+                    CK(cudaGraphLaunch(sim.mg_step_graph[p], sim.step_stream));
+                    sim.flip_parity();
+                    sim.step_count++;
+                    sim.cur_time += sim.params.dt;
+                } else {
+                    // ---- Slow path: direct launches (rebind / output / scripted) ----
+                    sim.step_pre_reduce();
+                    if (args.gpus > 1) {
+                        sim.launch_halo_exchange(
+                            world, g, prev_rank, next_rank,
+                            my_top_band, my_bot_band,
+                            halo_top_recv[g], halo_bot_recv[g],
+                            halo_band_floats);
+                    }
+                    sim.step_post_reduce();
                 }
-
-                sims[g]->step_post_reduce();
 
                 // Migration on rebind cadence (only when G > 1; for G=1
                 // migrate_cells is a no-op early-out). step_post_reduce
@@ -2594,10 +2630,47 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 }();
                 if (!skip_migration
                     && args.gpus > 1
-                    && sims[g]->step_count > 0
-                    && (sims[g]->step_count % REBIND_EVERY) == 0)
+                    && sim.step_count > 0
+                    && (sim.step_count % REBIND_EVERY) == 0)
                 {
-                    sims[g]->migrate_cells(world, g);
+                    sim.migrate_cells(world, g);
+                    // Migration may have moved cells between ranks, shifting
+                    // pointers and per-cell counts. Drop the cached graph
+                    // so the next fast step rebuilds with fresh state.
+                    sim.invalidate_mg_step_graph();
+
+                    // Cell-loss audit (off by default; env-guarded). When
+                    // CELL_SIM_AUDIT_CELLS=1 we sum num_cells across ranks
+                    // via NCCL after every migration and FATAL on drift.
+                    // Off path: a single getenv check at startup; cost
+                    // amortised to zero.
+                    static const bool audit_cells = []() {
+                        const char* e = std::getenv("CELL_SIM_AUDIT_CELLS");
+                        return e && e[0] == '1';
+                    }();
+                    if (audit_cells) {
+                        int32_t* d_local = sim.d_n_in_prev;   // reuse 1-int scratch
+                        int32_t  h_local = sim.cells.num_cells;
+                        CK(cudaMemcpyAsync(d_local, &h_local, sizeof(int32_t),
+                                           cudaMemcpyHostToDevice,
+                                           sim.step_stream));
+                        mg_allreduce_sum_i32(world.comms[g], d_local, 1,
+                                             sim.step_stream);
+                        int32_t h_total = 0;
+                        CK(cudaMemcpyAsync(&h_total, d_local, sizeof(int32_t),
+                                           cudaMemcpyDeviceToHost,
+                                           sim.step_stream));
+                        CK(cudaStreamSynchronize(sim.step_stream));
+                        if (h_total != sim.cells_global) {
+                            fprintf(stderr,
+                                "[FATAL] cell-loss audit: rank %d step %d "
+                                "sum=%d expected cells_global=%d "
+                                "(local=%d)\n",
+                                g, sim.step_count, h_total,
+                                sim.cells_global, sim.cells.num_cells);
+                            std::exit(1);
+                        }
+                    }
                 }
 
                 end_barrier.wait();
