@@ -1213,6 +1213,35 @@ void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
     k_halo_add<<<blocks, BS, 0, stream>>>(dst, src, n_floats);
 }
 
+// Fused two-pair halo add. Each thread updates one element of each pair
+// from a shared linear index; two pairs are independent so no synchronization
+// is needed between them. Doubles effective work per launch, halving the
+// fixed launch + cross-launch dependency cost.
+__global__ void k_halo_add_pair(float* __restrict__ dst0,
+                                const float* __restrict__ src0,
+                                float* __restrict__ dst1,
+                                const float* __restrict__ src1,
+                                size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < n; i += stride) {
+        dst0[i] += src0[i];
+        dst1[i] += src1[i];
+    }
+}
+
+void launch_halo_add_pair(float* dst0, const float* src0,
+                          float* dst1, const float* src1,
+                          std::size_t n_floats, cudaStream_t stream) {
+    if (n_floats == 0) return;
+    constexpr int BS = 256;
+    int blocks = (int)std::min<std::size_t>(
+        (n_floats + BS - 1) / BS, (std::size_t)1024);
+    if (blocks <= 0) blocks = 1;
+    k_halo_add_pair<<<blocks, BS, 0, stream>>>(
+        dst0, src0, dst1, src1, n_floats);
+}
+
 // ===========================================================================
 // 10. Cell migration kernels (multi-GPU only).
 // ---------------------------------------------------------------------------

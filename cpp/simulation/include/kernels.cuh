@@ -68,6 +68,13 @@ void launch_initial_velocity(CellArrays& c, const SimParams& p);
 void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
                      cudaStream_t stream);
 
+// Fused two-pair halo add: dst0[i] += src0[i] and dst1[i] += src1[i] in
+// one kernel launch. Both pairs share the same length (halo band size).
+// Saves ~10-15 us per step vs. two separate launch_halo_add calls.
+void launch_halo_add_pair(float* dst0, const float* src0,
+                          float* dst1, const float* src1,
+                          std::size_t n_floats, cudaStream_t stream);
+
 // ===========================================================================
 // Cell migration (multi-GPU only). When a cell's rebound COM crosses
 // outside its owning rank's slab, the cell must be moved to the

@@ -1590,8 +1590,9 @@ void Simulation::launch_halo_exchange(MgWorld& world, int my_rank,
         mg_recv_bytes(world.comms[my_rank], halo_bot_recv, next_rank,
                       halo_band_floats * sizeof(float), s);
         mg_group_end();
-        launch_halo_add(my_bot_band, halo_top_recv, halo_band_floats, s);
-        launch_halo_add(my_top_band, halo_bot_recv, halo_band_floats, s);
+        launch_halo_add_pair(my_bot_band, halo_top_recv,
+                             my_top_band, halo_bot_recv,
+                             halo_band_floats, s);
     } else {
         // G >= 3: standard pair-by-peer routing.
         mg_group_start();
@@ -1604,8 +1605,9 @@ void Simulation::launch_halo_exchange(MgWorld& world, int my_rank,
                          halo_bot_recv, next_rank,
                          halo_band_floats, s);
         mg_group_end();
-        launch_halo_add(my_top_band, halo_top_recv, halo_band_floats, s);
-        launch_halo_add(my_bot_band, halo_bot_recv, halo_band_floats, s);
+        launch_halo_add_pair(my_top_band, halo_top_recv,
+                             my_bot_band, halo_bot_recv,
+                             halo_band_floats, s);
     }
 }
 
@@ -2578,7 +2580,16 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 // graph is invalidated after migration since pointers
                 // and per-cell counts may have shifted.
                 Simulation& sim = *sims[g];
-                const bool fast = (args.gpus > 1) && sim.mg_step_is_fast_path();
+                // Env-guarded graph-capture disable. Useful when a kernel
+                // change interacts poorly with capture (see Win A / fused
+                // halo_add investigation).
+                static const bool no_mg_graph = []() {
+                    const char* e = std::getenv("CELL_SIM_NO_MG_GRAPH");
+                    return e && e[0] == '1';
+                }();
+                const bool fast = (args.gpus > 1)
+                                  && sim.mg_step_is_fast_path()
+                                  && !no_mg_graph;
                 if (fast) {
                     int p = sim.parity;
                     sim.sync_pool_to_parity();

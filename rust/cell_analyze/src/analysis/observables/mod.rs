@@ -26,6 +26,7 @@ pub mod msd_log_slope;
 pub mod msd_palmieri;
 pub mod overlap;
 pub mod per_cell_diffusion;
+pub mod percolation_cluster;
 pub mod polarity_tau;
 pub mod self_scattering;
 pub mod shape_index;
@@ -70,6 +71,7 @@ pub fn register_builtin() -> Vec<Box<dyn ErasedObservable>> {
         Box::new(EraseAdaptor(shape_index::ShapeIndex)),
         Box::new(EraseAdaptor(hexatic_order::HexaticOrder)),
         Box::new(EraseAdaptor(voronoi_shape::VoronoiShape)),
+        Box::new(EraseAdaptor(percolation_cluster::PercolationCluster::default())),
         // Polarity / energy
         Box::new(EraseAdaptor(polarity_tau::PolarityTau)),
         Box::new(EraseAdaptor(kinetic_energy::KineticEnergy)),
