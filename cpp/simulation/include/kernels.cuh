@@ -48,7 +48,8 @@ void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
                    cudaStream_t stream = 0);
 
 // One-shot host helpers used only at init / resume.
-void launch_rng_init(CellArrays& c, unsigned long seed);
+void launch_rng_init(CellArrays& c, unsigned long seed,
+                     const int* d_global_ids = nullptr);
 
 // Initialise phi tiles as tanh(2(r - R_eff)/(sqrt(2)*lambda)) profiles.
 // h_cx/h_cy are global-coord cell COMs (passed via temporary device arrays
@@ -60,6 +61,11 @@ void launch_init_phi(CellArrays& c, const SimParams& p,
 // without advancing phi. Used after both fresh init and resume so that the
 // first trajectory write has a meaningful velocity.
 void launch_initial_velocity(CellArrays& c, const SimParams& p);
+
+// Two-step variant used by multi-GPU init: scatter, then a halo exchange,
+// then the velocity reduce. Single-GPU should keep using launch_initial_velocity.
+void launch_initial_scatter(CellArrays& c, const SimParams& p);
+void launch_initial_velocity_reduce(CellArrays& c, const SimParams& p);
 
 // Halo support: in-place add. dst[i] += src[i] for i in [0, n_floats).
 // Used by the multi-GPU halo exchange to fold neighbour-rank contributions

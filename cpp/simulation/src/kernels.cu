@@ -1145,21 +1145,29 @@ __global__ void k_initial_velocity(
     }
 }
 
-void launch_initial_velocity(CellArrays& c, const SimParams& p) {
+// Initial scatter only — fills S from current phi_in. Multi-GPU calls
+// this first, then does a halo exchange, then calls
+// launch_initial_velocity_reduce. Single-GPU should just call
+// launch_initial_velocity below (does both in one shot).
+void launch_initial_scatter(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
-    // S sized by slab (== Ny for G=1).
     const size_t Sbytes = (size_t)c.S_ext_height * p.Nx * sizeof(float);
     cudaMemsetAsync(c.S, 0, Sbytes);
-    {
-        constexpr int CHUNK_PIXELS = 2048;
-        constexpr int BS = 128;
-        constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-        dim3 grid(MAX_CHUNKS, N);
-        k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S,
-                                  N, p.Nx, CHUNK_PIXELS,
-                                  c.S_y_lo, c.S_halo_h);
-    }
+    constexpr int CHUNK_PIXELS = 2048;
+    constexpr int BS = 128;
+    constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+    dim3 grid(MAX_CHUNKS, N);
+    k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S,
+                              N, p.Nx, CHUNK_PIXELS,
+                              c.S_y_lo, c.S_halo_h);
+}
+
+// Velocity reduce only — assumes S has been filled (and, for multi-GPU,
+// halo-exchanged) by the caller.
+void launch_initial_velocity_reduce(CellArrays& c, const SimParams& p) {
+    const int N = c.num_cells;
+    if (N == 0) return;
     k_initial_velocity<<<N, 256>>>(
         c.phi_in, c.origin, c.rect, c.S,
         c.v_A_cell, c.polar_x, c.polar_y,
@@ -1170,20 +1178,31 @@ void launch_initial_velocity(CellArrays& c, const SimParams& p) {
         c.S_y_lo, c.S_halo_h);
 }
 
+void launch_initial_velocity(CellArrays& c, const SimParams& p) {
+    launch_initial_scatter(c, p);
+    launch_initial_velocity_reduce(c, p);
+}
+
 // ---------------------------------------------------------------------------
 // 8. k_rng_init
 // ---------------------------------------------------------------------------
-__global__ void k_rng_init(curandState* st, unsigned long seed, int N) {
+__global__ void k_rng_init(curandState* st, unsigned long seed,
+                           const int* __restrict__ gid, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    curand_init(seed, i, 0, &st[i]);
+    // Use global cell ID as sequence number so the RNG stream for a
+    // given physical cell is identical regardless of how many GPUs
+    // (and therefore which local index) the cell ends up on.
+    int seq = gid ? gid[i] : i;
+    curand_init(seed, seq, 0, &st[i]);
 }
 
-void launch_rng_init(CellArrays& c, unsigned long seed) {
+void launch_rng_init(CellArrays& c, unsigned long seed,
+                     const int* d_global_ids) {
     const int N = c.num_cells;
     if (N == 0) return;
     k_rng_init<<<(N + 255) / 256, 256>>>(
-        (curandState*)c.rng_states, seed, N);
+        (curandState*)c.rng_states, seed, d_global_ids, N);
 }
 
 // ---------------------------------------------------------------------------

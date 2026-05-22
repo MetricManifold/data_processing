@@ -390,6 +390,25 @@ void Simulation::upload_initial_state() {
     std::vector<float> h_th(n), h_px(n), h_py(n);
     std::vector<float> h_cx(n), h_cy(n);
 
+    // Deterministic per-cell theta seeded by the GLOBAL cell id, not the
+    // local iteration index, so the same physical cell gets the same theta
+    // regardless of GPU count. The previous version called rand() per
+    // local cell, which produced different thetas in G=4 vs G=1 (rand()
+    // is process-global and slice_cells_to_local left only this rank's
+    // cells in h_cells, so iteration order was rank-dependent).
+    auto theta_for = [&](int gid) {
+        // splitmix-style 64-bit hash → float in [0, 2*pi)
+        uint64_t z = (uint64_t)params.polarity_seed * 0x9E3779B97F4A7C15ULL
+                   + (uint64_t)gid * 0xBF58476D1CE4E5B9ULL
+                   + 0x94D049BB133111EBULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z =  z ^ (z >> 31);
+        // Use top 24 bits for f32 mantissa precision.
+        float u = (float)((z >> 40) & ((1u<<24)-1)) / (float)(1u<<24);
+        return u * 2.0f * (float)M_PI;
+    };
+
     for (int i = 0; i < n; i++) {
         const auto& c = h_cells[i];
         h_origin[2*i + 0] = c.ox;
@@ -397,7 +416,8 @@ void Simulation::upload_initial_state() {
         h_g [i] = (float)c.gamma;
         h_vA[i] = (float)c.v_A;
         h_tr[i] = (float)c.radius;
-        float theta = (float)(rand() % 10000) / 10000.0f * 2.0f * (float)M_PI;
+        int gid = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
+        float theta = theta_for(gid);
         h_th[i] = theta;
         h_px[i] = cosf(theta);
         h_py[i] = sinf(theta);
@@ -567,7 +587,18 @@ void Simulation::seed_rng_if_fresh() {
     const unsigned long polar_seed = params.polarity_seed
                                      ? params.polarity_seed
                                      : (params.seed ? params.seed : 1234u);
-    launch_rng_init(cells, polar_seed);
+    // For multi-GPU: upload h_global_id to d_gid_src so each cell's
+    // curand sequence number matches its global ID, not its local index.
+    // This ensures the polarity noise stream for a given physical cell
+    // is identical regardless of GPU count.
+    const int* d_ids = nullptr;
+    if (gpus > 1 && !h_global_id.empty() && d_gid_src) {
+        CK(cudaMemcpy(d_gid_src, h_global_id.data(),
+                      h_global_id.size() * sizeof(int),
+                      cudaMemcpyHostToDevice));
+        d_ids = d_gid_src;
+    }
+    launch_rng_init(cells, polar_seed, d_ids);
 }
 
 void Simulation::compute_initial_velocities() {
@@ -2520,6 +2551,42 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
             CK(cudaMalloc(&halo_top_recv[g], halo_band_floats * sizeof(float)));
             CK(cudaMalloc(&halo_bot_recv[g], halo_band_floats * sizeof(float)));
         }
+
+        // Init-time halo exchange + velocity recompute. Without this the
+        // initial S is scatter-from-local-cells-only on each rank, so
+        // cells near slab boundaries see an incomplete S and start with
+        // slightly wrong velocities. After this fix, step-0 velocities
+        // match G=1 exactly (modulo float-atomic noise in scatter).
+        // Default streams are used here \u2014 init is one-shot, no need
+        // to optimise.
+        std::vector<std::thread> init_workers;
+        init_workers.reserve(args.gpus);
+        for (int g = 0; g < args.gpus; ++g) {
+            init_workers.emplace_back([&, g] {
+                CK(cudaSetDevice(world.devices[g]));
+                Simulation& sim   = *sims[g];
+                const int prev_r  = (g - 1 + args.gpus) % args.gpus;
+                const int next_r  = (g + 1) % args.gpus;
+                const int slab_h  = sim.cells.S_ext_height
+                                    - 2 * sim.cells.S_halo_h;
+                float* const S          = sim.cells.S;
+                float* const my_top     = S;
+                float* const my_bot     = S + (size_t)slab_h * s0.params.Nx;
+                // S was scatter-only-local from finalize_init. Exchange
+                // halo bands so cells near slab boundaries see neighbour
+                // contributions, then recompute initial velocities.
+                sim.launch_halo_exchange(world, g, prev_r, next_r,
+                                         my_top, my_bot,
+                                         halo_top_recv[g], halo_bot_recv[g],
+                                         halo_band_floats);
+                // Make sure the halo-add is visible to the default stream
+                // before the velocity reduce reads S.
+                CK(cudaStreamSynchronize(sim.step_stream));
+                launch_initial_velocity_reduce(sim.cells, sim.params);
+                CK(cudaDeviceSynchronize());
+            });
+        }
+        for (auto& t : init_workers) t.join();
     }
 
     // ---------------------------------------------------------------------
