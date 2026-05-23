@@ -137,6 +137,19 @@ pytest cpp/simulation/tests/python/test_cutover_parity.py -v --run-slow \
 - Baseline (for migration tests): `$env:BASELINE_BINARY = ...`. Auto-detected baseline is suppressed when it points at the same file as `SIM_BINARY` (post-cutover guard).
 - The harness probes `--help` once and `requires_flag(...)` skips tests for flags the binary lacks.
 
+### TILE_T and the `build_t192/` build tree
+- Default CMake `CELL_SIM_TILE_T=320`. Fast tests use `-N 200` style domains
+  that are **smaller than 320**, so they fatal against the default build
+  ("[FATAL] domain (200 x 200) smaller than TILE_T=320").
+- A pre-configured `cpp/simulation/build_t192/` tree exists with
+  `CELL_SIM_TILE_T=192`. Rebuild it (`cmake --build cpp/simulation/build_t192
+  --config Release`) and point pytest at its binary:
+  `$env:SIM_BINARY = (Resolve-Path cpp/simulation/build_t192/bin/cell_sim.exe).Path`.
+- May 23, 2026 baseline on this binary: **126 passed, 40 skipped, 1 failed**
+  (the failure is the pre-existing v4-legacy-checkpoint test, unrelated).
+- Long-term fix tracked as a TEST-DEBT item in `cpp/simulation/FIX_REPORT.md`
+  — tests should derive valid `-N` from the binary's TILE_T, not hard-code.
+
 ### Markers
 - `@pytest.mark.slow` — deselected by default. Enable with `--run-slow`.
 - Tests that need the baseline use `@requires_baseline()` and skip if it's missing.
