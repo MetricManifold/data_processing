@@ -2078,23 +2078,20 @@ void Simulation::write_trajectory() {
     traj_writer_cv.notify_one();
 }
 
-// ---------------------------------------------------------------------------
-// write_vtk — composite max(phi) field, big-endian binary VTK.
-// ---------------------------------------------------------------------------
-void Simulation::write_vtk() {
-    CK(cudaDeviceSynchronize());
-    int n = cells.num_cells;
-    int Nx = params.Nx, Ny = params.Ny;
-
-    std::vector<int> h_or(2 * n);
-    CK(cudaMemcpy(h_or.data(), cells.origin, 2*n*sizeof(int), cudaMemcpyDeviceToHost));
-
-    std::vector<float> tile(TILE_AREA);
-    std::vector<float> grid((size_t)Nx * Ny, 0.0f);
+static void composite_vtk_cells(Simulation& sim,
+                                std::vector<float>& grid,
+                                std::vector<int>& h_or,
+                                std::vector<float>& tile) {
+    const int n = sim.cells.num_cells;
+    if (n <= 0) return;
+    const int Nx = sim.params.Nx, Ny = sim.params.Ny;
+    h_or.resize(2 * n);
+    tile.resize(TILE_AREA);
+    CK(cudaMemcpy(h_or.data(), sim.cells.origin, 2*n*sizeof(int), cudaMemcpyDeviceToHost));
 
     for (int i = 0; i < n; i++) {
         CK(cudaMemcpy(tile.data(),
-                      cells.phi_in + (size_t)i * TILE_AREA,
+                      sim.cells.phi_in + (size_t)i * TILE_AREA,
                       TILE_AREA * sizeof(float), cudaMemcpyDeviceToHost));
         int ox = h_or[2*i + 0];
         int oy = h_or[2*i + 1];
@@ -2108,7 +2105,13 @@ void Simulation::write_vtk() {
             }
         }
     }
+}
 
+static void write_vtk_grid_file(const std::string& out_dir,
+                                int step_count,
+                                double cur_time,
+                                int Nx, int Ny,
+                                const std::vector<float>& grid) {
     auto swap_f32 = [](float fv) {
         uint32_t u; std::memcpy(&u, &fv, 4);
         u = ((u & 0x000000FFu) << 24) |
@@ -2137,6 +2140,19 @@ void Simulation::write_vtk() {
     fprintf(f, "LOOKUP_TABLE default\n");
     fwrite(be.data(), sizeof(float), be.size(), f);
     fclose(f);
+}
+
+// ---------------------------------------------------------------------------
+// write_vtk — composite max(phi) field, big-endian binary VTK.
+// ---------------------------------------------------------------------------
+void Simulation::write_vtk() {
+    CK(cudaDeviceSynchronize());
+    const int Nx = params.Nx, Ny = params.Ny;
+    std::vector<float> grid((size_t)Nx * Ny, 0.0f);
+    std::vector<int> h_or;
+    std::vector<float> tile;
+    composite_vtk_cells(*this, grid, h_or, tile);
+    write_vtk_grid_file(out_dir, step_count, cur_time, Nx, Ny, grid);
 }
 
 // ---------------------------------------------------------------------------
@@ -2362,6 +2378,23 @@ struct MgBarrier {
         }
     }
 };
+
+static void write_multi_gpu_vtk(const std::vector<std::unique_ptr<Simulation>>& sims,
+                                const MgWorld& world) {
+    if (sims.empty()) return;
+    Simulation& root = *sims[0];
+    const int Nx = root.params.Nx, Ny = root.params.Ny;
+    std::vector<float> grid((size_t)Nx * Ny, 0.0f);
+    std::vector<int> h_or;
+    std::vector<float> tile;
+
+    for (int g = 0; g < (int)sims.size(); ++g) {
+        CK(cudaSetDevice(world.devices[g]));
+        CK(cudaDeviceSynchronize());
+        composite_vtk_cells(*sims[g], grid, h_or, tile);
+    }
+    write_vtk_grid_file(root.out_dir, root.step_count, root.cur_time, Nx, Ny, grid);
+}
 
 // ---------------------------------------------------------------------------
 // Simulation::migrate_cells — implementation under ENABLE_MULTI_GPU.
@@ -2948,8 +2981,7 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
             wrote_any = true;
         }
         if (s0.vtk_interval > 0 && sc % s0.vtk_interval == 0) {
-            CK(cudaSetDevice(world.devices[0]));
-            sims[0]->write_vtk();
+            write_multi_gpu_vtk(sims, world);
             wrote_any = true;
         }
         (void)wrote_any;
