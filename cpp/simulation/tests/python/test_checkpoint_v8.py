@@ -59,6 +59,25 @@ class TestV8Resume:
         for c in chk2["cells"]:
             assert 0.5 * target_vol < c["volume"] < 2.0 * target_vol
 
+    def test_v8_resume_preserves_subdomain_padding(self, tmp_path):
+        """v8 stores live subdomain_padding; resume must not reset it."""
+        sub1 = tmp_path / "sub1"; sub1.mkdir()
+        out1 = run_sim(sub1, "-n", "4", "-N", "640", "-r", "49",
+                       "-t", "0.5", "--seed", "42",
+                       "--subdomain-padding", "3.5",
+                       "--save-interval", "0", "--trajectory-samples", "0")
+        ckpt = out1 / "checkpoint.bin"
+        chk1 = read_checkpoint(ckpt)
+        assert chk1["version"] == 8
+        assert chk1["params"]["subdomain_padding"] == pytest.approx(3.5)
+
+        sub2 = tmp_path / "sub2"; sub2.mkdir()
+        out2 = run_sim(sub2, "-c", str(ckpt), "-t", "1.0", "--seed", "42",
+                       "--save-interval", "0", "--trajectory-samples", "0")
+        chk2 = read_checkpoint(out2 / "checkpoint.bin")
+        assert chk2["version"] == 8
+        assert chk2["params"]["subdomain_padding"] == pytest.approx(3.5)
+
 
 class TestV8MultiRankGuard:
     """v8 multi-rank files must be loaded with matching --gpus or refused."""

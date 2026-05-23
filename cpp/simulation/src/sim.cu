@@ -768,7 +768,7 @@ bool peek_v8_rank_header(const std::string& path,
 // ----------------------------------------------------------------------------
 struct CheckpointPayload {
     uint32_t version = 0;
-    SimParams params{};       // decoded; subdomain_padding already reset
+    SimParams params{};       // decoded; legacy fixups already applied
     int32_t   step_count = 0;
     double    cur_time   = 0.0;
     int32_t   num_cells  = 0;
@@ -824,10 +824,9 @@ bool resolve_checkpoint_path(const std::string& path_in,
 bool decode_simparams(FILE* f, uint32_t ver, uint32_t sp_sz, SimParams& params) {
     if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7 || ver == 8)) {
         fread(&params, sp_sz, 1, f);
-        // subdomain_padding was a dead field in v6/v7 ckpts; reset to
-        // current default so resumed runs use a sane adaptive-rect K.
-        // CLI override below still wins.
-        params.subdomain_padding = SimParams{}.subdomain_padding;
+        // subdomain_padding was a dead field in v6/v7 ckpts; reset only
+        // those legacy versions. v8 writes the live adaptive-rect value.
+        if (ver < 8) params.subdomain_padding = SimParams{}.subdomain_padding;
         return true;
     }
     if (ver == 7 || ver == 8) {
