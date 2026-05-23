@@ -20,6 +20,7 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +53,32 @@ static int sim_env_int(const char* name, int fallback) {
                 cudaGetErrorString(e)); exit(1);                           \
     }                                                                      \
 } while(0)
+
+static bool ckpt_read_exact(FILE* f, void* dst, size_t elem_size,
+                            size_t count, const char* what) {
+    if (count == 0) return true;
+    size_t got = fread(dst, elem_size, count, f);
+    if (got != count) {
+        fprintf(stderr,
+                "[ckpt] short read while reading %s (got %zu/%zu items of %zu bytes)\n",
+                what, got, count, elem_size);
+        return false;
+    }
+    return true;
+}
+
+static bool ckpt_write_exact(FILE* f, const void* src, size_t elem_size,
+                             size_t count, const char* what) {
+    if (count == 0) return true;
+    size_t wrote = fwrite(src, elem_size, count, f);
+    if (wrote != count) {
+        fprintf(stderr,
+                "[ckpt] short write while writing %s (wrote %zu/%zu items of %zu bytes)\n",
+                what, wrote, count, elem_size);
+        return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // place_cells — rejection sampling with periodic distance.
@@ -823,7 +850,7 @@ bool resolve_checkpoint_path(const std::string& path_in,
 // sizeof(SimParams) — that's a hard incompatibility we can't recover from.
 bool decode_simparams(FILE* f, uint32_t ver, uint32_t sp_sz, SimParams& params) {
     if (sp_sz == sizeof(SimParams) && (ver == 6 || ver == 7 || ver == 8)) {
-        fread(&params, sp_sz, 1, f);
+        if (!ckpt_read_exact(f, &params, sp_sz, 1, "SimParams")) return false;
         // subdomain_padding was a dead field in v6/v7 ckpts; reset only
         // those legacy versions. v8 writes the live adaptive-rect value.
         if (ver < 8) params.subdomain_padding = SimParams{}.subdomain_padding;
@@ -850,7 +877,7 @@ bool decode_simparams(FILE* f, uint32_t ver, uint32_t sp_sz, SimParams& params) 
     // layouts. Mis-reading this caused the τ=1500 silent corruption in
     // FSS pipeline runs resumed from May-6 roihu equilibrations.
     std::vector<uint8_t> sp(sp_sz);
-    fread(sp.data(), 1, sp_sz, f);
+    if (!ckpt_read_exact(f, sp.data(), 1, sp_sz, "legacy SimParams")) return false;
     auto u_i32 = [&](size_t off) {
         int32_t v; std::memcpy(&v, sp.data() + off, 4); return v;
     };
@@ -895,7 +922,7 @@ bool decode_simparams(FILE* f, uint32_t ver, uint32_t sp_sz, SimParams& params) 
 
 // Read per-cell records into the payload. Handles v7/v8 native (uniform
 // TILE_T tiles) and legacy v3-v6 (variable W/H tiles, re-tile centred).
-void decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
+bool decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
                          CheckpointPayload& p) {
     const int nc = p.num_cells;
     p.cx.resize(nc); p.cy.resize(nc); p.vx.resize(nc); p.vy.resize(nc); p.vol.resize(nc);
@@ -908,7 +935,7 @@ void decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
         const size_t Tin_area = (size_t)Tin * Tin;
         for (int i = 0; i < nc; ++i) {
             ckpt::CellRecordHeader rec{};
-            fread(&rec, sizeof(rec), 1, f);
+            if (!ckpt_read_exact(f, &rec, sizeof(rec), 1, "cell record")) return false;
             if (ver == 8) p.gid[i] = rec.cell_id;
             p.cx[i] = rec.cx;  p.cy[i] = rec.cy;
             p.vx[i] = rec.vx;  p.vy[i] = rec.vy;
@@ -916,10 +943,12 @@ void decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
             p.ox[i] = rec.origin_x;  p.oy[i] = rec.origin_y;
             p.phi_tiles[i].assign(TILE_AREA, 0.0f);
             if (Tin == TILE_T) {
-                fread(p.phi_tiles[i].data(), sizeof(float), TILE_AREA, f);
+                if (!ckpt_read_exact(f, p.phi_tiles[i].data(), sizeof(float),
+                                     TILE_AREA, "native phi tile")) return false;
             } else {
                 std::vector<float> tile_in(Tin_area);
-                fread(tile_in.data(), sizeof(float), Tin_area, f);
+                if (!ckpt_read_exact(f, tile_in.data(), sizeof(float),
+                                     Tin_area, "retile input phi tile")) return false;
                 int dx = (TILE_T - Tin) / 2;
                 int dy = (TILE_T - Tin) / 2;
                 p.ox[i] = rec.origin_x - dx;
@@ -935,26 +964,31 @@ void decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
                 }
             }
         }
-        return;
+        return true;
     }
     // Legacy v3-v6: variable W/H tiles. Re-tile each cell into a
     // centred TILE_T x TILE_T buffer.
     for (int i = 0; i < nc; ++i) {
         int32_t cid;
         int32_t x0, y0, x1, y1;
-        fread(&cid, 4, 1, f);
-        fread(&x0, 4, 1, f); fread(&y0, 4, 1, f);
-        fread(&x1, 4, 1, f); fread(&y1, 4, 1, f);
-        fread(&p.cx[i],  4, 1, f); fread(&p.cy[i],  4, 1, f);
-        fread(&p.vx[i],  4, 1, f); fread(&p.vy[i],  4, 1, f);
-        fread(&p.vol[i], 4, 1, f);
+        if (!ckpt_read_exact(f, &cid, 4, 1, "legacy cell id")) return false;
+        if (!ckpt_read_exact(f, &x0, 4, 1, "legacy cell x0")) return false;
+        if (!ckpt_read_exact(f, &y0, 4, 1, "legacy cell y0")) return false;
+        if (!ckpt_read_exact(f, &x1, 4, 1, "legacy cell x1")) return false;
+        if (!ckpt_read_exact(f, &y1, 4, 1, "legacy cell y1")) return false;
+        if (!ckpt_read_exact(f, &p.cx[i], 4, 1, "legacy cell cx")) return false;
+        if (!ckpt_read_exact(f, &p.cy[i], 4, 1, "legacy cell cy")) return false;
+        if (!ckpt_read_exact(f, &p.vx[i], 4, 1, "legacy cell vx")) return false;
+        if (!ckpt_read_exact(f, &p.vy[i], 4, 1, "legacy cell vy")) return false;
+        if (!ckpt_read_exact(f, &p.vol[i], 4, 1, "legacy cell volume")) return false;
 
         int w = (x1 - x0) + 2 * halo;
         int h = (y1 - y0) + 2 * halo;
         int ox_legacy = x0 - halo;
         int oy_legacy = y0 - halo;
         std::vector<float> tile_legacy((size_t)w * h);
-        fread(tile_legacy.data(), sizeof(float), (size_t)w * h, f);
+        if (!ckpt_read_exact(f, tile_legacy.data(), sizeof(float),
+                     (size_t)w * h, "legacy phi tile")) return false;
 
         int dx = (TILE_T - w) / 2;
         int dy = (TILE_T - h) / 2;
@@ -971,20 +1005,33 @@ void decode_cell_records(FILE* f, uint32_t ver, int Tin, int halo,
             }
         }
     }
+    return true;
 }
 
 // Read magic-tagged per-cell sidecar blocks (VA_A/GAMA/RADI/POLR/RNGS) into
 // the payload. Stops at the first unrecognized magic (or EOF) and rewinds
 // so callers don't lose position.
-void decode_sidecars(FILE* f, CheckpointPayload& p) {
+bool decode_sidecars(FILE* f, CheckpointPayload& p) {
     while (true) {
         long pos = ftell(f);
         ckpt::SidecarBlockHeader sh{};
-        if (fread(&sh, sizeof(sh), 1, f) != 1) break;
+        size_t got = fread(&sh, 1, sizeof(sh), f);
+        if (got == 0) break;
+        if (got != sizeof(sh)) {
+            fprintf(stderr,
+                    "[ckpt] short read while reading sidecar header (got %zu/%zu bytes)\n",
+                    got, sizeof(sh));
+            return false;
+        }
+        if (sh.count < 0) {
+            fprintf(stderr, "[ckpt] invalid sidecar count %d\n", sh.count);
+            return false;
+        }
         if (sh.magic == ckpt::MAGIC_VA_A || sh.magic == ckpt::MAGIC_GAMA ||
             sh.magic == ckpt::MAGIC_RADI || sh.magic == ckpt::MAGIC_POLR) {
             std::vector<float> data(sh.count);
-            fread(data.data(), sizeof(float), sh.count, f);
+            if (!ckpt_read_exact(f, data.data(), sizeof(float), sh.count,
+                                 "float sidecar payload")) return false;
             if      (sh.magic == ckpt::MAGIC_VA_A) p.per_vA          = std::move(data);
             else if (sh.magic == ckpt::MAGIC_GAMA) p.per_gamma       = std::move(data);
             else if (sh.magic == ckpt::MAGIC_RADI) p.per_radius      = std::move(data);
@@ -992,12 +1039,14 @@ void decode_sidecars(FILE* f, CheckpointPayload& p) {
         } else if (sh.magic == ckpt::MAGIC_RNGS) {
             const size_t payload = (size_t)sh.count * sizeof(curandState);
             p.per_rng_bytes.assign(payload, 0);
-            if (payload > 0) fread(p.per_rng_bytes.data(), 1, payload, f);
+            if (!ckpt_read_exact(f, p.per_rng_bytes.data(), 1, payload,
+                                 "RNGS sidecar payload")) return false;
         } else {
             fseek(f, pos, SEEK_SET);
             break;
         }
     }
+    return true;
 }
 
 // Top-level pure file I/O: read whatever is on disk into a CheckpointPayload.
@@ -1011,10 +1060,19 @@ bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
     }
 
     uint32_t magic = 0, ver = 0;
-    fread(&magic, 4, 1, f);
-    fread(&ver,   4, 1, f);
+    if (!ckpt_read_exact(f, &magic, 4, 1, "checkpoint magic")) {
+        fclose(f); return false;
+    }
+    if (!ckpt_read_exact(f, &ver, 4, 1, "checkpoint version")) {
+        fclose(f); return false;
+    }
     if (magic != ckpt::MAGIC) {
         fprintf(stderr, "Not a cell_sim checkpoint (magic=0x%08x)\n", magic);
+        fclose(f); return false;
+    }
+    if (ver < ckpt::VERSION_MIN || ver > ckpt::VERSION_CURRENT) {
+        fprintf(stderr, "Unsupported checkpoint version %u (supported %u..%u)\n",
+                ver, ckpt::VERSION_MIN, ckpt::VERSION_CURRENT);
         fclose(f); return false;
     }
     out.version = ver;
@@ -1026,7 +1084,10 @@ bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
         prefix.magic   = magic;
         prefix.version = ver;
         const size_t tail_bytes = sizeof(prefix) - 8;
-        fread(reinterpret_cast<uint8_t*>(&prefix) + 8, tail_bytes, 1, f);
+        if (!ckpt_read_exact(f, reinterpret_cast<uint8_t*>(&prefix) + 8,
+                             tail_bytes, 1, "checkpoint prefix")) {
+            fclose(f); return false;
+        }
         cs     = prefix.step;
         ct_f64 = prefix.cur_time;
         nc     = prefix.num_cells_local;
@@ -1037,16 +1098,22 @@ bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
         sp_sz  = prefix.sp_sz;
     } else {
         // v3/v4: cur_time was f32 (4 bytes), 4-byte-shorter prefix.
-        fread(&cs, 4, 1, f);
+        if (!ckpt_read_exact(f, &cs, 4, 1, "legacy step")) {
+            fclose(f); return false;
+        }
         float ct_f32 = 0.0f;
-        fread(&ct_f32, 4, 1, f);
+        if (!ckpt_read_exact(f, &ct_f32, 4, 1, "legacy time")) {
+            fclose(f); return false;
+        }
         ct_f64 = ct_f32;
-        fread(&nc, 4, 1, f);
-        fread(&si, 4, 1, f);
-        fread(&ci2, 4, 1, f);
-        fread(&ts, 4, 1, f);
-        fread(bools, 1, 4, f);
-        fread(&sp_sz, 4, 1, f);
+        if (!ckpt_read_exact(f, &nc, 4, 1, "legacy cell count") ||
+            !ckpt_read_exact(f, &si, 4, 1, "legacy save interval") ||
+            !ckpt_read_exact(f, &ci2, 4, 1, "legacy reserved interval") ||
+            !ckpt_read_exact(f, &ts, 4, 1, "legacy trajectory samples") ||
+            !ckpt_read_exact(f, bools, 1, 4, "legacy flags") ||
+            !ckpt_read_exact(f, &sp_sz, 4, 1, "legacy SimParams size")) {
+            fclose(f); return false;
+        }
     }
     (void)si; (void)ci2; (void)ts; (void)bools;
 
@@ -1062,7 +1129,9 @@ bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
     int halo_legacy = out.params.halo;
     if (ver == 7 || ver == 8) {
         int32_t T_in = 0;
-        fread(&T_in, 4, 1, f);
+        if (!ckpt_read_exact(f, &T_in, 4, 1, "checkpoint TILE_T")) {
+            fclose(f); return false;
+        }
         Tin = T_in;
         if (Tin != TILE_T) {
             fprintf(stderr, "[ckpt] v%u TILE_T re-tile: file=%d build=%d\n",
@@ -1070,18 +1139,25 @@ bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
         }
         if (ver == 8) {
             ckpt::RankTrailer trailer{};
-            fread(&trailer, sizeof(trailer), 1, f);
+            if (!ckpt_read_exact(f, &trailer, sizeof(trailer), 1,
+                                 "rank trailer")) {
+                fclose(f); return false;
+            }
             out.v8_num_ranks = trailer.num_ranks;
             out.v8_rank_id   = trailer.rank_id;
             out.v8_n_global  = trailer.num_cells_global;
         }
     }
-    decode_cell_records(f, ver, Tin, halo_legacy, out);
+    if (!decode_cell_records(f, ver, Tin, halo_legacy, out)) {
+        fclose(f); return false;
+    }
     if (ver < 7) {
         // Legacy format had no halo concept after re-tile; record 0.
         out.params.halo = 0;
     }
-    decode_sidecars(f, out);
+    if (!decode_sidecars(f, out)) {
+        fclose(f); return false;
+    }
     fclose(f);
     return true;
 }
@@ -2189,6 +2265,10 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     snprintf(fn_tmp, sizeof(fn_tmp), "%s.tmp", fn);
     FILE* f = fopen(fn_tmp, "wb");
     if (!f) { fprintf(stderr, "Failed to open %s\n", fn_tmp); return; }
+    auto abort_checkpoint_write = [&]() {
+        fclose(f);
+        std::remove(fn_tmp);
+    };
 
     uint32_t sp_sz = sizeof(SimParams);
     int32_t T_w = TILE_T;
@@ -2206,15 +2286,19 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     prefix.reserved           = 0;
     prefix.trajectory_samples = params.trajectory_samples;
     prefix.sp_sz              = sp_sz;
-    fwrite(&prefix, sizeof(prefix), 1, f);
-    fwrite(&params, sp_sz, 1, f);
-    fwrite(&T_w, sizeof(T_w), 1, f);
+    if (!ckpt_write_exact(f, &prefix, sizeof(prefix), 1, "checkpoint prefix") ||
+        !ckpt_write_exact(f, &params, sp_sz, 1, "SimParams") ||
+        !ckpt_write_exact(f, &T_w, sizeof(T_w), 1, "checkpoint TILE_T")) {
+        abort_checkpoint_write(); return;
+    }
 
     ckpt::RankTrailer trailer{};
     trailer.num_ranks        = (gpus > 1) ? gpus : 1;
     trailer.rank_id          = (gpus > 1) ? rank : 0;
     trailer.num_cells_global = (gpus > 1) ? cells_global : n;
-    fwrite(&trailer, sizeof(trailer), 1, f);
+    if (!ckpt_write_exact(f, &trailer, sizeof(trailer), 1, "rank trailer")) {
+        abort_checkpoint_write(); return;
+    }
 
     auto wrap_d = [](double v, int L) {
         double m = std::fmod(v, (double)L);
@@ -2239,23 +2323,30 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         rec.vx       = vx[i];
         rec.vy       = vy[i];
         rec.volume   = vol;
-        fwrite(&rec, sizeof(rec), 1, f);
+        if (!ckpt_write_exact(f, &rec, sizeof(rec), 1, "cell record")) {
+            abort_checkpoint_write(); return;
+        }
 
         CK(cudaMemcpy(tile.data(),
                       cells.phi_in + (size_t)i * TILE_AREA,
                       TILE_AREA * sizeof(float), cudaMemcpyDeviceToHost));
-        fwrite(tile.data(), sizeof(float), TILE_AREA, f);
+        if (!ckpt_write_exact(f, tile.data(), sizeof(float), TILE_AREA, "phi tile")) {
+            abort_checkpoint_write(); return;
+        }
     }
 
-    auto write_per_cell = [&](uint32_t m, const float* dev_ptr) {
+    auto write_per_cell = [&](uint32_t m, const float* dev_ptr) -> bool {
         std::vector<float> h(n);
         CK(cudaMemcpy(h.data(), dev_ptr, n * sizeof(float), cudaMemcpyDeviceToHost));
         ckpt::SidecarBlockHeader sh{m, n};
-        fwrite(&sh, sizeof(sh), 1, f);
-        fwrite(h.data(), sizeof(float), n, f);
+        return ckpt_write_exact(f, &sh, sizeof(sh), 1, "float sidecar header") &&
+               ckpt_write_exact(f, h.data(), sizeof(float), n, "float sidecar payload");
     };
     for (auto& fld : per_cell_float_state()) {
-        if (fld.sidecar_magic != 0) write_per_cell(fld.sidecar_magic, *fld.dev_ptr);
+        if (fld.sidecar_magic != 0 &&
+            !write_per_cell(fld.sidecar_magic, *fld.dev_ptr)) {
+            abort_checkpoint_write(); return;
+        }
     }
 
     // C2: RNGS sidecar — per-cell curandState bytes so resume preserves
@@ -2266,11 +2357,17 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         std::vector<uint8_t> h_rng(bytes);
         CK(cudaMemcpy(h_rng.data(), cells.rng_states, bytes, cudaMemcpyDeviceToHost));
         ckpt::SidecarBlockHeader sh{ckpt::MAGIC_RNGS, n};
-        fwrite(&sh, sizeof(sh), 1, f);
-        fwrite(h_rng.data(), 1, bytes, f);
+        if (!ckpt_write_exact(f, &sh, sizeof(sh), 1, "RNGS sidecar header") ||
+            !ckpt_write_exact(f, h_rng.data(), 1, bytes, "RNGS sidecar payload")) {
+            abort_checkpoint_write(); return;
+        }
     }
 
-    fclose(f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "[ckpt] failed to close %s: %s\n", fn_tmp, std::strerror(errno));
+        std::remove(fn_tmp);
+        return;
+    }
 
     // Atomic rename: replace existing checkpoint.bin with the .tmp we just
     // wrote. std::filesystem::rename replaces on both Windows and POSIX.

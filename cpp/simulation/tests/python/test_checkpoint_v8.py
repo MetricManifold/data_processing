@@ -8,6 +8,7 @@ the C++ loader requires --gpus to match num_ranks on resume.
 Multi-rank tests need a multi-GPU build and are skipped locally.
 """
 import struct
+import subprocess
 import pytest
 from conftest import read_checkpoint, run_sim, CELL_SIM
 
@@ -77,6 +78,34 @@ class TestV8Resume:
         chk2 = read_checkpoint(out2 / "checkpoint.bin")
         assert chk2["version"] == 8
         assert chk2["params"]["subdomain_padding"] == pytest.approx(3.5)
+
+
+class TestV8CorruptInput:
+    """Malformed v8 checkpoints should fail before mutating simulation state."""
+
+    def test_truncated_v8_resume_reports_short_read(self, tmp_path):
+        good_dir = tmp_path / "good"; good_dir.mkdir()
+        out = run_sim(good_dir, "-n", "4", "-N", "640", "-r", "49",
+                      "-t", "0.5", "--seed", "42",
+                      "--save-interval", "0", "--trajectory-samples", "0")
+        good = out / "checkpoint.bin"
+        raw = good.read_bytes()
+        bad = tmp_path / "truncated_v8.bin"
+        bad.write_bytes(raw[:len(raw) // 2])
+
+        outdir = tmp_path / "resume_out"
+        outdir.mkdir()
+        result = subprocess.run(
+            [CELL_SIM, "-c", str(bad), "-t", "1.0",
+             "--save-interval", "0", "--trajectory-samples", "0",
+             "-o", str(outdir)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        combined = result.stderr + result.stdout
+        assert result.returncode != 0
+        assert "[ckpt] short read" in combined
 
 
 class TestV8MultiRankGuard:
