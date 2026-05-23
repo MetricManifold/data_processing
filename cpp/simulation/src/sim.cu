@@ -1828,23 +1828,18 @@ void Simulation::run() {
 
     while (step_count < target_step) {
         step();
-        bool wrote_output = false;
         if (params.save_interval > 0 && step_count % params.save_interval == 0) {
             char tag[32]; snprintf(tag, sizeof(tag), "%08d", step_count);
             save_checkpoint(out_dir, tag);
-            wrote_output = true;
         }
         if (checkpoint_interval > 0 && step_count % checkpoint_interval == 0) {
             save_checkpoint(out_dir);
-            wrote_output = true;
         }
         if (traj_fp && traj_every > 0 && step_count % traj_every == 0) {
             write_trajectory();
-            wrote_output = true;
         }
         if (vtk_interval > 0 && step_count % vtk_interval == 0) {
             write_vtk();
-            wrote_output = true;
         }
         // Status line: print on cadence regardless of whether trajectory/VTK
         // was written this step. The previous `wrote_output &&` gate caused
@@ -2816,8 +2811,6 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 s.params.Nx, s.params.Ny, s.params.dt, s.params.tau);
         }
     }
-
-    const size_t S_floats = (size_t)s0.params.Nx * s0.params.Ny;
 
     // ---------------------------------------------------------------------
     // Halo exchange staging buffers. Each rank's S buffer holds rows

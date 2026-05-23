@@ -129,20 +129,6 @@ void mg_finalize_world(MgWorld& w) {
     w.world_size = 1;
 }
 
-void mg_allreduce_sum_f32(MgComm* comm, float* buf, std::size_t n_floats,
-                          cudaStream_t stream)
-{
-    if (!comm || n_floats == 0) return;
-    ncclResult_t r = ncclAllReduce((const void*)buf, (void*)buf,
-                                   n_floats, ncclFloat32, ncclSum,
-                                   comm->c, stream);
-    if (r != ncclSuccess) {
-        fprintf(stderr, "[multi_gpu] ncclAllReduce: %s\n",
-                ncclGetErrorString(r));
-        std::exit(1);
-    }
-}
-
 void mg_allreduce_sum_i32(MgComm* comm, int32_t* buf, std::size_t n_ints,
                           cudaStream_t stream)
 {
@@ -178,29 +164,6 @@ void mg_send_recv_f32(MgComm* comm,
                                peer_recv, comm->c, stream);
     if (rr != ncclSuccess) {
         fprintf(stderr, "[multi_gpu] ncclRecv: %s\n",
-                ncclGetErrorString(rr));
-        std::exit(1);
-    }
-}
-
-void mg_send_recv_bytes(MgComm* comm,
-                        const void* src, int peer_send,
-                        void* dst, int peer_recv,
-                        std::size_t n_bytes,
-                        cudaStream_t stream)
-{
-    if (!comm || n_bytes == 0) return;
-    ncclResult_t rs = ncclSend(src, n_bytes, ncclChar,
-                               peer_send, comm->c, stream);
-    if (rs != ncclSuccess) {
-        fprintf(stderr, "[multi_gpu] ncclSend(bytes): %s\n",
-                ncclGetErrorString(rs));
-        std::exit(1);
-    }
-    ncclResult_t rr = ncclRecv(dst, n_bytes, ncclChar,
-                               peer_recv, comm->c, stream);
-    if (rr != ncclSuccess) {
-        fprintf(stderr, "[multi_gpu] ncclRecv(bytes): %s\n",
                 ncclGetErrorString(rr));
         std::exit(1);
     }
@@ -280,12 +243,6 @@ bool mg_init_world(int /*world_size*/, MgWorld& out) {
 
 void mg_finalize_world(MgWorld& /*w*/) {}
 
-void mg_allreduce_sum_f32(MgComm* /*c*/, float* /*buf*/,
-                          std::size_t /*n*/, cudaStream_t /*s*/) {
-    fprintf(stderr, "[multi_gpu] mg_allreduce_sum_f32 called in stub build\n");
-    std::exit(1);
-}
-
 void mg_allreduce_sum_i32(MgComm* /*c*/, int32_t* /*buf*/,
                           std::size_t /*n*/, cudaStream_t /*s*/) {
     fprintf(stderr, "[multi_gpu] mg_allreduce_sum_i32 called in stub build\n");
@@ -297,14 +254,6 @@ void mg_send_recv_f32(MgComm* /*c*/,
                       float* /*dst*/, int /*peer_recv*/,
                       std::size_t /*n*/, cudaStream_t /*s*/) {
     fprintf(stderr, "[multi_gpu] mg_send_recv_f32 called in stub build\n");
-    std::exit(1);
-}
-
-void mg_send_recv_bytes(MgComm* /*c*/,
-                        const void* /*src*/, int /*peer_send*/,
-                        void* /*dst*/, int /*peer_recv*/,
-                        std::size_t /*n*/, cudaStream_t /*s*/) {
-    fprintf(stderr, "[multi_gpu] mg_send_recv_bytes called in stub build\n");
     std::exit(1);
 }
 

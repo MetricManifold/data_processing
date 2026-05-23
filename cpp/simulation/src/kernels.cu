@@ -293,7 +293,6 @@ __global__ void k_evolve_l1(
     const float Ixn = sbroad[1];
     const float Iyn = sbroad[2];
 
-    const float invXi  = 1.0f / xi;
     const float coeffV = motility_coeff(kappa, xi, lambda_);
     const float vx     = coeffV * Ixn + vA * dirx[n];
     const float vy     = coeffV * Iyn + vA * diry[n];
@@ -607,7 +606,6 @@ __global__ void k_rhs_mb(
         const float gam    = gamma_cell[n];
         const float vA     = v_A_cell[n];
         const float R      = tgt_radius[n];
-        const float invXi  = 1.0f / xi;
         const float coeffV = motility_coeff(kappa, xi, lambda_);
         const float piR2   = PI * R * R;
         const float Vn     = V_in[n];
@@ -1250,31 +1248,10 @@ void launch_rng_init(CellArrays& c, unsigned long seed,
 }
 
 // ---------------------------------------------------------------------------
-// 9. k_halo_add — in-place dst[i] += src[i].
+// 9. Halo add — fused two-pair version only. The single-pair `launch_halo_add`
+// was the original implementation; both G=2 and G>=3 paths use the fused
+// variant now, which halves launch overhead.
 // ---------------------------------------------------------------------------
-// Used by multi-GPU halo exchange. The halo band is at most
-// 2 * HALO_H * Nx floats; e.g. for Nx=10412, HALO_H=159 that is ~13 MB
-// or ~3.3 M floats per band. A simple grid-stride loop saturates global
-// memory bandwidth, which dominates over any arithmetic here.
-// ---------------------------------------------------------------------------
-__global__ void k_halo_add(float* dst, const float* src, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = (size_t)gridDim.x * blockDim.x;
-    for (; i < n; i += stride) {
-        dst[i] += src[i];
-    }
-}
-
-void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
-                     cudaStream_t stream) {
-    if (n_floats == 0) return;
-    constexpr int BS = 256;
-    // Cap grid at a sensible size; the loop handles the rest.
-    int blocks = (int)std::min<std::size_t>(
-        (n_floats + BS - 1) / BS, (std::size_t)1024);
-    if (blocks <= 0) blocks = 1;
-    k_halo_add<<<blocks, BS, 0, stream>>>(dst, src, n_floats);
-}
 
 // Fused two-pair halo add. Each thread updates one element of each pair
 // from a shared linear index; two pairs are independent so no synchronization

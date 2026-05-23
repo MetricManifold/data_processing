@@ -71,16 +71,12 @@ void launch_initial_velocity(CellArrays& c, const SimParams& p);
 void launch_initial_scatter(CellArrays& c, const SimParams& p);
 void launch_initial_velocity_reduce(CellArrays& c, const SimParams& p);
 
-// Halo support: in-place add. dst[i] += src[i] for i in [0, n_floats).
+// Halo support: fused two-pair in-place add. dst0[i] += src0[i] and
+// dst1[i] += src1[i] in one kernel launch (both pairs share length).
 // Used by the multi-GPU halo exchange to fold neighbour-rank contributions
 // into the local S band after ncclSend/ncclRecv has placed the neighbour's
-// data in a staging buffer.
-void launch_halo_add(float* dst, const float* src, std::size_t n_floats,
-                     cudaStream_t stream);
-
-// Fused two-pair halo add: dst0[i] += src0[i] and dst1[i] += src1[i] in
-// one kernel launch. Both pairs share the same length (halo band size).
-// Saves ~10-15 us per step vs. two separate launch_halo_add calls.
+// data in a staging buffer. Saves ~10-15 us per step vs. two separate
+// launches.
 void launch_halo_add_pair(float* dst0, const float* src0,
                           float* dst1, const float* src1,
                           std::size_t n_floats, cudaStream_t stream);

@@ -66,13 +66,7 @@ bool mg_init_world(int world_size, MgWorld& out);
 // world or on an empty world.
 void mg_finalize_world(MgWorld& w);
 
-// In-place SUM all-reduce of `n_floats` float32s in `buf` for one rank.
-// MUST be issued inside an mg_group_start()/mg_group_end() pair when
-// driving multiple ranks from a single host thread, otherwise NCCL will
-// deadlock waiting for peers.
-void mg_allreduce_sum_f32(MgComm* comm, float* buf, std::size_t n_floats,
-                          cudaStream_t stream);
-
+// In-place SUM all-reduce on int32 buffers (cell-loss audit only).
 // Element-wise in-place AllReduce(SUM) on an int32 buffer. Used by the
 // cell-loss audit hook (CELL_SIM_AUDIT_CELLS=1) to verify that the total
 // cell count across ranks stays equal to cells_global. Off the hot path.
@@ -92,15 +86,8 @@ void mg_send_recv_f32(MgComm* comm,
                       std::size_t n_floats,
                       cudaStream_t stream);
 
-// Generic byte send/recv pair. Used by cell migration where the payload
-// is a packed struct (phi tile + header). Internally just calls ncclSend
-// and ncclRecv with ncclChar — NCCL is byte-transparent. Same group-call
-// requirements as mg_send_recv_f32.
-void mg_send_recv_bytes(MgComm* comm,
-                        const void* src, int peer_send,
-                        void* dst, int peer_recv,
-                        std::size_t n_bytes,
-                        cudaStream_t stream);
+// Generic byte send/recv pair. Use the explicit halves below; the
+// combined variant has no live caller anymore.
 
 // Pure send / recv halves of mg_send_recv_bytes, for when the four
 // directions of a migration exchange (up-send, down-send, prev-recv,
@@ -129,18 +116,3 @@ void mg_send_recv_i32(MgComm* comm,
 void mg_group_start();
 void mg_group_end();
 
-// ---------------------------------------------------------------------------
-// Cell partitioning helper (no NCCL dependency; lives here because the
-// multi-GPU runner is its only consumer). Slices N_global cells across
-// G ranks: ranks [0, N % G) get one extra cell each.
-// ---------------------------------------------------------------------------
-inline void mg_slice_cells(int N_global, int gpus, int rank,
-                           int& offset_out, int& count_out)
-{
-    if (gpus <= 1) { offset_out = 0; count_out = N_global; return; }
-    int base = N_global / gpus;
-    int rem  = N_global % gpus;
-    int extra_before = (rank < rem) ? rank : rem;
-    offset_out = rank * base + extra_before;
-    count_out  = base + ((rank < rem) ? 1 : 0);
-}
