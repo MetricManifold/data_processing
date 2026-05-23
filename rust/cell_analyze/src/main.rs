@@ -679,6 +679,7 @@ fn list_what(what: &str) {
         println!("  hexatic_order              ψ₆ + g₆(r)");
         println!("  voronoi_shape              q = P/√A from Voronoi polygons");
         println!("  percolation_cluster        Cluster-size order params (S_max, P_inf, χ) for mobile cells");
+        println!("  trajectory_xy              Per-cell (x, y) path through trajectory window (for trajectory_xy panels)");
         println!("  --- polarity / energy ---");
         println!("  polarity_tau               Persistence τ from polarity autocorrelation");
         println!("  kinetic_energy             ½⟨v²⟩(t) per cell + total");

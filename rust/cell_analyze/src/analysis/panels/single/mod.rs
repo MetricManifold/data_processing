@@ -13,6 +13,7 @@ pub mod gvi;
 pub mod ln_timeseries;
 pub mod msd;
 pub mod speed_bursts;
+pub mod trajectory_xy;
 
 /// Borrowed reference to one run for a single-run panel.
 pub struct SingleRunData<'a> {

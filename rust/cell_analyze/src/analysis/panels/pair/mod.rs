@@ -14,6 +14,7 @@ pub mod ln_timeseries;
 pub mod msd_t;
 pub mod speed_bursts;
 pub mod summary;
+pub mod trajectory_xy;
 
 /// Shared data shape consumed by every pair panel.
 pub struct PairPanelData<'a> {

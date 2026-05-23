@@ -289,6 +289,10 @@ pub enum PanelToml {
         /// L_n histogram panel: number of bins (default 40).
         #[serde(default)]
         bins: Option<usize>,
+        /// trajectory_xy pair: "unwrapped" (default), "box", or
+        /// "box_unwrapped".
+        #[serde(default)]
+        view: Option<String>,
     },
     /// Single-run panel. `input` references a `single_run` slot.
     Single {
@@ -313,6 +317,16 @@ pub enum PanelToml {
         /// MSD panel: also draw the population MSD (default true).
         #[serde(default)]
         show_population: Option<bool>,
+        /// trajectory_xy: "unwrapped" (default), "box" (axes = full
+        /// Lx × Ly with wrapped positions), or "box_unwrapped" (axes
+        /// = full Lx × Ly but path drawn unwrapped — may go outside the
+        /// box). "box" is what you want to see periodic boundary crossings.
+        #[serde(default)]
+        view: Option<String>,
+        /// trajectory_xy: color mode — "time" (default, viridis by time
+        /// fraction) or "solid" (one color per cell).
+        #[serde(default)]
+        color: Option<String>,
     },
     /// Overlay panel: N runs colored by series. `input` references an
     /// `overlay` slot.
@@ -1056,6 +1070,7 @@ fn render_figure(
                 msd_lag_max,
                 gvi_x_max,
                 bins,
+                view,
             } => {
                 let pairs = match ws.get(input)? {
                     Slot::RunPairs(p) => p,
@@ -1102,6 +1117,19 @@ fn render_figure(
                     }
                     .render(cell, &data, &opts)?,
                     "summary" => pp::summary::SummaryPair.render(cell, &data, &opts)?,
+                    "trajectory_xy" => {
+                        let view_mode = match view.as_deref().unwrap_or("unwrapped") {
+                            "box" => crate::analysis::panels::single::trajectory_xy::ViewMode::Box,
+                            "box_unwrapped" => crate::analysis::panels::single::trajectory_xy::ViewMode::BoxUnwrapped,
+                            "unwrapped" => crate::analysis::panels::single::trajectory_xy::ViewMode::Unwrapped,
+                            other => return Err(anyhow!("unknown trajectory_xy view `{}` (use unwrapped|box|box_unwrapped)", other)),
+                        };
+                        pp::trajectory_xy::TrajectoryXyPair {
+                            view: view_mode,
+                            draw_box: true,
+                        }
+                        .render(cell, &data, &opts)?
+                    }
                     other => {
                         return Err(anyhow!("unknown pair subtype `{}`", other));
                     }
@@ -1118,6 +1146,8 @@ fn render_figure(
                 gvi_x_max,
                 fit_eq5,
                 show_population,
+                view,
+                color,
             } => {
                 let single = match ws.get(input)? {
                     Slot::SingleRun(r) => r,
@@ -1154,6 +1184,25 @@ fn render_figure(
                         speed_max: speed_max.unwrap_or(0.02),
                     }
                     .render(cell, &data, &opts)?,
+                    "trajectory_xy" => {
+                        let view_mode = match view.as_deref().unwrap_or("unwrapped") {
+                            "box" => sp::trajectory_xy::ViewMode::Box,
+                            "box_unwrapped" => sp::trajectory_xy::ViewMode::BoxUnwrapped,
+                            "unwrapped" => sp::trajectory_xy::ViewMode::Unwrapped,
+                            other => return Err(anyhow!("unknown trajectory_xy view `{}` (use unwrapped|box|box_unwrapped)", other)),
+                        };
+                        let color_mode = match color.as_deref().unwrap_or("time") {
+                            "time" => sp::trajectory_xy::ColorMode::Time,
+                            "solid" => sp::trajectory_xy::ColorMode::Solid,
+                            other => return Err(anyhow!("unknown trajectory_xy color `{}` (use time|solid)", other)),
+                        };
+                        sp::trajectory_xy::TrajectoryXySingle {
+                            view: view_mode,
+                            color: color_mode,
+                            draw_box: true,
+                        }
+                        .render(cell, &data, &opts)?
+                    }
                     other => {
                         return Err(anyhow!("unknown single subtype `{}`", other));
                     }

@@ -32,6 +32,7 @@ pub mod self_scattering;
 pub mod shape_index;
 pub mod spatial_correlation;
 pub mod structure_factor;
+pub mod trajectory_xy;
 pub mod va_mobility;
 pub mod van_hove;
 pub mod velocity_autocorrelation;
@@ -72,6 +73,7 @@ pub fn register_builtin() -> Vec<Box<dyn ErasedObservable>> {
         Box::new(EraseAdaptor(hexatic_order::HexaticOrder)),
         Box::new(EraseAdaptor(voronoi_shape::VoronoiShape)),
         Box::new(EraseAdaptor(percolation_cluster::PercolationCluster::default())),
+        Box::new(EraseAdaptor(trajectory_xy::TrajectoryXy::default())),
         // Polarity / energy
         Box::new(EraseAdaptor(polarity_tau::PolarityTau)),
         Box::new(EraseAdaptor(kinetic_energy::KineticEnergy)),
