@@ -1876,10 +1876,48 @@ void Simulation::print_status() {
 
 // ---------------------------------------------------------------------------
 // write_trajectory — stable CSV format consumed by the Rust analyzer
-// and Python tooling. Centroids are computed on the host from (Cx, Cy, V, origin).
+// and Python tooling. Centroids are computed on the host from packed
+// per-cell fields (origin, Cx, Cy, V) that are gathered on-device by
+// k_pack_traj and shipped via one cudaMemcpyAsync to a pinned host ring.
+// The producer (step thread) never calls cudaStreamSynchronize; the
+// writer thread waits on a per-snapshot cudaEvent.
 // ---------------------------------------------------------------------------
+void Simulation::init_trajectory_ring() {
+    if (traj_ring_init) return;
+    const int cap = (cells.capacity > 0) ? cells.capacity : cells.num_cells;
+    if (cap <= 0) return;
+    CK(cudaMalloc(&d_traj_pack, (size_t)cap * sizeof(TrajPackedCell)));
+    // CELL_SIM_TRAJ_RING tunes how many in-flight snapshots are allowed.
+    // Depth 4 is enough to hide ~4x the writer's host time; raising it
+    // only matters if the formatter+disk get slower than the GPU step.
+    const int depth = std::max(2, sim_env_int("CELL_SIM_TRAJ_RING", 4));
+    traj_ring.resize(depth);
+    for (auto& slot : traj_ring) {
+        CK(cudaMallocHost((void**)&slot.host_packed,
+                          (size_t)cap * sizeof(TrajPackedCell)));
+        CK(cudaEventCreateWithFlags(&slot.ready_event, cudaEventDisableTiming));
+        traj_writer_free.push_back(&slot);
+    }
+    traj_ring_capacity = cap;
+    traj_ring_init = true;
+}
+
+void Simulation::free_trajectory_ring() {
+    if (!traj_ring_init) return;
+    for (auto& slot : traj_ring) {
+        if (slot.host_packed) { cudaFreeHost(slot.host_packed); slot.host_packed = nullptr; }
+        if (slot.ready_event) { cudaEventDestroy(slot.ready_event); slot.ready_event = nullptr; }
+    }
+    traj_ring.clear();
+    traj_writer_free.clear();
+    if (d_traj_pack) { cudaFree(d_traj_pack); d_traj_pack = nullptr; }
+    traj_ring_capacity = 0;
+    traj_ring_init = false;
+}
+
 void Simulation::start_trajectory_writer() {
     if (traj_writer_started || !traj_fp) return;
+    init_trajectory_ring();
     traj_writer_stop = false;
     traj_writer_thread = std::thread(&Simulation::trajectory_writer_loop, this);
     traj_writer_started = true;
@@ -1896,12 +1934,14 @@ void Simulation::finish_trajectory_writer() {
     traj_writer_started = false;
     traj_writer_stop = false;
     traj_writer_queue.clear();
+    traj_writer_free.clear();
     if (traj_fp) fflush(traj_fp);
+    free_trajectory_ring();
 }
 
 void Simulation::trajectory_writer_loop() {
     for (;;) {
-        TrajectorySnapshot snap;
+        TrajectorySnapshot* slot = nullptr;
         {
             std::unique_lock<std::mutex> lock(traj_writer_mutex);
             traj_writer_cv.wait(lock, [&] {
@@ -1911,17 +1951,24 @@ void Simulation::trajectory_writer_loop() {
                 if (traj_writer_stop) break;
                 continue;
             }
-            snap = std::move(traj_writer_queue.front());
+            slot = traj_writer_queue.front();
             traj_writer_queue.pop_front();
         }
+        // Block here, not on the producer: wait for the async D2H copy to
+        // land in the pinned host buffer before formatting.
+        CK(cudaEventSynchronize(slot->ready_event));
+        write_trajectory_snapshot(*slot);
+        {
+            std::lock_guard<std::mutex> lock(traj_writer_mutex);
+            traj_writer_free.push_back(slot);
+        }
         traj_writer_cv.notify_all();
-        write_trajectory_snapshot(snap);
     }
 }
 
 void Simulation::write_trajectory_snapshot(const TrajectorySnapshot& snap) {
     if (!traj_fp) return;
-    int n = (int)snap.V.size();
+    const int n = snap.n;
     const int Nx = params.Nx, Ny = params.Ny;
     const double dA = params.dA();
     const double tgt_r = params.target_radius;
@@ -1934,15 +1981,16 @@ void Simulation::write_trajectory_snapshot(const TrajectorySnapshot& snap) {
 
     int skipped_v0 = 0;
     for (int i = 0; i < n; i++) {
+        const TrajPackedCell& c = snap.host_packed[i];
         // Skip cells whose volume hasn't been refreshed yet — happens for
         // arrival slots in the rebind step that triggered a migration: the
         // tile is copied over but volumes/Cx/Cy aren't refilled until the
         // next reduce. Without this guard, Cx/V=0 emits the bare origin
         // and produces a fake L/2-sized cell jump for one frame.
-        if (snap.V[i] < 1e-6f) { ++skipped_v0; continue; }
-        double invV = 1.0 / snap.V[i];
-        double cx_g = wrap_d(snap.origin[2*i + 0] + snap.Cx[i] * invV, Nx);
-        double cy_g = wrap_d(snap.origin[2*i + 1] + snap.Cy[i] * invV, Ny);
+        if (c.V < 1e-6f) { ++skipped_v0; continue; }
+        double invV = 1.0 / c.V;
+        double cx_g = wrap_d(c.ox + c.Cx * invV, Nx);
+        double cy_g = wrap_d(c.oy + c.Cy * invV, Ny);
         // Free NaN tripwire: cx_g/cy_g already computed on host. If
         // either is non-finite, the cell's reductions are corrupted
         // (typical: NaN propagating from a previous step's RHS). Abort
@@ -1951,19 +1999,19 @@ void Simulation::write_trajectory_snapshot(const TrajectorySnapshot& snap) {
             fprintf(stderr,
                     "[FATAL] non-finite centroid for cell %d at step=%d "
                     "t=%.4f: cx=%g cy=%g — aborting\n",
-                        i, snap.step, snap.time, cx_g, cy_g);
+                    i, snap.step, snap.time, cx_g, cy_g);
             fflush(traj_fp);
             std::exit(2);
         }
-                float theta = atan2f(snap.py[i], snap.px[i]);
-                double perim = snap.per[i] * dA;
+        float theta = atan2f(c.py, c.px);
+        double perim = c.per * dA;
         double Ln = perim / (2.0 * M_PI * tgt_r);
-                double vol = snap.V[i] * dA;
-                int gid = ((int)snap.global_id.size() > i) ? snap.global_id[i] : i;
+        double vol = c.V * dA;
+        int gid = ((int)snap.global_id.size() > i) ? snap.global_id[i] : i;
         fprintf(traj_fp,
                 "%.6f %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
-                    snap.time, gid, cx_g, cy_g, snap.vx[i], snap.vy[i],
-                    snap.px[i], snap.py[i], theta, snap.vA[i], Ln, vol);
+                snap.time, gid, cx_g, cy_g, c.vx, c.vy,
+                c.px, c.py, theta, c.vA, Ln, vol);
     }
     ++traj_flush_counter;
     const int flush_every = sim_env_int("CELL_SIM_TRAJ_FLUSH_EVERY", 100);
@@ -1980,33 +2028,52 @@ void Simulation::write_trajectory_snapshot(const TrajectorySnapshot& snap) {
 
 void Simulation::write_trajectory() {
     if (!traj_fp) return;
-    if (step_stream) CK(cudaStreamSynchronize(step_stream));
     start_trajectory_writer();
-    int n = cells.num_cells;
-    TrajectorySnapshot snap;
-    snap.time = cur_time;
-    snap.step = step_count;
-    snap.origin.resize(2 * n);
-    snap.V.resize(n);  snap.Cx.resize(n); snap.Cy.resize(n); snap.per.resize(n);
-    snap.vx.resize(n); snap.vy.resize(n); snap.px.resize(n); snap.py.resize(n); snap.vA.resize(n);
-    if (gpus > 1 && (int)h_global_id.size() >= n) snap.global_id = h_global_id;
-    CK(cudaMemcpy(snap.origin.data(), cells.origin,       2*n*sizeof(int),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.V.data(),      cells.volumes,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.Cx.data(),     cells.Cx,           n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.Cy.data(),     cells.Cy,           n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.per.data(),    cells.perimeters,   n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.vx.data(),     cells.velocities_x, n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.vy.data(),     cells.velocities_y, n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.px.data(),     cells.polar_x,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.py.data(),     cells.polar_y,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(snap.vA.data(),     cells.v_A_cell,     n*sizeof(float),    cudaMemcpyDeviceToHost));
-    const int max_queue = std::max(1, sim_env_int("CELL_SIM_TRAJ_QUEUE", 1));
+    const int n = cells.num_cells;
+    if (n > traj_ring_capacity) {
+        // Should never happen: ring was sized to cells.capacity which
+        // includes the multi-GPU migration headroom. If it does, the
+        // contract is broken — abort rather than silently truncate.
+        fprintf(stderr,
+                "[FATAL] write_trajectory: num_cells %d > ring capacity %d\n",
+                n, traj_ring_capacity);
+        std::exit(2);
+    }
+
+    // Acquire a free slot. Blocks only if the writer is genuinely behind
+    // (ring full of in-flight snapshots) — with depth 4 and the writer
+    // doing ~50us/snapshot vs ~500us per step, never in steady state.
+    TrajectorySnapshot* slot = nullptr;
     {
         std::unique_lock<std::mutex> lock(traj_writer_mutex);
         traj_writer_cv.wait(lock, [&] {
-            return traj_writer_stop || (int)traj_writer_queue.size() < max_queue;
+            return traj_writer_stop || !traj_writer_free.empty();
         });
-        if (!traj_writer_stop) traj_writer_queue.push_back(std::move(snap));
+        if (traj_writer_stop) return;
+        slot = traj_writer_free.front();
+        traj_writer_free.pop_front();
+    }
+
+    slot->time = cur_time;
+    slot->step = step_count;
+    slot->n = n;
+    if (gpus > 1 && (int)h_global_id.size() >= n) {
+        slot->global_id.assign(h_global_id.begin(), h_global_id.begin() + n);
+    } else {
+        slot->global_id.clear();
+    }
+
+    // Pack on device, single async D2H, then mark ready. All three live on
+    // step_stream so they implicitly serialise after the step's evolve.
+    launch_pack_traj(cells, d_traj_pack, n, step_stream);
+    CK(cudaMemcpyAsync(slot->host_packed, d_traj_pack,
+                       (size_t)n * sizeof(TrajPackedCell),
+                       cudaMemcpyDeviceToHost, step_stream));
+    CK(cudaEventRecord(slot->ready_event, step_stream));
+
+    {
+        std::lock_guard<std::mutex> lock(traj_writer_mutex);
+        traj_writer_queue.push_back(slot);
     }
     traj_writer_cv.notify_one();
 }

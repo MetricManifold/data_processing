@@ -27,6 +27,10 @@ void launch_apply_scripted(CellArrays& c,
 // Zero S then scatter phi^2 into it (one CTA per cell).
 void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
 
+// Pack origin + per-cell observables into a contiguous device buffer for
+// single-memcpy trajectory I/O. `out` must point to >= N TrajPackedCell.
+void launch_pack_traj(CellArrays& c, TrajPackedCell* out, int N, cudaStream_t stream = 0);
+
 // Fused two-pass evolve. Pass 1 reduces V/Cx/Cy/Ix/Iy, broadcasts vx/vy.
 // Pass 2 reads S again, computes laplacian/double-well/repulsion/advection,
 // and writes phi_out plus reduces perimeter. Also writes velocities,

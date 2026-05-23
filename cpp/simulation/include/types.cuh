@@ -207,6 +207,20 @@ bool slab_in_window(int sy_local, int ext_height) {
 //   * observables (Cx, Cy, V, perimeter, velocities) are computed inside
 //     the fused evolve kernel and exposed on the host for trajectory I/O.
 // ---------------------------------------------------------------------------
+
+// Packed-per-cell layout used by the async trajectory writer. Produced by
+// k_pack_traj into a contiguous device buffer; one cudaMemcpyAsync moves
+// the whole batch to pinned host. Field order = the order the formatter
+// reads in write_trajectory_snapshot; keep them aligned.
+struct TrajPackedCell {
+    int   ox, oy;        // origin (cells.origin[2i], [2i+1])
+    float V, Cx, Cy;
+    float per;
+    float vx, vy;
+    float px, py;
+    float vA;
+};
+
 struct CellArrays {
     int num_cells = 0;
     // Allocated capacity for all per-cell arrays. For G=1 capacity ==

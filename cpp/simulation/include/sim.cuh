@@ -64,17 +64,30 @@ struct Simulation {
     FILE* traj_fp = nullptr;
     int traj_every = 0;
     int traj_flush_counter = 0;
+    // Async trajectory writer:
+    //   producer (step thread) launches k_pack_traj into a device buffer,
+    //   issues one cudaMemcpyAsync to a pinned host slot in `traj_ring`,
+    //   records `ready_event` on step_stream, pushes the slot onto
+    //   `traj_writer_queue`. Writer thread pops, cudaEventSynchronize,
+    //   formats fprintf, returns the slot to `traj_writer_free`. Producer
+    //   never calls cudaStreamSynchronize.
     struct TrajectorySnapshot {
         double time = 0.0;
         int step = 0;
-        std::vector<int> origin;
+        int n = 0;
+        TrajPackedCell* host_packed = nullptr;  // pinned, capacity slots
+        cudaEvent_t     ready_event = nullptr;
         std::vector<int> global_id;
-        std::vector<float> V, Cx, Cy, per, vx, vy, px, py, vA;
     };
+    TrajPackedCell* d_traj_pack = nullptr;          // device-side pack buffer
+    int             traj_ring_capacity = 0;         // = cells.capacity at init
+    std::vector<TrajectorySnapshot> traj_ring;      // owns pinned bufs + events
     std::thread traj_writer_thread;
     std::mutex traj_writer_mutex;
     std::condition_variable traj_writer_cv;
-    std::deque<TrajectorySnapshot> traj_writer_queue;
+    std::deque<TrajectorySnapshot*> traj_writer_queue;  // ready-to-write slots
+    std::deque<TrajectorySnapshot*> traj_writer_free;   // available slots
+    bool traj_ring_init = false;
     bool traj_writer_started = false;
     bool traj_writer_stop = false;
     bool save_final_checkpoint = true;
@@ -389,6 +402,8 @@ struct Simulation {
     void start_trajectory_writer();
     void finish_trajectory_writer();
     void trajectory_writer_loop();
+    void init_trajectory_ring();
+    void free_trajectory_ring();
     void write_trajectory_snapshot(const TrajectorySnapshot& snap);
     void write_vtk();
     void save_checkpoint(const std::string& dir, const std::string& tag = "");

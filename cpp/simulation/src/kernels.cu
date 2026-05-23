@@ -961,6 +961,50 @@ void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
+// 5a. k_pack_traj — gather origin + per-cell observables into a single
+// contiguous device buffer so the trajectory writer issues one async D2H
+// copy instead of one synchronous copy per field.
+// ---------------------------------------------------------------------------
+__global__ void k_pack_traj(
+    const int*   __restrict__ origin,
+    const float* __restrict__ V,
+    const float* __restrict__ Cx,
+    const float* __restrict__ Cy,
+    const float* __restrict__ per,
+    const float* __restrict__ vx,
+    const float* __restrict__ vy,
+    const float* __restrict__ px,
+    const float* __restrict__ py,
+    const float* __restrict__ vA,
+    TrajPackedCell* __restrict__ out,
+    int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    TrajPackedCell r;
+    r.ox  = origin[2*i + 0];
+    r.oy  = origin[2*i + 1];
+    r.V   = V[i];
+    r.Cx  = Cx[i];
+    r.Cy  = Cy[i];
+    r.per = per[i];
+    r.vx  = vx[i];
+    r.vy  = vy[i];
+    r.px  = px[i];
+    r.py  = py[i];
+    r.vA  = vA[i];
+    out[i] = r;
+}
+
+void launch_pack_traj(CellArrays& c, TrajPackedCell* out, int N, cudaStream_t stream) {
+    if (N <= 0) return;
+    k_pack_traj<<<(N + 255) / 256, 256, 0, stream>>>(
+        c.origin, c.volumes, c.Cx, c.Cy, c.perimeters,
+        c.velocities_x, c.velocities_y, c.polar_x, c.polar_y, c.v_A_cell,
+        out, N);
+}
+
+// ---------------------------------------------------------------------------
 // 5b. k_apply_scripted — write pre-determined (cid, theta) pairs.
 // ---------------------------------------------------------------------------
 // Used by --scripted-events deterministic replay. One thread per event.
