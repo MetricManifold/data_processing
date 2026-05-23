@@ -26,6 +26,25 @@
 #include <random>
 #include <sstream>
 
+static bool sim_env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return false;
+    return std::strcmp(value, "0") != 0
+        && std::strcmp(value, "false") != 0
+        && std::strcmp(value, "FALSE") != 0
+        && std::strcmp(value, "off") != 0
+        && std::strcmp(value, "OFF") != 0;
+}
+
+static int sim_env_int(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed < 0 || parsed > 1000000000L) return fallback;
+    return (int)parsed;
+}
+
 #define CK(call) do {                                                      \
     cudaError_t e = (call);                                                \
     if (e != cudaSuccess) {                                                \
@@ -314,6 +333,10 @@ void Simulation::alloc_gpu() {
 // ---------------------------------------------------------------------------
 void Simulation::configure_l2_persistence() {
     if (cells.S == nullptr || cells.num_cells == 0) return;
+    if (sim_env_flag_enabled("CELL_SIM_DISABLE_L2_PERSIST")) {
+        printf("[L2] persistence disabled by CELL_SIM_DISABLE_L2_PERSIST.\n");
+        return;
+    }
 
     int dev = 0;
     cudaGetDevice(&dev);
@@ -610,6 +633,7 @@ void Simulation::setup_step_stream() {
     // Dedicated stream for the captured step pipeline. Non-blocking so it
     // doesn't serialize against the default stream used by I/O paths.
     CK(cudaStreamCreateWithFlags(&step_stream, cudaStreamNonBlocking));
+    if (sim_env_flag_enabled("CELL_SIM_DISABLE_L2_PERSIST")) return;
     // Mirror the L2 access-policy-window onto step_stream so the
     // S-field benefits from persistence on the captured/replayed
     // kernels too. We size the window at min(S_bytes, carveout) so
@@ -1714,6 +1738,7 @@ void Simulation::run() {
         std::string tp = out_dir + "/trajectory.txt";
         traj_fp = fopen(tp.c_str(), "a");
         if (traj_fp) {
+            setvbuf(traj_fp, nullptr, _IOFBF, 1 << 20);
             fseek(traj_fp, 0, SEEK_END);
             long pos = ftell(traj_fp);
             if (pos == 0) {
@@ -1783,7 +1808,11 @@ void Simulation::run() {
         }
 #endif
     }
-    if (traj_fp) { fclose(traj_fp); traj_fp = nullptr; }
+    if (traj_fp) {
+        finish_trajectory_writer();
+        fclose(traj_fp);
+        traj_fp = nullptr;
+    }
 
     if (save_final_checkpoint) save_checkpoint(out_dir);
 
@@ -1850,24 +1879,50 @@ void Simulation::print_status() {
 // write_trajectory — stable CSV format consumed by the Rust analyzer
 // and Python tooling. Centroids are computed on the host from (Cx, Cy, V, origin).
 // ---------------------------------------------------------------------------
-void Simulation::write_trajectory() {
-    if (!traj_fp) return;
-    if (step_stream) CK(cudaStreamSynchronize(step_stream));
-    int n = cells.num_cells;
-    std::vector<int>   h_or(2 * n);
-    std::vector<float> V(n), Cx(n), Cy(n), per(n);
-    std::vector<float> vx(n), vy(n), px(n), py(n), vA(n);
-    CK(cudaMemcpy(h_or.data(), cells.origin,       2*n*sizeof(int),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(V.data(),    cells.volumes,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(Cx.data(),   cells.Cx,           n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(Cy.data(),   cells.Cy,           n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(per.data(),  cells.perimeters,   n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(vx.data(),   cells.velocities_x, n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(vy.data(),   cells.velocities_y, n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(px.data(),   cells.polar_x,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(py.data(),   cells.polar_y,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(vA.data(),   cells.v_A_cell,     n*sizeof(float),    cudaMemcpyDeviceToHost));
+void Simulation::start_trajectory_writer() {
+    if (traj_writer_started || !traj_fp) return;
+    traj_writer_stop = false;
+    traj_writer_thread = std::thread(&Simulation::trajectory_writer_loop, this);
+    traj_writer_started = true;
+}
 
+void Simulation::finish_trajectory_writer() {
+    if (!traj_writer_started) return;
+    {
+        std::lock_guard<std::mutex> lock(traj_writer_mutex);
+        traj_writer_stop = true;
+    }
+    traj_writer_cv.notify_all();
+    if (traj_writer_thread.joinable()) traj_writer_thread.join();
+    traj_writer_started = false;
+    traj_writer_stop = false;
+    traj_writer_queue.clear();
+    if (traj_fp) fflush(traj_fp);
+}
+
+void Simulation::trajectory_writer_loop() {
+    for (;;) {
+        TrajectorySnapshot snap;
+        {
+            std::unique_lock<std::mutex> lock(traj_writer_mutex);
+            traj_writer_cv.wait(lock, [&] {
+                return traj_writer_stop || !traj_writer_queue.empty();
+            });
+            if (traj_writer_queue.empty()) {
+                if (traj_writer_stop) break;
+                continue;
+            }
+            snap = std::move(traj_writer_queue.front());
+            traj_writer_queue.pop_front();
+        }
+        traj_writer_cv.notify_all();
+        write_trajectory_snapshot(snap);
+    }
+}
+
+void Simulation::write_trajectory_snapshot(const TrajectorySnapshot& snap) {
+    if (!traj_fp) return;
+    int n = (int)snap.V.size();
     const int Nx = params.Nx, Ny = params.Ny;
     const double dA = params.dA();
     const double tgt_r = params.target_radius;
@@ -1885,10 +1940,10 @@ void Simulation::write_trajectory() {
         // tile is copied over but volumes/Cx/Cy aren't refilled until the
         // next reduce. Without this guard, Cx/V=0 emits the bare origin
         // and produces a fake L/2-sized cell jump for one frame.
-        if (V[i] < 1e-6f) { ++skipped_v0; continue; }
-        double invV = 1.0 / V[i];
-        double cx_g = wrap_d(h_or[2*i + 0] + Cx[i] * invV, Nx);
-        double cy_g = wrap_d(h_or[2*i + 1] + Cy[i] * invV, Ny);
+        if (snap.V[i] < 1e-6f) { ++skipped_v0; continue; }
+        double invV = 1.0 / snap.V[i];
+        double cx_g = wrap_d(snap.origin[2*i + 0] + snap.Cx[i] * invV, Nx);
+        double cy_g = wrap_d(snap.origin[2*i + 1] + snap.Cy[i] * invV, Ny);
         // Free NaN tripwire: cx_g/cy_g already computed on host. If
         // either is non-finite, the cell's reductions are corrupted
         // (typical: NaN propagating from a previous step's RHS). Abort
@@ -1897,27 +1952,64 @@ void Simulation::write_trajectory() {
             fprintf(stderr,
                     "[FATAL] non-finite centroid for cell %d at step=%d "
                     "t=%.4f: cx=%g cy=%g — aborting\n",
-                    i, step_count, cur_time, cx_g, cy_g);
+                        i, snap.step, snap.time, cx_g, cy_g);
             fflush(traj_fp);
             std::exit(2);
         }
-        float theta = atan2f(py[i], px[i]);
-        double perim = per[i] * dA;
+                float theta = atan2f(snap.py[i], snap.px[i]);
+                double perim = snap.per[i] * dA;
         double Ln = perim / (2.0 * M_PI * tgt_r);
-        double vol = V[i] * dA;
-        int gid = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
+                double vol = snap.V[i] * dA;
+                int gid = ((int)snap.global_id.size() > i) ? snap.global_id[i] : i;
         fprintf(traj_fp,
                 "%.6f %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
-                cur_time, gid, cx_g, cy_g, vx[i], vy[i],
-                px[i], py[i], theta, vA[i], Ln, vol);
+                    snap.time, gid, cx_g, cy_g, snap.vx[i], snap.vy[i],
+                    snap.px[i], snap.py[i], theta, snap.vA[i], Ln, vol);
     }
-    fflush(traj_fp);
+    ++traj_flush_counter;
+    const int flush_every = sim_env_int("CELL_SIM_TRAJ_FLUSH_EVERY", 100);
+    if (flush_every <= 1 || (traj_flush_counter % flush_every) == 0) {
+        fflush(traj_fp);
+    }
     if (skipped_v0 > 0) {
         fprintf(stderr,
             "[traj] rank %d t=%.4f: skipped %d cell(s) with V=0 "
             "(post-migration pre-reduce); next sample will include them\n",
-            rank, cur_time, skipped_v0);
+            rank, snap.time, skipped_v0);
     }
+}
+
+void Simulation::write_trajectory() {
+    if (!traj_fp) return;
+    if (step_stream) CK(cudaStreamSynchronize(step_stream));
+    start_trajectory_writer();
+    int n = cells.num_cells;
+    TrajectorySnapshot snap;
+    snap.time = cur_time;
+    snap.step = step_count;
+    snap.origin.resize(2 * n);
+    snap.V.resize(n);  snap.Cx.resize(n); snap.Cy.resize(n); snap.per.resize(n);
+    snap.vx.resize(n); snap.vy.resize(n); snap.px.resize(n); snap.py.resize(n); snap.vA.resize(n);
+    if (gpus > 1 && (int)h_global_id.size() >= n) snap.global_id = h_global_id;
+    CK(cudaMemcpy(snap.origin.data(), cells.origin,       2*n*sizeof(int),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.V.data(),      cells.volumes,      n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.Cx.data(),     cells.Cx,           n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.Cy.data(),     cells.Cy,           n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.per.data(),    cells.perimeters,   n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.vx.data(),     cells.velocities_x, n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.vy.data(),     cells.velocities_y, n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.px.data(),     cells.polar_x,      n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.py.data(),     cells.polar_y,      n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(snap.vA.data(),     cells.v_A_cell,     n*sizeof(float),    cudaMemcpyDeviceToHost));
+    const int max_queue = std::max(1, sim_env_int("CELL_SIM_TRAJ_QUEUE", 1));
+    {
+        std::unique_lock<std::mutex> lock(traj_writer_mutex);
+        traj_writer_cv.wait(lock, [&] {
+            return traj_writer_stop || (int)traj_writer_queue.size() < max_queue;
+        });
+        if (!traj_writer_stop) traj_writer_queue.push_back(std::move(snap));
+    }
+    traj_writer_cv.notify_one();
 }
 
 // ---------------------------------------------------------------------------
@@ -2113,6 +2205,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
 // cleanup
 // ---------------------------------------------------------------------------
 void Simulation::cleanup() {
+    finish_trajectory_writer();
     for (int i = 0; i < 2; ++i) {
         if (step_graph[i])    { cudaGraphExecDestroy(step_graph[i]);    step_graph[i] = nullptr; }
         if (mg_step_graph[i]) { cudaGraphExecDestroy(mg_step_graph[i]); mg_step_graph[i] = nullptr; }
@@ -2512,6 +2605,7 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
         std::string tp = s.out_dir + "/trajectory.txt";
         s.traj_fp = fopen(tp.c_str(), "a");
         if (!s.traj_fp) continue;
+        setvbuf(s.traj_fp, nullptr, _IOFBF, 1 << 20);
         fseek(s.traj_fp, 0, SEEK_END);
         if (ftell(s.traj_fp) == 0) {
             fprintf(s.traj_fp,
@@ -2809,6 +2903,7 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
 
     for (int g = 0; g < args.gpus; ++g) {
         if (sims[g]->traj_fp) {
+            sims[g]->finish_trajectory_writer();
             fclose(sims[g]->traj_fp);
             sims[g]->traj_fp = nullptr;
         }

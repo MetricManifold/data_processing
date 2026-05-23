@@ -106,7 +106,7 @@ struct SimParams {
 // NOT need to be a power of two.
 // ---------------------------------------------------------------------------
 #ifndef CELL_SIM_TILE_T
-#define CELL_SIM_TILE_T 192
+#define CELL_SIM_TILE_T 320
 #endif
 static constexpr int TILE_T        = CELL_SIM_TILE_T;
 static_assert(TILE_T % 2 == 0, "TILE_T must be even");

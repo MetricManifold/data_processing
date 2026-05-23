@@ -5,6 +5,10 @@
 #include <string>
 #include <cstdio>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 // Which SimParams fields did the user explicitly override on the CLI?
 // On resume from checkpoint, set fields override the loaded values.
@@ -59,6 +63,20 @@ struct Simulation {
     std::string out_dir = "./output";
     FILE* traj_fp = nullptr;
     int traj_every = 0;
+    int traj_flush_counter = 0;
+    struct TrajectorySnapshot {
+        double time = 0.0;
+        int step = 0;
+        std::vector<int> origin;
+        std::vector<int> global_id;
+        std::vector<float> V, Cx, Cy, per, vx, vy, px, py, vA;
+    };
+    std::thread traj_writer_thread;
+    std::mutex traj_writer_mutex;
+    std::condition_variable traj_writer_cv;
+    std::deque<TrajectorySnapshot> traj_writer_queue;
+    bool traj_writer_started = false;
+    bool traj_writer_stop = false;
     bool save_final_checkpoint = true;
     int checkpoint_interval = 0;  // steps; 0 = disabled
     std::string gamma_spec;       // e.g. "0.35", "0.35:cell0", "0.35:20%"
@@ -368,6 +386,10 @@ struct Simulation {
     int migrate_cells(struct MgWorld& world, int rank);
     void print_status();
     void write_trajectory();
+    void start_trajectory_writer();
+    void finish_trajectory_writer();
+    void trajectory_writer_loop();
+    void write_trajectory_snapshot(const TrajectorySnapshot& snap);
     void write_vtk();
     void save_checkpoint(const std::string& dir, const std::string& tag = "");
 
