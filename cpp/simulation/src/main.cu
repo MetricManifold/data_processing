@@ -3,6 +3,9 @@
 #include "multi_gpu.cuh"
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <fstream>
@@ -19,6 +22,136 @@
 #define MKDIR(d) mkdir(d, 0755)
 #endif
 
+static bool cli_bad_value(const char* flag, const char* value, const char* reason) {
+    fprintf(stderr, "[cli] bad value for %s: '%s'", flag, value ? value : "");
+    if (reason && reason[0]) fprintf(stderr, " (%s)", reason);
+    fprintf(stderr, "\n");
+    return false;
+}
+
+static bool parse_int_range(const char* flag, const char* value,
+                            long min_value, long max_value, int& out) {
+    if (!value || !*value) return cli_bad_value(flag, value, "expected integer");
+    char* end = nullptr;
+    errno = 0;
+    long parsed = std::strtol(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0') {
+        return cli_bad_value(flag, value, "expected integer");
+    }
+    if (parsed < min_value || parsed > max_value) {
+        return cli_bad_value(flag, value, "out of range");
+    }
+    out = (int)parsed;
+    return true;
+}
+
+static bool parse_uint_value(const char* flag, const char* value, unsigned int& out) {
+    if (!value || !*value) return cli_bad_value(flag, value, "expected unsigned integer");
+    if (value[0] == '-') return cli_bad_value(flag, value, "must be >= 0");
+    char* end = nullptr;
+    errno = 0;
+    unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' || parsed > UINT_MAX) {
+        return cli_bad_value(flag, value, "expected unsigned integer");
+    }
+    out = (unsigned int)parsed;
+    return true;
+}
+
+static bool parse_double_value(const char* flag, const char* value, double& out) {
+    if (!value || !*value) return cli_bad_value(flag, value, "expected finite number");
+    char* end = nullptr;
+    errno = 0;
+    double parsed = std::strtod(value, &end);
+    if (errno == ERANGE || end == value || *end != '\0' || !std::isfinite(parsed)) {
+        return cli_bad_value(flag, value, "expected finite number");
+    }
+    out = parsed;
+    return true;
+}
+
+static bool parse_positive_double(const char* flag, const char* value, double& out) {
+    if (!parse_double_value(flag, value, out)) return false;
+    if (out <= 0.0) return cli_bad_value(flag, value, "must be > 0");
+    return true;
+}
+
+static bool parse_nonnegative_double(const char* flag, const char* value, double& out) {
+    if (!parse_double_value(flag, value, out)) return false;
+    if (out < 0.0) return cli_bad_value(flag, value, "must be >= 0");
+    return true;
+}
+
+static bool parse_selector_pair(const char* flag, const std::string& value,
+                                const std::string& body) {
+    size_t comma = body.find(',');
+    if (comma == std::string::npos || body.find(',', comma + 1) != std::string::npos) {
+        return cli_bad_value(flag, value.c_str(), "expected selector(x,y)");
+    }
+    double x = 0.0, y = 0.0;
+    return parse_double_value(flag, body.substr(0, comma).c_str(), x) &&
+           parse_double_value(flag, body.substr(comma + 1).c_str(), y);
+}
+
+static bool validate_gamma_selector(const char* flag, const std::string& spec,
+                                    const std::string& selector) {
+    if (selector.empty()) return cli_bad_value(flag, spec.c_str(), "missing selector");
+    if (selector.rfind("cell", 0) == 0) {
+        int cid = 0;
+        return parse_int_range(flag, selector.c_str() + 4, 0, INT_MAX, cid);
+    }
+    if (selector.rfind("nearest(", 0) == 0 && selector.back() == ')') {
+        return parse_selector_pair(flag, spec, selector.substr(8, selector.size() - 9));
+    }
+    if (selector.rfind("cluster(", 0) == 0 && selector.back() == ')') {
+        std::string body = selector.substr(8, selector.size() - 9);
+        size_t pct_mark = body.find('%');
+        size_t comma = body.find(',', pct_mark == std::string::npos ? 0 : pct_mark + 1);
+        if (pct_mark == std::string::npos || comma == std::string::npos) {
+            return cli_bad_value(flag, spec.c_str(), "expected cluster(p%,x,y)");
+        }
+        double pct = 0.0;
+        if (!parse_positive_double(flag, body.substr(0, pct_mark).c_str(), pct)) return false;
+        if (pct > 100.0) return cli_bad_value(flag, spec.c_str(), "percentage must be <= 100");
+        return parse_selector_pair(flag, spec, body.substr(pct_mark + 2));
+    }
+    size_t pct_mark = selector.find('%');
+    if (pct_mark != std::string::npos && pct_mark == selector.size() - 1) {
+        double pct = 0.0;
+        if (!parse_positive_double(flag, selector.substr(0, pct_mark).c_str(), pct)) return false;
+        if (pct > 100.0) return cli_bad_value(flag, spec.c_str(), "percentage must be <= 100");
+        return true;
+    }
+    return cli_bad_value(flag, spec.c_str(), "unknown gamma selector");
+}
+
+static bool validate_gamma_spec_arg(const char* flag, const std::string& spec,
+                                    double* bare_gamma_out = nullptr) {
+    if (spec.empty()) return cli_bad_value(flag, spec.c_str(), "empty gamma spec");
+    size_t start = 0;
+    bool first = true;
+    while (start <= spec.size()) {
+        size_t sep = spec.find(';', start);
+        std::string segment = (sep == std::string::npos)
+            ? spec.substr(start)
+            : spec.substr(start, sep - start);
+        if (segment.empty()) return cli_bad_value(flag, spec.c_str(), "empty gamma segment");
+        size_t colon = segment.find(':');
+        std::string gamma_text = (colon == std::string::npos) ? segment : segment.substr(0, colon);
+        double gamma = 0.0;
+        if (!parse_positive_double(flag, gamma_text.c_str(), gamma)) return false;
+        if (colon != std::string::npos &&
+            !validate_gamma_selector(flag, segment, segment.substr(colon + 1))) return false;
+        if (first && sep == std::string::npos && colon == std::string::npos && bare_gamma_out) {
+            *bare_gamma_out = gamma;
+        }
+        if (sep == std::string::npos) break;
+        start = sep + 1;
+        first = false;
+    }
+    return true;
+}
+
 static void usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  -n <num>              Number of cells (default: 8)\n");
@@ -31,7 +164,7 @@ static void usage(const char* prog) {
     printf("  -dt <step>            Time step (alias for --dt)\n");
     printf("  --v-A <f>             Active motility speed\n");
     printf("  --v-A-sigma <f>       Log-normal disorder σ on v_A (fresh init only)\n");
-    printf("  --tau <f>             Reorientation time (default: 10000; <=0 disables tumbling)\n");
+    printf("  --tau <f>             Reorientation time (default: 10000; 0 disables tumbling)\n");
     printf("  --gamma <spec>        Surface tension. <spec> = <f> | <f>:cell<k> | <f>:<p>%%\n");
     printf("  --kappa <f>           Interaction strength (default: 10.0)\n");
     printf("  --mu <f>              Volume constraint (default: 1.0)\n");
@@ -94,28 +227,60 @@ int main(int argc, char** argv) {
     int gpus = 1;                 // --gpus N. >1 requires ENABLE_MULTI_GPU.
 
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-n") && i+1<argc) { ncells = atoi(argv[++i]); ncells_set = true; }
-        else if (!strcmp(argv[i], "-r") && i+1<argc) { p.target_radius = atof(argv[++i]); ov.target_radius = true; }
-        else if (!strcmp(argv[i], "--radius") && i+1<argc) { p.target_radius = atof(argv[++i]); ov.target_radius = true; }
+        if      (!strcmp(argv[i], "-n") && i+1<argc) {
+            if (!parse_int_range("-n", argv[++i], 1, INT_MAX, ncells)) return 1;
+            ncells_set = true;
+        }
+        else if (!strcmp(argv[i], "-r") && i+1<argc) {
+            if (!parse_positive_double("-r", argv[++i], p.target_radius)) return 1;
+            ov.target_radius = true;
+        }
+        else if (!strcmp(argv[i], "--radius") && i+1<argc) {
+            if (!parse_positive_double("--radius", argv[++i], p.target_radius)) return 1;
+            ov.target_radius = true;
+        }
         else if (!strcmp(argv[i], "-N") && i+1<argc) { p.Nx = atoi(argv[++i]); p.Ny = p.Nx; nx_set = true; }
-        else if (!strcmp(argv[i], "--confluence") && i+1<argc) confluence = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-t") && i+1<argc) { p.t_end = atof(argv[++i]); ov.t_end = true; }
-        else if (!strcmp(argv[i], "--dt") && i+1<argc) { p.dt = atof(argv[++i]); ov.dt = true; }
-        else if (!strcmp(argv[i], "-dt") && i+1<argc) { p.dt = atof(argv[++i]); ov.dt = true; }
-        else if (!strcmp(argv[i], "--v-A") && i+1<argc) { p.v_A = atof(argv[++i]); ov.v_A = true; }
-        else if (!strcmp(argv[i], "--v-A-sigma") && i+1<argc) { v_A_sigma = atof(argv[++i]); }
-        else if (!strcmp(argv[i], "--tau") && i+1<argc) { p.tau = atof(argv[++i]); ov.tau = true; }
+        else if (!strcmp(argv[i], "--confluence") && i+1<argc) {
+            double parsed = 0.0;
+            if (!parse_positive_double("--confluence", argv[++i], parsed)) return 1;
+            confluence = (float)parsed;
+        }
+        else if (!strcmp(argv[i], "-t") && i+1<argc) {
+            if (!parse_nonnegative_double("-t", argv[++i], p.t_end)) return 1;
+            ov.t_end = true;
+        }
+        else if (!strcmp(argv[i], "--dt") && i+1<argc) {
+            if (!parse_positive_double("--dt", argv[++i], p.dt)) return 1;
+            ov.dt = true;
+        }
+        else if (!strcmp(argv[i], "-dt") && i+1<argc) {
+            if (!parse_positive_double("-dt", argv[++i], p.dt)) return 1;
+            ov.dt = true;
+        }
+        else if (!strcmp(argv[i], "--v-A") && i+1<argc) {
+            if (!parse_nonnegative_double("--v-A", argv[++i], p.v_A)) return 1;
+            ov.v_A = true;
+        }
+        else if (!strcmp(argv[i], "--v-A-sigma") && i+1<argc) {
+            if (!parse_nonnegative_double("--v-A-sigma", argv[++i], v_A_sigma)) return 1;
+        }
+        else if (!strcmp(argv[i], "--tau") && i+1<argc) {
+            if (!parse_nonnegative_double("--tau", argv[++i], p.tau)) return 1;
+            ov.tau = true;
+        }
         else if (!strcmp(argv[i], "--gamma") && i+1<argc) {
             // Composable: multiple --gamma flags accumulate, separated by ';'.
             // apply_gamma_spec() in sim.cu walks the segments in order.
             // The FIRST segment, if it's a bare scalar (no ':' / '%'), also
             // updates p.gamma globally (sets the baseline for all cells).
             std::string new_spec = argv[++i];
+            double bare_gamma = 0.0;
+            if (!validate_gamma_spec_arg("--gamma", new_spec, &bare_gamma)) return 1;
             if (gamma_spec.empty()) {
                 gamma_spec = new_spec;
                 if (new_spec.find(':') == std::string::npos &&
                     new_spec.find('%') == std::string::npos) {
-                    p.gamma = atof(new_spec.c_str());
+                    p.gamma = bare_gamma;
                     ov.gamma = true;
                 }
             } else {
@@ -123,13 +288,29 @@ int main(int argc, char** argv) {
                 gamma_spec += new_spec;
             }
         }
-        else if (!strcmp(argv[i], "--kappa") && i+1<argc) { p.kappa = atof(argv[++i]); ov.kappa = true; }
-        else if (!strcmp(argv[i], "--mu") && i+1<argc) { p.mu = atof(argv[++i]); ov.mu = true; }
-        else if (!strcmp(argv[i], "--xi") && i+1<argc) { p.xi = atof(argv[++i]); ov.xi = true; }
-        else if (!strcmp(argv[i], "--lambda") && i+1<argc) { p.lambda = atof(argv[++i]); ov.lambda = true; }
-        else if (!strcmp(argv[i], "-l") && i+1<argc) { p.lambda = atof(argv[++i]); ov.lambda = true; }
+        else if (!strcmp(argv[i], "--kappa") && i+1<argc) {
+            if (!parse_nonnegative_double("--kappa", argv[++i], p.kappa)) return 1;
+            ov.kappa = true;
+        }
+        else if (!strcmp(argv[i], "--mu") && i+1<argc) {
+            if (!parse_nonnegative_double("--mu", argv[++i], p.mu)) return 1;
+            ov.mu = true;
+        }
+        else if (!strcmp(argv[i], "--xi") && i+1<argc) {
+            if (!parse_positive_double("--xi", argv[++i], p.xi)) return 1;
+            ov.xi = true;
+        }
+        else if (!strcmp(argv[i], "--lambda") && i+1<argc) {
+            if (!parse_positive_double("--lambda", argv[++i], p.lambda)) return 1;
+            ov.lambda = true;
+        }
+        else if (!strcmp(argv[i], "-l") && i+1<argc) {
+            if (!parse_positive_double("-l", argv[++i], p.lambda)) return 1;
+            ov.lambda = true;
+        }
         else if (!strcmp(argv[i], "--subdomain-padding") && i+1<argc) {
-            p.subdomain_padding = atof(argv[++i]); ov.subdomain_padding = true;
+            if (!parse_nonnegative_double("--subdomain-padding", argv[++i], p.subdomain_padding)) return 1;
+            ov.subdomain_padding = true;
         }
         else if (!strcmp(argv[i], "--abp")) { p.abp = true; ov.abp = true; }
         else if (!strcmp(argv[i], "-o") && i+1<argc) outdir = argv[++i];
@@ -170,9 +351,13 @@ int main(int argc, char** argv) {
         // and writes observables.csv. Historic flags `--use-diagnostics` and
         // `--observable-interval` are removed here; restore as a single,
         // properly-implemented `--observables` flag once the kernel is ready.
-        else if (!strcmp(argv[i], "--seed") && i+1<argc) { p.seed = atoi(argv[++i]); ov.seed = true; }
+        else if (!strcmp(argv[i], "--seed") && i+1<argc) {
+            if (!parse_uint_value("--seed", argv[++i], p.seed)) return 1;
+            ov.seed = true;
+        }
         else if (!strcmp(argv[i], "--polarity-seed") && i+1<argc) {
-            p.polarity_seed = atoi(argv[++i]); ov.polarity_seed = true;
+            if (!parse_uint_value("--polarity-seed", argv[++i], p.polarity_seed)) return 1;
+            ov.polarity_seed = true;
         }
         else if (!strcmp(argv[i], "--scripted-events") && i+1<argc) {
             scripted_events_path = argv[++i];
