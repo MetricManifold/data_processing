@@ -1893,14 +1893,14 @@ void Simulation::run() {
     printf("[SIM] Done: %d steps, t=%.2f, wall=%.3fs (%.3f ms/step)\n",
            total, cur_time, wall, wall * 1000.0 / denom);
 #ifdef CELL_SIM_BBOX_TELEMETRY
-    extern __device__ int g_bbox_max_raw_hw;
-    extern __device__ int g_bbox_clamp_events;
-    int max_raw = 0, clamps = 0;
-    cudaMemcpyFromSymbol(&max_raw, g_bbox_max_raw_hw, sizeof(int));
-    cudaMemcpyFromSymbol(&clamps,  g_bbox_clamp_events, sizeof(int));
-    int ceiling = (TILE_T >> 1) - 1;
-    printf("[SIM] bbox-telemetry: lifetime max_raw_hw=%d (ceiling=%d, %.0f%% margin) total_clamp_events=%d\n",
-           max_raw, ceiling, 100.0 * (1.0 - (double)max_raw / ceiling), clamps);
+    {
+        extern void read_bbox_telemetry(int*, int*);
+        int max_raw = 0, clamps = 0;
+        read_bbox_telemetry(&max_raw, &clamps);
+        int ceiling = (TILE_T >> 1) - 1;
+        printf("[SIM] bbox-telemetry: lifetime max_raw_hw=%d (ceiling=%d, %.0f%% margin) total_clamp_events=%d\n",
+               max_raw, ceiling, 100.0 * (1.0 - (double)max_raw / ceiling), clamps);
+    }
 #endif
 }
 
@@ -1932,15 +1932,15 @@ void Simulation::print_status() {
     // Read the device counters set in k_rebind. Off-default; see comment
     // at the top of kernels.cu for why this should not be enabled in
     // general production runs.
-    extern __device__ int g_bbox_max_raw_hw;
-    extern __device__ int g_bbox_clamp_events;
-    int max_raw = 0, clamps = 0;
-    cudaMemcpyFromSymbol(&max_raw, g_bbox_max_raw_hw, sizeof(int));
-    cudaMemcpyFromSymbol(&clamps,  g_bbox_clamp_events, sizeof(int));
-    int ceiling = (TILE_T >> 1) - 1;
-    if (clamps > 0 || max_raw >= (int)(0.9f * ceiling)) {
-        printf("  [bbox] max_raw_hw=%d (ceiling=%d, %.0f%% margin) clamp_events=%d\n",
-               max_raw, ceiling, 100.0 * (1.0 - (double)max_raw / ceiling), clamps);
+    {
+        extern void read_bbox_telemetry(int*, int*);
+        int max_raw = 0, clamps = 0;
+        read_bbox_telemetry(&max_raw, &clamps);
+        int ceiling = (TILE_T >> 1) - 1;
+        if (clamps > 0 || max_raw >= (int)(0.9f * ceiling)) {
+            printf("  [bbox] max_raw_hw=%d (ceiling=%d, %.0f%% margin) clamp_events=%d\n",
+                   max_raw, ceiling, 100.0 * (1.0 - (double)max_raw / ceiling), clamps);
+        }
     }
 #endif
 }

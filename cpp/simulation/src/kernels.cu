@@ -21,8 +21,29 @@
 //
 // SHOULD NOT BE ENABLED IN GENERAL. Off by default. Enable only for one-off
 // audits of bbox saturation: each rebind atomicMaxes the pre-clamp half-width
-// into a device counter. Cost is one global atomicMax per cell per rebind\n// (negligible vs the rebind itself) plus a 4-byte D2H copy at print_interval.
-// Host code prints a summary line in print_status() and a lifetime max at\n// end of run. Logs are quiet unless a clamp event occurs.\n//\n// To enable: add -DCELL_SIM_BBOX_TELEMETRY to the compiler command line\n// (e.g. via `cmake -DCMAKE_CUDA_FLAGS=-DCELL_SIM_BBOX_TELEMETRY ...`).\n// ---------------------------------------------------------------------------\n#ifdef CELL_SIM_BBOX_TELEMETRY\n__device__ int g_bbox_max_raw_hw = 0;\n__device__ int g_bbox_clamp_events = 0;\n#endif\n\n// All kernels assume a fixed power-of-two tile (TILE_T) and a unified phi
+// into a device counter. Cost is one global atomicMax per cell per rebind
+// (negligible vs the rebind itself) plus a 4-byte D2H copy at print_interval.
+// Host code prints a summary line in print_status() and a lifetime max at
+// end of run. Logs are quiet unless a clamp event occurs.
+//
+// To enable: add -DCELL_SIM_BBOX_TELEMETRY to the compiler command line
+// (e.g. via `cmake -DCMAKE_CUDA_FLAGS=-DCELL_SIM_BBOX_TELEMETRY ...`).
+// ---------------------------------------------------------------------------
+#ifdef CELL_SIM_BBOX_TELEMETRY
+__device__ int g_bbox_max_raw_hw = 0;
+__device__ int g_bbox_clamp_events = 0;
+
+// Host-callable getter. Defined in this TU so the cudaMemcpyFromSymbol
+// resolves against the __device__ symbol in the same compilation unit
+// (CUDA_SEPARABLE_COMPILATION is OFF, so cross-TU `extern __device__`
+// references don't link).
+void read_bbox_telemetry(int* max_raw, int* clamps) {
+    cudaMemcpyFromSymbol(max_raw, g_bbox_max_raw_hw,    sizeof(int));
+    cudaMemcpyFromSymbol(clamps,  g_bbox_clamp_events, sizeof(int));
+}
+#endif
+
+// All kernels assume a fixed power-of-two tile (TILE_T) and a unified phi
 // pool of N*TILE_AREA floats.  No neighbour list, no halo, no spatial hash.
 
 #include "kernels.cuh"
