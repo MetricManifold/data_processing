@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <random>
 #include <sstream>
 
@@ -2185,6 +2186,18 @@ static void write_vtk_grid_file(const std::string& out_dir,
                                 double cur_time,
                                 int Nx, int Ny,
                                 const std::vector<float>& grid) {
+    auto vtk_write_exact = [](FILE* f, const void* src, size_t elem_size,
+                              size_t count, const char* what) {
+        if (count == 0) return true;
+        size_t wrote = fwrite(src, elem_size, count, f);
+        if (wrote != count) {
+            fprintf(stderr,
+                    "[vtk] short write while writing %s (wrote %zu/%zu items of %zu bytes)\n",
+                    what, wrote, count, elem_size);
+            return false;
+        }
+        return true;
+    };
     auto swap_f32 = [](float fv) {
         uint32_t u; std::memcpy(&u, &fv, 4);
         u = ((u & 0x000000FFu) << 24) |
@@ -2200,19 +2213,26 @@ static void write_vtk_grid_file(const std::string& out_dir,
     snprintf(fn, sizeof(fn), "%s/output_%06d.vtk", out_dir.c_str(), step_count);
     FILE* f = fopen(fn, "wb");
     if (!f) { fprintf(stderr, "Failed to open %s\n", fn); return; }
-    fprintf(f, "# vtk DataFile Version 3.0\n");
-    fprintf(f, "cell_sim phase-field composite step=%d t=%.6f\n",
-            step_count, cur_time);
-    fprintf(f, "BINARY\n");
-    fprintf(f, "DATASET STRUCTURED_POINTS\n");
-    fprintf(f, "DIMENSIONS %d %d 1\n", Nx, Ny);
-    fprintf(f, "ORIGIN 0 0 0\n");
-    fprintf(f, "SPACING 1 1 1\n");
-    fprintf(f, "POINT_DATA %lld\n", (long long)Nx * Ny);
-    fprintf(f, "SCALARS phi float 1\n");
-    fprintf(f, "LOOKUP_TABLE default\n");
-    fwrite(be.data(), sizeof(float), be.size(), f);
-    fclose(f);
+    std::ostringstream header;
+    header << "# vtk DataFile Version 3.0\n"
+           << "cell_sim phase-field composite step=" << step_count
+            << " t=" << std::fixed << std::setprecision(6) << cur_time << "\n"
+           << "BINARY\n"
+           << "DATASET STRUCTURED_POINTS\n"
+           << "DIMENSIONS " << Nx << " " << Ny << " 1\n"
+           << "ORIGIN 0 0 0\n"
+           << "SPACING 1 1 1\n"
+           << "POINT_DATA " << (long long)Nx * Ny << "\n"
+           << "SCALARS phi float 1\n"
+           << "LOOKUP_TABLE default\n";
+    const std::string header_text = header.str();
+    bool ok = vtk_write_exact(f, header_text.data(), 1, header_text.size(), "VTK header") &&
+              vtk_write_exact(f, be.data(), sizeof(float), be.size(), "VTK phi payload");
+    if (fclose(f) != 0) {
+        fprintf(stderr, "[vtk] failed to close %s\n", fn);
+        ok = false;
+    }
+    if (!ok) std::remove(fn);
 }
 
 // ---------------------------------------------------------------------------

@@ -365,14 +365,15 @@ def read_checkpoint(path):
 
         # Optional per-cell magic-tagged arrays. Order-independent parser:
         # the binary may emit blocks in any order (writer has historically
-        # emitted GAMA, RADI, VA_A, POLR in that order but we don't depend
-        # on it). Keep reading 4-byte magics until we hit an unknown one.
+        # emitted float sidecars first, followed by the raw RNGS byte block.
+        # Keep reading 4-byte magics until we hit an unknown one.
         magic_to_name = {
             0x56415F41: "v_A",
             0x47414D41: "gamma",
             0x52414449: "radius",
             0x504F4C52: "polar_theta",
         }
+        rngs_magic = 0x53474E52
         per_cell = {}
         while True:
             pos = f.tell()
@@ -381,10 +382,23 @@ def read_checkpoint(path):
                 break
             m = struct.unpack("<I", raw)[0]
             name = magic_to_name.get(m)
-            if name is None:
+            if name is None and m != rngs_magic:
                 f.seek(pos)  # not one of ours — stop
                 break
             count = struct.unpack("<i", f.read(4))[0]
+            if m == rngs_magic:
+                payload = f.read()
+                assert count >= 0, f"negative RNGS sidecar count {count}"
+                assert count == 0 or len(payload) % count == 0, \
+                    f"RNGS payload bytes {len(payload)} not divisible by count {count}"
+                state_bytes = 0 if count == 0 else len(payload) // count
+                per_cell["rng_state"] = (
+                    np.frombuffer(payload, dtype=np.uint8)
+                    .copy()
+                    .reshape(count, state_bytes)
+                )
+                params["rng_state_bytes_per_cell"] = state_bytes
+                break
             data = np.frombuffer(f.read(count * 4), dtype=np.float32).copy()
             per_cell[name] = data
 

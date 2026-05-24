@@ -37,6 +37,19 @@ class TestV8Header:
         # For single-GPU, h_global_id is identity so cell ids are 0..N-1.
         assert ids == list(range(chk["num_cells"]))
 
+    def test_v8_rngs_sidecar_is_parsed(self, tmp_path):
+        """Current v8 checkpoints carry per-cell curandState bytes as RNGS."""
+        out = run_sim(tmp_path, "-n", "4", "-N", "640", "-r", "49",
+                      "-t", "0.02", "--dt", "0.01", "--v-A", "0.01",
+                      "--tau", "100", "--seed", "42", "--polarity-seed", "123",
+                      "--save-interval", "0", "--trajectory-samples", "0")
+        chk = read_checkpoint(out / "checkpoint.bin")
+        rng_state = chk["per_cell"].get("rng_state")
+        assert rng_state is not None
+        assert rng_state.shape[0] == chk["num_cells"]
+        assert rng_state.shape[1] == chk["params"]["rng_state_bytes_per_cell"]
+        assert rng_state.shape[1] > 0
+
 
 class TestV8Resume:
     """v8 same-G resume produces consistent state."""
