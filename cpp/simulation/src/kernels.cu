@@ -3,7 +3,7 @@
 // Layout:
 //   1. Device helpers
 //   2. k_scatter_S       — atomicAdd phi^2 into global S
-//   3. k_evolve_l1       — fused two-pass evolve (reduce → broadcast → write)
+//   3. Multi-block evolve pipeline: k_reduce_mb_fast/full + k_rhs_mb
 //   4. k_rebind          — COM-recentre tile (origin shift + tile copy)
 //   5. k_polar           — per-cell polarity update (RTP + ABP)
 //   6. k_init_phi        — tanh init profile
@@ -167,201 +167,7 @@ void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. k_evolve_l1 — fused two-pass evolve.
-// ---------------------------------------------------------------------------
-// One CTA per cell, BS=256 threads. phi is read from L1 (no shared-mem
-// caching — the 64KB shared variant tested in the reference forced 1 block
-// per SM and was slower). The compiler keeps a hot working set in registers
-// and the L1/texture cache picks up the spatial reuse from neighbouring
-// thread iterations.
-//
-// Pass 1 accumulates V, Ix, Iy (interaction integrals) and Cx, Cy
-// (tile-local centroid moments) per cell. A 5-channel block reduction
-// produces those scalars in shared memory; thread 0 broadcasts (Vn, vx, vy)
-// for use in Pass 2 and writes the per-cell observables.
-//
-// Pass 2 re-reads phi (L1-hot) and S (L2-hot), computes the full PDE RHS
-// (Laplacian + double-well + volume constraint + repulsion), advects with
-// the freshly-broadcast velocity, and writes phi_out. Perimeter
-// (sum |grad phi|) is accumulated in the same pass and reduced separately.
-//
-// Per-cell scalars read inline:
-//   gamma_cell[n], v_A_cell[n]   — vary per cell (gamma_spec / v_A_sigma)
-//   tgt_radius[n]                — used for piR2 / volume constraint
-// All other physics constants are passed as kernel arguments and broadcast
-// from constant-bandwidth registers.
-// ---------------------------------------------------------------------------
-__global__ void k_evolve_l1(
-    const float* __restrict__ phi,
-    const int*   __restrict__ origin,
-    const int*   __restrict__ rect,
-    const float* __restrict__ S,
-    const float* __restrict__ gamma_cell,
-    const float* __restrict__ v_A_cell,
-    const float* __restrict__ tgt_radius,
-    const float* __restrict__ dirx,
-    const float* __restrict__ diry,
-    float* __restrict__ V_out,
-    float* __restrict__ Cx_out,
-    float* __restrict__ Cy_out,
-    float* __restrict__ Cxx_out,
-    float* __restrict__ Cyy_out,
-    float* __restrict__ peri_out,
-    float* __restrict__ vx_out,
-    float* __restrict__ vy_out,
-    float* __restrict__ phi_out,
-    int N, int L,
-    float lambda_, float kappa, float mu,
-    float xi, float dt,
-    int y_lo, int halo_h)
-{
-    const int n = blockIdx.x;
-    if (n >= N) return;
-    const int BS  = blockDim.x;          // expect 256
-    const int tid = threadIdx.x;
-
-    const float* tile = phi     + (size_t)n * TILE_AREA;
-    float*       outp = phi_out + (size_t)n * TILE_AREA;
-    const int gx0 = origin[2*n + 0];
-    const int gy0 = origin[2*n + 1];
-    const int rx0 = rect[4*n + 0];
-    const int ry0 = rect[4*n + 1];
-    const int rw  = rect[4*n + 2];
-    const int rh  = rect[4*n + 3];
-    const int rect_total = rw * rh;
-    const float gam = gamma_cell[n];
-    const float vA  = v_A_cell[n];
-    const float R   = tgt_radius[n];
-
-    // ----- Pass 1: V, Ix, Iy, Cx, Cy, Cxx, Cyy -----
-    int lx0 = rx0 + (tid % rw);
-    int ly  = ry0 + (tid / rw);
-    int lx  = lx0;
-    float sV = 0.0f, sIx = 0.0f, sIy = 0.0f;
-    float sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f;
-    for (int p = tid; p < rect_total; p += BS) {
-        int idx = ly * TILE_T + lx;
-        float c   = __ldg(tile + idx);
-        float xp_ = (lx + 1 < TILE_T) ? __ldg(tile + idx + 1)      : 0.0f;
-        float xm_ = (lx     > 0)      ? __ldg(tile + idx - 1)      : 0.0f;
-        float yp_ = (ly + 1 < TILE_T) ? __ldg(tile + idx + TILE_T) : 0.0f;
-        float ym_ = (ly     > 0)      ? __ldg(tile + idx - TILE_T) : 0.0f;
-        float gx = 0.5f * (xp_ - xm_);
-        float gy = 0.5f * (yp_ - ym_);
-        int gxg = wrap_i(gx0 + lx, L);
-        int gyg = wrap_i(gy0 + ly, L);
-        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
-        float Sv   = S[sy * L + gxg];
-        float Soth = Sv - c * c;
-        if (Soth < 0.0f) Soth = 0.0f;
-        float c2 = c * c;
-        float fx = (float)lx, fy = (float)ly;
-        sV   += c2;
-        sIx  += c * gx * Soth;
-        sIy  += c * gy * Soth;
-        sCx  += c2 * fx;
-        sCy  += c2 * fy;
-        sCxx += c2 * fx * fx;
-        sCyy += c2 * fy * fy;
-        lx += BS;
-        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
-    }
-
-    // 7-channel block reduction via warp-shuffle.
-    // Shared mem: one warp-leader slot per warp per channel (=> 7*32 floats max),
-    // plus one float per channel for broadcast = 7 floats. Total 7*32 + 7 = 231
-    // floats (~924 B). Independent of BS (so BS can change without reworking
-    // the shmem footprint).
-    __shared__ float ssmem[7 * 32];
-    __shared__ float sbroad[7];
-    {
-        float v0 = block_sum(sV,   ssmem + 0*32);
-        float v1 = block_sum(sIx,  ssmem + 1*32);
-        float v2 = block_sum(sIy,  ssmem + 2*32);
-        float v3 = block_sum(sCx,  ssmem + 3*32);
-        float v4 = block_sum(sCy,  ssmem + 4*32);
-        float v5 = block_sum(sCxx, ssmem + 5*32);
-        float v6 = block_sum(sCyy, ssmem + 6*32);
-        if (tid == 0) {
-            sbroad[0] = v0; sbroad[1] = v1; sbroad[2] = v2;
-            sbroad[3] = v3; sbroad[4] = v4; sbroad[5] = v5;
-            sbroad[6] = v6;
-        }
-    }
-    __syncthreads();
-    const float Vn  = sbroad[0];
-    const float Ixn = sbroad[1];
-    const float Iyn = sbroad[2];
-
-    const float coeffV = motility_coeff(kappa, xi, lambda_);
-    const float vx     = coeffV * Ixn + vA * dirx[n];
-    const float vy     = coeffV * Iyn + vA * diry[n];
-
-    if (tid == 0) {
-        V_out[n]   = Vn;
-        Cx_out[n]  = sbroad[3];
-        Cy_out[n]  = sbroad[4];
-        Cxx_out[n] = sbroad[5];
-        Cyy_out[n] = sbroad[6];
-        vx_out[n]  = vx;
-        vy_out[n]  = vy;
-    }
-
-    const float piR2 = PI * R * R;
-    const float volC = (2.0f * mu / piR2) * (piR2 - Vn);
-    const float dwC  = gam * bulk_coeff(lambda_);
-    const float repC = interaction_coeff(kappa, lambda_);
-
-    // ----- Pass 2: PDE update + perimeter reduction -----
-    // Only writes pixels inside the rect. Pixels outside the rect of
-    // phi_out remain zero: alloc_gpu zeroes the pool initially, and
-    // k_rebind zeroes outside-new-rect on every rebind step. Between
-    // rebinds the rect doesn't grow, so the outside pixels of phi_out
-    // (which become phi_in two steps from now) stay clean.
-
-    lx = lx0; ly = ry0 + (tid / rw);
-    float sPeri = 0.0f;
-    for (int p = tid; p < rect_total; p += BS) {
-        int idx = ly * TILE_T + lx;
-        float c    = __ldg(tile + idx);
-        float xp_  = (lx + 1 < TILE_T)                     ? __ldg(tile + idx + 1)          : 0.0f;
-        float xm_  = (lx     > 0)                          ? __ldg(tile + idx - 1)          : 0.0f;
-        float yp_  = (ly + 1 < TILE_T)                     ? __ldg(tile + idx + TILE_T)     : 0.0f;
-        float ym_  = (ly     > 0)                          ? __ldg(tile + idx - TILE_T)     : 0.0f;
-        float xpyp = (lx + 1 < TILE_T && ly + 1 < TILE_T)  ? __ldg(tile + idx + TILE_T + 1) : 0.0f;
-        float xpym = (lx + 1 < TILE_T && ly     > 0)       ? __ldg(tile + idx - TILE_T + 1) : 0.0f;
-        float xmyp = (lx     > 0      && ly + 1 < TILE_T)  ? __ldg(tile + idx + TILE_T - 1) : 0.0f;
-        float xmym = (lx     > 0      && ly     > 0)       ? __ldg(tile + idx - TILE_T - 1) : 0.0f;
-
-        float lap = lap9(c, xm_, xp_, ym_, yp_, xmym, xpym, xmyp, xpyp);
-        float gx  = 0.5f * (xp_ - xm_);
-        float gy  = 0.5f * (yp_ - ym_);
-
-        int gxg = wrap_i(gx0 + lx, L);
-        int gyg = wrap_i(gy0 + ly, L);
-        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
-        float Sv   = S[sy * L + gxg];
-        float Soth = Sv - c * c;
-        if (Soth < 0.0f) Soth = 0.0f;
-
-        float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
-        float rhs = gam * lap - dwC * dw + volC * c - repC * c * Soth;
-        float adv = vx * gx + vy * gy;
-        outp[idx] = c + dt * (rhs - adv);
-
-        sPeri += sqrtf(gx * gx + gy * gy);
-        lx += BS;
-        while (lx >= rx0 + rw) { lx -= rw; ly += 1; }
-    }
-
-    // 1-channel perimeter reduction via warp-shuffle. Reuse ssmem (first 32).
-    __syncthreads();
-    float pn = block_sum(sPeri, ssmem);
-    if (tid == 0) peri_out[n] = pn;
-}
-
-// ---------------------------------------------------------------------------
-// 3b. Multi-block scatter/reduce/RHS pipeline.
+// 3. Multi-block scatter/reduce/RHS pipeline.
 // ---------------------------------------------------------------------------
 // Grid shape (chunks_per_cell, N). Each block processes CHUNK_PIXELS pixels
 // of the active rect for one cell. Splitting the cell across many blocks
@@ -670,10 +476,9 @@ void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
                    cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0) return;
-    // Multi-block scatter+reduce+RHS pipeline (replaces fused k_evolve_l1).
-    // Splitting reduce/RHS across many blocks pumps SM occupancy at all N,
-    // including the large-N regime where a single block per cell would
-    // bottleneck on the heavy fused kernel's register footprint.
+    // Multi-block scatter+reduce+RHS pipeline. Splitting reduce/RHS across
+    // many blocks pumps SM occupancy at all N, including the large-N regime
+    // where a single block per cell would bottleneck on register footprint.
     constexpr int CHUNK_PIXELS = 4096;
     constexpr int BS = 256;
     constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
@@ -1086,13 +891,10 @@ void launch_init_phi(CellArrays& c, const SimParams& p,
 // ---------------------------------------------------------------------------
 // 7. k_initial_velocity — one-shot velocity reduction.
 // ---------------------------------------------------------------------------
-// Computes the same V/Cx/Cy/Ix/Iy reduction as k_evolve_l1's Pass 1, plus
-// perimeter, but does NOT advance phi. Used after init / resume so that the
-// first trajectory write contains a meaningful velocity (interaction +
+// Computes the same V/Cx/Cy/Ix/Iy reduction as the multi-block fast reduce,
+// plus perimeter, but does NOT advance phi. Used after init / resume so that
+// the first trajectory write contains a meaningful velocity (interaction +
 // active component), and so that downstream code doesn't see zero volumes.
-//
-// Implemented by reusing k_evolve_l1 with a tagged dt=0 fast path is
-// possible, but it's cleaner to have a dedicated kernel that skips Pass 2.
 // ---------------------------------------------------------------------------
 __global__ void k_initial_velocity(
     const float* __restrict__ phi,

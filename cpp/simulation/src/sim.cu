@@ -345,7 +345,7 @@ void Simulation::alloc_gpu() {
 // ---------------------------------------------------------------------------
 // configure_l2_persistence — pin the global S field in L2 cache via the
 // CUDA access-policy-window mechanism. S is read once per pixel by every
-// cell's tile (k_evolve_l1 pass-1 reads + pass-2 reads), so it gets reused
+// cell's tile (scatter + reduce + RHS all read S), so it gets reused
 // O(N_cells_overlapping) times per step. Pinning it as "persisting" tells
 // the L2 controller to prefer it over the streaming reads of phi tiles.
 //

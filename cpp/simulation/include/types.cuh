@@ -257,7 +257,7 @@ struct CellArrays {
     // guaranteed zero (rebind zeros them), so skipping them is exact.
     int* rect = nullptr;           // [4 * N]
 
-    // Per-cell observables produced by k_evolve_l1.
+    // Per-cell observables produced by the multi-block reduce / RHS path.
     float* volumes      = nullptr; // [N] : sum phi (tile-local; multiply by dA for area)
     float* Ix           = nullptr; // [N] : tile-local sum(c * grad_x * S_other) (interaction integral, x)
     float* Iy           = nullptr; // [N] : tile-local sum(c * grad_y * S_other) (interaction integral, y)
