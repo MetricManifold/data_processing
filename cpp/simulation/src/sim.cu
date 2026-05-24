@@ -129,10 +129,12 @@ void Simulation::place_cells(int n, double R) {
         if (!ok) {
             spacing *= 0.95;
             if (spacing < R) {
-                fprintf(stderr, "Warning: placed %d/%d\n", placed, n);
-                h_cells.resize(placed);
-                cells_global = placed;
-                break;
+                fprintf(stderr,
+                        "[init] failed to place all cells: placed %d/%d "
+                        "before minimum spacing fell below target radius "
+                        "(R=%.6g, domain=%dx%d)\n",
+                        placed, n, R, params.Nx, params.Ny);
+                std::exit(1);
             }
         }
     }

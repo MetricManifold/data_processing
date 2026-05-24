@@ -34,6 +34,31 @@ class TestSmoke:
             assert c["volume"] > 0
             assert not np.any(np.isnan(c["phi"]))
 
+    def test_impossible_initial_placement_fails_loudly(self, tmp_path):
+        import subprocess
+        from conftest import CELL_SIM
+
+        outdir = tmp_path / "impossible"
+        cmd = [
+            CELL_SIM,
+            "-n", "2",
+            "-N", "320",
+            "-r", "250",
+            "-t", "0",
+            "--dt", "0.01",
+            "--v-A", "0",
+            "--seed", "42",
+            "--save-interval", "0",
+            "--trajectory-samples", "0",
+            "--no-save-final-checkpoint",
+            "-o", str(outdir),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        assert result.returncode != 0
+        combined = result.stderr + result.stdout
+        assert "[init] failed to place all cells" in combined
+        assert "placed 1/2" in combined
+
 
 # ============================================================================
 # 1b. Trajectory integrity (header, monotonic timestamps, no NaN)
