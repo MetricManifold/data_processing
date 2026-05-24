@@ -19,15 +19,22 @@
 // The data-parallel scheme implemented here is:
 //   - Cells are partitioned across G ranks: rank g owns indices
 //     [cell_offset[g], cell_offset[g] + cells_local[g]).
-//   - The global S(x,y) field is FULLY REPLICATED on every rank.
-//   - Per step: each rank scatters phi_n^2 of its cells into its local S.
-//     Then ncclAllReduce(SUM) makes the full population's S identical on
-//     every rank. Then each rank's evolve reads its own slice's phi and
-//     writes its own phi_out. No tile / phi data ever crosses the wire.
+//   - The global S(x,y) field is SLAB-DECOMPOSED. Each rank owns a
+//     contiguous y-stripe of S plus a 2*HALO_H halo on each side. Per
+//     step: each rank scatters phi_n^2 of its cells into its local slab
+//     + halo. Neighbour ranks then exchange and SUM the halo strips via
+//     ncclSend/ncclRecv pairs (one fused halo-add kernel folds the
+//     received bands back into the local slab). Reduce/RHS read S
+//     strictly inside [y_lo - HALO_H, y_hi + HALO_H).
+//   - Cells whose rebound COM crosses a slab boundary migrate to the
+//     neighbour rank at REBIND_EVERY steps; mg_send_recv_i32 +
+//     mg_send_bytes/mg_recv_bytes pairs ship the per-cell payload.
+//   - The only AllReduce we still issue per step is the int32
+//     cell-loss audit (off the hot path; opt-in via CELL_SIM_AUDIT_CELLS).
 //
-// This is the only collective we issue per step. Sized for the target
-// 12800-cell run (Nx ~ 10358, S ~ 410 MB) it is ~1-2 ms on NVLink on
-// 4xH100 — comfortably less than the per-step compute cost at that N.
+// Halo exchange volume is O(2*HALO_H*Nx) per step per rank, vs the
+// O(Nx*Ny) of the old replicated-S all-reduce. For Nx=Ny=10412, HALO_H=159
+// that is ~13 MB/step vs the old ~410 MB/step — ~30x less wire traffic.
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -44,7 +51,7 @@ struct MgComm;
 struct MgWorld {
     int world_size = 1;
     std::vector<MgComm*>      comms;    // size = world_size
-    std::vector<cudaStream_t> streams;  // dedicated allreduce stream/rank
+    std::vector<cudaStream_t> streams;  // dedicated halo-exchange stream/rank
     std::vector<int>          devices;  // CUDA device id per rank
 };
 
@@ -56,10 +63,8 @@ bool mg_available();
 // Initialize NCCL communicators for `world_size` devices in this process.
 // Devices used are 0..world_size-1 by default; callers can constrain via
 // CUDA_VISIBLE_DEVICES. Streams are non-blocking, one per rank, used for
-// the S allreduce so it can overlap with the rank's own kernel work.
-//
-// Returns true on success. On failure, prints to stderr and leaves `out`
-// in a destroyable-but-empty state.
+// the halo Send/Recv pairs so they can overlap with the rank's own kernel
+// work.
 bool mg_init_world(int world_size, MgWorld& out);
 
 // Destroy NCCL comms and streams. Safe to call on a partially initialised

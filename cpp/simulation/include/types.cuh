@@ -61,7 +61,21 @@ struct SimParams {
     // field was a dead leftover in v3..v7 and is repurposed here, so
     // resumes from older checkpoints reset it to the default at load.
     double subdomain_padding = 2.0;
-    int halo = 0;                  // unused in v3 (kept for checkpoint round-trip)
+    // [DEPRECATED RUNTIME, KEPT FOR BINARY LAYOUT]
+    //
+    // Legacy v3-v6 checkpoints stored a per-cell tile halo dimension
+    // alongside an interior W/H pair. The fixed-tile rewrite eliminated
+    // both — every cell now uses TILE_T x TILE_T with the active region
+    // tracked by CellArrays::rect. No runtime code reads `halo` anymore;
+    // decode_simparams threads the saved value as `halo_legacy` to
+    // decode_cell_records, which uses it ONLY when re-tiling legacy
+    // checkpoint rows.
+    //
+    // The field stays in SimParams because removing it would shift
+    // sizeof(SimParams) and break v8 binary layout (which fwrites the
+    // struct verbatim). Do NOT add new uses; do NOT delete without a
+    // checkpoint format bump.
+    int halo = 0;
     int save_interval = 0;
     int print_interval = 100;
     int trajectory_samples = 100;

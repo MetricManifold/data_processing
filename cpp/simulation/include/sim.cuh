@@ -195,10 +195,10 @@ struct Simulation {
     // params.seed) so per-cell scalars and origins are bit-identical
     // across ranks before slicing, then keeps only its local slice
     // [cell_offset, cell_offset + cells.num_cells) inside h_cells and
-    // GPU buffers. The global S(x,y) is REPLICATED on every rank and
-    // kept consistent by an NCCL all-reduce sandwiched between the
-    // pre-reduce and post-reduce step phases (see step_pre_reduce /
-    // step_post_reduce below).
+    // GPU buffers. The global S(x,y) is SLAB-DECOMPOSED across ranks:
+    // each rank owns a y-stripe plus 2*HALO_H halo on each side. Halo
+    // strips are exchanged + summed between neighbours via ncclSend/Recv
+    // pairs in step_pre_reduce/step_post_reduce. No full-S all-reduce.
     int gpus           = 1;
     int rank           = 0;
     int device         = 0;
@@ -271,9 +271,10 @@ struct Simulation {
     void compute_initial_velocities();
     void step();
     // Multi-GPU step decomposition. The orchestrator drives:
-    //   for each rank g: sim[g].step_pre_reduce()
-    //   ncclGroupStart(); for each g: ncclAllReduce(S); ncclGroupEnd()
-    //   for each rank g: sim[g].step_post_reduce()
+    //   for each rank g: sim[g].step_pre_reduce()       // polar + scatter_S
+    //   ncclGroupStart(); for each g: halo Send/Recv pairs; ncclGroupEnd()
+    //   for each rank g: launch_halo_add_pair (fold neighbour bands in)
+    //   for each rank g: sim[g].step_post_reduce()      // evolve [+ rebind]
     // step() (single-GPU monolithic, with graph fast path) calls neither
     // of these — it remains the hot path for --gpus 1.
     void step_pre_reduce();
@@ -417,8 +418,8 @@ struct Simulation {
 // Multi-GPU orchestrator. Defined in src/multi_gpu.cu when ENABLE_MULTI_GPU
 // is ON. Returns 0 on success. Handles cudaSetDevice, NCCL world setup,
 // per-rank Simulation init (fresh or from checkpoint), the lockstep step
-// loop with NCCL all-reduce on S, and rank-0-driven I/O. Caller owns
-// nothing — full lifecycle is managed inside.
+// loop with slab halo exchange on S, periodic cell migration, and
+// rank-0-driven I/O. Caller owns nothing — full lifecycle is managed inside.
 //
 // When ENABLE_MULTI_GPU is OFF this function is not defined; main.cu
 // guards the call with mg_available() and never reaches it.
