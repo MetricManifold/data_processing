@@ -12,7 +12,12 @@ use crate::analysis::panels::{Panel, PanelOpts};
 
 use super::OverlayData;
 
-pub struct LnTimeseriesOverlay;
+/// Overlay L_n(t) renderer (N runs). `decimate_max = Some(N)` thins
+/// each trace to at most ~N points; default None preserves every frame.
+#[derive(Default)]
+pub struct LnTimeseriesOverlay {
+    pub decimate_max: Option<usize>,
+}
 
 impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesOverlay {
     type Data = OverlayData<'a>;
@@ -76,7 +81,9 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesOverlay {
 
         for (i, (label, ts, series, mean)) in all.into_iter().enumerate() {
             let color = PALETTE[i % PALETTE.len()];
-            let step = (ts.len() / 1000).max(1);
+            let step = self.decimate_max
+                .map(|m| (ts.len() / m.max(1)).max(1))
+                .unwrap_or(1);
             chart
                 .draw_series(LineSeries::new(
                     ts.iter()

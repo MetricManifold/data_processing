@@ -14,11 +14,15 @@ use super::{PairPanelData, CTRL_ALPHA, CTRL_COLOR, SOFT_ALPHA, SOFT_COLOR};
 
 pub struct SpeedBurstsPair {
     pub speed_max: f64,
+    /// Optional max points per trace; if Some(N) and trace has more
+    /// than N samples, decimate via step_by((len/N).max(1)) before
+    /// rendering. None = full fidelity.
+    pub decimate_max: Option<usize>,
 }
 
 impl Default for SpeedBurstsPair {
     fn default() -> Self {
-        Self { speed_max: 0.02 }
+        Self { speed_max: 0.02, decimate_max: None }
     }
 }
 
@@ -82,8 +86,12 @@ impl<'a, 'b> Panel<'a, 'b> for SpeedBurstsPair {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
-        let step_n = (num.t_tau.len() / 1000).max(1);
-        let step_d = (den.t_tau.len() / 1000).max(1);
+        let step_n = self.decimate_max
+            .map(|m| (num.t_tau.len() / m.max(1)).max(1))
+            .unwrap_or(1);
+        let step_d = self.decimate_max
+            .map(|m| (den.t_tau.len() / m.max(1)).max(1))
+            .unwrap_or(1);
         chart
             .draw_series(LineSeries::new(
                 num.t_tau

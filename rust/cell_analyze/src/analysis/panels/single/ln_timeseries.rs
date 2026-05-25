@@ -11,7 +11,13 @@ use crate::analysis::panels::{Panel, PanelOpts};
 
 use super::{SingleRunData, SINGLE_COLOR};
 
-pub struct LnTimeseriesSingle;
+/// Single-run L_n(t) renderer. `decimate_max = Some(N)` thins the
+/// trace to at most ~N points via step_by; default None preserves
+/// every frame for full-fidelity rendering.
+#[derive(Default)]
+pub struct LnTimeseriesSingle {
+    pub decimate_max: Option<usize>,
+}
 
 impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesSingle {
     type Data = SingleRunData<'a>;
@@ -59,7 +65,9 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesSingle {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
-        let step = (ln.t_tau.len() / 1000).max(1);
+        let step = self.decimate_max
+            .map(|m| (ln.t_tau.len() / m.max(1)).max(1))
+            .unwrap_or(1);
         chart
             .draw_series(LineSeries::new(
                 ln.t_tau

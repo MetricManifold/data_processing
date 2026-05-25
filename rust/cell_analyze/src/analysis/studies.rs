@@ -293,6 +293,10 @@ pub enum PanelToml {
         /// "box_unwrapped".
         #[serde(default)]
         view: Option<String>,
+        /// speed_bursts/ln_timeseries: if set, thin traces longer than
+        /// this many points via step_by. Default = None (full fidelity).
+        #[serde(default)]
+        decimate_max: Option<usize>,
     },
     /// Single-run panel. `input` references a `single_run` slot.
     Single {
@@ -327,6 +331,10 @@ pub enum PanelToml {
         /// fraction) or "solid" (one color per cell).
         #[serde(default)]
         color: Option<String>,
+        /// speed_bursts/ln_timeseries: if set, thin traces longer than
+        /// this many points via step_by. Default = None (full fidelity).
+        #[serde(default)]
+        decimate_max: Option<usize>,
     },
     /// Overlay panel: N runs colored by series. `input` references an
     /// `overlay` slot.
@@ -344,6 +352,10 @@ pub enum PanelToml {
         msd_lag_max: Option<f64>,
         #[serde(default)]
         gvi_x_max: Option<f64>,
+        /// ln_timeseries: if set, thin traces longer than this many
+        /// points via step_by. Default = None (full fidelity).
+        #[serde(default)]
+        decimate_max: Option<usize>,
     },
 }
 
@@ -1071,6 +1083,7 @@ fn render_figure(
                 gvi_x_max,
                 bins,
                 view,
+                decimate_max,
             } => {
                 let pairs = match ws.get(input)? {
                     Slot::RunPairs(p) => p,
@@ -1099,9 +1112,13 @@ fn render_figure(
                 match subtype.as_str() {
                     "speed_bursts" => pp::speed_bursts::SpeedBurstsPair {
                         speed_max: speed_max.unwrap_or(0.02),
+                        decimate_max: *decimate_max,
                     }
                     .render(cell, &data, &opts)?,
-                    "ln_timeseries" => pp::ln_timeseries::LnTimeseriesPair.render(cell, &data, &opts)?,
+                    "ln_timeseries" => pp::ln_timeseries::LnTimeseriesPair {
+                        decimate_max: *decimate_max,
+                    }
+                    .render(cell, &data, &opts)?,
                     "ln_histogram" => pp::ln_histogram::LnHistogramPair {
                         n_bins: bins.unwrap_or(40),
                     }
@@ -1148,6 +1165,7 @@ fn render_figure(
                 show_population,
                 view,
                 color,
+                decimate_max,
             } => {
                 let single = match ws.get(input)? {
                     Slot::SingleRun(r) => r,
@@ -1179,9 +1197,13 @@ fn render_figure(
                         fit_eq5: fit_eq5.unwrap_or(true),
                     }
                     .render(cell, &data, &opts)?,
-                    "ln_timeseries" => sp::ln_timeseries::LnTimeseriesSingle.render(cell, &data, &opts)?,
+                    "ln_timeseries" => sp::ln_timeseries::LnTimeseriesSingle {
+                        decimate_max: *decimate_max,
+                    }
+                    .render(cell, &data, &opts)?,
                     "speed_bursts" => sp::speed_bursts::SpeedBurstsSingle {
                         speed_max: speed_max.unwrap_or(0.02),
+                        decimate_max: *decimate_max,
                     }
                     .render(cell, &data, &opts)?,
                     "trajectory_xy" => {
@@ -1216,6 +1238,7 @@ fn render_figure(
                 y_range,
                 msd_lag_max,
                 gvi_x_max,
+                decimate_max,
             } => {
                 let overlay = match ws.get(input)? {
                     Slot::Overlay(o) => o,
@@ -1250,7 +1273,10 @@ fn render_figure(
                         x_max: gvi_x_max.unwrap_or(0.022),
                     }
                     .render(cell, &data, &opts)?,
-                    "ln_timeseries" => op::ln_timeseries::LnTimeseriesOverlay.render(cell, &data, &opts)?,
+                    "ln_timeseries" => op::ln_timeseries::LnTimeseriesOverlay {
+                        decimate_max: *decimate_max,
+                    }
+                    .render(cell, &data, &opts)?,
                     other => {
                         return Err(anyhow!("unknown overlay subtype `{}`", other));
                     }
