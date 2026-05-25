@@ -82,11 +82,14 @@ impl<'a, 'b> Panel<'a, 'b> for SpeedBurstsPair {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
+        let step_n = (num.t_tau.len() / 1000).max(1);
+        let step_d = (den.t_tau.len() / 1000).max(1);
         chart
             .draw_series(LineSeries::new(
                 num.t_tau
                     .iter()
-                    .zip(num.speeds.iter())
+                    .step_by(step_n)
+                    .zip(num.speeds.iter().step_by(step_n))
                     .map(|(&t, &s)| (t, s.min(y_max))),
                 SOFT_ALPHA.stroke_width(1),
             ))?
@@ -96,7 +99,8 @@ impl<'a, 'b> Panel<'a, 'b> for SpeedBurstsPair {
             .draw_series(LineSeries::new(
                 den.t_tau
                     .iter()
-                    .zip(den.speeds.iter())
+                    .step_by(step_d)
+                    .zip(den.speeds.iter().step_by(step_d))
                     .map(|(&t, &s)| (t, s.min(y_max))),
                 CTRL_ALPHA.stroke_width(1),
             ))?

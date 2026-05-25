@@ -59,11 +59,13 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesSingle {
             .bold_line_style(RGBAColor(200, 200, 200, 0.3))
             .draw()?;
 
+        let step = (ln.t_tau.len() / 1000).max(1);
         chart
             .draw_series(LineSeries::new(
                 ln.t_tau
                     .iter()
-                    .zip(ln.series.iter())
+                    .step_by(step)
+                    .zip(ln.series.iter().step_by(step))
                     .map(|(&t, &l)| (t, l.min(y_max).max(y_min))),
                 SINGLE_COLOR.stroke_width(1),
             ))?

@@ -76,10 +76,12 @@ impl<'a, 'b> Panel<'a, 'b> for LnTimeseriesOverlay {
 
         for (i, (label, ts, series, mean)) in all.into_iter().enumerate() {
             let color = PALETTE[i % PALETTE.len()];
+            let step = (ts.len() / 1000).max(1);
             chart
                 .draw_series(LineSeries::new(
                     ts.iter()
-                        .zip(series.iter())
+                        .step_by(step)
+                        .zip(series.iter().step_by(step))
                         .map(|(&t, &l)| (t, l.min(y_max).max(y_min))),
                     color.mix(0.6).stroke_width(1),
                 ))?
