@@ -53,7 +53,17 @@ def get_report_dir():
 
 
 def _safe_name(test_name):
-    return test_name.replace("::", "__").replace("[", "_").replace("]", "").replace(" ", "_")
+    # pytest nodeids include path separators ("cpp/simulation/tests/python/...").
+    # Without stripping them, savefig() lands artifacts inside a nested tree
+    # whose parents don't exist and the test fails on write. Strip both
+    # slash variants so every artifact is a flat file in the report dir.
+    return (test_name
+            .replace("::", "__")
+            .replace("/", "_")
+            .replace("\\", "_")
+            .replace("[", "_")
+            .replace("]", "")
+            .replace(" ", "_"))
 
 
 def _short_name(test_name):
