@@ -1151,6 +1151,15 @@ bool read_checkpoint(const std::string& path, CheckpointPayload& out) {
         if (!ckpt_read_exact(f, &T_in, 4, 1, "checkpoint TILE_T")) {
             fclose(f); return false;
         }
+        // Reject obviously-malformed TILE_T before downstream allocators
+        // size phi tiles from it. Re-tile across power-of-two TILE_T changes
+        // works; a negative or absurd value means the checkpoint is corrupt.
+        if (T_in <= 0 || T_in > 4096) {
+            fprintf(stderr,
+                    "[ckpt] v%u TILE_T=%d out of plausible range (1..4096); "
+                    "checkpoint is corrupt or foreign\n", ver, T_in);
+            fclose(f); return false;
+        }
         Tin = T_in;
         if (Tin != TILE_T) {
             fprintf(stderr, "[ckpt] v%u TILE_T re-tile: file=%d build=%d\n",
@@ -3024,17 +3033,7 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 // migrate_cells is a no-op early-out). step_post_reduce
                 // ran k_rebind on this step iff (step_count is now a
                 // multiple of REBIND_EVERY) — it does the increment last.
-                //
-                // Diagnostic: CELL_SIM_SKIP_MIGRATION=1 disables migration
-                // entirely. Useful for short runs where no cell crosses a
-                // slab boundary, isolating the per-step halo cost from
-                // the migration host-sync cost. Does NOT disable rebind.
-                static const bool skip_migration = []() {
-                    const char* e = std::getenv("CELL_SIM_SKIP_MIGRATION");
-                    return e && e[0] == '1';
-                }();
-                if (!skip_migration
-                    && args.gpus > 1
+                if (args.gpus > 1
                     && sim.step_count > 0
                     && (sim.step_count % REBIND_EVERY) == 0)
                 {

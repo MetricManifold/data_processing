@@ -196,8 +196,9 @@ static void usage(const char* prog) {
     printf("  --gpus <n>            Run on N GPUs (default: 1). N>1 requires a build with\n");
     printf("                        -DENABLE_MULTI_GPU=ON (NCCL). Single-process,\n");
     printf("                        one-thread, multi-device. Cells are partitioned\n");
-    printf("                        across GPUs; the global S(x,y) field is replicated\n");
-    printf("                        and kept in sync via NCCL all-reduce per step.\n");
+    printf("                        across GPUs; the global S(x,y) field is slab-\n");
+    printf("                        decomposed, with halo Send/Recv pairs between\n");
+    printf("                        neighbours each step.\n");
     printf("  -h, --help            Show this help\n");
 }
 
@@ -331,34 +332,37 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-o") && i+1<argc) outdir = argv[++i];
         else if (!strcmp(argv[i], "-c") && i+1<argc) ckpt_path = argv[++i];
         else if (!strcmp(argv[i], "--save-interval") && i+1<argc) {
-            p.save_interval = atoi(argv[++i]); ov.save_interval = true;
+            if (!parse_int_range("--save-interval", argv[++i], 0, INT_MAX, p.save_interval)) return 1;
+            ov.save_interval = true;
         }
         else if (!strcmp(argv[i], "--checkpoint-interval") && i+1<argc) {
-            checkpoint_interval = atoi(argv[++i]);
+            if (!parse_int_range("--checkpoint-interval", argv[++i], 0, INT_MAX, checkpoint_interval)) return 1;
         }
         else if (!strcmp(argv[i], "--save-final-checkpoint")) save_final = true;
         else if (!strcmp(argv[i], "--no-save-final-checkpoint")) save_final = false;
         else if (!strcmp(argv[i], "--print-interval") && i+1<argc) {
-            p.print_interval = atoi(argv[++i]); ov.print_interval = true;
+            if (!parse_int_range("--print-interval", argv[++i], 0, INT_MAX, p.print_interval)) return 1;
+            ov.print_interval = true;
         }
         else if (!strcmp(argv[i], "--trajectory-samples") && i+1<argc) {
-            p.trajectory_samples = atoi(argv[++i]); ov.trajectory_samples = true;
+            if (!parse_int_range("--trajectory-samples", argv[++i], 0, INT_MAX, p.trajectory_samples)) return 1;
+            ov.trajectory_samples = true;
         }
         // Accept-and-translate: --trajectory-interval is converted to --trajectory-samples
         // once we know t_end and dt (after parsing finishes).
         else if (!strcmp(argv[i], "--trajectory-interval") && i+1<argc) {
-            trajectory_interval = atoi(argv[++i]);
+            if (!parse_int_range("--trajectory-interval", argv[++i], 0, INT_MAX, trajectory_interval)) return 1;
         }
         else if (!strcmp(argv[i], "--vtk-interval") && i+1<argc) {
-            vtk_interval = atoi(argv[++i]);
+            if (!parse_int_range("--vtk-interval", argv[++i], 0, INT_MAX, vtk_interval)) return 1;
         }
         else if (!strcmp(argv[i], "--live-view")) { live_view = true; }
         else if (!strcmp(argv[i], "--live-view-interval") && i+1<argc) {
-            live_view_interval = atoi(argv[++i]);
+            if (!parse_int_range("--live-view-interval", argv[++i], 1, INT_MAX, live_view_interval)) return 1;
             live_view_interval_set = true;
         }
         else if (!strcmp(argv[i], "--live-view-tu") && i+1<argc) {
-            live_view_tu = atof(argv[++i]);
+            if (!parse_nonnegative_double("--live-view-tu", argv[++i], live_view_tu)) return 1;
         }
         // TODO(observables): re-introduce a `--observables [interval=<n>]` CLI
         // surface that drives an on-GPU per-cell measurement pass (volume,

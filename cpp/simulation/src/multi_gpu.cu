@@ -88,13 +88,6 @@ bool mg_init_world(int world_size, MgWorld& out) {
         out.devices[g] = (loopback_dev >= 0) ? loopback_dev : g;
     }
 
-    out.streams.resize(world_size, nullptr);
-    for (int g = 0; g < world_size; ++g) {
-        MG_CUDA_CK(cudaSetDevice(out.devices[g]));
-        MG_CUDA_CK(cudaStreamCreateWithFlags(&out.streams[g],
-                                             cudaStreamNonBlocking));
-    }
-
     // Single-process, multi-device init: ncclCommInitAll handles the unique
     // ID exchange internally and creates one comm per device.
     std::vector<ncclComm_t> raw(world_size);
@@ -118,13 +111,6 @@ void mg_finalize_world(MgWorld& w) {
         }
     }
     w.comms.clear();
-    for (size_t g = 0; g < w.streams.size(); ++g) {
-        if (w.streams[g]) {
-            cudaSetDevice(w.devices[g]);
-            cudaStreamDestroy(w.streams[g]);
-        }
-    }
-    w.streams.clear();
     w.devices.clear();
     w.world_size = 1;
 }

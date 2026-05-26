@@ -50,9 +50,8 @@ struct MgComm;
 // process. world_size == 1 is a valid configuration (no-op collectives).
 struct MgWorld {
     int world_size = 1;
-    std::vector<MgComm*>      comms;    // size = world_size
-    std::vector<cudaStream_t> streams;  // dedicated halo-exchange stream/rank
-    std::vector<int>          devices;  // CUDA device id per rank
+    std::vector<MgComm*> comms;     // size = world_size
+    std::vector<int>     devices;   // CUDA device id per rank
 };
 
 // Compile-time capability probe.
@@ -62,13 +61,12 @@ bool mg_available();
 
 // Initialize NCCL communicators for `world_size` devices in this process.
 // Devices used are 0..world_size-1 by default; callers can constrain via
-// CUDA_VISIBLE_DEVICES. Streams are non-blocking, one per rank, used for
-// the halo Send/Recv pairs so they can overlap with the rank's own kernel
-// work.
+// CUDA_VISIBLE_DEVICES. NCCL calls in this codebase are issued on each
+// Simulation's `step_stream`, not on a shared per-rank stream.
 bool mg_init_world(int world_size, MgWorld& out);
 
-// Destroy NCCL comms and streams. Safe to call on a partially initialised
-// world or on an empty world.
+// Destroy NCCL comms. Safe to call on a partially initialised world or
+// on an empty world.
 void mg_finalize_world(MgWorld& w);
 
 // In-place SUM all-reduce on int32 buffers (cell-loss audit only).
