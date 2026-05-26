@@ -5,10 +5,11 @@
 // tracks the cell's current extent.
 //
 // Checkpoint compatibility:
-//   * Reads:  v3, v4, v5, v6 (legacy variable-W/H tiles) AND v7 (TILE_T
-//             uniform tiles). On legacy load we re-tile each cell into a
-//             centred TILE_T x TILE_T buffer.
-//   * Writes: v7 only.
+//   * Reads:  v3, v4, v5, v6 (legacy variable-W/H tiles), v7 (TILE_T
+//             uniform tiles), and v8 (TILE_T tiles + rank trailer). Legacy
+//             versions are re-tiled into a centred TILE_T x TILE_T buffer.
+//   * Writes: current = ckpt::VERSION_CURRENT (v8). See checkpoint_format.cuh
+//             for the record layout and version bump procedure.
 
 #include "sim.cuh"
 #include "checkpoint_format.cuh"
@@ -44,6 +45,31 @@ bool termination_requested() {
     return g_terminate_requested.load(std::memory_order_seq_cst);
 }
 
+// ---------------------------------------------------------------------------
+// Runtime env vars (the only ones the simulator reads at runtime).
+//
+// Production-safe (default OFF, opt-in only when tuning):
+//   CELL_SIM_DISABLE_L2_PERSIST  Skip the L2 access-policy-window on S.
+//                                Costs ~5-34% wall depending on arch.
+//   CELL_SIM_TRAJ_RING           Async trajectory ring depth (default 4).
+//   CELL_SIM_TRAJ_FLUSH_EVERY    fflush(traj_fp) cadence (default 100).
+//
+// Diagnostic / debug:
+//   CELL_SIM_AUDIT_CELLS         Multi-GPU only. Sum cells_global across
+//                                ranks every migration and fatal on drift.
+//                                Off the hot path; one int32 allreduce.
+//   CELL_SIM_NO_MG_GRAPH         Multi-GPU only. Disable mg_step_graph
+//                                capture; useful when debugging graph
+//                                state corruption.
+//
+// Build/runtime locator (multi_gpu.cu):
+//   CELL_SIM_LOOPBACK_DEVICE     For loopback NCCL on a single physical
+//                                GPU; useful for Windows / no-multi-GPU
+//                                test boxes.
+//
+// Telemetry (build-time -DCELL_SIM_BBOX_TELEMETRY):
+//   Counters live in kernels.cu, printed at run end. Not env-gated.
+// ---------------------------------------------------------------------------
 static bool sim_env_flag_enabled(const char* name) {
     const char* value = std::getenv(name);
     if (!value || !*value) return false;
@@ -122,10 +148,15 @@ void Simulation::place_cells(int n, double R) {
     }
     double area = (double)params.Nx * params.Ny;
     double spacing = std::fmax(2.0 * R, std::sqrt(area / n) * 0.8);
+    // Rejection-sampling budget: kPlacementAttemptsPerSpacing trials at each
+    // spacing radius, then shrink spacing by kPlacementSpacingDecay and retry.
+    // If spacing falls below R we give up and fail-loud — see [init] message.
+    constexpr int    kPlacementAttemptsPerSpacing = 10000;
+    constexpr double kPlacementSpacingDecay       = 0.95;
     int placed = 0;
     while (placed < n) {
         bool ok = false;
-        for (int att = 0; att < 10000 && !ok; att++) {
+        for (int att = 0; att < kPlacementAttemptsPerSpacing && !ok; att++) {
             double cx = (double)rand() / RAND_MAX * params.Nx;
             double cy = (double)rand() / RAND_MAX * params.Ny;
             bool good = true;
@@ -144,7 +175,7 @@ void Simulation::place_cells(int n, double R) {
             }
         }
         if (!ok) {
-            spacing *= 0.95;
+            spacing *= kPlacementSpacingDecay;
             if (spacing < R) {
                 fprintf(stderr,
                         "[init] failed to place all cells: placed %d/%d "
@@ -1317,11 +1348,13 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
     if (v_A_sigma > 0.0) payload.per_vA.clear();
     // Guard the "all-zero sidecar" case: equilibrations with v_A=0 still
     // emit a VA_A sidecar (all zeros). Resuming with --v-A>0 must use the
-    // CLI value, not the zero sidecar.
+    // CLI value, not the zero sidecar. kZeroSidecarSumEpsilon distinguishes
+    // genuine all-zero data from float noise around zero.
     if (ov.v_A && !payload.per_vA.empty() && cli.v_A > 0.0) {
+        constexpr double kZeroSidecarSumEpsilon = 1e-12;
         double sum = 0.0;
         for (float v : payload.per_vA) sum += std::fabs(v);
-        if (sum <= 1e-12) payload.per_vA.clear();
+        if (sum <= kZeroSidecarSumEpsilon) payload.per_vA.clear();
     }
 
     // Polarity RNG for legacy resumes that lack a POLR block.
@@ -1662,16 +1695,16 @@ void Simulation::step() {
 // ---------------------------------------------------------------------------
 // The orchestrator drives one step like this, for each rank g in lockstep:
 //
-//   for g: sim[g].step_pre_reduce();          // polar + scatter to LOCAL S
+//   for g: sim[g].step_pre_reduce();          // polar + scatter to LOCAL S slab
 //   ncclGroupStart();
-//   for g: ncclAllReduce(S, sum, comm[g], stream[g]);
-//   ncclGroupEnd();
+//   for g: launch_halo_exchange();            // ncclSend/Recv pairs between
+//   ncclGroupEnd();                           //   neighbour slabs only
 //   for g: sim[g].step_post_reduce();         // evolve + maybe rebind
 //
-// Graph capture is NOT used on this path — capturing across an external
-// NCCL collective is fragile, and the per-step graph savings (~3-5us) are
-// dwarfed by the all-reduce. The graph fast path remains in step() above
-// and is what --gpus 1 always uses.
+// The orchestrator captures this whole sequence into a per-parity CUDA
+// graph (mg_step_graph) on the fast path; only the slow path (rebind,
+// scripted events, full reduce) issues the kernels directly. See
+// run_multi_gpu in this file for the graph capture site.
 //
 // step_pre_reduce / step_post_reduce together advance step_count and
 // cur_time by exactly one step (post_reduce does the increment). It is
@@ -2306,7 +2339,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         snprintf(fn, sizeof(fn), "%s/checkpoint.bin", dir.c_str());
     else
         snprintf(fn, sizeof(fn), "%s/checkpoint_%s.bin", dir.c_str(), tag.c_str());
-    // C3: atomic write. Write to <fn>.tmp and rename on close. Without this,
+    // Atomic write: write to <fn>.tmp and rename on close. Without this,
     // a SLURM SIGTERM-on-timeout mid-write truncates checkpoint.bin and
     // overwrites the previous good copy, losing the run.
     char fn_tmp[520];
@@ -2397,7 +2430,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         }
     }
 
-    // C2: RNGS sidecar — per-cell curandState bytes so resume preserves
+    // RNGS sidecar — per-cell curandState bytes so resume preserves
     // the random-stream continuity. Without this, chained jobs replay the
     // same tumble decisions from offset 0 every time finalize_init runs.
     {
@@ -3176,6 +3209,19 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
     }
     mg_finalize_world(world);
     return 0;
+}
+
+#else  // ENABLE_MULTI_GPU
+
+// Stub: main.cu's --gpus>1 path is gated on mg_available(), so this is
+// unreachable in normal use. Exists only so the build link succeeds when
+// the full multi-GPU orchestrator is compiled out.
+int run_multi_gpu(const MultiGpuRunArgs& /*args*/) {
+    fprintf(stderr,
+            "[multi_gpu] run_multi_gpu called in stub build "
+            "(ENABLE_MULTI_GPU=OFF). This is a bug — main.cu should have "
+            "rejected --gpus>1 before reaching here.\n");
+    std::exit(1);
 }
 
 #endif  // ENABLE_MULTI_GPU

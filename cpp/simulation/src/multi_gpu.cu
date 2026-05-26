@@ -11,7 +11,6 @@
 // ---------------------------------------------------------------------------
 
 #include "multi_gpu.cuh"
-#include "sim.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -263,17 +262,5 @@ void mg_send_recv_i32(MgComm* /*c*/,
 
 void mg_group_start() {}
 void mg_group_end()   {}
-
-// run_multi_gpu is implemented in sim.cu under the same ENABLE_MULTI_GPU
-// guard. main.cu's --gpus>1 path is gated on mg_available() so this stub
-// is unreachable in normal use; it exists only so the build link succeeds
-// when the orchestrator's full implementation is excluded.
-int run_multi_gpu(const MultiGpuRunArgs& /*args*/) {
-    fprintf(stderr,
-            "[multi_gpu] run_multi_gpu called in stub build "
-            "(ENABLE_MULTI_GPU=OFF). This is a bug — main.cu should have "
-            "rejected --gpus>1 before reaching here.\n");
-    std::exit(1);
-}
 
 #endif  // ENABLE_MULTI_GPU

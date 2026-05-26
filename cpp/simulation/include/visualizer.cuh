@@ -9,8 +9,9 @@
 //
 // Renders the global S(x,y) = sum_n phi_n(x,y)^2 field directly from device
 // memory each call (no host copies). Single-window viridis colormap; user
-// closes the window or presses ESC to terminate the viewer (the simulation
-// keeps running). Designed for the tile-pool layout.
+// closes the window or presses ESC to stop the simulation (Simulation::run
+// breaks out of the step loop when the viewer reports should_close). Designed
+// for the tile-pool layout.
 //
 // Overlays (drawn from device data, no host roundtrip):
 //   * Red tint on soft cells (gamma_cell < soft_gamma_threshold).
@@ -78,10 +79,10 @@ private:
     bool initialized = false;
     int tex_width = 0, tex_height = 0;
     // Dedicated non-blocking CUDA stream so viz kernels never serialize
-    // against the sim's default-stream work; gated by sim_done / viz_done
-    // events so frames are skipped if the previous one is still in flight.
+    // against the sim's step_stream work; the caller (Simulation::run)
+    // synchronizes step_stream before update() so sim buffers are stable.
     cudaStream_t viz_stream = 0;
-    cudaEvent_t  sim_done = nullptr;  // recorded on default stream pre-update
+    cudaEvent_t  sim_done = nullptr;  // recorded pre-update for frame pacing
     cudaEvent_t  viz_done = nullptr;  // recorded on viz_stream post-update
     bool         viz_in_flight = false;
 };

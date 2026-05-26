@@ -176,8 +176,10 @@ static void usage(const char* prog) {
     printf("  --abp                 Use ABP instead of run-and-tumble\n");
     printf("  -o <dir>              Output directory (default: ./output)\n");
     printf("  -c <path>             Resume from checkpoint\n");
-    printf("  --save-interval <n>   Save checkpoint every N steps (0=off)\n");
-    printf("  --checkpoint-interval <n>  Alias for --save-interval\n");
+    printf("  --save-interval <n>        Write tagged archival checkpoint every N steps\n");
+    printf("                             (filename includes step number; 0=off)\n");
+    printf("  --checkpoint-interval <n>  Write rolling resumable checkpoint.bin every N steps\n");
+    printf("                             (single file, overwritten; 0=off)\n");
     printf("  --save-final-checkpoint    Save final checkpoint at t_end (default: on)\n");
     printf("  --no-save-final-checkpoint Disable final checkpoint save\n");
     printf("  --print-interval <n>  Console print interval (default: 100)\n");
@@ -255,7 +257,11 @@ int main(int argc, char** argv) {
             if (!parse_positive_double("--radius", argv[++i], p.target_radius)) return 1;
             ov.target_radius = true;
         }
-        else if (!strcmp(argv[i], "-N") && i+1<argc) { p.Nx = atoi(argv[++i]); p.Ny = p.Nx; nx_set = true; }
+        else if (!strcmp(argv[i], "-N") && i+1<argc) {
+            if (!parse_int_range("-N", argv[++i], 1, INT_MAX, p.Nx)) return 1;
+            p.Ny = p.Nx;
+            nx_set = true;
+        }
         else if (!strcmp(argv[i], "--confluence") && i+1<argc) {
             double parsed = 0.0;
             if (!parse_positive_double("--confluence", argv[++i], parsed)) return 1;
@@ -382,11 +388,7 @@ int main(int argc, char** argv) {
             scripted_events_path = argv[++i];
         }
         else if (!strcmp(argv[i], "--gpus") && i+1<argc) {
-            gpus = atoi(argv[++i]);
-            if (gpus < 1) {
-                fprintf(stderr, "Error: --gpus must be >= 1 (got %d)\n", gpus);
-                return 1;
-            }
+            if (!parse_int_range("--gpus", argv[++i], 1, INT_MAX, gpus)) return 1;
         }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown: %s\n", argv[i]); return 1; }

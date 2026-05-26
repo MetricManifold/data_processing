@@ -1183,10 +1183,10 @@ __global__ void k_classify_migrants(
         // Cell jumped more than one slab in a single rebind interval.
         // Drift per rebind is ~v_max * dt * REBIND_EVERY ≈ 0.04 px, far
         // less than slab_height. If we hit this, something is wrong —
-        // either v_A is unrealistically large or there's a bug. Keep the
-        // cell as a stay so the run doesn't crash; the host post-step
-        // check (host counts stay/up/down) will detect imbalance and
-        // print a warning. We log via the global counter `g_long_jump`.
+        // either v_A is unrealistically large or there's a bug. We keep
+        // the cell as a stay so the run doesn't crash; the host-side
+        // CELL_SIM_AUDIT_CELLS path (when enabled) will catch any
+        // resulting cells_global drift and exit.
         int slot = atomicAdd(d_n_stay, 1);
         stay_idx[slot] = i;
     }

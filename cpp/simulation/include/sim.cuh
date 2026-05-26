@@ -244,7 +244,8 @@ struct Simulation {
     void init(const SimParams& p, int n_cells);
     bool init_from_checkpoint(const std::string& path,
                               const SimParams& cli_params,
-                              const SimOverrides& ov);    void run();
+                              const SimOverrides& ov);
+    void run();
     void cleanup();
 
     // internal
