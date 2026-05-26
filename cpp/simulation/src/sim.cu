@@ -27,6 +27,22 @@
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <atomic>
+
+// Cooperative-termination flag. Set by request_termination() from a
+// SIGTERM/SIGINT handler in main.cu; polled by the step loop. Atomic
+// because the handler runs on a different thread context than the step
+// loop. Sequential consistency is fine — this is once-per-step polling,
+// not a hot path.
+static std::atomic<bool> g_terminate_requested{false};
+
+void request_termination() {
+    g_terminate_requested.store(true, std::memory_order_seq_cst);
+}
+
+bool termination_requested() {
+    return g_terminate_requested.load(std::memory_order_seq_cst);
+}
 
 static bool sim_env_flag_enabled(const char* name) {
     const char* value = std::getenv(name);
@@ -1830,6 +1846,12 @@ void Simulation::run() {
     }
 
     while (step_count < target_step) {
+        if (termination_requested()) {
+            printf("[SIM] termination signal received at step %d (t=%.4f); "
+                   "flushing trajectory + final checkpoint and exiting\n",
+                   step_count, cur_time);
+            break;
+        }
         step();
         if (params.save_interval > 0 && step_count % params.save_interval == 0) {
             char tag[32]; snprintf(tag, sizeof(tag), "%08d", step_count);
@@ -3062,6 +3084,12 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
     }
 
     while (sims[0]->step_count < target_step) {
+        if (termination_requested()) {
+            printf("[MG] termination signal received at step %d (t=%.4f); "
+                   "flushing per-rank trajectories + final checkpoints and exiting\n",
+                   sims[0]->step_count, sims[0]->cur_time);
+            break;
+        }
         // Wake all workers; they advance the step count atomically.
         start_barrier.wait();
         // Block until every worker has finished post_reduce.

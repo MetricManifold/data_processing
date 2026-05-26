@@ -12,6 +12,7 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#include <csignal>
 #include <cuda_runtime.h>
 
 #ifdef _WIN32
@@ -203,6 +204,20 @@ static void usage(const char* prog) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
+    // Cooperative SIGTERM/SIGINT: ask the step loop to break, so trajectory
+    // writer drains and the final checkpoint is saved instead of dying
+    // mid-fprintf. A second signal of the same kind falls through to the
+    // default handler (immediate terminate), so the user can always abort
+    // a hung shutdown with a second Ctrl+C / kill. std::signal is portable
+    // across POSIX and Windows; both platforms self-reset to SIG_DFL on
+    // some signals already, but we re-arm SIG_DFL explicitly to be sure.
+    auto handler = [](int) {
+        request_termination();
+        std::signal(SIGTERM, SIG_DFL);
+        std::signal(SIGINT,  SIG_DFL);
+    };
+    std::signal(SIGTERM, handler);
+    std::signal(SIGINT,  handler);
     SimParams p;
     SimOverrides ov;
     int ncells = 8;

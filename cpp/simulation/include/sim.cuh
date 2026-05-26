@@ -438,3 +438,15 @@ struct MultiGpuRunArgs {
     bool          save_final          = true;
 };
 int run_multi_gpu(const MultiGpuRunArgs& args);
+
+// ---------------------------------------------------------------------------
+// Cooperative termination. main.cu installs SIGTERM/SIGINT handlers that
+// call request_termination(); the step loop in Simulation::run() (and the
+// multi-GPU orchestrator) polls termination_requested() once per step and
+// breaks out before the next step if set. This lets the normal cleanup
+// path run on signal: trajectory writer drains, final checkpoint writes,
+// then the process exits. Without this, SIGTERM kills mid-fprintf and
+// trajectory.txt is truncated mid-line.
+void request_termination();
+bool termination_requested();
+

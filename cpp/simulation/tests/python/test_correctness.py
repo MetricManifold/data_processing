@@ -3,6 +3,7 @@ Tier 1: Code correctness tests.
 These test plumbing, not physics — CLI overrides, checkpoint round-trips, etc.
 """
 import math
+import os
 import pytest
 import numpy as np
 from conftest import run_sim, read_checkpoint, read_trajectory, requires_flag
@@ -58,6 +59,128 @@ class TestSmoke:
         combined = result.stderr + result.stdout
         assert "[init] failed to place all cells" in combined
         assert "placed 1/2" in combined
+
+    @pytest.mark.skipif(os.name == "nt",
+                        reason="POSIX SIGTERM semantics required; Windows "
+                               "subprocess.terminate() is TerminateProcess "
+                               "(non-graceful), which can't exercise the "
+                               "cooperative shutdown handler.")
+    def test_sigterm_flushes_trajectory_and_checkpoint(self, tmp_path):
+        """SIGTERM mid-run must produce a clean trajectory.txt (no truncated
+        line) and a final checkpoint whose t matches the last trajectory
+        sample. Regression for the silent truncation bug where the async
+        writer ring + producer were killed mid-fprintf, leaving traj.txt's
+        last line cut off and the final checkpoint unwritten."""
+        import subprocess, signal, time
+        from conftest import CELL_SIM, read_checkpoint
+
+        outdir = tmp_path / "sigterm"
+        outdir.mkdir()
+        # N=1152 keeps the run > 10s on RTX 4090; smaller N finishes before
+        # the test can reliably send SIGTERM.
+        cmd = [
+            CELL_SIM,
+            "-n", "1152",
+            "--confluence", "0.90",
+            "-r", "49",
+            "-t", "200",
+            "--dt", "0.01",
+            "--v-A", "0.01",
+            "--tau", "10000",
+            "--trajectory-samples", "1000",
+            "--save-final-checkpoint",
+            "--save-interval", "0",
+            "--checkpoint-interval", "0",
+            "--print-interval", "100",
+            "--seed", "42",
+            "--polarity-seed", "1",
+            "-o", str(outdir),
+        ]
+        # Use file redirection rather than PIPE: with --print-interval 100
+        # the sim emits ~10 KB/s of stdout; if Popen captures via PIPE and
+        # the parent doesn't read, the pipe buffer (~64 KB on Linux) fills
+        # and the sim blocks on stdout write, never writing trajectory frames.
+        stdout_file = outdir / "stdout.log"
+        stderr_file = outdir / "stderr.log"
+        sf = open(stdout_file, "w")
+        ef = open(stderr_file, "w")
+        proc = subprocess.Popen(cmd, stdout=sf, stderr=ef)
+        # Wait for init to complete (the [SIM] init: line is printed just
+        # before the run loop starts), then give the run loop another 2 s
+        # so the trajectory writer has frames queued.
+        init_deadline = time.time() + 30
+        seen_init = False
+        while time.time() < init_deadline:
+            time.sleep(0.2)
+            if proc.poll() is not None:
+                break
+            try:
+                content = stdout_file.read_text(errors="replace")
+            except Exception:
+                content = ""
+            if "[SIM] init:" in content:
+                seen_init = True
+                break
+        if not seen_init or proc.poll() is not None:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            sf.close(); ef.close()
+            pytest.fail(
+                f"sim did not reach init within 30 s (rc={proc.returncode}). "
+                f"Stdout:\n{stdout_file.read_text(errors='replace')[-1500:]}"
+            )
+        time.sleep(2.0)
+        if proc.poll() is not None:
+            sf.close(); ef.close()
+            pytest.fail(
+                f"sim exited before SIGTERM could be sent (rc={proc.returncode}); "
+                f"increase t_end. Stdout:\n"
+                f"{stdout_file.read_text(errors='replace')[-1500:]}"
+            )
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            sf.close(); ef.close()
+            pytest.fail("sim did not exit within 30s of SIGTERM")
+        sf.close(); ef.close()
+        stdout_text = stdout_file.read_text(errors="replace")
+        stderr_text = stderr_file.read_text(errors="replace")
+        combined = stdout_text + stderr_text
+        assert proc.returncode == 0, \
+            f"sim exited with {proc.returncode} (expected 0 after cooperative SIGTERM); output:\n{combined[-2000:]}"
+        assert "termination signal received" in combined, \
+            f"expected '[SIM] termination signal received' in stdout; output:\n{combined[-2000:]}"
+
+        traj_path = outdir / "trajectory.txt"
+        ckpt_path = outdir / "checkpoint.bin"
+        assert traj_path.exists(), "trajectory.txt missing"
+        assert ckpt_path.exists(), "checkpoint.bin missing (final checkpoint not saved)"
+
+        # The last data line of trajectory.txt must be complete: 12 fields,
+        # all parseable as numbers. Pre-fix this line was truncated mid-write.
+        with open(traj_path) as f:
+            lines = [ln for ln in f.read().splitlines() if ln and not ln.startswith("#")]
+        assert len(lines) > 0, "no trajectory data rows"
+        last_fields = lines[-1].split()
+        assert len(last_fields) == 12, \
+            f"truncated last trajectory line: {len(last_fields)} fields, expected 12: {lines[-1]!r}"
+        for f in last_fields:
+            float(f)  # raises ValueError on garbage
+
+        # Last trajectory time must equal the checkpoint's t (within one
+        # frame interval), proving the writer drained before exit.
+        last_traj_t = float(last_fields[0])
+        chk = read_checkpoint(ckpt_path)
+        ckpt_time = chk["time"]
+        # Frame interval at the configured cadence is ~0.2 time-units (t=200 /
+        # 1000 samples); 1.0 is a generous tolerance. A pre-fix run would
+        # mismatch by 10-30 time-units.
+        assert abs(ckpt_time - last_traj_t) < 1.0, \
+            f"trajectory last t={last_traj_t} but checkpoint t={ckpt_time}; " \
+            f"writer didn't drain before exit"
 
 
 # ============================================================================
