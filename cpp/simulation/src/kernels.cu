@@ -3,7 +3,10 @@
 // Layout:
 //   1. Device helpers
 //   2. k_scatter_S       — atomicAdd phi^2 into global S
-//   3. Multi-block evolve pipeline: k_reduce_mb_fast/full + k_rhs_mb
+//   3. Multi-block evolve pipeline:
+//        k_reduce_mb_{fast,full} -> per-chunk partials (deterministic),
+//        k_finalize_reduce       -> 5 host-only moments on full-reduce steps,
+//        k_rhs_mb                -> per-cell V/Ix/Iy sum + RHS + phi update
 //   4. k_rebind          — COM-recentre tile (origin shift + tile copy)
 //   5. k_polar           — per-cell polarity update (RTP + ABP)
 //   6. k_init_phi        — tanh init profile
@@ -93,8 +96,10 @@ __device__ __forceinline__ float warp_sum(float v) {
 // Block-level sum reduce. Uses warp-shuffle within each warp + a single
 // shared-memory pass across warp leaders. Block size must be a multiple of
 // 32 and <= 1024 (so warp count fits in a single warp). After this returns,
-// thread 0 holds the block-wide sum; other threads' return value is
-// undefined. Caller should broadcast via shared memory if needed.
+// only thread 0 holds the block-wide sum; other threads' return is 0.
+// The trailing __syncthreads makes it safe to call multiple times in a row
+// reusing the same `smem` scratch (otherwise warp 0's next smem[warpId]=v
+// write would race other warps' tail read of smem from the previous call).
 //
 //   smem must point at >= 32 floats (one per warp leader).
 __device__ __forceinline__ float block_sum(float v, float* smem) {
@@ -104,13 +109,14 @@ __device__ __forceinline__ float block_sum(float v, float* smem) {
     v = warp_sum(v);
     if (lane == 0) smem[warpId] = v;
     __syncthreads();
+    float result = 0.0f;
     if (warpId == 0) {
         float s = (threadIdx.x < nWarps) ? smem[threadIdx.x] : 0.0f;
         s = warp_sum(s);
-        if (lane == 0) smem[0] = s;
+        if (lane == 0) result = s;
     }
     __syncthreads();
-    return smem[0];
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,10 +185,8 @@ void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     // even at large N (1152 cells * 9 chunks/cell = 10368 blocks vs the
     // 1152-block "fused" alternative which left ~85% of warps idle on
     // a 76-SM device).
-    constexpr int CHUNK_PIXELS = 4096;
     constexpr int BS = 256;
-    constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-    k_scatter_S<<<dim3(chunks_per_cell, N), BS, 0, stream>>>(
+    k_scatter_S<<<dim3(REDUCE_CHUNKS_PER_CELL, N), BS, 0, stream>>>(
         c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS,
         c.S_y_lo, c.S_halo_h);
 }
@@ -192,44 +196,35 @@ void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
 // ---------------------------------------------------------------------------
 // Grid shape (chunks_per_cell, N). Each block processes CHUNK_PIXELS pixels
 // of the active rect for one cell. Splitting the cell across many blocks
-// pumps occupancy when N is small. Per-cell accumulators are filled by
-// atomicAdd from one thread per block; the host pre-zeros them.
+// pumps occupancy when N is small. Per-cell partial moments are written
+// to disjoint slots in `reduce_partials` (no atomics) and summed in
+// fixed cb=0..chunks-1 order: V/Ix/Iy inside k_rhs_mb's per-cell
+// prologue (one launch saved), and the 5 host-only moments (perim, Cx,
+// Cy, Cxx, Cyy) inside k_finalize_reduce on full-reduce steps.
+//
+// Determinism: same-binary same-GPU runs give bit-identical V/Ix/Iy/
+// (host-only moments) because the partial slots are written in disjoint
+// locations and summed in fixed cb order. The scatter into S is still
+// nondeterministic via atomicAdd; that is the next thing to fix.
+//
 // All pixels inside the active rect are evaluated unconditionally; we do
 // NOT background-skip on phi < threshold. The rect itself is the locality
 // optimisation; further skipping would change reductions / RHS by amounts
 // below f32 epsilon but not bit-exact, which is unacceptable here.
 // ---------------------------------------------------------------------------
 
-__global__ void k_zero_per_cell(
-    float* a, float* b, float* c, float* d,
-    float* e, float* f, float* g, float* h,
-    int N)
-{
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
-    a[n] = 0.0f; b[n] = 0.0f; c[n] = 0.0f; d[n] = 0.0f;
-    e[n] = 0.0f; f[n] = 0.0f; g[n] = 0.0f; h[n] = 0.0f;
-}
-
-__global__ void k_zero_per_cell3(
-    float* a, float* b, float* c, int N)
-{
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= N) return;
-    a[n] = 0.0f; b[n] = 0.0f; c[n] = 0.0f;
-}
-
-// Fast reduce: only V, Ix, Iy. Used on non-rebind, non-output steps.
-// Saves 5 atomicAdds per chunk and 5 block-reductions vs the full variant.
+// Fast reduce: V, Ix, Iy. Used on non-rebind, non-output steps. Each
+// chunk-block computes its block-wide partial via block_sum and stores
+// it at partials[moment * plane + cb*cap + n]. RHS sums along cb for
+// V/Ix/Iy; the full-reduce kernel below writes the same three plus
+// peri/Cx/Cy/Cxx/Cyy for downstream consumers.
 __global__ void k_reduce_mb_fast(
     const float* __restrict__ phi,
     const int*   __restrict__ origin,
     const int*   __restrict__ rect,
     const float* __restrict__ S,
-    float* __restrict__ V_out,
-    float* __restrict__ Ix_out,
-    float* __restrict__ Iy_out,
-    int N, int L, int CHUNK_PIXELS,
+    float* __restrict__ partials,
+    int N, int cap, int L, int CHUNK_PIXELS,
     int y_lo, int halo_h)
 {
     const int n  = blockIdx.y;
@@ -241,7 +236,6 @@ __global__ void k_reduce_mb_fast(
     const int rh  = rect[4*n + 3];
     const int rect_total = rw * rh;
     const int p_start = cb * CHUNK_PIXELS;
-    if (p_start >= rect_total) return;
     const int p_end = min(p_start + CHUNK_PIXELS, rect_total);
     const int gx0 = origin[2*n + 0];
     const int gy0 = origin[2*n + 1];
@@ -251,34 +245,36 @@ __global__ void k_reduce_mb_fast(
 
     float sV = 0.0f, sIx = 0.0f, sIy = 0.0f;
 
-    const int step_x = BS % rw;
-    const int step_y = BS / rw;
-    const int rx_end = rx0 + rw;
-    int p0 = p_start + tid;
-    int lx = rx0 + (p0 % rw);
-    int ly = ry0 + (p0 / rw);
-    for (int p = p0; p < p_end; p += BS) {
-        int idx = ly * TILE_T + lx;
-        // rect invariant: rx0 >= 1 && rx0+rw <= TILE_T-1, same for y.
-        // All 5-pt stencil neighbors are in-tile, no boundary guards.
-        float c   = __ldg(tile + idx);
-        float xp_ = __ldg(tile + idx + 1);
-        float xm_ = __ldg(tile + idx - 1);
-        float yp_ = __ldg(tile + idx + TILE_T);
-        float ym_ = __ldg(tile + idx - TILE_T);
-        float gx = 0.5f * (xp_ - xm_);
-        float gy = 0.5f * (yp_ - ym_);
-        int gxg = wrap_i(gx0 + lx, L);
-        int gyg = wrap_i(gy0 + ly, L);
-        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
-        float Sv   = __ldg(S + sy * L + gxg);
-        float Soth = Sv - c * c;
-        if (Soth < 0.0f) Soth = 0.0f;
-        sV  += c * c;
-        sIx += c * gx * Soth;
-        sIy += c * gy * Soth;
-        lx += step_x; ly += step_y;
-        if (lx >= rx_end) { lx -= rw; ly += 1; }
+    if (p_start < rect_total) {
+        const int step_x = BS % rw;
+        const int step_y = BS / rw;
+        const int rx_end = rx0 + rw;
+        int p0 = p_start + tid;
+        int lx = rx0 + (p0 % rw);
+        int ly = ry0 + (p0 / rw);
+        for (int p = p0; p < p_end; p += BS) {
+            int idx = ly * TILE_T + lx;
+            // rect invariant: rx0 >= 1 && rx0+rw <= TILE_T-1, same for y.
+            // All 5-pt stencil neighbors are in-tile, no boundary guards.
+            float c   = __ldg(tile + idx);
+            float xp_ = __ldg(tile + idx + 1);
+            float xm_ = __ldg(tile + idx - 1);
+            float yp_ = __ldg(tile + idx + TILE_T);
+            float ym_ = __ldg(tile + idx - TILE_T);
+            float gx = 0.5f * (xp_ - xm_);
+            float gy = 0.5f * (yp_ - ym_);
+            int gxg = wrap_i(gx0 + lx, L);
+            int gyg = wrap_i(gy0 + ly, L);
+            int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+            float Sv   = __ldg(S + sy * L + gxg);
+            float Soth = Sv - c * c;
+            if (Soth < 0.0f) Soth = 0.0f;
+            sV  += c * c;
+            sIx += c * gx * Soth;
+            sIy += c * gy * Soth;
+            lx += step_x; ly += step_y;
+            if (lx >= rx_end) { lx -= rw; ly += 1; }
+        }
     }
 
     __shared__ float ws[32];
@@ -286,29 +282,26 @@ __global__ void k_reduce_mb_fast(
     sIx = block_sum(sIx, ws);
     sIy = block_sum(sIy, ws);
     if (tid == 0) {
-        atomicAdd(&V_out[n],  sV);
-        atomicAdd(&Ix_out[n], sIx);
-        atomicAdd(&Iy_out[n], sIy);
+        // moment-major, chunk-minor: stride = cap floats between cells
+        // within one (moment, chunk) plane. Finalize sums along cb.
+        const size_t row = (size_t)cb * cap + n;
+        partials[0 * (size_t)REDUCE_CHUNKS_PER_CELL * cap + row] = sV;
+        partials[1 * (size_t)REDUCE_CHUNKS_PER_CELL * cap + row] = sIx;
+        partials[2 * (size_t)REDUCE_CHUNKS_PER_CELL * cap + row] = sIy;
     }
 }
 
 // Full reduce: V, Ix, Iy, perimeter, Cx, Cy, Cxx, Cyy.
 // Used on rebind steps (rebind needs Cx/Cy/Cxx/Cyy) and on output steps
 // (host reads V, Cx, Cy, perimeter for trajectory/VTK/checkpoint).
+// Per-chunk partials written to `partials`; finalized by k_finalize_reduce.
 __global__ void k_reduce_mb_full(
     const float* __restrict__ phi,
     const int*   __restrict__ origin,
     const int*   __restrict__ rect,
     const float* __restrict__ S,
-    float* __restrict__ V_out,
-    float* __restrict__ Ix_out,
-    float* __restrict__ Iy_out,
-    float* __restrict__ peri_out,
-    float* __restrict__ Cx_out,
-    float* __restrict__ Cy_out,
-    float* __restrict__ Cxx_out,
-    float* __restrict__ Cyy_out,
-    int N, int L, int CHUNK_PIXELS,
+    float* __restrict__ partials,
+    int N, int cap, int L, int CHUNK_PIXELS,
     int y_lo, int halo_h)
 {
     const int n  = blockIdx.y;
@@ -320,7 +313,6 @@ __global__ void k_reduce_mb_full(
     const int rh  = rect[4*n + 3];
     const int rect_total = rw * rh;
     const int p_start = cb * CHUNK_PIXELS;
-    if (p_start >= rect_total) return;
     const int p_end = min(p_start + CHUNK_PIXELS, rect_total);
     const int gx0 = origin[2*n + 0];
     const int gy0 = origin[2*n + 1];
@@ -331,40 +323,42 @@ __global__ void k_reduce_mb_full(
     float sV = 0.0f, sIx = 0.0f, sIy = 0.0f, sPeri = 0.0f;
     float sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f;
 
-    const int step_x = BS % rw;
-    const int step_y = BS / rw;
-    const int rx_end = rx0 + rw;
-    int p0 = p_start + tid;
-    int lx = rx0 + (p0 % rw);
-    int ly = ry0 + (p0 / rw);
-    for (int p = p0; p < p_end; p += BS) {
-        int idx = ly * TILE_T + lx;
-        // rect invariant: stencil neighbors in-tile, no boundary guards.
-        float c   = __ldg(tile + idx);
-        float xp_ = __ldg(tile + idx + 1);
-        float xm_ = __ldg(tile + idx - 1);
-        float yp_ = __ldg(tile + idx + TILE_T);
-        float ym_ = __ldg(tile + idx - TILE_T);
-        float gx = 0.5f * (xp_ - xm_);
-        float gy = 0.5f * (yp_ - ym_);
-        int gxg = wrap_i(gx0 + lx, L);
-        int gyg = wrap_i(gy0 + ly, L);
-        int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
-        float Sv   = __ldg(S + sy * L + gxg);
-        float Soth = Sv - c * c;
-        if (Soth < 0.0f) Soth = 0.0f;
-        float c2 = c * c;
-        float fx = (float)lx, fy = (float)ly;
-        sV    += c2;
-        sIx   += c * gx * Soth;
-        sIy   += c * gy * Soth;
-        sPeri += sqrtf(gx * gx + gy * gy);
-        sCx   += c2 * fx;
-        sCy   += c2 * fy;
-        sCxx  += c2 * fx * fx;
-        sCyy  += c2 * fy * fy;
-        lx += step_x; ly += step_y;
-        if (lx >= rx_end) { lx -= rw; ly += 1; }
+    if (p_start < rect_total) {
+        const int step_x = BS % rw;
+        const int step_y = BS / rw;
+        const int rx_end = rx0 + rw;
+        int p0 = p_start + tid;
+        int lx = rx0 + (p0 % rw);
+        int ly = ry0 + (p0 / rw);
+        for (int p = p0; p < p_end; p += BS) {
+            int idx = ly * TILE_T + lx;
+            // rect invariant: stencil neighbors in-tile, no boundary guards.
+            float c   = __ldg(tile + idx);
+            float xp_ = __ldg(tile + idx + 1);
+            float xm_ = __ldg(tile + idx - 1);
+            float yp_ = __ldg(tile + idx + TILE_T);
+            float ym_ = __ldg(tile + idx - TILE_T);
+            float gx = 0.5f * (xp_ - xm_);
+            float gy = 0.5f * (yp_ - ym_);
+            int gxg = wrap_i(gx0 + lx, L);
+            int gyg = wrap_i(gy0 + ly, L);
+            int sy  = slab_local_y(gyg, y_lo, halo_h, L, L);
+            float Sv   = __ldg(S + sy * L + gxg);
+            float Soth = Sv - c * c;
+            if (Soth < 0.0f) Soth = 0.0f;
+            float c2 = c * c;
+            float fx = (float)lx, fy = (float)ly;
+            sV    += c2;
+            sIx   += c * gx * Soth;
+            sIy   += c * gy * Soth;
+            sPeri += sqrtf(gx * gx + gy * gy);
+            sCx   += c2 * fx;
+            sCy   += c2 * fy;
+            sCxx  += c2 * fx * fx;
+            sCyy  += c2 * fy * fy;
+            lx += step_x; ly += step_y;
+            if (lx >= rx_end) { lx -= rw; ly += 1; }
+        }
     }
 
     __shared__ float ws[32];
@@ -377,17 +371,63 @@ __global__ void k_reduce_mb_full(
     sCxx  = block_sum(sCxx,  ws);
     sCyy  = block_sum(sCyy,  ws);
     if (tid == 0) {
-        atomicAdd(&V_out[n],    sV);
-        atomicAdd(&Ix_out[n],   sIx);
-        atomicAdd(&Iy_out[n],   sIy);
-        atomicAdd(&peri_out[n], sPeri);
-        atomicAdd(&Cx_out[n],   sCx);
-        atomicAdd(&Cy_out[n],   sCy);
-        atomicAdd(&Cxx_out[n],  sCxx);
-        atomicAdd(&Cyy_out[n],  sCyy);
+        const size_t plane = (size_t)REDUCE_CHUNKS_PER_CELL * cap;
+        const size_t row   = (size_t)cb * cap + n;
+        partials[0 * plane + row] = sV;
+        partials[1 * plane + row] = sIx;
+        partials[2 * plane + row] = sIy;
+        partials[3 * plane + row] = sPeri;
+        partials[4 * plane + row] = sCx;
+        partials[5 * plane + row] = sCy;
+        partials[6 * plane + row] = sCxx;
+        partials[7 * plane + row] = sCyy;
     }
 }
 
+// Deterministic finalize for the 5 host-only moments (perim, Cx, Cy,
+// Cxx, Cyy). V/Ix/Iy are handled inside k_rhs_mb's per-cell prologue,
+// saving one launch on every step. This kernel runs only on full-
+// reduce steps (rebind / output).
+__global__ void k_finalize_reduce(
+    const float* __restrict__ partials,
+    float* __restrict__ peri_out,
+    float* __restrict__ Cx_out,
+    float* __restrict__ Cy_out,
+    float* __restrict__ Cxx_out,
+    float* __restrict__ Cyy_out,
+    int N, int cap)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const size_t plane = (size_t)REDUCE_CHUNKS_PER_CELL * cap;
+    float sPeri = 0.0f, sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f;
+    #pragma unroll 1
+    for (int cb = 0; cb < REDUCE_CHUNKS_PER_CELL; ++cb) {
+        const size_t row = (size_t)cb * cap + n;
+        sPeri += partials[3 * plane + row];
+        sCx   += partials[4 * plane + row];
+        sCy   += partials[5 * plane + row];
+        sCxx  += partials[6 * plane + row];
+        sCyy  += partials[7 * plane + row];
+    }
+    peri_out[n] = sPeri;
+    Cx_out[n]   = sCx;
+    Cy_out[n]   = sCy;
+    Cxx_out[n]  = sCxx;
+    Cyy_out[n]  = sCyy;
+}
+
+// k_rhs_mb — phi update + V/Ix/Iy finalize fused.
+//
+// Per-cell prologue (one thread per cell, in the cb=0 path that publishes
+// the velocity): sums chunk partials for V/Ix/Iy in fixed cb order and
+// writes them to V_out/Ix_out/Iy_out, then computes the per-block
+// coefficients (vx, vy, volC, dwC, repC, gam) and broadcasts via shmem.
+// Main loop: each thread evaluates the 9-pt Laplacian, double-well,
+// volume-correction, S-repulsion, and advection at its pixel, writing
+// phi_out. Fusing the finalize into the prologue saves one kernel
+// launch per step (the previous standalone k_finalize_reduce now only
+// runs on full-reduce steps for the 5 host-only moments).
 __global__ void k_rhs_mb(
     const float* __restrict__ phi,
     const int*   __restrict__ origin,
@@ -397,14 +437,15 @@ __global__ void k_rhs_mb(
     const float* __restrict__ v_A_cell,
     const float* __restrict__ dirx,
     const float* __restrict__ diry,
-    const float* __restrict__ V_in,
-    const float* __restrict__ Ix_in,
-    const float* __restrict__ Iy_in,
+    const float* __restrict__ partials,
     const float* __restrict__ tgt_radius,
+    float* __restrict__ V_out,
+    float* __restrict__ Ix_out,
+    float* __restrict__ Iy_out,
     float* __restrict__ vx_out,
     float* __restrict__ vy_out,
     float* __restrict__ phi_out,
-    int N, int L, int CHUNK_PIXELS,
+    int N, int cap, int L, int CHUNK_PIXELS,
     float lambda_, float kappa, float mu,
     float xi, float dt,
     int y_lo, int halo_h)
@@ -430,14 +471,32 @@ __global__ void k_rhs_mb(
     // Per-cell coefficients computed once per block, broadcast via shared.
     __shared__ float vx_s, vy_s, volC_s, dwC_s, repC_s, gam_s;
     if (tid == 0) {
+        // Sum V/Ix/Iy chunk partials in fixed cb=0..chunks-1 order. The
+        // reduce kernel wrote each chunk's block-sum to
+        // partials[moment * plane + cb*cap + n]. Fusing this here replaces
+        // the standalone k_finalize_reduce kernel for the V/Ix/Iy moments,
+        // saving one launch per step.
+        const size_t plane = (size_t)REDUCE_CHUNKS_PER_CELL * cap;
+        float Vn = 0.0f, Ixn = 0.0f, Iyn = 0.0f;
+        #pragma unroll
+        for (int ccb = 0; ccb < REDUCE_CHUNKS_PER_CELL; ++ccb) {
+            const size_t row = (size_t)ccb * cap + n;
+            Vn  += partials[0 * plane + row];
+            Ixn += partials[1 * plane + row];
+            Iyn += partials[2 * plane + row];
+        }
+        // Chunk 0 publishes the per-cell scalars for downstream
+        // (rebind reads V; output reads V/Ix/Iy via velocities).
+        if (cb == 0) {
+            V_out[n]  = Vn;
+            Ix_out[n] = Ixn;
+            Iy_out[n] = Iyn;
+        }
         const float gam    = gamma_cell[n];
         const float vA     = v_A_cell[n];
         const float R      = tgt_radius[n];
         const float coeffV = motility_coeff(kappa, xi, lambda_);
         const float piR2   = PI * R * R;
-        const float Vn     = V_in[n];
-        const float Ixn    = Ix_in[n];
-        const float Iyn    = Iy_in[n];
         const float vx     = coeffV * Ixn + vA * dirx[n];
         const float vy     = coeffV * Iyn + vA * diry[n];
         vx_s   = vx;
@@ -446,7 +505,6 @@ __global__ void k_rhs_mb(
         dwC_s  = gam * bulk_coeff(lambda_);
         repC_s = interaction_coeff(kappa, lambda_);
         gam_s  = gam;
-        // Only chunk 0 writes the per-cell velocity (avoids redundant writes).
         if (cb == 0) {
             vx_out[n] = vx;
             vy_out[n] = vy;
@@ -500,44 +558,42 @@ void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
     // Multi-block scatter+reduce+RHS pipeline. Splitting reduce/RHS across
     // many blocks pumps SM occupancy at all N, including the large-N regime
     // where a single block per cell would bottleneck on register footprint.
-    constexpr int CHUNK_PIXELS = 4096;
     constexpr int BS = 256;
-    constexpr int chunks_per_cell = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-    dim3 grid_mb(chunks_per_cell, N);
+    dim3 grid_mb(REDUCE_CHUNKS_PER_CELL, N);
 
-    {
-        int bsz = 128, gsz = (N + bsz - 1) / bsz;
-        if (need_full_reduce) {
-            k_zero_per_cell<<<gsz, bsz, 0, stream>>>(
-                c.volumes, c.Ix, c.Iy, c.perimeters,
-                c.Cx, c.Cy, c.Cxx, c.Cyy, N);
-        } else {
-            k_zero_per_cell3<<<gsz, bsz, 0, stream>>>(
-                c.volumes, c.Ix, c.Iy, N);
-        }
-    }
     if (need_full_reduce) {
         k_reduce_mb_full<<<grid_mb, BS, 0, stream>>>(
             c.phi_in, c.origin, c.rect, c.S,
-            c.volumes, c.Ix, c.Iy, c.perimeters,
-            c.Cx, c.Cy, c.Cxx, c.Cyy,
-            N, p.Nx, CHUNK_PIXELS,
+            c.reduce_partials,
+            N, c.capacity, p.Nx, CHUNK_PIXELS,
             c.S_y_lo, c.S_halo_h);
     } else {
         k_reduce_mb_fast<<<grid_mb, BS, 0, stream>>>(
             c.phi_in, c.origin, c.rect, c.S,
-            c.volumes, c.Ix, c.Iy,
-            N, p.Nx, CHUNK_PIXELS,
+            c.reduce_partials,
+            N, c.capacity, p.Nx, CHUNK_PIXELS,
             c.S_y_lo, c.S_halo_h);
+    }
+    // V / Ix / Iy are summed inside k_rhs_mb (one thread per cell) and
+    // written to c.volumes / c.Ix / c.Iy. The standalone finalize kernel
+    // now only handles the 5 host-only moments (perim, Cx, Cy, Cxx, Cyy)
+    // and only runs on full-reduce steps (rebind / output).
+    if (need_full_reduce) {
+        int bsz = 128, gsz = (N + bsz - 1) / bsz;
+        k_finalize_reduce<<<gsz, bsz, 0, stream>>>(
+            c.reduce_partials,
+            c.perimeters, c.Cx, c.Cy, c.Cxx, c.Cyy,
+            N, c.capacity);
     }
     k_rhs_mb<<<grid_mb, BS, 0, stream>>>(
         c.phi_in, c.origin, c.rect, c.S,
         c.gamma_cell, c.v_A_cell,
         c.polar_x, c.polar_y,
-        c.volumes, c.Ix, c.Iy, c.tgt_radius,
+        c.reduce_partials, c.tgt_radius,
+        c.volumes, c.Ix, c.Iy,
         c.velocities_x, c.velocities_y,
         c.phi_out,
-        N, p.Nx, CHUNK_PIXELS,
+        N, c.capacity, p.Nx, CHUNK_PIXELS,
         (float)p.lambda, (float)p.kappa, (float)p.mu,
         (float)p.xi,     (float)p.dt,
         c.S_y_lo, c.S_halo_h);

@@ -12,6 +12,16 @@
 // step by atomic scatter and read back during evolve.
 // ---------------------------------------------------------------------------
 
+// Multi-block evolve chunking. Each block handles CHUNK_PIXELS pixels of
+// one cell's active rect; with TILE_AREA pixels per cell there are
+// REDUCE_CHUNKS_PER_CELL blocks per cell. Hoisted here so alloc_gpu can
+// size the deterministic-reduce partial buffer to match the launch.
+static constexpr int CHUNK_PIXELS           = 4096;
+static constexpr int REDUCE_CHUNKS_PER_CELL =
+    (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
+// 8 moments accumulated by k_reduce_mb_full: V, Ix, Iy, perim, Cx, Cy, Cxx, Cyy.
+static constexpr int REDUCE_NMOMENTS        = 8;
+
 // Polarity update (RTP or ABP, per p.abp). Cheap: one thread per cell.
 void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
 

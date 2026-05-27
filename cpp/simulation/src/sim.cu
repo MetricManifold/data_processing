@@ -324,6 +324,12 @@ void Simulation::alloc_gpu() {
     af(cells.velocities_x, cap);
     af(cells.velocities_y, cap);
 
+    // Deterministic-reduce scratch: REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL
+    // floats per cell. Size matches the (chunks_per_cell, N) launch shape
+    // in launch_evolve so each block has a private destination slot.
+    af(cells.reduce_partials,
+       (size_t)REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL * cap);
+
     for (auto& f : per_cell_float_state()) {
         af(*f.dev_ptr, cap);
     }
@@ -2353,6 +2359,35 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
 
     uint32_t sp_sz = sizeof(SimParams);
     int32_t T_w = TILE_T;
+    // SimParams has 7 bytes of tail padding (after `bool abp`) that C++
+    // value-init does not zero. Writing the live `params` directly would
+    // include whatever stack/heap junk happens to occupy those bytes,
+    // breaking bit-reproducibility of checkpoint files between runs.
+    // memset to zero then field-by-field copy.
+    SimParams params_clean;
+    std::memset(&params_clean, 0, sizeof(params_clean));
+    params_clean.Nx                 = params.Nx;
+    params_clean.Ny                 = params.Ny;
+    params_clean.dx                 = params.dx;
+    params_clean.dy                 = params.dy;
+    params_clean.dt                 = params.dt;
+    params_clean.t_end              = params.t_end;
+    params_clean.lambda             = params.lambda;
+    params_clean.gamma              = params.gamma;
+    params_clean.kappa              = params.kappa;
+    params_clean.target_radius      = params.target_radius;
+    params_clean.mu                 = params.mu;
+    params_clean.v_A                = params.v_A;
+    params_clean.xi                 = params.xi;
+    params_clean.tau                = params.tau;
+    params_clean.subdomain_padding  = params.subdomain_padding;
+    params_clean.halo               = params.halo;
+    params_clean.save_interval      = params.save_interval;
+    params_clean.print_interval     = params.print_interval;
+    params_clean.trajectory_samples = params.trajectory_samples;
+    params_clean.seed               = params.seed;
+    params_clean.polarity_seed      = params.polarity_seed;
+    params_clean.abp                = params.abp;
     // v8 multi-rank header: every checkpoint carries (num_ranks, rank_id,
     // num_cells_global). Single-GPU runs write (1, 0, nc). Multi-rank
     // runs write the per-rank coordinates, and each cell record uses its
@@ -2368,7 +2403,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     prefix.trajectory_samples = params.trajectory_samples;
     prefix.sp_sz              = sp_sz;
     if (!ckpt_write_exact(f, &prefix, sizeof(prefix), 1, "checkpoint prefix") ||
-        !ckpt_write_exact(f, &params, sp_sz, 1, "SimParams") ||
+        !ckpt_write_exact(f, &params_clean, sp_sz, 1, "SimParams") ||
         !ckpt_write_exact(f, &T_w, sizeof(T_w), 1, "checkpoint TILE_T")) {
         abort_checkpoint_write(); return;
     }
