@@ -330,6 +330,20 @@ void Simulation::alloc_gpu() {
     af(cells.reduce_partials,
        (size_t)REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL * cap);
 
+    // Deterministic-scatter tile schedule. tile_off is sized once for the
+    // local slab partition (ext_height * Nx); entries buffer starts at
+    // a generous estimate (~80 tiles/cell at confluent rho=0.9) and grows
+    // inside rebuild_scatter_schedule if needed.
+    cells.num_scatter_tiles_x = (params.Nx + TILE_S - 1) / TILE_S;
+    cells.num_scatter_tiles_y = (cells.S_ext_height + TILE_S - 1) / TILE_S;
+    const int num_scatter_tiles =
+        cells.num_scatter_tiles_x * cells.num_scatter_tiles_y;
+    ai(cells.d_scatter_tile_off, num_scatter_tiles + 1);
+    cells.scatter_entry_capacity = cap * 80;
+    CK(cudaMalloc(&cells.d_scatter_tile_entries,
+                  cells.scatter_entry_capacity * sizeof(ScatterTileEntry)));
+    cells.scatter_total_entries = 0;
+
     for (auto& f : per_cell_float_state()) {
         af(*f.dev_ptr, cap);
     }
@@ -739,8 +753,12 @@ void Simulation::setup_step_stream() {
 
 void Simulation::finalize_init() {
     seed_rng_if_fresh();
-    compute_initial_velocities();
     setup_step_stream();
+    // Build the scatter tile schedule before the first scatter so
+    // launch_initial_velocity (-> launch_initial_scatter) can use the
+    // gather kernel rather than racing through atomicAdd.
+    rebuild_scatter_schedule();
+    compute_initial_velocities();
     CK(cudaDeviceSynchronize());
 }
 
@@ -1671,6 +1689,7 @@ void Simulation::step() {
                           (float)params.subdomain_padding,
                           (float)params.gamma, step_stream);
             flip_parity();
+            rebuild_scatter_schedule();
         }
     }
 
@@ -1739,6 +1758,7 @@ void Simulation::step_post_reduce() {
                       (float)params.subdomain_padding,
                       (float)params.gamma, step_stream);
         flip_parity();
+        rebuild_scatter_schedule();
     }
 
 #ifndef NDEBUG
@@ -1827,6 +1847,176 @@ void Simulation::invalidate_mg_step_graph() {
         }
         mg_step_graph_built[i] = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// rebuild_scatter_schedule — deterministic S-scatter tile schedule.
+// ---------------------------------------------------------------------------
+// Partitions the local S slab into TILE_S x TILE_S patches and, for each
+// patch, lists the cells whose rects overlap it (sorted by ascending
+// cell id). The scatter kernel reads this list and accumulates phi^2
+// contributions into each output site in a fixed cell-id order, killing
+// FP32-non-associative atomic ordering noise.
+//
+// Called after init, after every k_rebind, and after multi-GPU
+// migration. Periodic wrap on both axes is handled by replicating each
+// cell's rect across (-1, 0, +1) periodic images in x and y, then
+// clipping each image to the slab and intersecting with each tile.
+// ---------------------------------------------------------------------------
+void Simulation::rebuild_scatter_schedule() {
+    const int N = cells.num_cells;
+    cells.scatter_total_entries = 0;
+    if (N == 0) {
+        const int num_tiles = cells.num_scatter_tiles_x
+                            * cells.num_scatter_tiles_y;
+        std::vector<int> zeros(num_tiles + 1, 0);
+        CK(cudaMemcpy(cells.d_scatter_tile_off, zeros.data(),
+                      (num_tiles + 1) * sizeof(int),
+                      cudaMemcpyHostToDevice));
+        return;
+    }
+
+    CK(cudaStreamSynchronize(step_stream));
+    std::vector<int> h_origin(2 * N);
+    std::vector<int> h_rect(4 * N);
+    CK(cudaMemcpy(h_origin.data(), cells.origin, 2 * N * sizeof(int),
+                  cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_rect.data(), cells.rect, 4 * N * sizeof(int),
+                  cudaMemcpyDeviceToHost));
+
+    const int Tx = cells.num_scatter_tiles_x;
+    const int Ty = cells.num_scatter_tiles_y;
+    const int num_tiles = Tx * Ty;
+    const int Lx = params.Nx;
+    const int Ly = params.Ny;  // S slab is (ext_height x Nx); single-GPU
+                               // ext_height == Ny, so the periodic-wrap y
+                               // window is [0, Ly).
+
+    // First pass: count entries per tile.
+    std::vector<int> tile_count(num_tiles + 1, 0);
+
+    // For each cell, walk its rect (in cell-tile local coords) by global
+    // coords and find which S-tiles it touches. Periodic wrap: try
+    // shifted copies (kx, ky) in {-1, 0, +1}. With cell rect ~120 px and
+    // domain >= TILE_T=320, at most one wrap copy lands in the domain
+    // per axis.
+    auto for_each_overlap_tile = [&](int n, auto&& fn) {
+        const int gx0 = h_origin[2*n + 0];
+        const int gy0 = h_origin[2*n + 1];
+        const int rx0 = h_rect[4*n + 0];
+        const int ry0 = h_rect[4*n + 1];
+        const int rw  = h_rect[4*n + 2];
+        const int rh  = h_rect[4*n + 3];
+        if (rw <= 0 || rh <= 0) return;
+        // Global write window (raw, unwrapped).
+        const int raw_x = gx0 + rx0;
+        const int raw_y = gy0 + ry0;
+        for (int ky = -1; ky <= 1; ++ky) {
+            const int gy_lo = raw_y + ky * Ly;
+            const int gy_hi = gy_lo + rh;
+            if (gy_hi <= 0 || gy_lo >= Ly) continue;
+            const int clip_y0 = (gy_lo < 0) ? 0 : gy_lo;
+            const int clip_y1 = (gy_hi > Ly) ? Ly : gy_hi;
+            for (int kx = -1; kx <= 1; ++kx) {
+                const int gx_lo = raw_x + kx * Lx;
+                const int gx_hi = gx_lo + rw;
+                if (gx_hi <= 0 || gx_lo >= Lx) continue;
+                const int clip_x0 = (gx_lo < 0) ? 0 : gx_lo;
+                const int clip_x1 = (gx_hi > Lx) ? Lx : gx_hi;
+                // Iterate tiles overlapping [clip_x0,clip_x1) x [clip_y0,clip_y1).
+                const int tx_lo = clip_x0 / TILE_S;
+                const int tx_hi = (clip_x1 - 1) / TILE_S;
+                const int ty_lo = clip_y0 / TILE_S;
+                const int ty_hi = (clip_y1 - 1) / TILE_S;
+                for (int ty = ty_lo; ty <= ty_hi; ++ty) {
+                    const int tile_y0 = ty * TILE_S;
+                    const int tile_y1 = tile_y0 + TILE_S;
+                    const int iy0 = (clip_y0 > tile_y0) ? clip_y0 : tile_y0;
+                    const int iy1 = (clip_y1 < tile_y1) ? clip_y1 : tile_y1;
+                    for (int tx = tx_lo; tx <= tx_hi; ++tx) {
+                        const int tile_x0 = tx * TILE_S;
+                        const int tile_x1 = tile_x0 + TILE_S;
+                        const int ix0 = (clip_x0 > tile_x0) ? clip_x0 : tile_x0;
+                        const int ix1 = (clip_x1 < tile_x1) ? clip_x1 : tile_x1;
+                        if (ix0 >= ix1 || iy0 >= iy1) continue;
+                        const int tile_id = ty * Tx + tx;
+                        // Cell-local src coords for the intersection.
+                        const int src_x = (ix0 - gx_lo) + rx0;
+                        const int src_y = (iy0 - gy_lo) + ry0;
+                        const int dst_x = ix0 - tile_x0;
+                        const int dst_y = iy0 - tile_y0;
+                        const int w = ix1 - ix0;
+                        const int h = iy1 - iy0;
+                        fn(tile_id, src_x, src_y, dst_x, dst_y, w, h);
+                    }
+                }
+            }
+        }
+    };
+
+    // Pass 1: count.
+    for (int n = 0; n < N; ++n) {
+        for_each_overlap_tile(n,
+            [&](int tile_id, int, int, int, int, int, int) {
+                ++tile_count[tile_id + 1];
+            });
+    }
+    // Exclusive scan -> tile_off.
+    for (int t = 0; t < num_tiles; ++t) {
+        tile_count[t + 1] += tile_count[t];
+    }
+    const int total_entries = tile_count[num_tiles];
+    if (total_entries > cells.scatter_entry_capacity) {
+        // Grow by 2x or to fit, whichever is larger. Free old.
+        cudaFree(cells.d_scatter_tile_entries);
+        int new_cap = cells.scatter_entry_capacity * 2;
+        if (new_cap < total_entries) new_cap = total_entries;
+        CK(cudaMalloc(&cells.d_scatter_tile_entries,
+                      new_cap * sizeof(ScatterTileEntry)));
+        cells.scatter_entry_capacity = new_cap;
+    }
+    cells.scatter_total_entries = total_entries;
+
+    // Pass 2: fill. Use a per-tile cursor (a copy of tile_count[t] for
+    // t < num_tiles). Cells are walked in ascending id order so entries
+    // land in ascending id order within each tile naturally — no sort
+    // needed.
+    std::vector<int> cursor(tile_count.begin(), tile_count.begin() + num_tiles);
+    std::vector<ScatterTileEntry> h_entries(total_entries);
+    for (int n = 0; n < N; ++n) {
+        for_each_overlap_tile(n,
+            [&](int tile_id, int src_x, int src_y,
+                int dst_x, int dst_y, int w, int h) {
+                int slot = cursor[tile_id]++;
+                ScatterTileEntry& e = h_entries[slot];
+                e.cell_id = n;
+                e.src_x   = (short)src_x;
+                e.src_y   = (short)src_y;
+                e.dst_x   = (short)dst_x;
+                e.dst_y   = (short)dst_y;
+                e.w       = (short)w;
+                e.h       = (short)h;
+            });
+    }
+
+    // Upload.
+    CK(cudaMemcpy(cells.d_scatter_tile_off, tile_count.data(),
+                  (num_tiles + 1) * sizeof(int),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(cells.d_scatter_tile_entries, h_entries.data(),
+                  total_entries * sizeof(ScatterTileEntry),
+                  cudaMemcpyHostToDevice));
+
+    // Captured graphs encode the previous scatter launch shape (grid
+    // dim, entry list pointer). Drop them; next step re-captures.
+    for (int i = 0; i < 2; ++i) {
+        if (step_graph[i]) {
+            cudaGraphExecDestroy(step_graph[i]);
+            step_graph[i] = nullptr;
+        }
+        step_graph_built[i] = false;
+    }
+    invalidate_mg_step_graph();
 }
 
 void Simulation::launch_mg_fast_step_kernels(MgWorld& world, int my_rank,
@@ -3110,6 +3300,10 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                     // pointers and per-cell counts. Drop the cached graph
                     // so the next fast step rebuilds with fresh state.
                     sim.invalidate_mg_step_graph();
+                    // Re-tile the scatter schedule too: the local cell set
+                    // changed, so the previous tile lists no longer cover
+                    // the right cells.
+                    sim.rebuild_scatter_schedule();
 
                     // Cell-loss audit (off by default; env-guarded). When
                     // CELL_SIM_AUDIT_CELLS=1 we sum num_cells across ranks

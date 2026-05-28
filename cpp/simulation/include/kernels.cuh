@@ -22,6 +22,28 @@ static constexpr int REDUCE_CHUNKS_PER_CELL =
 // 8 moments accumulated by k_reduce_mb_full: V, Ix, Iy, perim, Cx, Cy, Cxx, Cyy.
 static constexpr int REDUCE_NMOMENTS        = 8;
 
+// Deterministic-scatter tiling. The S slab is partitioned into
+// TILE_S x TILE_S patches; one CTA owns one patch and gathers
+// contributions from the (cell-id-sorted) list of cells whose rects
+// overlap the patch. TILE_S=16 gives 256 threads/block, one per output
+// site; no shared-memory reduction tree.
+static constexpr int TILE_S = 16;
+
+// One per (cell, S-tile) overlap pair in the scatter schedule. Packed
+// to 16 bytes; src_/dst_/w/h fit in int16 since they're bounded by
+// TILE_T (320) and TILE_S (16) respectively.
+struct ScatterTileEntry {
+    int   cell_id;   // ascending within a tile (the sort key)
+    short src_x;     // local-x in cell phi tile of the clipped rect
+    short src_y;     // local-y in cell phi tile
+    short dst_x;     // local-x in the S tile (0..TILE_S-1)
+    short dst_y;     // local-y in the S tile
+    short w;         // width of the clipped rect
+    short h;         // height
+};
+static_assert(sizeof(ScatterTileEntry) == 16,
+              "ScatterTileEntry size drift; rebuild_scatter_schedule packs by hand");
+
 // Polarity update (RTP or ABP, per p.abp). Cheap: one thread per cell.
 void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
 

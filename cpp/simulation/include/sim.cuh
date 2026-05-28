@@ -304,6 +304,15 @@ struct Simulation {
     // pointers / per-cell counts may have shifted.
     void invalidate_mg_step_graph();
 
+    // Rebuild the deterministic scatter tile schedule. Pulls origin/rect
+    // from device, computes the per-tile cell-overlap list with periodic
+    // wrap, sorts each tile's entries by ascending cell id, and uploads
+    // the CSR (d_scatter_tile_off, d_scatter_tile_entries) plus tile
+    // counts. Called after init, after every k_rebind, and after
+    // multi-GPU migration. Also invalidates step_graph[] because the
+    // scatter kernel grid shape may have changed.
+    void rebuild_scatter_schedule();
+
     // Issue the multi-GPU fast-step kernel sequence (polar + scatter +
     // halo + zero + fast-reduce + RHS) onto step_stream. Used both as
     // the inner work for graph capture and as the slow-path equivalent.

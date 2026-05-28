@@ -120,75 +120,82 @@ __device__ __forceinline__ float block_sum(float v, float* smem) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. k_scatter_S — atomicAdd phi^2 into global S
+// 2. k_gather_S — deterministic gather into S
 // ---------------------------------------------------------------------------
-// Iterates only the active rect (rx0, ry0, rw, rh) inside each cell's
-// TILE_T x TILE_T buffer. Pixels outside the rect are zero by
-// construction (k_rebind zeroes them), so skipping is exact.
+// Replaces the racing atomicAdd scatter. The host pre-builds a per-tile
+// list of cells whose rects overlap that tile, sorted by ascending cell
+// id (see Simulation::rebuild_scatter_schedule). One CTA owns one
+// TILE_S x TILE_S patch of the local S slab; each thread owns exactly
+// one output site and walks the tile's entry list in fixed order,
+// accumulating phi^2 contributions in a single sequential FP32 chain.
+//
+// Determinism. No two threads write the same site (each thread owns
+// its site), so there are no atomics on S. Entry list order is fixed
+// by the host build, FP32 add chain is sequential per site. Across
+// runs of the same binary on the same GPU with the same inputs, every
+// S[i] is byte-identical.
+//
+// The kernel zeroes its output site at thread-start, so the caller no
+// longer needs to cudaMemsetAsync S to zero.
 // ---------------------------------------------------------------------------
-__global__ void k_scatter_S(
+__global__ void k_gather_S(
     const float* __restrict__ phi,
-    const int*   __restrict__ origin,
-    const int*   __restrict__ rect,
+    const int*   __restrict__ tile_off,
+    const ScatterTileEntry* __restrict__ entries,
     float* __restrict__ S,
-    int N, int L, int CHUNK_PIXELS,
-    int y_lo, int halo_h)
+    int Tx, int Lx,
+    int y_lo, int halo_h, int Sy_full)
 {
-    const int n  = blockIdx.y;
-    const int cb = blockIdx.x;       // chunk index within this cell
-    if (n >= N) return;
-    const float* tile = phi + (size_t)n * TILE_AREA;
-    const int gx0 = origin[2*n + 0];
-    const int gy0 = origin[2*n + 1];
-    const int rx0 = rect[4*n + 0];
-    const int ry0 = rect[4*n + 1];
-    const int rw  = rect[4*n + 2];
-    const int rh  = rect[4*n + 3];
-    const int total = rw * rh;
-    const int chunk_start = cb * CHUNK_PIXELS;
-    if (chunk_start >= total) return;
-    const int chunk_end = min(total, chunk_start + CHUNK_PIXELS);
-    const int BS  = blockDim.x;
-    const int tid = threadIdx.x;
+    const int tx = blockIdx.x;
+    const int ty = blockIdx.y;
+    const int tile_id = ty * Tx + tx;
+    const int e_lo = tile_off[tile_id];
+    const int e_hi = tile_off[tile_id + 1];
 
-    const int step_x = BS % rw;
-    const int step_y = BS / rw;
-    const int rx_end = rx0 + rw;
-    int p0 = chunk_start + tid;
-    int lx = rx0 + (p0 % rw);
-    int ly = ry0 + (p0 / rw);
-    for (int p = p0; p < chunk_end; p += BS) {
+    const int dx = threadIdx.x;
+    const int dy = threadIdx.y;
+    const int gx_site = tx * TILE_S + dx;
+    const int gy_site = ty * TILE_S + dy;
+    // Clip the tile to the slab in both axes (the rightmost / bottom
+    // tile of an odd-sized domain may be partially outside).
+    if (gx_site >= Lx || gy_site >= Sy_full) return;
+
+    float acc = 0.0f;
+    for (int e = e_lo; e < e_hi; ++e) {
+        const ScatterTileEntry ent = entries[e];
+        // Site is in the tile but maybe outside this entry's clipped
+        // rect. Test against [dst, dst+w) x [dst, dst+h).
+        if (dx < ent.dst_x || dx >= ent.dst_x + ent.w) continue;
+        if (dy < ent.dst_y || dy >= ent.dst_y + ent.h) continue;
+        const int lx = ent.src_x + (dx - ent.dst_x);
+        const int ly = ent.src_y + (dy - ent.dst_y);
+        const float* tile = phi + (size_t)ent.cell_id * TILE_AREA;
         float v = __ldg(tile + ly * TILE_T + lx);
-        // Every pixel inside the rect contributes to S (no background-skip):
-        // skipping changes the global S field by ~rect_area * 1e-12 which is
-        // below f32 epsilon but not bit-exact.
-        int gx = wrap_i(gx0 + lx, L);
-        int gy = wrap_i(gy0 + ly, L);
-        // Slab index. For G=1 this is the identity (halo_h=0). For G>1
-        // the ownership contract (cell migrated whenever its rebound COM
-        // crosses the slab interior boundary) guarantees sy is always a
-        // valid index into the (ext_height x L) slab buffer.
-        int sy = slab_local_y(gy, y_lo, halo_h, /*ext*/ L, L);
-        atomicAdd(&S[sy * L + gx], v * v);
-        lx += step_x; ly += step_y;
-        if (lx >= rx_end) { lx -= rw; ly += 1; }
+        acc += v * v;
     }
+    // For multi-GPU the slab y origin is y_lo; halo rows live at
+    // [0, halo_h) and [slab_h + halo_h, ext_height). The S buffer is
+    // (ext_height x Lx), and gy_site here is already in slab-local
+    // (i.e. 0..ext_height-1) coords because we built the tile schedule
+    // against the local slab. Single-GPU: y_lo=halo_h=0 so this is the
+    // identity.
+    (void)y_lo; (void)halo_h;
+    S[(size_t)gy_site * Lx + gx_site] = acc;
 }
 
 void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0) return;
-    // S is sized by the slab's extended height (== Ny for G=1).
-    const size_t Sbytes = (size_t)c.S_ext_height * p.Nx * sizeof(float);
-    cudaMemsetAsync(c.S, 0, Sbytes, stream);
-    // Always multi-block: chunking by ~4096 pixels keeps the SMs saturated
-    // even at large N (1152 cells * 9 chunks/cell = 10368 blocks vs the
-    // 1152-block "fused" alternative which left ~85% of warps idle on
-    // a 76-SM device).
-    constexpr int BS = 256;
-    k_scatter_S<<<dim3(REDUCE_CHUNKS_PER_CELL, N), BS, 0, stream>>>(
-        c.phi_in, c.origin, c.rect, c.S, N, p.Nx, CHUNK_PIXELS,
-        c.S_y_lo, c.S_halo_h);
+    // No memset: every site is written exactly once by k_gather_S.
+    const int Tx = c.num_scatter_tiles_x;
+    const int Ty = c.num_scatter_tiles_y;
+    dim3 grid(Tx, Ty);
+    dim3 block(TILE_S, TILE_S);
+    k_gather_S<<<grid, block, 0, stream>>>(
+        c.phi_in, c.d_scatter_tile_off,
+        reinterpret_cast<const ScatterTileEntry*>(c.d_scatter_tile_entries),
+        c.S, Tx, p.Nx,
+        c.S_y_lo, c.S_halo_h, c.S_ext_height);
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,19 +1076,21 @@ __global__ void k_initial_velocity(
 // Initial scatter only — fills S from current phi_in. Multi-GPU calls
 // this first, then does a halo exchange, then calls
 // launch_initial_velocity_reduce. Single-GPU should just call
-// launch_initial_velocity below (does both in one shot).
+// launch_initial_velocity below (does both in one shot). Uses the same
+// deterministic gather kernel as the step path; the caller (finalize_init)
+// builds the tile schedule first.
 void launch_initial_scatter(CellArrays& c, const SimParams& p) {
     const int N = c.num_cells;
     if (N == 0) return;
-    const size_t Sbytes = (size_t)c.S_ext_height * p.Nx * sizeof(float);
-    cudaMemsetAsync(c.S, 0, Sbytes);
-    constexpr int CHUNK_PIXELS = 2048;
-    constexpr int BS = 128;
-    constexpr int MAX_CHUNKS = (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-    dim3 grid(MAX_CHUNKS, N);
-    k_scatter_S<<<grid, BS>>>(c.phi_in, c.origin, c.rect, c.S,
-                              N, p.Nx, CHUNK_PIXELS,
-                              c.S_y_lo, c.S_halo_h);
+    const int Tx = c.num_scatter_tiles_x;
+    const int Ty = c.num_scatter_tiles_y;
+    dim3 grid(Tx, Ty);
+    dim3 block(TILE_S, TILE_S);
+    k_gather_S<<<grid, block>>>(
+        c.phi_in, c.d_scatter_tile_off,
+        reinterpret_cast<const ScatterTileEntry*>(c.d_scatter_tile_entries),
+        c.S, Tx, p.Nx,
+        c.S_y_lo, c.S_halo_h, c.S_ext_height);
 }
 
 // Velocity reduce only — assumes S has been filled (and, for multi-GPU,

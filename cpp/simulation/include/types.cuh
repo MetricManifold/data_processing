@@ -296,6 +296,33 @@ struct CellArrays {
     // Sized in alloc_gpu by REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL * cap.
     float* reduce_partials = nullptr;
 
+    // Deterministic-scatter tile schedule. Built by
+    // Simulation::rebuild_scatter_schedule() on init and after every
+    // rebind / migration. The scatter step iterates over TILE_S x TILE_S
+    // tiles of the local S slab; for each tile, it gathers contributions
+    // from the (cell-id-sorted) list of cells whose rects overlap that
+    // tile and sums in fixed cell-id order. No atomics on S; FP32
+    // accumulation order is pinned across runs.
+    //
+    //   d_scatter_tile_off[num_tiles + 1]  — CSR offsets into the entry list.
+    //   d_scatter_tile_entries[total_entries] — packed (cell_id, clipped rect)
+    //     entries; one per (cell, tile) overlap pair. Layout per entry:
+    //       int32 cell_id     // ascending within a tile (the sort key)
+    //       int16 src_x       // local-x in cell tile of the clipped rect
+    //       int16 src_y       // local-y in cell tile of the clipped rect
+    //       int16 dst_x       // local-x in the S tile (0..TILE_S-1)
+    //       int16 dst_y       // local-y in the S tile (0..TILE_S-1)
+    //       int16 w, h        // width, height of the clipped rect
+    //   num_scatter_tiles_x, num_scatter_tiles_y — for grid sizing.
+    //   scatter_entry_capacity — current allocation; grown as needed.
+    //   scatter_total_entries  — actual entries used in current schedule.
+    int   num_scatter_tiles_x  = 0;
+    int   num_scatter_tiles_y  = 0;
+    int   scatter_entry_capacity = 0;
+    int   scatter_total_entries  = 0;
+    int*  d_scatter_tile_off     = nullptr; // [num_tiles + 1]
+    void* d_scatter_tile_entries = nullptr; // [total_entries] structs
+
     // Polarisation. theta is the persistent angle; (px, py) = (cos, sin).
     float* polar_theta  = nullptr; // [N]
     float* polar_x      = nullptr; // [N]
