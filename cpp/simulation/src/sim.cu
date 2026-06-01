@@ -316,6 +316,7 @@ void Simulation::alloc_gpu() {
 
     auto ai = [&](int*&   p, size_t k) { CK(cudaMalloc(&p, k * sizeof(int))); };
     auto af = [&](float*& p, size_t k) { CK(cudaMalloc(&p, k * sizeof(float))); };
+    auto ad = [&](double*& p, size_t k) { CK(cudaMalloc(&p, k * sizeof(double))); };
 
     // All per-cell arrays sized by capacity. Slots [num_cells, capacity)
     // are uninitialised junk; kernels never read them because they iterate
@@ -325,27 +326,27 @@ void Simulation::alloc_gpu() {
     ai(cells.rect,   4 * cap);
 
 #ifdef CELL_SIM_LEGACY_STEP
-    af(cells.volumes,      cap);
-    af(cells.Ix,           cap);
-    af(cells.Iy,           cap);
+    ad(cells.volumes,      cap);
+    ad(cells.Ix,           cap);
+    ad(cells.Iy,           cap);
 #else
     // Opus path: V/Ix/Iy double-buffered for lagged-moment reads.
     // cells.{volumes,Ix,Iy} are aliases maintained by sync_pool_to_parity.
-    af(cells.V_pool [0],   cap);
-    af(cells.V_pool [1],   cap);
-    af(cells.Ix_pool[0],   cap);
-    af(cells.Ix_pool[1],   cap);
-    af(cells.Iy_pool[0],   cap);
-    af(cells.Iy_pool[1],   cap);
+    ad(cells.V_pool [0],   cap);
+    ad(cells.V_pool [1],   cap);
+    ad(cells.Ix_pool[0],   cap);
+    ad(cells.Ix_pool[1],   cap);
+    ad(cells.Iy_pool[0],   cap);
+    ad(cells.Iy_pool[1],   cap);
     cells.volumes = cells.V_pool [0];
     cells.Ix      = cells.Ix_pool[0];
     cells.Iy      = cells.Iy_pool[0];
-    CK(cudaMemset(cells.V_pool [0], 0, cap * sizeof(float)));
-    CK(cudaMemset(cells.V_pool [1], 0, cap * sizeof(float)));
-    CK(cudaMemset(cells.Ix_pool[0], 0, cap * sizeof(float)));
-    CK(cudaMemset(cells.Ix_pool[1], 0, cap * sizeof(float)));
-    CK(cudaMemset(cells.Iy_pool[0], 0, cap * sizeof(float)));
-    CK(cudaMemset(cells.Iy_pool[1], 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.V_pool [0], 0, cap * sizeof(double)));
+    CK(cudaMemset(cells.V_pool [1], 0, cap * sizeof(double)));
+    CK(cudaMemset(cells.Ix_pool[0], 0, cap * sizeof(double)));
+    CK(cudaMemset(cells.Ix_pool[1], 0, cap * sizeof(double)));
+    CK(cudaMemset(cells.Iy_pool[0], 0, cap * sizeof(double)));
+    CK(cudaMemset(cells.Iy_pool[1], 0, cap * sizeof(double)));
 
     // Worst-case work list: every cell with a near-full rect (TILE_T-2).
     // OPUS_MAX_WORKITEMS_PER_CELL is sized for that bound. The rebind step
@@ -366,11 +367,11 @@ void Simulation::alloc_gpu() {
     CK(cudaMemset(cells.new_rect, 0, 4 * cap * sizeof(int)));
 #endif
 
-    af(cells.Cx,           cap);
-    af(cells.Cy,           cap);
-    af(cells.Cxx,          cap);
-    af(cells.Cyy,          cap);
-    af(cells.perimeters,   cap);
+    ad(cells.Cx,           cap);
+    ad(cells.Cy,           cap);
+    ad(cells.Cxx,          cap);
+    ad(cells.Cyy,          cap);
+    ad(cells.perimeters,   cap);
     af(cells.velocities_x, cap);
     af(cells.velocities_y, cap);
 

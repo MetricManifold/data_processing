@@ -390,25 +390,25 @@ __global__ void k_reduce_mb_full(
 // reduce steps (rebind / output).
 __global__ void k_finalize_reduce(
     const float* __restrict__ partials,
-    float* __restrict__ peri_out,
-    float* __restrict__ Cx_out,
-    float* __restrict__ Cy_out,
-    float* __restrict__ Cxx_out,
-    float* __restrict__ Cyy_out,
+    double* __restrict__ peri_out,
+    double* __restrict__ Cx_out,
+    double* __restrict__ Cy_out,
+    double* __restrict__ Cxx_out,
+    double* __restrict__ Cyy_out,
     int N, int cap)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
     const size_t plane = (size_t)REDUCE_CHUNKS_PER_CELL * cap;
-    float sPeri = 0.0f, sCx = 0.0f, sCy = 0.0f, sCxx = 0.0f, sCyy = 0.0f;
+    double sPeri = 0.0, sCx = 0.0, sCy = 0.0, sCxx = 0.0, sCyy = 0.0;
     #pragma unroll 1
     for (int cb = 0; cb < REDUCE_CHUNKS_PER_CELL; ++cb) {
         const size_t row = (size_t)cb * cap + n;
-        sPeri += partials[3 * plane + row];
-        sCx   += partials[4 * plane + row];
-        sCy   += partials[5 * plane + row];
-        sCxx  += partials[6 * plane + row];
-        sCyy  += partials[7 * plane + row];
+        sPeri += (double)partials[3 * plane + row];
+        sCx   += (double)partials[4 * plane + row];
+        sCy   += (double)partials[5 * plane + row];
+        sCxx  += (double)partials[6 * plane + row];
+        sCyy  += (double)partials[7 * plane + row];
     }
     peri_out[n] = sPeri;
     Cx_out[n]   = sCx;
@@ -439,9 +439,9 @@ __global__ void k_rhs_mb(
     const float* __restrict__ diry,
     const float* __restrict__ partials,
     const float* __restrict__ tgt_radius,
-    float* __restrict__ V_out,
-    float* __restrict__ Ix_out,
-    float* __restrict__ Iy_out,
+    double* __restrict__ V_out,
+    double* __restrict__ Ix_out,
+    double* __restrict__ Iy_out,
     float* __restrict__ vx_out,
     float* __restrict__ vy_out,
     float* __restrict__ phi_out,
@@ -620,11 +620,11 @@ __global__ void k_rebind(
     float* __restrict__ phi_out,
     int* __restrict__ origin,
     int* __restrict__ rect,
-    const float* __restrict__ V,
-    const float* __restrict__ Cx,
-    const float* __restrict__ Cy,
-    const float* __restrict__ Cxx,
-    const float* __restrict__ Cyy,
+    const double* __restrict__ V,
+    const double* __restrict__ Cx,
+    const double* __restrict__ Cy,
+    const double* __restrict__ Cxx,
+    const double* __restrict__ Cyy,
     const float* __restrict__ tgt_radius,
     const float* __restrict__ gamma_cell,
     int N,
@@ -654,21 +654,21 @@ __global__ void k_rebind(
         sold[2] = rect[4*n + 2];
         sold[3] = rect[4*n + 3];
 
-        float Vn = V[n];
-        float invV = (Vn > 1e-6f) ? 1.0f / Vn : 0.0f;
-        float mx = Cx[n] * invV;
-        float my = Cy[n] * invV;
-        int sx = __float2int_rn(mx) - Th;
-        int sy = __float2int_rn(my) - Th;
+        double Vn   = V[n];
+        double invV = (Vn > 1e-6) ? 1.0 / Vn : 0.0;
+        double mxd  = Cx[n] * invV;
+        double myd  = Cy[n] * invV;
+        int sx = __double2int_rn(mxd) - Th;
+        int sy = __double2int_rn(myd) - Th;
         sshift[0] = sx;
         sshift[1] = sy;
         origin[2*n + 0] += sx;
         origin[2*n + 1] += sy;
 
-        float varx = Cxx[n] * invV - mx * mx;
-        float vary = Cyy[n] * invV - my * my;
-        if (varx < 0.0f) varx = 0.0f;
-        if (vary < 0.0f) vary = 0.0f;
+        double varxd = Cxx[n] * invV - mxd * mxd;
+        double varyd = Cyy[n] * invV - myd * myd;
+        float varx = (float)((varxd < 0.0) ? 0.0 : varxd);
+        float vary = (float)((varyd < 0.0) ? 0.0 : varyd);
         float sigx = sqrtf(varx);
         float sigy = sqrtf(vary);
         // Per-axis half-widths: hw = ceil(2*sigma + margin). The 2*sigma
@@ -868,10 +868,10 @@ void launch_polar(CellArrays& c, const SimParams& p, double cur_time,
 // ---------------------------------------------------------------------------
 __global__ void k_pack_traj(
     const int*   __restrict__ origin,
-    const float* __restrict__ V,
-    const float* __restrict__ Cx,
-    const float* __restrict__ Cy,
-    const float* __restrict__ per,
+    const double* __restrict__ V,
+    const double* __restrict__ Cx,
+    const double* __restrict__ Cy,
+    const double* __restrict__ per,
     const float* __restrict__ vx,
     const float* __restrict__ vy,
     const float* __restrict__ px,
@@ -885,10 +885,10 @@ __global__ void k_pack_traj(
     TrajPackedCell r;
     r.ox  = origin[2*i + 0];
     r.oy  = origin[2*i + 1];
-    r.V   = V[i];
-    r.Cx  = Cx[i];
-    r.Cy  = Cy[i];
-    r.per = per[i];
+    r.V   = (float)V[i];
+    r.Cx  = (float)Cx[i];
+    r.Cy  = (float)Cy[i];
+    r.per = (float)per[i];
     r.vx  = vx[i];
     r.vy  = vy[i];
     r.px  = px[i];
@@ -1002,12 +1002,12 @@ __global__ void k_initial_velocity(
     const float* __restrict__ v_A_cell,
     const float* __restrict__ dirx,
     const float* __restrict__ diry,
-    float* __restrict__ V_out,
-    float* __restrict__ Cx_out,
-    float* __restrict__ Cy_out,
-    float* __restrict__ Cxx_out,
-    float* __restrict__ Cyy_out,
-    float* __restrict__ peri_out,
+    double* __restrict__ V_out,
+    double* __restrict__ Cx_out,
+    double* __restrict__ Cy_out,
+    double* __restrict__ Cxx_out,
+    double* __restrict__ Cyy_out,
+    double* __restrict__ peri_out,
     float* __restrict__ vx_out,
     float* __restrict__ vy_out,
     int N, int L,
@@ -1076,12 +1076,12 @@ __global__ void k_initial_velocity(
         float Ixn = v1;
         float Iyn = v2;
         float coeffV = motility_coeff(kappa, xi, lambda_);
-        V_out[n]    = Vn;
-        Cx_out[n]   = v3;
-        Cy_out[n]   = v4;
-        Cxx_out[n]  = v5;
-        Cyy_out[n]  = v6;
-        peri_out[n] = v7;
+        V_out[n]    = (double)Vn;
+        Cx_out[n]   = (double)v3;
+        Cy_out[n]   = (double)v4;
+        Cxx_out[n]  = (double)v5;
+        Cyy_out[n]  = (double)v6;
+        peri_out[n] = (double)v7;
         vx_out[n]   = coeffV * Ixn + vA * dirx[n];
         vy_out[n]   = coeffV * Iyn + vA * diry[n];
     }

@@ -286,17 +286,22 @@ struct CellArrays {
     // moments into the other. `volumes`, `Ix`, `Iy` are aliases into the
     // parity-current half, refreshed by Simulation::sync_pool_to_parity.
     // Under -DCELL_SIM_LEGACY_STEP only the unprefixed buffers are allocated.
-    float* volumes      = nullptr; // [N] : sum phi^2 (tile-local)
-    float* Ix           = nullptr; // [N] : tile-local sum(c * grad_x * S_other)
-    float* Iy           = nullptr; // [N] : tile-local sum(c * grad_y * S_other)
-    float* V_pool [2]   = {nullptr, nullptr};
-    float* Ix_pool[2]   = {nullptr, nullptr};
-    float* Iy_pool[2]   = {nullptr, nullptr};
-    float* Cx           = nullptr; // [N] : tile-local sum(phi^2 * lx)
-    float* Cy           = nullptr; // [N] : tile-local sum(phi^2 * ly)
-    float* Cxx          = nullptr; // [N] : tile-local sum(phi^2 * lx^2)
-    float* Cyy          = nullptr; // [N] : tile-local sum(phi^2 * ly^2)
-    float* perimeters   = nullptr; // [N] : sum |grad phi| (tile-local)
+    // Per-cell scalar accumulators: stored as f64 so that the cross-CTA
+    // atomicAdd reductions are commutative within FP precision (f32
+    // atomicAdd order varies run-to-run, costing a few ULP). Read by
+    // velocity finalisation, rebind COM, visualizer, trajectory writer
+    // (all of which downcast to float at the consumer).
+    double* volumes      = nullptr; // [N] : sum phi^2 (tile-local)
+    double* Ix           = nullptr; // [N] : tile-local sum(c * grad_x * S_other)
+    double* Iy           = nullptr; // [N] : tile-local sum(c * grad_y * S_other)
+    double* V_pool [2]   = {nullptr, nullptr};
+    double* Ix_pool[2]   = {nullptr, nullptr};
+    double* Iy_pool[2]   = {nullptr, nullptr};
+    double* Cx           = nullptr; // [N] : tile-local sum(phi^2 * lx)
+    double* Cy           = nullptr; // [N] : tile-local sum(phi^2 * ly)
+    double* Cxx          = nullptr; // [N] : tile-local sum(phi^2 * lx^2)
+    double* Cyy          = nullptr; // [N] : tile-local sum(phi^2 * ly^2)
+    double* perimeters   = nullptr; // [N] : sum |grad phi| (tile-local)
     float* velocities_x = nullptr; // [N] : interaction integral + v_A * polar_x
     float* velocities_y = nullptr; // [N] : interaction integral + v_A * polar_y
 

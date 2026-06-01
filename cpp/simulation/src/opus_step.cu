@@ -60,17 +60,17 @@ __global__ void k_opus_step(
     float*       __restrict__ phiOut,
     const float* __restrict__ Sin,
     float*       __restrict__ Sout,
-    const float* __restrict__ Vlag,
-    const float* __restrict__ Ixlag,
-    const float* __restrict__ Iylag,
-    float*       __restrict__ Vout,
-    float*       __restrict__ Ixout,
-    float*       __restrict__ Iyout,
-    float*       __restrict__ perim_out,
-    float*       __restrict__ Cx_out,
-    float*       __restrict__ Cy_out,
-    float*       __restrict__ Cxx_out,
-    float*       __restrict__ Cyy_out,
+    const double* __restrict__ Vlag,
+    const double* __restrict__ Ixlag,
+    const double* __restrict__ Iylag,
+    double*       __restrict__ Vout,
+    double*       __restrict__ Ixout,
+    double*       __restrict__ Iyout,
+    double*       __restrict__ perim_out,
+    double*       __restrict__ Cx_out,
+    double*       __restrict__ Cy_out,
+    double*       __restrict__ Cxx_out,
+    double*       __restrict__ Cyy_out,
     const int*       __restrict__ origin,      // SOURCE-frame origin
     const int*       __restrict__ rect,        // SOURCE rect (worklist domain)
     const int*       __restrict__ dst_rect,    // DEST rect (DO_REBIND only; nullptr otherwise)
@@ -160,9 +160,9 @@ __global__ void k_opus_step(
     const float vA     = vA_cell[n];
     const float R      = tgt_R_c[n];
     const float piR2   = (float)M_PI * R * R;
-    const float V_lag  = Vlag[n];
-    const float Ix_lag = Ixlag[n];
-    const float Iy_lag = Iylag[n];
+    const float V_lag  = (float)Vlag[n];
+    const float Ix_lag = (float)Ixlag[n];
+    const float Iy_lag = (float)Iylag[n];
     const float dwC    = gam * bulk_coeff<float>(lambda_);
     const float repC   = interaction_coeff<float>(kappa, lambda_);
     const float volC   = (2.0f * mu / piR2) * (piR2 - V_lag);
@@ -170,6 +170,9 @@ __global__ void k_opus_step(
     const float vx     = coeffV * Ix_lag + vA * dirx_c[n];
     const float vy     = coeffV * Iy_lag + vA * diry_c[n];
 
+    // Per-pixel reductions in f32 (bounded values, ~1024 adds per CTA —
+    // well within f32 mantissa). The cross-CTA combine via atomicAdd to the
+    // per-cell outputs is in f64 to commute that nondeterministic step.
     float v=0.f, ix=0.f, iy=0.f;
     float pp=0.f, cx=0.f, cy=0.f, cxx=0.f, cyy=0.f;
 
@@ -264,9 +267,12 @@ __global__ void k_opus_step(
     float bx = block_sum_op(ix, red +   NWARP);
     float by = block_sum_op(iy, red + 2*NWARP);
     if (tid == 0) {
-        atomicAdd(&Vout [n], bv);
-        atomicAdd(&Ixout[n], bx);
-        atomicAdd(&Iyout[n], by);
+        // Widen to f64 at the cross-CTA combine. f64 atomicAdd of values
+        // that fit comfortably in f64 mantissa is order-insensitive at the
+        // ULP level, removing the bulk of run-to-run nondeterminism.
+        atomicAdd(&Vout [n], (double)bv);
+        atomicAdd(&Ixout[n], (double)bx);
+        atomicAdd(&Iyout[n], (double)by);
     }
     if constexpr (DO_EXT) {
         float bp  = block_sum_op(pp,  red + 3*NWARP);
@@ -275,18 +281,18 @@ __global__ void k_opus_step(
         float bxx = block_sum_op(cxx, red + 6*NWARP);
         float byy = block_sum_op(cyy, red + 7*NWARP);
         if (tid == 0) {
-            atomicAdd(&perim_out[n], bp);
-            atomicAdd(&Cx_out [n],   bcx);
-            atomicAdd(&Cy_out [n],   bcy);
-            atomicAdd(&Cxx_out[n],   bxx);
-            atomicAdd(&Cyy_out[n],   byy);
+            atomicAdd(&perim_out[n], (double)bp);
+            atomicAdd(&Cx_out [n],   (double)bcx);
+            atomicAdd(&Cy_out [n],   (double)bcy);
+            atomicAdd(&Cxx_out[n],   (double)bxx);
+            atomicAdd(&Cyy_out[n],   (double)byy);
         }
     }
 }
 
 __global__ void k_opus_finalize_velocity(
     int N,
-    const float* __restrict__ Ix, const float* __restrict__ Iy,
+    const double* __restrict__ Ix, const double* __restrict__ Iy,
     const float* __restrict__ vA, const float* __restrict__ dirx,
     const float* __restrict__ diry,
     float* __restrict__ vx_out, float* __restrict__ vy_out,
@@ -295,8 +301,8 @@ __global__ void k_opus_finalize_velocity(
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
     const float c = motility_coeff<float>(kappa, xi, lambda_);
-    vx_out[n] = c * Ix[n] + vA[n] * dirx[n];
-    vy_out[n] = c * Iy[n] + vA[n] * diry[n];
+    vx_out[n] = c * (float)Ix[n] + vA[n] * dirx[n];
+    vy_out[n] = c * (float)Iy[n] + vA[n] * diry[n];
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +321,11 @@ __global__ void k_opus_finalize_velocity(
 // ---------------------------------------------------------------------------
 __global__ void k_opus_compute_rebind_meta(
     int N,
-    const float* __restrict__ V,
-    const float* __restrict__ Cx,
-    const float* __restrict__ Cy,
-    const float* __restrict__ Cxx,
-    const float* __restrict__ Cyy,
+    const double* __restrict__ V,
+    const double* __restrict__ Cx,
+    const double* __restrict__ Cy,
+    const double* __restrict__ Cxx,
+    const double* __restrict__ Cyy,
     const int*   __restrict__ rect,
     const float* __restrict__ gamma_cell,
     const float* __restrict__ tgt_radius,
@@ -333,21 +339,21 @@ __global__ void k_opus_compute_rebind_meta(
 
     const int Th = TILE_T >> 1;
 
-    float Vn   = V[n];
-    float invV = (Vn > 1e-6f) ? 1.0f / Vn : 0.0f;
-    float mx   = Cx[n] * invV;
-    float my   = Cy[n] * invV;
-    int   sx   = __float2int_rn(mx) - Th;
-    int   sy   = __float2int_rn(my) - Th;
+    double Vn   = V[n];
+    double invV = (Vn > 1e-6) ? 1.0 / Vn : 0.0;
+    double mxd  = Cx[n] * invV;
+    double myd  = Cy[n] * invV;
+    int   sx   = __double2int_rn(mxd) - Th;
+    int   sy   = __double2int_rn(myd) - Th;
     shift_xy[2*n + 0] = sx;
     shift_xy[2*n + 1] = sy;
 
-    float varx = Cxx[n] * invV - mx * mx;
-    float vary = Cyy[n] * invV - my * my;
-    if (varx < 0.0f) varx = 0.0f;
-    if (vary < 0.0f) vary = 0.0f;
-    float sigx = sqrtf(varx);
-    float sigy = sqrtf(vary);
+    double varxd = Cxx[n] * invV - mxd * mxd;
+    double varyd = Cyy[n] * invV - myd * myd;
+    if (varxd < 0.0) varxd = 0.0;
+    if (varyd < 0.0) varyd = 0.0;
+    float sigx = (float)sqrt(varxd);
+    float sigy = (float)sqrt(varyd);
 
     float gn = gamma_cell[n];
     float soft_scale = 1.0f;
@@ -466,15 +472,15 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
 
     // Zero next-step scatter/atomic targets.
     OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(float), stream));
+    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
+    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
+    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
     if (need_full) {
-        OPUS_CK(cudaMemsetAsync(c.perimeters, 0, N * sizeof(float), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cx,         0, N * sizeof(float), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cy,         0, N * sizeof(float), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cxx,        0, N * sizeof(float), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cyy,        0, N * sizeof(float), stream));
+        OPUS_CK(cudaMemsetAsync(c.perimeters, 0, N * sizeof(double), stream));
+        OPUS_CK(cudaMemsetAsync(c.Cx,         0, N * sizeof(double), stream));
+        OPUS_CK(cudaMemsetAsync(c.Cy,         0, N * sizeof(double), stream));
+        OPUS_CK(cudaMemsetAsync(c.Cxx,        0, N * sizeof(double), stream));
+        OPUS_CK(cudaMemsetAsync(c.Cyy,        0, N * sizeof(double), stream));
     }
 
     dim3 blk(BX, BY);
@@ -573,11 +579,11 @@ void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
     const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
     OPUS_CK(cudaMemcpyAsync(c.S_pool [t], c.S_pool [f], S_elems*sizeof(float),
                             cudaMemcpyDeviceToDevice, stream));
-    OPUS_CK(cudaMemcpyAsync(c.V_pool [t], c.V_pool [f], N*sizeof(float),
+    OPUS_CK(cudaMemcpyAsync(c.V_pool [t], c.V_pool [f], N*sizeof(double),
                             cudaMemcpyDeviceToDevice, stream));
-    OPUS_CK(cudaMemcpyAsync(c.Ix_pool[t], c.Ix_pool[f], N*sizeof(float),
+    OPUS_CK(cudaMemcpyAsync(c.Ix_pool[t], c.Ix_pool[f], N*sizeof(double),
                             cudaMemcpyDeviceToDevice, stream));
-    OPUS_CK(cudaMemcpyAsync(c.Iy_pool[t], c.Iy_pool[f], N*sizeof(float),
+    OPUS_CK(cudaMemcpyAsync(c.Iy_pool[t], c.Iy_pool[f], N*sizeof(double),
                             cudaMemcpyDeviceToDevice, stream));
 }
 
@@ -655,9 +661,9 @@ void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
 
     // Zero next-step scatter/atomic targets.
     OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(float), stream));
+    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
+    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
+    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
 
     dim3 blk(BX, BY);
     k_opus_step<false, true><<<c.workCount, blk, 0, stream>>>(
@@ -691,9 +697,9 @@ void launch_opus_step_cleanup(CellArrays& c, const SimParams& p,
     const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
 
     OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(float), stream));
+    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
+    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
+    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
 
     // Allocate-once zero-shift scratch (used as the shift_xy argument).
     static int* d_zero_shift = nullptr;
