@@ -797,8 +797,16 @@ void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
 // 5. k_polar — per-cell polarity update.
 // ---------------------------------------------------------------------------
 // theta is the persistent polar angle; (px, py) = (cos, sin) are the
-// derived unit vector. ABP: theta diffuses each step. RTP: with prob
-// (1 - exp(-dt/tau)) re-randomise theta uniformly.
+// derived unit vector.
+//
+// RTP (default): event-driven. Each cell carries next_tumble_time[n], the
+// continuous-time instant of its next tumble. A tumble fires iff
+// cur_time >= next_tumble_time[n]. On fire: re-draw theta uniformly in
+// [0, 2pi), re-draw the next inter-arrival as Exponential(1/tau) and
+// advance next_tumble_time accordingly. Skipped (no curand call) when
+// the gate doesn't fire — which is most steps at typical tau >> dt.
+//
+// ABP: theta diffuses every step (no schedule; still uses per-step curand).
 //
 // One thread per cell. Skipped entirely when v_A == 0 (no motility) or
 // when tau <= 0 (sentinel: hold polarity fixed forever).
@@ -807,36 +815,49 @@ __global__ void k_polar(
     curandState* __restrict__ st,
     float* __restrict__ theta_arr,
     float* __restrict__ px, float* __restrict__ py,
+    double* __restrict__ next_tumble_time,
+    double cur_time,
     float dt, float tau, bool abp, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    curandState s = st[i];
-    float theta = theta_arr[i];
-    bool changed = false;
     if (abp) {
-        theta += sqrtf(2.0f * dt / tau) * curand_normal(&s);
-        changed = true;
-    } else {
-        if (curand_uniform(&s) < 1.0f - expf(-dt / tau)) {
-            theta = curand_uniform(&s) * 2.0f * PI;
-            changed = true;
-        }
-    }
-    if (changed) {
+        curandState s = st[i];
+        float theta = theta_arr[i] + sqrtf(2.0f * dt / tau) * curand_normal(&s);
         theta_arr[i] = theta;
         px[i] = cosf(theta);
         py[i] = sinf(theta);
+        st[i] = s;
+        return;
     }
+    // RTP gate: skip cells whose next tumble is in the future. The gate
+    // load + compare is the only cost for ~all cells almost all of the
+    // time (at tau = 10000, dt = 0.01, per-step fire prob ~ 1e-6 / cell).
+    if (cur_time < next_tumble_time[i]) return;
+
+    curandState s = st[i];
+    float theta = curand_uniform(&s) * 2.0f * PI;
+    float u2    = curand_uniform(&s);
+    // Exponential(1/tau) inter-arrival. curand_uniform returns (0, 1],
+    // so 1 - u2 is in [0, 1) — clamp away from 0 to avoid log(0) = -inf.
+    float oneMinusU = 1.0f - u2;
+    if (oneMinusU < 1e-12f) oneMinusU = 1e-12f;
+    double dt_next = -(double)tau * (double)logf(oneMinusU);
+    next_tumble_time[i] += dt_next;
+    theta_arr[i] = theta;
+    px[i] = cosf(theta);
+    py[i] = sinf(theta);
     st[i] = s;
 }
 
-void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream) {
+void launch_polar(CellArrays& c, const SimParams& p, double cur_time,
+                  cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0 || p.v_A == 0.0 || p.tau <= 0.0) return;
     k_polar<<<(N + 255) / 256, 256, 0, stream>>>(
         (curandState*)c.rng_states,
         c.polar_theta, c.polar_x, c.polar_y,
+        c.next_tumble_time, cur_time,
         (float)p.dt, (float)p.tau, p.abp, N);
 }
 
@@ -1124,6 +1145,39 @@ void launch_rng_init(CellArrays& c, unsigned long seed,
     if (N == 0) return;
     k_rng_init<<<(N + 255) / 256, 256>>>(
         (curandState*)c.rng_states, seed, d_global_ids, N);
+}
+
+// ---------------------------------------------------------------------------
+// 8a. k_init_tumble_schedule
+// ---------------------------------------------------------------------------
+// Per cell: draw the first tumble time as cur_time + Exponential(1/tau).
+// Called once at fresh init AFTER k_rng_init has seeded the per-cell curand
+// streams. On resume the next_tumble_time array is restored from checkpoint
+// sidecar and this kernel is NOT called.
+// ---------------------------------------------------------------------------
+__global__ void k_init_tumble_schedule(
+    curandState* __restrict__ st,
+    double* __restrict__ next_tumble_time,
+    double cur_time, float tau, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    curandState s = st[i];
+    float u = curand_uniform(&s);
+    float oneMinusU = 1.0f - u;
+    if (oneMinusU < 1e-12f) oneMinusU = 1e-12f;
+    double dt_next = -(double)tau * (double)logf(oneMinusU);
+    next_tumble_time[i] = cur_time + dt_next;
+    st[i] = s;
+}
+
+void launch_init_tumble_schedule(CellArrays& c, const SimParams& p,
+                                 double cur_time) {
+    const int N = c.num_cells;
+    if (N == 0 || p.tau <= 0.0) return;
+    k_init_tumble_schedule<<<(N + 255) / 256, 256>>>(
+        (curandState*)c.rng_states, c.next_tumble_time,
+        cur_time, (float)p.tau, N);
 }
 
 // ---------------------------------------------------------------------------

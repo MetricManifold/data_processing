@@ -383,6 +383,9 @@ void Simulation::alloc_gpu() {
 
     CK(cudaMalloc(&cells.rng_states, cap * sizeof(curandState)));
 
+    CK(cudaMalloc(&cells.next_tumble_time, cap * sizeof(double)));
+    CK(cudaMemset(cells.next_tumble_time, 0, cap * sizeof(double)));
+
     CK(cudaMemset(cells.velocities_x, 0, cap * sizeof(float)));
     CK(cudaMemset(cells.velocities_y, 0, cap * sizeof(float)));
 
@@ -750,22 +753,29 @@ void Simulation::seed_rng_if_fresh() {
     // checkpoint's RNGS sidecar. (Without this guard, a chained run with
     // the same polarity_seed re-seeds each cell back to offset 0 and
     // replays the same tumble decisions across resume.)
-    if (rng_restored_from_ckpt) return;
-    const unsigned long polar_seed = params.polarity_seed
-                                     ? params.polarity_seed
-                                     : (params.seed ? params.seed : 1234u);
-    // For multi-GPU: upload h_global_id to d_gid_src so each cell's
-    // curand sequence number matches its global ID, not its local index.
-    // This ensures the polarity noise stream for a given physical cell
-    // is identical regardless of GPU count.
-    const int* d_ids = nullptr;
-    if (gpus > 1 && !h_global_id.empty() && d_gid_src) {
-        CK(cudaMemcpy(d_gid_src, h_global_id.data(),
-                      h_global_id.size() * sizeof(int),
-                      cudaMemcpyHostToDevice));
-        d_ids = d_gid_src;
+    if (!rng_restored_from_ckpt) {
+        const unsigned long polar_seed = params.polarity_seed
+                                         ? params.polarity_seed
+                                         : (params.seed ? params.seed : 1234u);
+        // For multi-GPU: upload h_global_id to d_gid_src so each cell's
+        // curand sequence number matches its global ID, not its local index.
+        // This ensures the polarity noise stream for a given physical cell
+        // is identical regardless of GPU count.
+        const int* d_ids = nullptr;
+        if (gpus > 1 && !h_global_id.empty() && d_gid_src) {
+            CK(cudaMemcpy(d_gid_src, h_global_id.data(),
+                          h_global_id.size() * sizeof(int),
+                          cudaMemcpyHostToDevice));
+            d_ids = d_gid_src;
+        }
+        launch_rng_init(cells, polar_seed, d_ids);
     }
-    launch_rng_init(cells, polar_seed, d_ids);
+    // Always draw next_tumble_time from the (fresh or restored) curand
+    // state. On resume the new schedule will differ from what a continuous
+    // run would have produced — acceptable since equilibration→production
+    // is the common resume path. A future NTUM checkpoint sidecar would
+    // give true continuity across mid-production resume.
+    launch_init_tumble_schedule(cells, params, cur_time);
 }
 
 void Simulation::compute_initial_velocities() {
@@ -1741,7 +1751,7 @@ void Simulation::step() {
     if (scripted_active) {
         apply_scripted_events_for_step();
     } else {
-        launch_polar(cells, params, step_stream);
+        launch_polar(cells, params, cur_time, step_stream);
     }
 
 #ifndef CELL_SIM_LEGACY_STEP
@@ -1827,7 +1837,7 @@ void Simulation::step_pre_reduce() {
     if (scripted_active) {
         apply_scripted_events_for_step();
     } else {
-        launch_polar(cells, params, step_stream);
+        launch_polar(cells, params, cur_time, step_stream);
     }
     launch_scatter_S(cells, params, step_stream);
 }
@@ -1943,7 +1953,7 @@ void Simulation::launch_mg_fast_step_kernels(MgWorld& world, int my_rank,
     // no full reduction. Pointer state is owned by the parity invariant
     // (sync_pool_to_parity has already been called by the caller before
     // we get here — graph capture freezes the pointers seen at this point).
-    launch_polar(cells, params, step_stream);
+    launch_polar(cells, params, cur_time, step_stream);
     launch_scatter_S(cells, params, step_stream);
     if (gpus > 1) {
         launch_halo_exchange(world, my_rank, prev_rank, next_rank,
@@ -2645,6 +2655,7 @@ void Simulation::cleanup() {
         if (f.scratch_ptr) cf(*f.scratch_ptr);
     }
     cf(cells.rng_states);
+    cf(cells.next_tumble_time);
     cf(d_scripted_cid);
     cf(d_scripted_theta);
     // Migration buffers (multi-GPU only; nullptr for G=1).

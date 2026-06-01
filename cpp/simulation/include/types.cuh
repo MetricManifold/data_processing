@@ -334,6 +334,13 @@ struct CellArrays {
     float* polar_x      = nullptr; // [N]
     float* polar_y      = nullptr; // [N]
 
+    // Next scheduled tumble time per cell (continuous time, double).
+    // k_polar fires a tumble iff cur_time >= next_tumble_time[n]. On a fire,
+    // it re-draws (theta, next_tumble_time) from the per-cell curand stream.
+    // Avoids the per-step Bernoulli draw of the legacy k_polar; for typical
+    // dt/tau ~ 1e-6, the per-step check is essentially free.
+    double* next_tumble_time = nullptr; // [N]
+
     // Per-cell physics scalars (gamma & v_A may vary per cell).
     float* gamma_cell   = nullptr; // [N]
     float* v_A_cell     = nullptr; // [N]

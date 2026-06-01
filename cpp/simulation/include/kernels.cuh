@@ -23,7 +23,8 @@ static constexpr int REDUCE_CHUNKS_PER_CELL =
 static constexpr int REDUCE_NMOMENTS        = 8;
 
 // Polarity update (RTP or ABP, per p.abp). Cheap: one thread per cell.
-void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
+void launch_polar(CellArrays& c, const SimParams& p, double cur_time,
+                  cudaStream_t stream = 0);
 
 // Apply a list of scripted tumble events: for each i in [0, count),
 // theta[d_cid[i]] = d_theta[i]; px = cos(theta); py = sin(theta).
@@ -64,6 +65,13 @@ void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
 // One-shot host helpers used only at init / resume.
 void launch_rng_init(CellArrays& c, unsigned long seed,
                      const int* d_global_ids = nullptr);
+
+// Draw initial per-cell next_tumble_time = cur_time + Exponential(1/tau).
+// Called once at fresh init after launch_rng_init has seeded the per-cell
+// curand streams. NOT called on resume (next_tumble_time restored from
+// checkpoint sidecar instead).
+void launch_init_tumble_schedule(CellArrays& c, const SimParams& p,
+                                 double cur_time);
 
 // Initialise phi tiles as tanh(2(r - R_eff)/(sqrt(2)*lambda)) profiles.
 // h_cx/h_cy are global-coord cell COMs (passed via temporary device arrays
