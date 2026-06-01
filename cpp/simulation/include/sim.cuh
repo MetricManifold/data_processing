@@ -130,24 +130,20 @@ struct Simulation {
     // Returns false (and prints to stderr) on parse error.
     bool load_scripted_events(const std::string& path);
 
-    // ---- CUDA Graph capture for the hot step pipeline.
-    // step_stream is a non-default stream so launches can be captured.
-    // step_graph[parity] is the cached executable graph for the single-GPU
-    // "regular fast" step (polar + scatter + fast-reduce + RHS) with the
-    // pool half-pointers baked in by parity.
+    // ---- step stream.
+    // Single-GPU opus path now uses direct kernel launches every step (no
+    // CUDA Graph cache) — the kernel sequence is short (polar + opus_step +
+    // finalize_velocity), launch latency is sub-microsecond per kernel, and
+    // graph capture's value didn't justify the bookkeeping cost. The graph
+    // path remains only for the legacy single-GPU step pipeline (kept
+    // behind -DCELL_SIM_LEGACY_STEP) and the multi-GPU mg_step_graph path.
     //
-    // mg_step_graph[parity] is the analogous cache for the multi-GPU fast
-    // step: it captures polar + scatter + (NCCL halo Send/Recv pairs) +
-    // halo_add + zero + fast-reduce + RHS in one launch. NCCL 2.18+
-    // supports kernel capture, and our build (2.29.7) is well above that.
-    // Both graphs are invalidated and rebuilt at every migration round
-    // because pointers and per-cell counts may shift.
-    //
-    // Output / rebind / scripted / first-step paths fall back to direct
-    // launches on the same stream.
+    // mg_step_graph[parity] is the multi-GPU graph cache: captures
+    // polar + scatter + (NCCL halo Send/Recv pairs) + halo_add + zero +
+    // fast-reduce + RHS in one launch. NCCL 2.18+ supports kernel capture
+    // and our build is well above that. Invalidated at every migration
+    // round because pointers and per-cell counts may shift.
     cudaStream_t    step_stream            = nullptr;
-    cudaGraphExec_t step_graph[2]          = {nullptr, nullptr};
-    bool            step_graph_built[2]    = {false, false};
     cudaGraphExec_t mg_step_graph[2]       = {nullptr, nullptr};
     bool            mg_step_graph_built[2] = {false, false};
     int             parity                 = 0;

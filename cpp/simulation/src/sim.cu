@@ -1737,99 +1737,47 @@ void Simulation::step() {
     const bool kOpus = (gpus <= 1);
 #endif
 
-    if (fast_path) {
-        if (!step_graph_built[parity]) {
-            // Capture once per parity. cudaStreamCaptureModeThreadLocal so
-            // unrelated CUDA calls on the host (e.g. cudaMalloc) don't
-            // accidentally get pulled into the capture.
-            cudaGraph_t graph = nullptr;
-            CK(cudaStreamBeginCapture(step_stream,
-                                      cudaStreamCaptureModeThreadLocal));
-            launch_polar(cells, params, step_stream);
-            if (kOpus) {
-                launch_opus_step(cells, params, parity,
-                                 /*need_full=*/false, step_stream);
-                launch_opus_finalize_velocity(cells, params,
-                                              /*read from*/ parity ^ 1,
-                                              step_stream);
-            } else {
-                launch_scatter_S(cells, params, step_stream);
-                launch_evolve(cells, params,
-                              /*need_full_reduce=*/false, step_stream);
-            }
-            CK(cudaStreamEndCapture(step_stream, &graph));
-            CK(cudaGraphInstantiate(&step_graph[parity], graph, nullptr, nullptr, 0));
-            cudaGraphDestroy(graph);
-            step_graph_built[parity] = true;
-        }
-        CK(cudaGraphLaunch(step_graph[parity], step_stream));
-        flip_parity();
+    // Common preamble for both fast and slow paths: tumble decisions.
+    if (scripted_active) {
+        apply_scripted_events_for_step();
     } else {
-        // Slow path: direct launches on step_stream so ordering matches the
-        // graph path (no cross-stream sync needed).
-        if (scripted_active) {
-            apply_scripted_events_for_step();
-        } else {
-            launch_polar(cells, params, step_stream);
-        }
+        launch_polar(cells, params, step_stream);
+    }
 
 #ifndef CELL_SIM_LEGACY_STEP
-        if (kOpus && f.will_rebind) {
-            // Fused-rebind step. Replaces the standard opus_step + separate
-            // rebind. opus_step_rebind does evolve + shift + S scatter in one
-            // pass; it advances time by exactly one dt, same as a regular
-            // step. Consumes V/Cx/Cy/Cxx/Cyy that were produced by the
-            // PREVIOUS step's opus_step<DO_EXT=true> (need_full_red is set
-            // on the step before will_rebind under opus). 2-step lag on the
-            // shift moments is fine — cell COM drifts ~0.01 px per step so
-            // the integer-rounded shift is the same as a 0-step-lag choice.
-            launch_opus_compute_rebind_meta(cells, params, parity, step_stream);
-            int rebind_wc = build_opus_work_list_for_rebind(cells);
-            static int last_wc = -1;
-            if (rebind_wc != last_wc) {
-                for (int i = 0; i < 2; ++i) {
-                    if (step_graph[i]) {
-                        cudaGraphExecDestroy(step_graph[i]);
-                        step_graph[i] = nullptr;
-                    }
-                    step_graph_built[i] = false;
-                }
-                last_wc = rebind_wc;
-            }
-            launch_opus_step_rebind(cells, params, parity, step_stream);
-            launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
-            flip_parity();
-            launch_opus_apply_rebind_meta(cells, step_stream);
-            int new_wc = build_opus_work_list_host(cells);
-            if (new_wc != last_wc) {
-                for (int i = 0; i < 2; ++i) {
-                    if (step_graph[i]) {
-                        cudaGraphExecDestroy(step_graph[i]);
-                        step_graph[i] = nullptr;
-                    }
-                    step_graph_built[i] = false;
-                }
-                last_wc = new_wc;
-            }
-        } else
+    if (kOpus && f.will_rebind) {
+        // Fused-rebind step: replaces standard opus_step + separate rebind
+        // kernel. opus_step_rebind does evolve + shift + S scatter in one
+        // pass; advances time by exactly one dt. Consumes V/Cx/Cy/Cxx/Cyy
+        // from the PREVIOUS step's opus_step<DO_EXT=true>: need_full_red is
+        // set one step earlier than will_rebind (see compute_step_flags).
+        launch_opus_compute_rebind_meta(cells, params, parity, step_stream);
+        build_opus_work_list_for_rebind(cells);
+        launch_opus_step_rebind(cells, params, parity, step_stream);
+        launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
+        flip_parity();
+        launch_opus_apply_rebind_meta(cells, step_stream);
+        build_opus_work_list_host(cells);
+    } else
 #endif
-        if (kOpus) {
-            launch_opus_step(cells, params, parity, f.need_full_red, step_stream);
-            launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
-            flip_parity();
-        } else {
-            launch_scatter_S(cells, params, step_stream);
-            launch_evolve(cells, params, f.need_full_red, step_stream);
-            flip_parity();
+    if (kOpus) {
+        launch_opus_step(cells, params, parity, f.need_full_red, step_stream);
+        launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
+        flip_parity();
+    } else {
+        launch_scatter_S(cells, params, step_stream);
+        launch_evolve(cells, params, f.need_full_red, step_stream);
+        flip_parity();
 
-            if (f.will_rebind) {
-                launch_rebind(cells,
-                              (float)params.subdomain_padding,
-                              (float)params.gamma, step_stream);
-                flip_parity();
-            }
+        if (f.will_rebind) {
+            launch_rebind(cells,
+                          (float)params.subdomain_padding,
+                          (float)params.gamma, step_stream);
+            flip_parity();
         }
     }
+    (void)fast_path;  // fast_path no longer drives a separate capture branch;
+                      // kept as a flag for future readers / multi-GPU code.
 
 #ifndef NDEBUG
     // Per-step launch error check: useful in Debug builds, off in Release
@@ -2659,9 +2607,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
 void Simulation::cleanup() {
     finish_trajectory_writer();
     for (int i = 0; i < 2; ++i) {
-        if (step_graph[i])    { cudaGraphExecDestroy(step_graph[i]);    step_graph[i] = nullptr; }
         if (mg_step_graph[i]) { cudaGraphExecDestroy(mg_step_graph[i]); mg_step_graph[i] = nullptr; }
-        step_graph_built[i]    = false;
         mg_step_graph_built[i] = false;
     }
     if (step_stream) { cudaStreamDestroy(step_stream); step_stream = nullptr; }
