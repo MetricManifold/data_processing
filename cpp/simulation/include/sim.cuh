@@ -162,6 +162,17 @@ struct Simulation {
     void sync_pool_to_parity() {
         cells.phi_in  = (parity == 0) ? phi_A : phi_B;
         cells.phi_out = (parity == 0) ? phi_B : phi_A;
+#ifndef CELL_SIM_LEGACY_STEP
+        // Opus path: S / volumes / Ix / Iy are double-buffered. Refresh
+        // the legacy single-buffer aliases to point at the parity-current
+        // halves so downstream code (trajectory writer, rebind, VTK, ...)
+        // that reads cells.S / cells.volumes / cells.Ix / cells.Iy gets
+        // the most recently produced moment set.
+        if (cells.S_pool[0])  cells.S       = cells.S_pool [parity];
+        if (cells.V_pool[0])  cells.volumes = cells.V_pool [parity];
+        if (cells.Ix_pool[0]) cells.Ix      = cells.Ix_pool[parity];
+        if (cells.Iy_pool[0]) cells.Iy      = cells.Iy_pool[parity];
+#endif
     }
     void flip_parity() {
         parity ^= 1;

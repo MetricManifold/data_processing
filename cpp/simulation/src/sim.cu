@@ -14,6 +14,7 @@
 #include "sim.cuh"
 #include "checkpoint_format.cuh"
 #include "multi_gpu.cuh"
+#include "opus_step.cuh"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cstdlib>
@@ -300,8 +301,18 @@ void Simulation::alloc_gpu() {
         std::exit(1);
     }
     const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
+#ifdef CELL_SIM_LEGACY_STEP
     CK(cudaMalloc(&cells.S, S_bytes));
     CK(cudaMemset(cells.S, 0, S_bytes));
+#else
+    // Opus path: allocate S_pool[0]|S_pool[1] as one contiguous block so a
+    // single L2 access-policy window can pin both halves. cells.S is an
+    // alias maintained by sync_pool_to_parity.
+    CK(cudaMalloc(&cells.S_pool[0], 2 * S_bytes));
+    cells.S_pool[1] = cells.S_pool[0] + (size_t)cells.S_ext_height * params.Nx;
+    CK(cudaMemset(cells.S_pool[0], 0, 2 * S_bytes));
+    cells.S = cells.S_pool[0];
+#endif
 
     auto ai = [&](int*&   p, size_t k) { CK(cudaMalloc(&p, k * sizeof(int))); };
     auto af = [&](float*& p, size_t k) { CK(cudaMalloc(&p, k * sizeof(float))); };
@@ -313,9 +324,45 @@ void Simulation::alloc_gpu() {
     ai(cells.origin, 2 * cap);
     ai(cells.rect,   4 * cap);
 
+#ifdef CELL_SIM_LEGACY_STEP
     af(cells.volumes,      cap);
     af(cells.Ix,           cap);
     af(cells.Iy,           cap);
+#else
+    // Opus path: V/Ix/Iy double-buffered for lagged-moment reads.
+    // cells.{volumes,Ix,Iy} are aliases maintained by sync_pool_to_parity.
+    af(cells.V_pool [0],   cap);
+    af(cells.V_pool [1],   cap);
+    af(cells.Ix_pool[0],   cap);
+    af(cells.Ix_pool[1],   cap);
+    af(cells.Iy_pool[0],   cap);
+    af(cells.Iy_pool[1],   cap);
+    cells.volumes = cells.V_pool [0];
+    cells.Ix      = cells.Ix_pool[0];
+    cells.Iy      = cells.Iy_pool[0];
+    CK(cudaMemset(cells.V_pool [0], 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.V_pool [1], 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.Ix_pool[0], 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.Ix_pool[1], 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.Iy_pool[0], 0, cap * sizeof(float)));
+    CK(cudaMemset(cells.Iy_pool[1], 0, cap * sizeof(float)));
+
+    // Worst-case work list: every cell with a near-full rect (TILE_T-2).
+    // OPUS_MAX_WORKITEMS_PER_CELL is sized for that bound. The fused-rebind
+    // path can emit up to ~2x as many items per cell (covering the union of
+    // old and shifted-new rects), so we allocate 2x the regular worst case.
+    const int work_cap = 2 * OPUS_MAX_WORKITEMS_PER_CELL * cap;
+    CK(cudaMalloc(&cells.d_work, (size_t)work_cap * sizeof(WorkItem)));
+    cells.d_work_cap = work_cap;
+    cells.workCount  = 0;
+
+    // Fused-rebind scratch (per-cell shift and new rect).
+    ai(cells.shift_xy, 2 * cap);
+    ai(cells.new_rect, 4 * cap);
+    CK(cudaMemset(cells.shift_xy, 0, 2 * cap * sizeof(int)));
+    CK(cudaMemset(cells.new_rect, 0, 4 * cap * sizeof(int)));
+#endif
+
     af(cells.Cx,           cap);
     af(cells.Cy,           cap);
     af(cells.Cxx,          cap);
@@ -433,15 +480,29 @@ void Simulation::configure_l2_persistence() {
     }
 
     // S is sized by the slab's extended height, not Ny (== Ny for G=1).
+    // Under opus, both S halves are pinned in one window (S_pool[0] base,
+    // 2*S_bytes). Under legacy, the single S buffer is pinned.
     const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
+#ifdef CELL_SIM_LEGACY_STEP
+    const size_t S_window_bytes = S_bytes;
+    void*        S_window_base  = cells.S;
+#else
+    const size_t S_window_bytes = 2 * S_bytes;
+    void*        S_window_base  = cells.S_pool[0] ? (void*)cells.S_pool[0] : (void*)cells.S;
+#endif
 
-    // Use the full available carveout. When S fits, pin all of it; when
-    // S exceeds the carveout, pin the leading carveout-worth of bytes
-    // (testsim approach). Even partial pinning gives a measurable win
-    // because the hot rebind / reduce / RHS reads of S are spatially
-    // localized to whichever cells happen to be in flight.
-    const size_t persist_size = std::min((size_t)max_persist_bytes, S_bytes);
-    const size_t window_bytes = persist_size;
+    // Pin the full S window. When it fits in the carveout, hitRatio=1
+    // pins it all. When it's larger (e.g. opus's double-buffered S on a
+    // 4090m: 77 MB window vs 46 MB carveout), set hitRatio so the L2
+    // probabilistically retains carveout / window of the accesses; this
+    // beats pinning only the leading carveout-worth of bytes because the
+    // alternating opus parity needs both halves.
+    const bool window_fits = (S_window_bytes <= (size_t)max_persist_bytes);
+    const size_t persist_size = std::min((size_t)max_persist_bytes, S_window_bytes);
+    const size_t window_bytes = S_window_bytes;
+    const float hit_ratio = window_fits
+        ? 1.0f
+        : (float)((double)max_persist_bytes / (double)S_window_bytes);
 
     // Reserve the carveout. cudaDeviceSetLimit grows the carveout to the
     // requested size if larger than current.
@@ -458,9 +519,9 @@ void Simulation::configure_l2_persistence() {
     // persistence; hitProp = persisting (kept), missProp = streaming
     // (don't pollute L2).
     cudaStreamAttrValue attr = {};
-    attr.accessPolicyWindow.base_ptr  = cells.S;
+    attr.accessPolicyWindow.base_ptr  = S_window_base;
     attr.accessPolicyWindow.num_bytes = window_bytes;
-    attr.accessPolicyWindow.hitRatio  = 1.0f;
+    attr.accessPolicyWindow.hitRatio  = hit_ratio;
     attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
     attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
 
@@ -474,12 +535,12 @@ void Simulation::configure_l2_persistence() {
         return;
     }
 
-    if (S_bytes <= (size_t)max_persist_bytes) {
-        printf("[L2] persisting full S (%.1f MB) in carveout (max %.1f MB)\n",
-               S_bytes / 1e6, max_persist_bytes / 1e6);
+    if (window_fits) {
+        printf("[L2] persisting full S window (%.1f MB) in carveout (max %.1f MB)\n",
+               S_window_bytes / 1e6, max_persist_bytes / 1e6);
     } else {
-        printf("[L2] persisting first %.1f MB of S=%.1f MB (carveout max %.1f MB)\n",
-               window_bytes / 1e6, S_bytes / 1e6, max_persist_bytes / 1e6);
+        printf("[L2] partial-pin S window=%.1f MB carveout=%.1f MB hitRatio=%.2f\n",
+               S_window_bytes / 1e6, max_persist_bytes / 1e6, hit_ratio);
     }
 }
 
@@ -726,11 +787,22 @@ void Simulation::setup_step_stream() {
                            cudaDevAttrMaxPersistingL2CacheSize, 0);
     if (max_persist_bytes <= 0) return;
     const size_t S_bytes = (size_t)cells.S_ext_height * params.Nx * sizeof(float);
-    const size_t window_bytes = std::min((size_t)max_persist_bytes, S_bytes);
+#ifdef CELL_SIM_LEGACY_STEP
+    const size_t S_window_bytes = S_bytes;
+    void*        S_window_base  = cells.S;
+#else
+    const size_t S_window_bytes = 2 * S_bytes;
+    void*        S_window_base  = cells.S_pool[0] ? (void*)cells.S_pool[0] : (void*)cells.S;
+#endif
+    const bool window_fits = (S_window_bytes <= (size_t)max_persist_bytes);
+    const size_t window_bytes = S_window_bytes;
+    const float hit_ratio = window_fits
+        ? 1.0f
+        : (float)((double)max_persist_bytes / (double)S_window_bytes);
     cudaStreamAttrValue attr = {};
-    attr.accessPolicyWindow.base_ptr  = cells.S;
+    attr.accessPolicyWindow.base_ptr  = S_window_base;
     attr.accessPolicyWindow.num_bytes = window_bytes;
-    attr.accessPolicyWindow.hitRatio  = 1.0f;
+    attr.accessPolicyWindow.hitRatio  = hit_ratio;
     attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
     attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
     cudaStreamSetAttribute(step_stream,
@@ -740,6 +812,17 @@ void Simulation::setup_step_stream() {
 void Simulation::finalize_init() {
     seed_rng_if_fresh();
     compute_initial_velocities();
+#ifndef CELL_SIM_LEGACY_STEP
+    // Opus path: launch_initial_velocity above ran scatter_S + reduce
+    // against the parity-0 halves (the aliases cells.S/volumes/Ix/Iy
+    // point there). Mirror to parity-1 so whichever parity is current
+    // on the first step has a consistent lagged-moment set. Build the
+    // initial work list from the current rect.
+    if (gpus <= 1) {
+        launch_opus_seed_parity_mirror(cells, params, /*from_parity=*/0, 0);
+        build_opus_work_list_host(cells);
+    }
+#endif
     setup_step_stream();
     CK(cudaDeviceSynchronize());
 }
@@ -1605,7 +1688,17 @@ Simulation::StepFlags Simulation::compute_step_flags(int next_step) const {
     f.will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
     f.will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
     f.will_vtk    = (vtk_interval > 0 && next_step % vtk_interval == 0);
+#ifdef CELL_SIM_LEGACY_STEP
+    // Legacy needs moments of the step's INPUT phi during the rebind step
+    // itself, because launch_rebind reads them after the evolve.
     f.need_full_red = f.will_rebind || f.will_traj || f.will_save || f.will_ckpt || f.will_vtk;
+#else
+    // Opus fused-rebind: the rebind step consumes moments produced by the
+    // PREVIOUS step's opus_step<DO_EXT=true>. So fire need_full one step
+    // earlier than will_rebind. Output cadences are unchanged.
+    bool next_step_is_rebind = ((next_step + 1) % REBIND_EVERY) == 0;
+    f.need_full_red = next_step_is_rebind || f.will_traj || f.will_save || f.will_ckpt || f.will_vtk;
+#endif
     return f;
 }
 
@@ -1636,6 +1729,14 @@ void Simulation::step() {
     // launch (output, rebind path) reads the right buffer.
     sync_pool_to_parity();
 
+#ifdef CELL_SIM_LEGACY_STEP
+    constexpr bool kOpus = false;
+#else
+    // Opus path: only on single-GPU. Multi-GPU still uses the legacy
+    // scatter+evolve path (slab decomposition with halo exchange).
+    const bool kOpus = (gpus <= 1);
+#endif
+
     if (fast_path) {
         if (!step_graph_built[parity]) {
             // Capture once per parity. cudaStreamCaptureModeThreadLocal so
@@ -1645,8 +1746,17 @@ void Simulation::step() {
             CK(cudaStreamBeginCapture(step_stream,
                                       cudaStreamCaptureModeThreadLocal));
             launch_polar(cells, params, step_stream);
-            launch_scatter_S(cells, params, step_stream);
-            launch_evolve(cells, params, /*need_full_reduce=*/false, step_stream);
+            if (kOpus) {
+                launch_opus_step(cells, params, parity,
+                                 /*need_full=*/false, step_stream);
+                launch_opus_finalize_velocity(cells, params,
+                                              /*read from*/ parity ^ 1,
+                                              step_stream);
+            } else {
+                launch_scatter_S(cells, params, step_stream);
+                launch_evolve(cells, params,
+                              /*need_full_reduce=*/false, step_stream);
+            }
             CK(cudaStreamEndCapture(step_stream, &graph));
             CK(cudaGraphInstantiate(&step_graph[parity], graph, nullptr, nullptr, 0));
             cudaGraphDestroy(graph);
@@ -1662,15 +1772,62 @@ void Simulation::step() {
         } else {
             launch_polar(cells, params, step_stream);
         }
-        launch_scatter_S(cells, params, step_stream);
-        launch_evolve(cells, params, f.need_full_red, step_stream);
-        flip_parity();
 
-        if (f.will_rebind) {
-            launch_rebind(cells,
-                          (float)params.subdomain_padding,
-                          (float)params.gamma, step_stream);
+#ifndef CELL_SIM_LEGACY_STEP
+        if (kOpus && f.will_rebind) {
+            // Fused-rebind step. Replaces the standard opus_step + separate
+            // rebind. opus_step_rebind does evolve + shift + S scatter in one
+            // pass; it advances time by exactly one dt, same as a regular
+            // step. Consumes V/Cx/Cy/Cxx/Cyy that were produced by the
+            // PREVIOUS step's opus_step<DO_EXT=true> (need_full_red is set
+            // on the step before will_rebind under opus). 2-step lag on the
+            // shift moments is fine — cell COM drifts ~0.01 px per step so
+            // the integer-rounded shift is the same as a 0-step-lag choice.
+            launch_opus_compute_rebind_meta(cells, params, parity, step_stream);
+            int rebind_wc = build_opus_work_list_for_rebind(cells);
+            static int last_wc = -1;
+            if (rebind_wc != last_wc) {
+                for (int i = 0; i < 2; ++i) {
+                    if (step_graph[i]) {
+                        cudaGraphExecDestroy(step_graph[i]);
+                        step_graph[i] = nullptr;
+                    }
+                    step_graph_built[i] = false;
+                }
+                last_wc = rebind_wc;
+            }
+            launch_opus_step_rebind(cells, params, parity, step_stream);
+            launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
             flip_parity();
+            launch_opus_apply_rebind_meta(cells, step_stream);
+            int new_wc = build_opus_work_list_host(cells);
+            if (new_wc != last_wc) {
+                for (int i = 0; i < 2; ++i) {
+                    if (step_graph[i]) {
+                        cudaGraphExecDestroy(step_graph[i]);
+                        step_graph[i] = nullptr;
+                    }
+                    step_graph_built[i] = false;
+                }
+                last_wc = new_wc;
+            }
+        } else
+#endif
+        if (kOpus) {
+            launch_opus_step(cells, params, parity, f.need_full_red, step_stream);
+            launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
+            flip_parity();
+        } else {
+            launch_scatter_S(cells, params, step_stream);
+            launch_evolve(cells, params, f.need_full_red, step_stream);
+            flip_parity();
+
+            if (f.will_rebind) {
+                launch_rebind(cells,
+                              (float)params.subdomain_padding,
+                              (float)params.gamma, step_stream);
+                flip_parity();
+            }
         }
     }
 
@@ -2512,10 +2669,27 @@ void Simulation::cleanup() {
     cf(cells.phi_pool);
     cells.phi_in = cells.phi_out = nullptr;
     phi_A = phi_B = nullptr;
+#ifdef CELL_SIM_LEGACY_STEP
     cf(cells.S);
+    cf(cells.volumes); cf(cells.Ix); cf(cells.Iy);
+#else
+    // Opus path: real allocations live in *_pool[0]; *_pool[1] is either
+    // a +offset alias (S_pool[1]) or a separate cudaMalloc (V/Ix/Iy_pool[1]).
+    // cells.S / volumes / Ix / Iy are aliases (do NOT cudaFree them).
+    cf(cells.S_pool[0]);
+    cells.S_pool[1] = nullptr;
+    cells.S = nullptr;
+    cf(cells.V_pool [0]); cf(cells.V_pool [1]);
+    cf(cells.Ix_pool[0]); cf(cells.Ix_pool[1]);
+    cf(cells.Iy_pool[0]); cf(cells.Iy_pool[1]);
+    cells.volumes = cells.Ix = cells.Iy = nullptr;
+    if (cells.d_work) { cudaFree(cells.d_work); cells.d_work = nullptr; }
+    cells.d_work_cap = 0; cells.workCount = 0;
+    cf(cells.shift_xy);
+    cf(cells.new_rect);
+#endif
     cf(cells.origin);
     cf(cells.rect);
-    cf(cells.volumes); cf(cells.Ix); cf(cells.Iy);
     cf(cells.Cx); cf(cells.Cy);
     cf(cells.Cxx); cf(cells.Cyy);
     cf(cells.perimeters);

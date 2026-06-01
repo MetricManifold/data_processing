@@ -252,7 +252,14 @@ struct CellArrays {
     float* phi_out  = nullptr;     // alias into phi_pool (scratch half)
 
     // Global sum field S(x,y) = sum_n phi_n(x,y)^2. Atomic-scatter target.
-    float* S = nullptr;            // [Nx * Ny]
+    //
+    // Under the opus single-pass step (default), S is double-buffered:
+    // S_pool[0] and S_pool[1] are one contiguous cudaMalloc of 2*S_bytes
+    // (so a single L2 access-policy window pins both halves). `S` is an
+    // alias into S_pool[parity], refreshed by Simulation::sync_pool_to_parity.
+    // Under -DCELL_SIM_LEGACY_STEP, only `S` is allocated (S_pool stays null).
+    float* S          = nullptr;     // [Nx * Ny]  (alias of S_pool[parity] in opus path)
+    float* S_pool[2]  = {nullptr, nullptr};
 
     // Slab partition descriptor for S (single-GPU defaults: covers the
     // whole grid). All kernels that touch S use these to translate a
@@ -272,9 +279,19 @@ struct CellArrays {
     int* rect = nullptr;           // [4 * N]
 
     // Per-cell observables produced by the multi-block reduce / RHS path.
-    float* volumes      = nullptr; // [N] : sum phi (tile-local; multiply by dA for area)
-    float* Ix           = nullptr; // [N] : tile-local sum(c * grad_x * S_other) (interaction integral, x)
-    float* Iy           = nullptr; // [N] : tile-local sum(c * grad_y * S_other) (interaction integral, y)
+    //
+    // Under the opus single-pass step (default), volumes/Ix/Iy are
+    // double-buffered (V_pool[2], Ix_pool[2], Iy_pool[2]) so the kernel
+    // can read lagged moments from one half while atomicAdding fresh
+    // moments into the other. `volumes`, `Ix`, `Iy` are aliases into the
+    // parity-current half, refreshed by Simulation::sync_pool_to_parity.
+    // Under -DCELL_SIM_LEGACY_STEP only the unprefixed buffers are allocated.
+    float* volumes      = nullptr; // [N] : sum phi^2 (tile-local)
+    float* Ix           = nullptr; // [N] : tile-local sum(c * grad_x * S_other)
+    float* Iy           = nullptr; // [N] : tile-local sum(c * grad_y * S_other)
+    float* V_pool [2]   = {nullptr, nullptr};
+    float* Ix_pool[2]   = {nullptr, nullptr};
+    float* Iy_pool[2]   = {nullptr, nullptr};
     float* Cx           = nullptr; // [N] : tile-local sum(phi^2 * lx)
     float* Cy           = nullptr; // [N] : tile-local sum(phi^2 * ly)
     float* Cxx          = nullptr; // [N] : tile-local sum(phi^2 * lx^2)
@@ -282,6 +299,22 @@ struct CellArrays {
     float* perimeters   = nullptr; // [N] : sum |grad phi| (tile-local)
     float* velocities_x = nullptr; // [N] : interaction integral + v_A * polar_x
     float* velocities_y = nullptr; // [N] : interaction integral + v_A * polar_y
+
+    // Opus single-pass step: per-CTA work list of 32x32 sub-tiles to
+    // evaluate (one CTA per item). Built host-side from cells.rect after
+    // every rebind. d_work is sized for the worst-case at capacity (every
+    // cell with a full TILE_T-2 rect); workCount is the active size used
+    // as the launch grid. d_work_cap counts WorkItems (not bytes).
+    void* d_work       = nullptr;  // really WorkItem*; void* to keep this header light
+    int   d_work_cap   = 0;
+    int   workCount    = 0;
+
+    // Opus fused-rebind scratch: per-cell (sx, sy) shift and (rx0, ry0, rw, rh)
+    // new-rect computed by launch_opus_compute_rebind_meta before the rebind
+    // step. Consumed by launch_opus_step_rebind, then applied to origin/rect
+    // by launch_opus_apply_rebind_meta. Sized to capacity in alloc_gpu.
+    int*  shift_xy     = nullptr;  // [2 * cap]
+    int*  new_rect     = nullptr;  // [4 * cap]
 
     // Deterministic-reduce scratch for k_reduce_mb_{fast,full}. Each chunk
     // block writes its block-wide partial into a fixed slot here. V/Ix/Iy

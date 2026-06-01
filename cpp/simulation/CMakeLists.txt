@@ -65,6 +65,7 @@ set(CELL_SIM_SOURCES
     src/kernels.cu
     src/sim.cu
     src/multi_gpu.cu
+    src/opus_step.cu
 )
 if(ENABLE_VISUALIZER)
     list(APPEND CELL_SIM_SOURCES src/visualizer.cu)
