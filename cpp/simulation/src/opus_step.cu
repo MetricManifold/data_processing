@@ -54,7 +54,7 @@ __device__ __forceinline__ float block_sum_op(float v, float* sm) {
     return r;
 }
 
-template<bool DO_EXT>
+template<bool DO_EXT, bool DO_REBIND>
 __global__ void k_opus_step(
     const float* __restrict__ phiIn,
     float*       __restrict__ phiOut,
@@ -71,9 +71,12 @@ __global__ void k_opus_step(
     float*       __restrict__ Cy_out,
     float*       __restrict__ Cxx_out,
     float*       __restrict__ Cyy_out,
-    const int*       __restrict__ origin,
-    const int*       __restrict__ rect,
+    const int*       __restrict__ origin,      // SOURCE-frame origin
+    const int*       __restrict__ rect,        // SOURCE rect (worklist domain)
+    const int*       __restrict__ dst_rect,    // DEST rect (DO_REBIND only; nullptr otherwise)
+    const int*       __restrict__ shift_xy,    // (sx, sy) per cell (DO_REBIND only; nullptr otherwise)
     const WorkItem*  __restrict__ work,
+    const int*       __restrict__ work_count,  // device-side actual count; early-exit if blockIdx.x >= *count
     const float* __restrict__ gamma_cell,
     const float* __restrict__ vA_cell,
     const float* __restrict__ dirx_c,
@@ -86,10 +89,17 @@ __global__ void k_opus_step(
     __shared__ float sm[HH][HW];
     __shared__ float red[NWARP * (DO_EXT ? 8 : 3)];
 
+    // Early-exit on grid blocks beyond the actual worklist count. Grid is
+    // launched at d_work_cap (worst-case) so we don't need to sync the
+    // count back to host; the in-kernel check skips dead blocks for ~free.
+    if (blockIdx.x >= *work_count) return;
+
     const WorkItem wi = work[blockIdx.x];
-    const int n   = wi.tile;
-    const int sx  = wi.sx;
-    const int sy  = wi.sy;
+    const int n        = wi.tile;
+    // Work-item (sx, sy) is interpreted as the DESTINATION-frame sub-tile origin.
+    // On non-rebind steps shift = (0, 0) so destination == source.
+    const int dst_sx   = wi.sx;
+    const int dst_sy   = wi.sy;
 
     const int gx0 = origin[2*n + 0];
     const int gy0 = origin[2*n + 1];
@@ -97,21 +107,55 @@ __global__ void k_opus_step(
     const int ry0 = rect[4*n + 1];
     const int rw  = rect[4*n + 2];
     const int rh  = rect[4*n + 3];
+    const int rxe = rx0 + rw;
+    const int rye = ry0 + rh;
+
+    // Shift: source = destination + shift (note: matches opus's convention,
+    // where shiftXY = -recenter_shift, so new_origin = old_origin + (-shift)).
+    int shf_x = 0, shf_y = 0;
+    if constexpr (DO_REBIND) {
+        shf_x = shift_xy[2*n + 0];
+        shf_y = shift_xy[2*n + 1];
+    }
+    // Destination rect (only meaningful on rebind steps). Pre-clamped subset
+    // of source rect by compute_rebind_meta, so the worklist over source
+    // rect fully covers the destination footprint.
+    int drx0 = rx0, dry0 = ry0, drxe = rxe, drye = rye;
+    if constexpr (DO_REBIND) {
+        drx0 = dst_rect[4*n + 0];
+        dry0 = dst_rect[4*n + 1];
+        drxe = drx0 + dst_rect[4*n + 2];
+        drye = dry0 + dst_rect[4*n + 3];
+    }
 
     const float* ph = phiIn  + (size_t)n * TILE_AREA;
     float*       po = phiOut + (size_t)n * TILE_AREA;
     const int tid   = threadIdx.y * BX + threadIdx.x;
 
-    // 34x34 halo load. cell_sim's rect invariant guarantees
-    // (sx-1..sx+OW) and (sy-1..sy+OH) sit fully inside [0, TILE_T-1].
+    // 34x34 halo load from SOURCE frame (dst + shift - 1).
+    // Non-rebind: shift=0 so this is just (sx-1..sx+OW, sy-1..sy+OH) inside [0, TILE_T).
+    // Rebind: same bounds shifted; we guard against OOB defensively.
+    const int hx0 = dst_sx + shf_x - 1;
+    const int hy0 = dst_sy + shf_y - 1;
     #pragma unroll
     for (int idx = tid; idx < HW * HH; idx += NTH) {
         int lxi = idx % HW, lyi = idx / HW;
-        sm[lyi][lxi] = ph[(size_t)(sy - 1 + lyi) * TILE_T + (sx - 1 + lxi)];
+        int xi  = hx0 + lxi;
+        int yi  = hy0 + lyi;
+        float v = 0.0f;
+        if constexpr (DO_REBIND) {
+            if ((unsigned)xi < (unsigned)TILE_T && (unsigned)yi < (unsigned)TILE_T) {
+                v = ph[(size_t)yi * TILE_T + xi];
+            }
+        } else {
+            v = ph[(size_t)yi * TILE_T + xi];
+        }
+        sm[lyi][lxi] = v;
     }
     __syncthreads();
 
-    // Per-tile coefficients from LAGGED V/Ix/Iy.
+    // Per-tile coefficients from LAGGED V/Ix/Iy. Lagged moments are physical
+    // (frame-invariant) so they're correct under rebind without any fixup.
     const float gam    = gamma_cell[n];
     const float vA     = vA_cell[n];
     const float R      = tgt_R_c[n];
@@ -126,16 +170,41 @@ __global__ void k_opus_step(
     const float vx     = coeffV * Ix_lag + vA * dirx_c[n];
     const float vy     = coeffV * Iy_lag + vA * diry_c[n];
 
-    const int rxe = rx0 + rw, rye = ry0 + rh;
     float v=0.f, ix=0.f, iy=0.f;
     float pp=0.f, cx=0.f, cy=0.f, cxx=0.f, cyy=0.f;
 
     #pragma unroll
     for (int r = 0; r < RY; ++r) {
         const int oy = threadIdx.y + r * BY;
-        const int lx = sx + threadIdx.x;
-        const int ly = sy + oy;
-        if (lx >= rxe || ly >= rye) continue;
+        // Destination tile-local pixel.
+        const int dlx = dst_sx + threadIdx.x;
+        const int dly = dst_sy + oy;
+        // Source tile-local pixel (== destination on non-rebind).
+        const int slx = dlx + shf_x;
+        const int sly = dly + shf_y;
+
+        // Worklist domain is the SOURCE rect (where phi is non-zero). Skip
+        // pixels whose source is outside the source rect.
+        if (slx >= rxe || sly >= rye) continue;
+
+        // On rebind steps, check destination is inside new (subset) rect.
+        bool dst_in_new = true;
+        if constexpr (DO_REBIND) {
+            dst_in_new = (dlx >= drx0 && dlx < drxe &&
+                          dly >= dry0 && dly < drye);
+        }
+
+        if constexpr (DO_REBIND) {
+            if (!dst_in_new) {
+                // Destination outside new rect: zero it (clears stale phi
+                // from a prior parity write in this slot).
+                if ((unsigned)dlx < (unsigned)TILE_T &&
+                    (unsigned)dly < (unsigned)TILE_T) {
+                    po[(size_t)dly * TILE_T + dlx] = 0.0f;
+                }
+                continue;
+            }
+        }
 
         const int tx = threadIdx.x + 1, ty = oy + 1;
         const float c  = sm[ty  ][tx  ];
@@ -153,22 +222,28 @@ __global__ void k_opus_step(
         const float gx = 0.5f * (e  - w);
         const float gy = 0.5f * (nN - sS);
 
-        // Slab-aware S index. Single-GPU: identity in [0, Ny).
-        const int gxg = wrap_g(gx0 + lx, Nx);
-        const int gyg = wrap_g(gy0 + ly, Ny);
+        // Scatter into S at SOURCE-frame global address. Origin is updated by
+        // apply_rebind_meta AFTER this kernel, so (gx0 + slx) here equals
+        // (new_origin + dlx) on the next step — the same physical pixel.
+        const int gxg = wrap_g(gx0 + slx, Nx);
+        const int gyg = wrap_g(gy0 + sly, Ny);
         const int syL = slab_local_y(gyg, S_y_lo, S_halo_h, S_ext_height, Ny);
         const size_t gIdx = (size_t)syL * Nx + gxg;
 
         const float Sg = Sin[gIdx];
         const float term = fmaxf(0.0f, Sg - c*c);
 
-        // (a) FRESH reductions of phi_in.
+        // (a) FRESH reductions of phi_in. Frame-invariant sums; use source
+        // values regardless of DO_REBIND.
         const float c2 = c * c;
         v  += c2;
         ix += c * gx * term;
         iy += c * gy * term;
         if constexpr (DO_EXT) {
-            const float flx = (float)lx, fly = (float)ly;
+            // Position moments: use DESTINATION coords so the NEXT rebind's
+            // COM is expressed in the post-rebind frame. (On non-rebind
+            // steps dlx == slx so the choice doesn't matter.)
+            const float flx = (float)dlx, fly = (float)dly;
             pp  += sqrtf(gx*gx + gy*gy);
             cx  += c2 * flx;
             cy  += c2 * fly;
@@ -181,7 +256,7 @@ __global__ void k_opus_step(
         const float rhs = gam * lap - dwC * dw + volC * c - repC * c * term;
         const float adv = vx * gx + vy * gy;
         const float pn  = c + dt * (rhs - adv);
-        po[(size_t)ly * TILE_T + lx] = pn;
+        po[(size_t)dly * TILE_T + dlx] = pn;
         atomicAdd(&Sout[gIdx], pn * pn);
     }
 
@@ -245,6 +320,7 @@ __global__ void k_opus_compute_rebind_meta(
     const float* __restrict__ Cy,
     const float* __restrict__ Cxx,
     const float* __restrict__ Cyy,
+    const int*   __restrict__ rect,
     const float* __restrict__ gamma_cell,
     const float* __restrict__ tgt_radius,
     int*  __restrict__ shift_xy,
@@ -289,10 +365,35 @@ __global__ void k_opus_compute_rebind_meta(
     if (hwy > hmax) hwy = hmax;
     if (hwx < bbox_min) hwx = bbox_min;
     if (hwy < bbox_min) hwy = bbox_min;
-    new_rect[4*n + 0] = Th - hwx;
-    new_rect[4*n + 1] = Th - hwy;
-    new_rect[4*n + 2] = 2 * hwx;
-    new_rect[4*n + 3] = 2 * hwy;
+
+    // New rect (destination frame), centered at tile center.
+    int nrx0 = Th - hwx;
+    int nry0 = Th - hwy;
+    int nrxe = Th + hwx;
+    int nrye = Th + hwy;
+
+    // CLAMP new_rect to subset of old_rect so that the source-frame worklist
+    // (over old_rect) fully covers every destination pixel of the new rect.
+    // Without this we'd need a union worklist; with it the same worklist is
+    // reusable for regular and rebind steps.
+    const int orx0 = rect[4*n + 0];
+    const int ory0 = rect[4*n + 1];
+    const int orxe = orx0 + rect[4*n + 2];
+    const int orye = ory0 + rect[4*n + 3];
+    if (nrx0 < orx0) nrx0 = orx0;
+    if (nry0 < ory0) nry0 = ory0;
+    if (nrxe > orxe) nrxe = orxe;
+    if (nrye > orye) nrye = orye;
+    // Also guarantee 1px halo margin (stencil reads).
+    if (nrx0 < 1)            nrx0 = 1;
+    if (nry0 < 1)            nry0 = 1;
+    if (nrxe > TILE_T - 1)   nrxe = TILE_T - 1;
+    if (nrye > TILE_T - 1)   nrye = TILE_T - 1;
+
+    new_rect[4*n + 0] = nrx0;
+    new_rect[4*n + 1] = nry0;
+    new_rect[4*n + 2] = nrxe - nrx0;
+    new_rect[4*n + 3] = nrye - nry0;
 }
 
 // ---------------------------------------------------------------------------
@@ -319,213 +420,37 @@ __global__ void k_opus_apply_rebind_meta(
 }
 
 // ---------------------------------------------------------------------------
-// k_opus_step_rebind — fused rebind+evolve step kernel.
-//
-// Sibling of k_opus_step but with two extra behaviors:
-//
-//   * Each pixel processed has a SOURCE-frame address (sx, sy) (the
-//     work-list sub-tile origin) and the kernel reads phi/halo at that
-//     source-frame location. It computes RHS as usual.
-//
-//   * The WRITE goes to a DESTINATION-frame address (sx - shift_x,
-//     sy - shift_y). If the destination is inside new_rect, phi_new is
-//     written and phi_new^2 is scattered to S at the (source-frame) global
-//     address. If the destination is OUTSIDE new_rect (periphery being
-//     trimmed), 0 is written and no scatter happens.
-//
-// Why the scatter address can stay source-frame: origin is unchanged by
-// this kernel (host applies origin += shift afterward), so the global
-// address of pixel (sx, sy) computed using the CURRENT origin equals the
-// global address of pixel (sx - shift_x, sy - shift_y) computed using the
-// POST-rebind origin (= current origin + shift). Both expressions name
-// the same physical pixel.
-//
-// Worklist coverage: the host builds a union worklist covering the source-
-// frame bounding box of (old_rect U new_rect_shifted_back). This ensures
-// every periphery destination pixel that needs zeroing is reached, and
-// every new-rect destination pixel that needs evolving is reached.
-//
-// Fresh moments (V/Ix/Iy) are accumulated over source-frame pixels — they
-// characterize phi_in and are invariant under the tile-local shift.
 // ---------------------------------------------------------------------------
-__global__ void k_opus_step_rebind(
-    const float* __restrict__ phiIn,
-    float*       __restrict__ phiOut,
-    const float* __restrict__ Sin,
-    float*       __restrict__ Sout,
-    const float* __restrict__ Vlag,
-    const float* __restrict__ Ixlag,
-    const float* __restrict__ Iylag,
-    float*       __restrict__ Vout,
-    float*       __restrict__ Ixout,
-    float*       __restrict__ Iyout,
-    const int*       __restrict__ origin,
-    const int*       __restrict__ rect,
-    const int*       __restrict__ shift_xy,
-    const int*       __restrict__ new_rect_arr,
-    const WorkItem*  __restrict__ work,
-    const float* __restrict__ gamma_cell,
-    const float* __restrict__ vA_cell,
-    const float* __restrict__ dirx_c,
-    const float* __restrict__ diry_c,
-    const float* __restrict__ tgt_R_c,
-    int Nx, int Ny,
-    int S_y_lo, int S_halo_h, int S_ext_height,
-    float lambda_, float kappa, float mu, float xi, float dt)
+// k_opus_build_worklist — device-side worklist construction.
+//
+// One thread per cell. Each thread enumerates its cell's 32x32 sub-tiles
+// inside the cell's rect and appends them as WorkItem entries via a single
+// global atomic counter. Avoids the host round-trip + blocking stream sync
+// of the previous host-side build, keeping the pipeline full across rebinds.
+//
+// Sub-tile emission order is non-deterministic across runs (atomic order),
+// but within a single launch the work is identical — every WorkItem ends
+// up in the array, just at a non-deterministic slot. The opus kernel is
+// indifferent to work order, so this has no observable effect.
+// ---------------------------------------------------------------------------
+__global__ void k_opus_build_worklist(
+    int N,
+    const int* __restrict__ rect,
+    WorkItem*  __restrict__ out_work,
+    int*       __restrict__ out_count)
 {
-    __shared__ float sm[HH][HW];
-    __shared__ float red[NWARP * 3];
-
-    const WorkItem wi = work[blockIdx.x];
-    const int n   = wi.tile;
-    const int sx  = wi.sx;  // source-frame sub-tile origin
-    const int sy  = wi.sy;
-
-    const int gx0  = origin[2*n + 0];
-    const int gy0  = origin[2*n + 1];
-    const int rx0  = rect[4*n + 0];
-    const int ry0  = rect[4*n + 1];
-    const int rw   = rect[4*n + 2];
-    const int rh   = rect[4*n + 3];
-    const int sh_x = shift_xy[2*n + 0];
-    const int sh_y = shift_xy[2*n + 1];
-    const int nrx0 = new_rect_arr[4*n + 0];
-    const int nry0 = new_rect_arr[4*n + 1];
-    const int nrw  = new_rect_arr[4*n + 2];
-    const int nrh  = new_rect_arr[4*n + 3];
-
-    const float* ph = phiIn  + (size_t)n * TILE_AREA;
-    float*       po = phiOut + (size_t)n * TILE_AREA;
-    const int tid   = threadIdx.y * BX + threadIdx.x;
-
-    // Halo load at source-frame (sx, sy). The halo extent (sx-1..sx+OW,
-    // sy-1..sy+OH) must lie inside [0, TILE_T-1]. The work-list builder
-    // is responsible for not emitting sub-tiles whose halo would bust the
-    // tile edge; the rect invariant + shift bound guarantees this for any
-    // sub-tile that intersects the old rect. For sub-tiles that lie
-    // entirely outside the old rect (purely periphery in the dest frame),
-    // we still load the halo but every pixel will be 0 by invariant.
-    #pragma unroll
-    for (int idx = tid; idx < HW * HH; idx += NTH) {
-        int lxi = idx % HW, lyi = idx / HW;
-        int yi  = sy - 1 + lyi;
-        int xi  = sx - 1 + lxi;
-        // Defensive guard against worklist edge cases; never trips for valid lists.
-        float v = 0.0f;
-        if ((unsigned)xi < (unsigned)TILE_T && (unsigned)yi < (unsigned)TILE_T) {
-            v = ph[(size_t)yi * TILE_T + xi];
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const int rx0 = rect[4*n + 0];
+    const int ry0 = rect[4*n + 1];
+    const int rw  = rect[4*n + 2];
+    const int rh  = rect[4*n + 3];
+    for (int sy = ry0; sy < ry0 + rh; sy += OH) {
+        for (int sx = rx0; sx < rx0 + rw; sx += OW) {
+            int idx = atomicAdd(out_count, 1);
+            WorkItem w = { n, sx, sy };
+            out_work[idx] = w;
         }
-        sm[lyi][lxi] = v;
-    }
-    __syncthreads();
-
-    // Lagged per-tile coefficients (identical to non-rebind step).
-    const float gam    = gamma_cell[n];
-    const float vA     = vA_cell[n];
-    const float R      = tgt_R_c[n];
-    const float piR2   = (float)M_PI * R * R;
-    const float V_lag  = Vlag[n];
-    const float Ix_lag = Ixlag[n];
-    const float Iy_lag = Iylag[n];
-    const float dwC    = gam * bulk_coeff<float>(lambda_);
-    const float repC   = interaction_coeff<float>(kappa, lambda_);
-    const float volC   = (2.0f * mu / piR2) * (piR2 - V_lag);
-    const float coeffV = motility_coeff<float>(kappa, xi, lambda_);
-    const float vx     = coeffV * Ix_lag + vA * dirx_c[n];
-    const float vy     = coeffV * Iy_lag + vA * diry_c[n];
-
-    const int rxe  = rx0  + rw;
-    const int rye  = ry0  + rh;
-    const int nrxe = nrx0 + nrw;
-    const int nrye = nry0 + nrh;
-
-    float v_acc=0.f, ix_acc=0.f, iy_acc=0.f;
-
-    #pragma unroll
-    for (int r = 0; r < RY; ++r) {
-        const int oy = threadIdx.y + r * BY;
-        const int lx = sx + threadIdx.x;        // source-frame
-        const int ly = sy + oy;
-
-        // Destination-frame coordinates.
-        const int out_lx = lx - sh_x;
-        const int out_ly = ly - sh_y;
-
-        // Skip if destination is outside the tile entirely (shouldn't happen
-        // under invariants, defensive guard).
-        if ((unsigned)out_lx >= (unsigned)TILE_T) continue;
-        if ((unsigned)out_ly >= (unsigned)TILE_T) continue;
-
-        const bool dst_in_new = (out_lx >= nrx0 && out_lx < nrxe &&
-                                 out_ly >= nry0 && out_ly < nrye);
-        const bool src_in_old = (lx >= rx0 && lx < rxe &&
-                                 ly >= ry0 && ly < rye);
-
-        if (!dst_in_new) {
-            // Periphery: zero the destination pixel. No scatter, no moments.
-            // (We still need to write 0 because phi_out's previous content
-            // may be stale from two parities ago.)
-            po[(size_t)out_ly * TILE_T + out_lx] = 0.0f;
-            continue;
-        }
-
-        if (!src_in_old) {
-            // Destination inside new rect but source outside old rect (the
-            // "rect grew" case). Source phi was 0; phi_new from RHS at
-            // c=0 with all-0 halo is 0.
-            po[(size_t)out_ly * TILE_T + out_lx] = 0.0f;
-            continue;
-        }
-
-        // Standard path: source inside old rect, destination inside new rect.
-        const int tx = threadIdx.x + 1, ty = oy + 1;
-        const float c  = sm[ty  ][tx  ];
-        const float e  = sm[ty  ][tx+1];
-        const float w  = sm[ty  ][tx-1];
-        const float nN = sm[ty+1][tx  ];
-        const float sS = sm[ty-1][tx  ];
-        const float ne = sm[ty+1][tx+1];
-        const float nw = sm[ty+1][tx-1];
-        const float se = sm[ty-1][tx+1];
-        const float sw = sm[ty-1][tx-1];
-
-        const float lap = (4.0f*(e+w+nN+sS) + (ne+nw+se+sw) - 20.0f*c) * (1.0f/6.0f);
-        const float gx = 0.5f * (e  - w);
-        const float gy = 0.5f * (nN - sS);
-
-        const int gxg = wrap_g(gx0 + lx, Nx);
-        const int gyg = wrap_g(gy0 + ly, Ny);
-        const int syL = slab_local_y(gyg, S_y_lo, S_halo_h, S_ext_height, Ny);
-        const size_t gIdx = (size_t)syL * Nx + gxg;
-
-        const float Sg = Sin[gIdx];
-        const float term = fmaxf(0.0f, Sg - c*c);
-
-        // Fresh moments — source-frame values (physical, invariant under shift).
-        const float c2 = c * c;
-        v_acc  += c2;
-        ix_acc += c * gx * term;
-        iy_acc += c * gy * term;
-
-        const float dw  = c * (1.0f - c) * (1.0f - 2.0f * c);
-        const float rhs = gam * lap - dwC * dw + volC * c - repC * c * term;
-        const float adv = vx * gx + vy * gy;
-        const float pn  = c + dt * (rhs - adv);
-
-        // Write at DESTINATION-frame address; scatter S at source-frame
-        // global address (== destination-frame global address with the
-        // post-rebind origin, since origin += shift after this kernel).
-        po[(size_t)out_ly * TILE_T + out_lx] = pn;
-        atomicAdd(&Sout[gIdx], pn * pn);
-    }
-
-    float bv = block_sum_op(v_acc,  red);
-    float bx = block_sum_op(ix_acc, red +   NWARP);
-    float by = block_sum_op(iy_acc, red + 2*NWARP);
-    if (tid == 0) {
-        atomicAdd(&Vout [n], bv);
-        atomicAdd(&Ixout[n], bx);
-        atomicAdd(&Iyout[n], by);
     }
 }
 
@@ -554,26 +479,28 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
 
     dim3 blk(BX, BY);
     if (need_full) {
-        k_opus_step<true><<<c.workCount, blk, 0, stream>>>(
+        k_opus_step<true, false><<<c.workCount, blk, 0, stream>>>(
             c.phi_in, c.phi_out,
             c.S_pool[parity], c.S_pool[q],
             c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
             c.V_pool [q],      c.Ix_pool[q],      c.Iy_pool[q],
             c.perimeters, c.Cx, c.Cy, c.Cxx, c.Cyy,
-            c.origin, c.rect, (const WorkItem*)c.d_work,
+            c.origin, c.rect, /*dst_rect=*/nullptr, /*shift_xy=*/nullptr,
+            (const WorkItem*)c.d_work, c.d_work_count,
             c.gamma_cell, c.v_A_cell, c.polar_x, c.polar_y, c.tgt_radius,
             (int)p.Nx, (int)p.Ny,
             c.S_y_lo, c.S_halo_h, c.S_ext_height,
             (float)p.lambda, (float)p.kappa, (float)p.mu,
             (float)p.xi, (float)p.dt);
     } else {
-        k_opus_step<false><<<c.workCount, blk, 0, stream>>>(
+        k_opus_step<false, false><<<c.workCount, blk, 0, stream>>>(
             c.phi_in, c.phi_out,
             c.S_pool[parity], c.S_pool[q],
             c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
             c.V_pool [q],      c.Ix_pool[q],      c.Iy_pool[q],
             nullptr, nullptr, nullptr, nullptr, nullptr,
-            c.origin, c.rect, (const WorkItem*)c.d_work,
+            c.origin, c.rect, /*dst_rect=*/nullptr, /*shift_xy=*/nullptr,
+            (const WorkItem*)c.d_work, c.d_work_count,
             c.gamma_cell, c.v_A_cell, c.polar_x, c.polar_y, c.tgt_radius,
             (int)p.Nx, (int)p.Ny,
             c.S_y_lo, c.S_halo_h, c.S_ext_height,
@@ -626,6 +553,12 @@ int build_opus_work_list_host(CellArrays& c)
     }
     OPUS_CK(cudaMemcpy((WorkItem*)c.d_work, h_work.data(), wc * sizeof(WorkItem),
                        cudaMemcpyHostToDevice));
+    // Mirror count to device so the in-kernel early-exit check on
+    // k_opus_step (blockIdx.x >= *work_count) is a no-op when grid == wc.
+    if (c.d_work_count) {
+        OPUS_CK(cudaMemcpy(c.d_work_count, &wc, sizeof(int),
+                           cudaMemcpyHostToDevice));
+    }
     c.workCount = wc;
     return wc;
 }
@@ -662,6 +595,7 @@ void launch_opus_compute_rebind_meta(CellArrays& c, const SimParams& p,
     k_opus_compute_rebind_meta<<<blocks, BS, 0, stream>>>(
         N,
         c.V_pool [parity], c.Cx, c.Cy, c.Cxx, c.Cyy,
+        c.rect,
         c.gamma_cell, c.tgt_radius,
         c.shift_xy, c.new_rect,
         (float)p.subdomain_padding, (float)p.gamma,
@@ -678,82 +612,37 @@ void launch_opus_apply_rebind_meta(CellArrays& c, cudaStream_t stream)
         N, c.origin, c.rect, c.shift_xy, c.new_rect);
 }
 
-// Build a per-cell source-frame union worklist: bounding box of
-// (old_rect U new_rect_shifted_back_to_source_frame) where
-// new_rect_shifted_back = (nrx0 + sx, nry0 + sy, nrw, nrh).
+// Device-side worklist build. Reuses the existing worklist for BOTH regular
+// and rebind steps: new_rect is clamped to a subset of old_rect by
+// compute_rebind_meta, so the source-frame worklist over old_rect fully
+// covers every destination pixel that needs writing on the rebind step.
 //
-// This is called between launch_opus_compute_rebind_meta and
-// launch_opus_step_rebind on rebind cadence. It syncs the stream
-// because it must read the just-computed shift_xy and new_rect.
-int build_opus_work_list_for_rebind(CellArrays& c)
+// Called once at fresh init AND inside each rebind cycle (after the rebind
+// step + apply_meta have updated cells.rect). Resets the device counter to
+// zero, then atomic-emits one WorkItem per (cell, sub-tile-in-rect).
+//
+// We DO NOT sync to read the count back. Subsequent k_opus_step launches
+// use c.d_work_cap (worst-case count) as the grid size; dead blocks
+// early-exit on the in-kernel rect check. This avoids a per-rebind stream
+// drain that would otherwise serialize ~3 ms of pending step work.
+//
+// Slots in c.d_work beyond the current count retain stale (cell, sx, sy)
+// triples from previous worklist builds. Those triples are themselves
+// valid old worklist entries — the kernel safely processes or skips them
+// via the rect intersection check. The atomicAdd into S only fires for
+// in-rect pixels, so no double-counting.
+void launch_opus_build_worklist(CellArrays& c, cudaStream_t stream)
 {
     const int N = c.num_cells;
-    if (N == 0) { c.workCount = 0; return 0; }
-
-    // Wait for compute_rebind_meta to finish on step_stream before reading.
-    OPUS_CK(cudaDeviceSynchronize());
-
-    std::vector<int> h_rect(4 * N);
-    std::vector<int> h_new (4 * N);
-    std::vector<int> h_shf (2 * N);
-    OPUS_CK(cudaMemcpy(h_rect.data(), c.rect,     4 * N * sizeof(int),
-                       cudaMemcpyDeviceToHost));
-    OPUS_CK(cudaMemcpy(h_new.data(),  c.new_rect, 4 * N * sizeof(int),
-                       cudaMemcpyDeviceToHost));
-    OPUS_CK(cudaMemcpy(h_shf.data(),  c.shift_xy, 2 * N * sizeof(int),
-                       cudaMemcpyDeviceToHost));
-
-    std::vector<WorkItem> h_work;
-    // Worst case is ~2x the regular worklist per cell on rebind.
-    h_work.reserve(N * 2 * OPUS_MAX_WORKITEMS_PER_CELL);
-
-    for (int n = 0; n < N; ++n) {
-        const int orx0 = h_rect[4*n + 0];
-        const int ory0 = h_rect[4*n + 1];
-        const int orw  = h_rect[4*n + 2];
-        const int orh  = h_rect[4*n + 3];
-        const int nrx0 = h_new [4*n + 0];
-        const int nry0 = h_new [4*n + 1];
-        const int nrw  = h_new [4*n + 2];
-        const int nrh  = h_new [4*n + 3];
-        const int sx   = h_shf [2*n + 0];
-        const int sy   = h_shf [2*n + 1];
-
-        // new_rect shifted back into source frame.
-        const int srx0 = nrx0 + sx;
-        const int sry0 = nry0 + sy;
-
-        // Source-frame bounding box of (old_rect U shifted_new_rect).
-        int x_lo = orx0  < srx0  ? orx0  : srx0;
-        int y_lo = ory0  < sry0  ? ory0  : sry0;
-        int x_hi = orx0 + orw  > srx0 + nrw  ? orx0 + orw  : srx0 + nrw;
-        int y_hi = ory0 + orh  > sry0 + nrh  ? ory0 + orh  : sry0 + nrh;
-
-        // Clamp to the safe halo-load region [1, TILE_T-1) on both axes —
-        // the halo at (sx-1, sy-1) and (sx+OW, sy+OH) must stay inside the
-        // tile. Anything that gets clipped here was outside both rects on
-        // that side anyway, so nothing to do at those pixels.
-        if (x_lo < 1)            x_lo = 1;
-        if (y_lo < 1)            y_lo = 1;
-        if (x_hi > TILE_T - 1)   x_hi = TILE_T - 1;
-        if (y_hi > TILE_T - 1)   y_hi = TILE_T - 1;
-        if (x_hi <= x_lo || y_hi <= y_lo) continue;
-
-        for (int wsy = y_lo; wsy < y_hi; wsy += OH)
-            for (int wsx = x_lo; wsx < x_hi; wsx += OW)
-                h_work.push_back({n, wsx, wsy});
-    }
-    const int wc = (int)h_work.size();
-    if (wc > c.d_work_cap) {
-        fprintf(stderr,
-            "[opus] rebind worklist (%d) exceeds capacity (%d). "
-            "Increase d_work_cap in alloc_gpu.\n", wc, c.d_work_cap);
-        std::exit(1);
-    }
-    OPUS_CK(cudaMemcpy((WorkItem*)c.d_work, h_work.data(),
-                       wc * sizeof(WorkItem), cudaMemcpyHostToDevice));
-    c.workCount = wc;
-    return wc;
+    if (N == 0) { c.workCount = 0; return; }
+    OPUS_CK(cudaMemsetAsync(c.d_work_count, 0, sizeof(int), stream));
+    constexpr int BS = 128;
+    int blocks = (N + BS - 1) / BS;
+    k_opus_build_worklist<<<blocks, BS, 0, stream>>>(
+        N, c.rect, (WorkItem*)c.d_work, c.d_work_count);
+    // No host-readback / sync. Subsequent step launches use d_work_cap as
+    // the grid size; the kernel early-exits per CTA on blockIdx.x >= count.
+    c.workCount = c.d_work_cap;
 }
 
 void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
@@ -771,13 +660,60 @@ void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
     OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(float), stream));
 
     dim3 blk(BX, BY);
-    k_opus_step_rebind<<<c.workCount, blk, 0, stream>>>(
+    k_opus_step<false, true><<<c.workCount, blk, 0, stream>>>(
         c.phi_in, c.phi_out,
         c.S_pool[parity], c.S_pool[q],
         c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
         c.V_pool [q],      c.Ix_pool[q],      c.Iy_pool[q],
-        c.origin, c.rect, c.shift_xy, c.new_rect,
-        (const WorkItem*)c.d_work,
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        c.origin, c.rect, c.new_rect, c.shift_xy,
+        (const WorkItem*)c.d_work, c.d_work_count,
+        c.gamma_cell, c.v_A_cell, c.polar_x, c.polar_y, c.tgt_radius,
+        (int)p.Nx, (int)p.Ny,
+        c.S_y_lo, c.S_halo_h, c.S_ext_height,
+        (float)p.lambda, (float)p.kappa, (float)p.mu,
+        (float)p.xi, (float)p.dt);
+}
+
+// Cleanup step: an extra DO_REBIND step with shift = (0, 0) and
+// src_rect == dst_rect == new_rect. Runs after the rebind step (and after
+// parity flip + apply_meta) to zero out the OTHER ping-pong phi buffer's
+// periphery — pixels that were inside the OLD rect (and got evolved into
+// the OTHER buffer ~2 parities ago) but are now outside the new rect. Without
+// this, the step after next reads stale phi at the new-rect boundary's halo.
+// S is not affected (rebuilt by scatter every step from in-rect phi only).
+void launch_opus_step_cleanup(CellArrays& c, const SimParams& p,
+                              int parity, cudaStream_t stream)
+{
+    const int N = c.num_cells;
+    if (N == 0 || c.workCount == 0) return;
+    const int q = parity ^ 1;
+    const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
+
+    OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
+    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(float), stream));
+    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(float), stream));
+    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(float), stream));
+
+    // Allocate-once zero-shift scratch (used as the shift_xy argument).
+    static int* d_zero_shift = nullptr;
+    static int  d_zero_shift_cap = 0;
+    if (d_zero_shift_cap < 2 * N) {
+        if (d_zero_shift) cudaFree(d_zero_shift);
+        OPUS_CK(cudaMalloc(&d_zero_shift, 2 * N * sizeof(int)));
+        OPUS_CK(cudaMemset(d_zero_shift, 0, 2 * N * sizeof(int)));
+        d_zero_shift_cap = 2 * N;
+    }
+
+    dim3 blk(BX, BY);
+    k_opus_step<false, true><<<c.workCount, blk, 0, stream>>>(
+        c.phi_in, c.phi_out,
+        c.S_pool[parity], c.S_pool[q],
+        c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
+        c.V_pool [q],      c.Ix_pool[q],      c.Iy_pool[q],
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        c.origin, c.rect, c.rect, d_zero_shift,   // src_rect == dst_rect == new (current) rect
+        (const WorkItem*)c.d_work, c.d_work_count,
         c.gamma_cell, c.v_A_cell, c.polar_x, c.polar_y, c.tgt_radius,
         (int)p.Nx, (int)p.Ny,
         c.S_y_lo, c.S_halo_h, c.S_ext_height,

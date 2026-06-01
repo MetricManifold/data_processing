@@ -63,60 +63,79 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
 void launch_opus_finalize_velocity(CellArrays& c, const SimParams& p,
                                    int parity, cudaStream_t stream = 0);
 
-// Build the work list from cells.rect on the host. D2H the rect, walk it,
-// upload. Returns the new work count (also written to cells.workCount).
-// Call after every rebind and at fresh init.
-int build_opus_work_list_host(CellArrays& c);
-
 // Mirror the parity-`from` halves of S/V/Ix/Iy into the parity-`from^1`
 // halves via cudaMemcpyDeviceToDevice. Called at fresh init (from=0,
-// after launch_initial_velocity has filled the parity-0 halves) and
-// after every rebind (from=current parity, after re-scatter+reduce has
-// filled the parity-current halves) so the next opus step has a
-// consistent lagged-moment set regardless of which parity is current.
+// after launch_initial_velocity has filled the parity-0 halves) so the
+// first step has a consistent lagged-moment set regardless of which
+// parity is current.
 void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
                                     int from_parity,
                                     cudaStream_t stream = 0);
 
+// Device-side worklist build. Resets the in-band atomic counter, runs a
+// 1-thread-per-cell kernel that emits one WorkItem per (cell, sub-tile-
+// in-rect), then reads the count back via a 4-byte pinned-memory D2H +
+// stream sync (so the caller knows the launch grid for subsequent step
+// kernels). Sets c.workCount.
+//
+// Reused for BOTH regular and rebind steps: new_rect is clamped to a
+// subset of old_rect by compute_rebind_meta, so the source-frame worklist
+// over old_rect fully covers every destination pixel of the new rect.
+void launch_opus_build_worklist(CellArrays& c, cudaStream_t stream = 0);
+
+// Host-built worklist alternative. Syncs the stream, reads c.rect D2H,
+// emits one WorkItem per (cell, sub-tile-in-rect), H2D copies the array,
+// sets c.workCount = actual count, and mirrors the count into
+// c.d_work_count (so the in-kernel early-exit on k_opus_step is a no-op
+// when the launch grid equals workCount). Used in the cell_sim integration
+// because rect counts vary widely per step and launching the worst-case
+// grid leaves most blocks idle (~30% perf regression at N=1152).
+int build_opus_work_list_host(CellArrays& c);
+
 // ---------------------------------------------------------------------------
-// Fused rebind path. Replaces the separate launch_rebind kernel + the
-// scatter_S+reduce+mirror reseed. Sequence per rebind:
+// Fused rebind path. Replaces the separate launch_rebind kernel and the
+// scatter_S+reduce+mirror reseed. Sequence per rebind cycle:
 //
 //   1. launch_opus_compute_rebind_meta(c, p, parity, stream)
 //      Per cell, reads V/Cx/Cy/Cxx/Cyy from the parity-current half (which
 //      were freshly produced by the previous DO_EXT step), computes the
 //      integer shift (sx, sy) so COM lands at (T/2, T/2), and the new rect
-//      from second-moment width. Writes c.shift_xy and c.new_rect.
+//      from second-moment width. Clamps new_rect to a SUBSET of old_rect
+//      so the source-frame worklist remains valid. Writes c.shift_xy and
+//      c.new_rect.
 //
-//   2. build_opus_work_list_for_rebind(c)  (host helper; syncs the stream)
-//      D2H c.rect, c.shift_xy, c.new_rect. Builds the source-frame union
-//      bounding box per cell (= bbox of old_rect U new_rect_shifted_to_src)
-//      and enumerates 32x32 sub-tiles covering it. Uploads to c.d_work.
-//      Returns new workCount.
+//   2. launch_opus_step_rebind(c, p, parity, stream)
+//      k_opus_step<DO_EXT=false, DO_REBIND=true>. Work-item (sx, sy) is
+//      destination-frame; source = dest + shift. Reads phi[parity] at
+//      source, writes phi[parity^1] at destination; periphery destinations
+//      get 0. S[parity^1] scatter is at the SOURCE-frame global address
+//      (which equals destination-frame global address with the post-rebind
+//      origin), so S ends up exactly correct post-rebind.
 //
-//   3. launch_opus_step_rebind(c, p, parity, stream)
-//      Same as launch_opus_step but with DO_REBIND=true. Reads phi[parity],
-//      writes phi[parity^1] at SHIFTED destination addresses (lx-sx, ly-sy).
-//      Scatters phi_new^2 into S[parity^1] at the SAME global address as
-//      the unshifted scatter would (because rebind preserves global pixel
-//      positions), so S[parity^1] is exactly correct post-rebind.
-//      Writes 0 at destinations outside new_rect (periphery cleanup).
-//      Accumulates fresh moments of phi_in into V/Ix/Iy_pool[parity^1].
+//   3. flip parity (caller).
 //
-//   4. flip parity (caller).
-//
-//   5. launch_opus_apply_rebind_meta(c, stream)
+//   4. launch_opus_apply_rebind_meta(c, stream)
 //      Per cell, applies origin += shift_xy and rect = new_rect.
 //
-//   6. build_opus_work_list_host(c)  (rebuild regular worklist from new rect)
+//   5. launch_opus_step_cleanup(c, p, parity, stream)
+//      Required: an additional DO_REBIND step with shift=0 and
+//      src_rect == dst_rect == new_rect. Clears stale order-1 phi from the
+//      OTHER ping-pong buffer's old\new periphery (those pixels were
+//      evolved into the other buffer two parities ago and would otherwise
+//      be read as stale halo on the step-after-next). Caller flips parity
+//      after this returns.
+//
+//   6. launch_opus_build_worklist(c, stream)
+//      Rebuild the (now-tightened) worklist for the upcoming regular steps.
 // ---------------------------------------------------------------------------
 
 void launch_opus_compute_rebind_meta(CellArrays& c, const SimParams& p,
                                      int parity, cudaStream_t stream = 0);
 
-int  build_opus_work_list_for_rebind(CellArrays& c);
-
 void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
                              int parity, cudaStream_t stream = 0);
 
 void launch_opus_apply_rebind_meta(CellArrays& c, cudaStream_t stream = 0);
+
+void launch_opus_step_cleanup(CellArrays& c, const SimParams& p,
+                              int parity, cudaStream_t stream = 0);

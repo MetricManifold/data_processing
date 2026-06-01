@@ -180,6 +180,7 @@ struct Simulation {
     // one helper now keeps the cadence rules in a single place.
     struct StepFlags {
         bool will_rebind;
+        bool will_cleanup;   // opus only: step immediately after a rebind
         bool will_traj;
         bool will_save;
         bool will_ckpt;

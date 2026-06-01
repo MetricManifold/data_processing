@@ -348,12 +348,15 @@ void Simulation::alloc_gpu() {
     CK(cudaMemset(cells.Iy_pool[1], 0, cap * sizeof(float)));
 
     // Worst-case work list: every cell with a near-full rect (TILE_T-2).
-    // OPUS_MAX_WORKITEMS_PER_CELL is sized for that bound. The fused-rebind
-    // path can emit up to ~2x as many items per cell (covering the union of
-    // old and shifted-new rects), so we allocate 2x the regular worst case.
-    const int work_cap = 2 * OPUS_MAX_WORKITEMS_PER_CELL * cap;
+    // OPUS_MAX_WORKITEMS_PER_CELL is sized for that bound. The rebind step
+    // reuses the same worklist (new_rect is clamped to a subset of old_rect
+    // so the source-frame worklist over old_rect fully covers it), so no
+    // extra capacity is needed for rebind.
+    const int work_cap = OPUS_MAX_WORKITEMS_PER_CELL * cap;
     CK(cudaMalloc(&cells.d_work, (size_t)work_cap * sizeof(WorkItem)));
     cells.d_work_cap = work_cap;
+    CK(cudaMalloc(&cells.d_work_count, sizeof(int)));
+    CK(cudaMemset(cells.d_work_count, 0, sizeof(int)));
     cells.workCount  = 0;
 
     // Fused-rebind scratch (per-cell shift and new rect).
@@ -1693,7 +1696,8 @@ bool Simulation::load_scripted_events(const std::string& path) {
 // ---------------------------------------------------------------------------
 Simulation::StepFlags Simulation::compute_step_flags(int next_step) const {
     StepFlags f{};
-    f.will_rebind = (next_step % REBIND_EVERY) == 0;
+    f.will_rebind  = (next_step % REBIND_EVERY) == 0;
+    f.will_cleanup = ((next_step - 1) % REBIND_EVERY) == 0 && next_step > 1;
     f.will_traj   = (traj_fp && traj_every > 0 && next_step % traj_every == 0);
     f.will_save   = (params.save_interval > 0 && next_step % params.save_interval == 0);
     f.will_ckpt   = (checkpoint_interval  > 0 && next_step % checkpoint_interval == 0);
@@ -1702,6 +1706,7 @@ Simulation::StepFlags Simulation::compute_step_flags(int next_step) const {
     // Legacy needs moments of the step's INPUT phi during the rebind step
     // itself, because launch_rebind reads them after the evolve.
     f.need_full_red = f.will_rebind || f.will_traj || f.will_save || f.will_ckpt || f.will_vtk;
+    f.will_cleanup = false;  // legacy has no cleanup step
 #else
     // Opus fused-rebind: the rebind step consumes moments produced by the
     // PREVIOUS step's opus_step<DO_EXT=true>. So fire need_full one step
@@ -1732,7 +1737,7 @@ void Simulation::apply_scripted_events_for_step() {
 void Simulation::step() {
     int next_step = step_count + 1;
     const StepFlags f = compute_step_flags(next_step);
-    const bool fast_path = !scripted_active && !f.will_rebind && !f.need_full_red
+    const bool fast_path = !scripted_active && !f.will_rebind && !f.will_cleanup && !f.need_full_red
                            && (params.v_A != 0.0) && (params.tau > 0.0);
 
     // Keep cells.phi_in / phi_out in sync with parity, so any direct kernel
@@ -1761,12 +1766,30 @@ void Simulation::step() {
         // pass; advances time by exactly one dt. Consumes V/Cx/Cy/Cxx/Cyy
         // from the PREVIOUS step's opus_step<DO_EXT=true>: need_full_red is
         // set one step earlier than will_rebind (see compute_step_flags).
+        //
+        // The rebind step is followed by a CLEANUP step (next step()
+        // invocation, gated by f.will_cleanup) that zeros stale order-1
+        // phi in the other ping-pong buffer's periphery. See opus's note:
+        // without it the step-after-next reads stale halo at the new-rect
+        // boundary.
+        //
+        // Worklist is reused across regular AND rebind steps: new_rect is
+        // clamped to a subset of old_rect by compute_rebind_meta, so the
+        // source-frame worklist over old_rect fully covers every
+        // destination pixel of the new rect.
         launch_opus_compute_rebind_meta(cells, params, parity, step_stream);
-        build_opus_work_list_for_rebind(cells);
         launch_opus_step_rebind(cells, params, parity, step_stream);
         launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
         flip_parity();
         launch_opus_apply_rebind_meta(cells, step_stream);
+    } else if (kOpus && f.will_cleanup) {
+        // Cleanup step: an extra DO_REBIND step with shift=0 and
+        // src_rect == dst_rect == new_rect. Zeros stale periphery in the
+        // other ping-pong buffer. After the cleanup, rebuild the worklist
+        // from the (now-tightened) rect for the upcoming regular steps.
+        launch_opus_step_cleanup(cells, params, parity, step_stream);
+        launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
+        flip_parity();
         build_opus_work_list_host(cells);
     } else
 #endif
@@ -2640,6 +2663,7 @@ void Simulation::cleanup() {
     cf(cells.Iy_pool[0]); cf(cells.Iy_pool[1]);
     cells.volumes = cells.Ix = cells.Iy = nullptr;
     if (cells.d_work) { cudaFree(cells.d_work); cells.d_work = nullptr; }
+    if (cells.d_work_count) { cudaFree(cells.d_work_count); cells.d_work_count = nullptr; }
     cells.d_work_cap = 0; cells.workCount = 0;
     cf(cells.shift_xy);
     cf(cells.new_rect);

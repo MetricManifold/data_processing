@@ -306,6 +306,7 @@ struct CellArrays {
     // cell with a full TILE_T-2 rect); workCount is the active size used
     // as the launch grid. d_work_cap counts WorkItems (not bytes).
     void* d_work       = nullptr;  // really WorkItem*; void* to keep this header light
+    int*  d_work_count = nullptr;  // device-side count of valid worklist entries
     int   d_work_cap   = 0;
     int   workCount    = 0;
 
