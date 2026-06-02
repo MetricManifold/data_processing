@@ -2122,9 +2122,9 @@ void Simulation::run() {
 void Simulation::print_status() {
     if (step_stream) CK(cudaStreamSynchronize(step_stream));
     int n = cells.num_cells;
-    std::vector<float> vols(n);
-    CK(cudaMemcpy(vols.data(), cells.volumes, n * sizeof(float), cudaMemcpyDeviceToHost));
-    double avg = 0; for (float v : vols) avg += v; avg /= n;
+    std::vector<double> vols(n);
+    CK(cudaMemcpy(vols.data(), cells.volumes, n * sizeof(double), cudaMemcpyDeviceToHost));
+    double avg = 0; for (double v : vols) avg += v; avg /= n;
     double tgt = params.target_area();
     // Free NaN tripwire: avg already computed; if it's not finite,
     // physics has gone off the rails (typical cause: a kernel produced
@@ -2470,12 +2470,12 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
     int n = cells.num_cells;
 
     std::vector<int>   h_or(2 * n);
-    std::vector<float> V(n), Cx(n), Cy(n);
+    std::vector<double> V(n), Cx(n), Cy(n);
     std::vector<float> vx(n), vy(n);
     CK(cudaMemcpy(h_or.data(), cells.origin,       2*n*sizeof(int),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(V.data(),    cells.volumes,      n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(Cx.data(),   cells.Cx,           n*sizeof(float),    cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(Cy.data(),   cells.Cy,           n*sizeof(float),    cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(V.data(),    cells.volumes,      n*sizeof(double),   cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(Cx.data(),   cells.Cx,           n*sizeof(double),   cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(Cy.data(),   cells.Cy,           n*sizeof(double),   cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(vx.data(),   cells.velocities_x, n*sizeof(float),    cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(vy.data(),   cells.velocities_y, n*sizeof(float),    cudaMemcpyDeviceToHost));
 
@@ -2564,10 +2564,10 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
 
     std::vector<float> tile(TILE_AREA);
     for (int i = 0; i < n; i++) {
-        double invV = (V[i] > 1e-6f) ? 1.0 / V[i] : 0.0;
+        double invV = (V[i] > 1e-6) ? 1.0 / V[i] : 0.0;
         float cx = (float)wrap_d(h_or[2*i + 0] + Cx[i] * invV, Nx);
         float cy = (float)wrap_d(h_or[2*i + 1] + Cy[i] * invV, Ny);
-        float vol = V[i] * (float)params.dA();
+        float vol = (float)(V[i] * params.dA());
 
         ckpt::CellRecordHeader rec{};
         rec.cell_id  = (gpus > 1 && (int)h_global_id.size() > i) ? h_global_id[i] : i;
@@ -2581,9 +2581,7 @@ void Simulation::save_checkpoint(const std::string& dir, const std::string& tag)
         if (!ckpt_write_exact(f, &rec, sizeof(rec), 1, "cell record")) {
             abort_checkpoint_write(); return;
         }
-
-        CK(cudaMemcpy(tile.data(),
-                      cells.phi_in + (size_t)i * TILE_AREA,
+        CK(cudaMemcpy(tile.data(), cells.phi_in + (size_t)i * TILE_AREA,
                       TILE_AREA * sizeof(float), cudaMemcpyDeviceToHost));
         if (!ckpt_write_exact(f, tile.data(), sizeof(float), TILE_AREA, "phi tile")) {
             abort_checkpoint_write(); return;
