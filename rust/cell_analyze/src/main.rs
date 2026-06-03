@@ -69,6 +69,12 @@ enum Commands {
         /// Label each cell with its ID at the centroid position
         #[arg(long)]
         label_cells: bool,
+        /// Label each cell with its aspect ratio (sqrt(λ_max/λ_min) of
+        /// the inertia tensor of phi^2). Computed directly from the
+        /// per-cell tile so periodic-wrap segmentation artifacts don't
+        /// affect it. Drawn at the cell's true centroid.
+        #[arg(long)]
+        label_ar: bool,
         /// Movie mode: render all VTK frames in directory, then assemble with ffmpeg
         #[arg(long)]
         movie: bool,
@@ -195,7 +201,7 @@ fn main() -> Result<()> {
             }
             analysis::studies::run_study(&config, &data_dir, skip_validation)?;
         }
-        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata, skip_validation } => {
+        Commands::Snapshot { input, output, width: _, label_cells, label_ar, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata, skip_validation } => {
             // Validation pre-pass: if the input is a checkpoint inside a
             // run directory, validate that directory first. We don't try
             // to validate VTK paths or movie directories — those have a
@@ -434,6 +440,74 @@ fn main() -> Result<()> {
                         eprintln!("  Loaded {} cell centroids from checkpoint ({} soft)", centroids.len(), n_soft);
                     }
 
+                    if label_ar {
+                        // Compute per-cell aspect ratio from the inertia tensor of phi^2
+                        // over the cell's tile. Centroid is computed in the same pass so
+                        // the label lands on the true center-of-mass of the cell.
+                        // Pixels with phi < 0.05 contribute negligibly; we sum unweighted
+                        // by phi^2 which is the standard "mass" distribution.
+                        let nx_i = ckpt.params.nx as i32;
+                        let ny_i = ckpt.params.ny as i32;
+                        for cell in ckpt.cells.iter() {
+                            let w = cell.phi_w as usize;
+                            let h = cell.phi_h as usize;
+                            let ox = cell.bbox.x0 as f64;
+                            let oy = cell.bbox.y0 as f64;
+                            let mut m0 = 0.0_f64;
+                            let mut mx = 0.0_f64;
+                            let mut my = 0.0_f64;
+                            for j in 0..h {
+                                for i in 0..w {
+                                    let p = cell.phi[j * w + i] as f64;
+                                    if p < 0.05 { continue; }
+                                    let w2 = p * p;
+                                    m0 += w2;
+                                    mx += w2 * (i as f64);
+                                    my += w2 * (j as f64);
+                                }
+                            }
+                            if m0 <= 0.0 { continue; }
+                            let cx_local = mx / m0;
+                            let cy_local = my / m0;
+                            let mut sxx = 0.0_f64;
+                            let mut syy = 0.0_f64;
+                            let mut sxy = 0.0_f64;
+                            for j in 0..h {
+                                let dy = j as f64 - cy_local;
+                                for i in 0..w {
+                                    let p = cell.phi[j * w + i] as f64;
+                                    if p < 0.05 { continue; }
+                                    let w2 = p * p;
+                                    let dx = i as f64 - cx_local;
+                                    sxx += w2 * dx * dx;
+                                    syy += w2 * dy * dy;
+                                    sxy += w2 * dx * dy;
+                                }
+                            }
+                            sxx /= m0; syy /= m0; sxy /= m0;
+                            // Eigenvalues of 2x2 symmetric matrix [[sxx,sxy],[sxy,syy]]
+                            let tr = sxx + syy;
+                            let det = sxx * syy - sxy * sxy;
+                            let disc = (tr * tr / 4.0 - det).max(0.0).sqrt();
+                            let l_max = tr / 2.0 + disc;
+                            let l_min = (tr / 2.0 - disc).max(1e-30);
+                            let ar = (l_max / l_min).sqrt();
+                            // Global centroid (wrap to domain).
+                            let mut gx = ox + cx_local;
+                            let mut gy = oy + cy_local;
+                            gx = gx.rem_euclid(nx_i as f64);
+                            gy = gy.rem_euclid(ny_i as f64);
+                            let id = cell.id as u32;
+                            // Push centroid if not already present (label_cells may
+                            // have populated it already).
+                            if !centroids.iter().any(|c| c.0 == id) {
+                                centroids.push((id, gx as f64, gy as f64, false));
+                            }
+                            gamma_labels.insert(id, format!("AR{:.2}", ar));
+                        }
+                        eprintln!("  Computed AR for {} cells", centroids.len());
+                    }
+
                     (phi, nx, ny, title)
                 };
 
@@ -465,7 +539,7 @@ fn main() -> Result<()> {
                 let polarity_data = overlays.as_ref().map(|(p, _)| p.as_slice()).unwrap_or(&[]);
                 let energy_data = overlays.as_ref().map(|(_, e)| e.as_slice()).unwrap_or(&[]);
 
-                let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells, &centroids,
+                let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells || label_ar, &centroids,
                     polarity_data, energy_data, &gamma_labels);
 
                 // Build metadata banner for checkpoint snapshots
