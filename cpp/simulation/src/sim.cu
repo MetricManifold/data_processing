@@ -1863,13 +1863,31 @@ void Simulation::step_pre_reduce() {
     } else {
         launch_polar(cells, params, cur_time, step_stream);
     }
+#ifdef CELL_SIM_LEGACY_STEP
     launch_scatter_S(cells, params, step_stream);
+#else
+    // Opus path: fuse scatter + evolve into the single-pass step kernel.
+    // The kernel reads phi/S at `parity` (current) and writes phi_out +
+    // scatters S into S_pool[parity^1]. Halo exchange after this targets
+    // S_pool[parity^1] (see mg_S_target_ptr).
+    const int next_step = step_count + 1;
+    const StepFlags f = compute_step_flags(next_step);
+    if (f.will_rebind) {
+        launch_opus_compute_rebind_meta(cells, params, parity, step_stream);
+        launch_opus_step_rebind(cells, params, parity, step_stream);
+    } else if (f.will_cleanup) {
+        launch_opus_step_cleanup(cells, params, parity, step_stream);
+    } else {
+        launch_opus_step(cells, params, parity, f.need_full_red, step_stream);
+    }
+#endif
 }
 
 void Simulation::step_post_reduce() {
     int next_step = step_count + 1;
     const StepFlags f = compute_step_flags(next_step);
 
+#ifdef CELL_SIM_LEGACY_STEP
     launch_evolve(cells, params, f.need_full_red, step_stream);
     flip_parity();
 
@@ -1879,6 +1897,23 @@ void Simulation::step_post_reduce() {
                       (float)params.gamma, step_stream);
         flip_parity();
     }
+#else
+    // Opus path: pre_reduce already launched the step kernel that wrote
+    // V/Ix/Iy into V_pool[parity^1] etc. Finalize velocity in that half,
+    // then flip parity to make it current.
+    launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
+    flip_parity();
+    if (f.will_rebind) {
+        // Apply the rebind meta (origin/rect updates). Worklist is reused
+        // across rebind since new_rect is clamped to a subset of old_rect.
+        launch_opus_apply_rebind_meta(cells, step_stream);
+    } else if (f.will_cleanup) {
+        // After cleanup the rect is settled; rebuild the worklist for the
+        // upcoming regular steps. Host build syncs the stream; acceptable
+        // because cleanup steps are off the fast path.
+        build_opus_work_list_host(cells);
+    }
+#endif
 
 #ifndef NDEBUG
     cudaError_t err = cudaPeekAtLastError();
@@ -1947,10 +1982,30 @@ void Simulation::launch_halo_exchange(MgWorld& world, int my_rank,
     }
 }
 
+// Helper that returns the S buffer the just-issued scatter wrote into.
+// Legacy: cells.S is the single scatter target (single-buffered).
+// Opus: S_pool[parity ^ 1] — the kernel reads parity, writes parity^1.
+// Parity flip and graph-cache keying handle correctness across steps.
+float* Simulation::mg_S_after_scatter_ptr() const {
+#ifdef CELL_SIM_LEGACY_STEP
+    return cells.S;
+#else
+    if (cells.S_pool[0]) {
+        return cells.S_pool[parity ^ 1];
+    }
+    return cells.S;
+#endif
+}
+
 bool Simulation::mg_step_is_fast_path() const {
     if (scripted_active) return false;
     int next_step = step_count + 1;
     if ((next_step % REBIND_EVERY) == 0) return false;
+#ifndef CELL_SIM_LEGACY_STEP
+    // Opus path: the step immediately following a rebind is the cleanup
+    // step (slow path because it rebuilds the host worklist).
+    if (((next_step - 1) % REBIND_EVERY) == 0 && next_step > 1) return false;
+#endif
     if (traj_fp && traj_every > 0 && (next_step % traj_every) == 0) return false;
     if (params.save_interval > 0 && (next_step % params.save_interval) == 0) return false;
     if (checkpoint_interval  > 0 && (next_step % checkpoint_interval)  == 0) return false;
@@ -1978,6 +2033,7 @@ void Simulation::launch_mg_fast_step_kernels(MgWorld& world, int my_rank,
     // (sync_pool_to_parity has already been called by the caller before
     // we get here — graph capture freezes the pointers seen at this point).
     launch_polar(cells, params, cur_time, step_stream);
+#ifdef CELL_SIM_LEGACY_STEP
     launch_scatter_S(cells, params, step_stream);
     if (gpus > 1) {
         launch_halo_exchange(world, my_rank, prev_rank, next_rank,
@@ -1986,6 +2042,20 @@ void Simulation::launch_mg_fast_step_kernels(MgWorld& world, int my_rank,
                              halo_band_floats);
     }
     launch_evolve(cells, params, /*need_full_reduce=*/false, step_stream);
+#else
+    // Opus fast path: single fused step, then halo exchange the freshly-
+    // scattered S (in S_pool[parity^1]), then finalize velocity. Parity
+    // flip happens on the host after the captured region returns.
+    launch_opus_step(cells, params, parity, /*need_full_red=*/false,
+                     step_stream);
+    if (gpus > 1) {
+        launch_halo_exchange(world, my_rank, prev_rank, next_rank,
+                             my_top_band, my_bot_band,
+                             halo_top_recv, halo_bot_recv,
+                             halo_band_floats);
+    }
+    launch_opus_finalize_velocity(cells, params, parity ^ 1, step_stream);
+#endif
     // NOTE: flip_parity is done by the caller, *outside* the captured
     // region. That keeps host-side parity state consistent across graph
     // launches and avoids re-capturing the graph on every parity flip
@@ -3182,9 +3252,16 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
             const int next_rank = (g + 1) % args.gpus;
             const int slab_h    = sims[g]->cells.S_ext_height
                                   - 2 * sims[g]->cells.S_halo_h;
-            float* const S          = sims[g]->cells.S;
-            float* const my_top_band = S;                                  // rows [0, 2H)
-            float* const my_bot_band = S + (size_t)slab_h * s0.params.Nx;  // rows [slab_h, slab_h + 2H)
+            // Opus path scatters into S_pool[parity^1] which changes each
+            // step; recompute bands per step. Legacy path uses cells.S
+            // (single-buffered). mg_S_after_scatter_ptr() returns the
+            // current scatter target.
+            auto compute_bands = [&](Simulation& sim,
+                                     float** out_top, float** out_bot) {
+                float* S = sim.mg_S_after_scatter_ptr();
+                *out_top = S;
+                *out_bot = S + (size_t)slab_h * s0.params.Nx;
+            };
 
             while (true) {
                 start_barrier.wait();
@@ -3219,6 +3296,12 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                     int p = sim.parity;
                     sim.sync_pool_to_parity();
                     if (!sim.mg_step_graph_built[p]) {
+                        // Bands depend on the post-scatter target buffer,
+                        // which (for opus) is parity-dependent. Capture
+                        // them at graph-build time; per-parity graph cache
+                        // keys keep both halves correctly wired.
+                        float *my_top_band, *my_bot_band;
+                        compute_bands(sim, &my_top_band, &my_bot_band);
                         cudaGraph_t graph = nullptr;
                         CK(cudaStreamBeginCapture(
                             sim.step_stream,
@@ -3242,6 +3325,9 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                     // ---- Slow path: direct launches (rebind / output / scripted) ----
                     sim.step_pre_reduce();
                     if (args.gpus > 1) {
+                        // Bands point at whatever scatter just wrote into.
+                        float *my_top_band, *my_bot_band;
+                        compute_bands(sim, &my_top_band, &my_bot_band);
                         sim.launch_halo_exchange(
                             world, g, prev_rank, next_rank,
                             my_top_band, my_bot_band,
@@ -3264,6 +3350,21 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                     // pointers and per-cell counts. Drop the cached graph
                     // so the next fast step rebuilds with fresh state.
                     sim.invalidate_mg_step_graph();
+#ifndef CELL_SIM_LEGACY_STEP
+                    // Opus path: stays were compacted and arrivals were
+                    // appended, but V/Ix/Iy were not migrated alongside
+                    // (their pool indices no longer match the new cell
+                    // layout). Reset lagged moments to (V=π·R², Ix=Iy=0)
+                    // for all cells \u2014 the next step (cleanup) will write
+                    // fresh values for everyone, so this only affects ONE
+                    // step's volume-correction + advection terms.
+                    // Rebuild the worklist for the new cell layout.
+                    if (sim.cells.V_pool[0]) {
+                        launch_opus_init_lagged_moments(
+                            sim.cells, sim.params, sim.parity, sim.step_stream);
+                    }
+                    build_opus_work_list_host(sim.cells);
+#endif
 
                     // Cell-loss audit (off by default; env-guarded). When
                     // CELL_SIM_AUDIT_CELLS=1 we sum num_cells across ranks

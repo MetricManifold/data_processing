@@ -587,6 +587,36 @@ void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
                             cudaMemcpyDeviceToDevice, stream));
 }
 
+namespace {
+__global__ void k_opus_init_lagged_moments(
+    int N,
+    const float* __restrict__ tgt_radius,
+    double* __restrict__ V_out,
+    double* __restrict__ Ix_out,
+    double* __restrict__ Iy_out)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const float R = tgt_radius[n];
+    V_out[n]  = (double)(M_PI * R * R);
+    Ix_out[n] = 0.0;
+    Iy_out[n] = 0.0;
+}
+}  // namespace
+
+void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& /*p*/,
+                                     int parity, cudaStream_t stream)
+{
+    const int N = c.num_cells;
+    if (N == 0) return;
+    const int q = parity & 1;
+    constexpr int BS = 128;
+    int blocks = (N + BS - 1) / BS;
+    k_opus_init_lagged_moments<<<blocks, BS, 0, stream>>>(
+        N, c.tgt_radius,
+        c.V_pool[q], c.Ix_pool[q], c.Iy_pool[q]);
+}
+
 // ---------------------------------------------------------------------------
 // Fused-rebind launchers
 // ---------------------------------------------------------------------------

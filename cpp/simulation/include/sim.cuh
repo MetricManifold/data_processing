@@ -303,6 +303,14 @@ struct Simulation {
                               float* halo_top_recv, float* halo_bot_recv,
                               size_t halo_band_floats);
 
+    // Returns the S buffer that the just-launched scatter wrote into,
+    // i.e. the buffer the halo exchange needs to operate on. For the
+    // legacy path this is cells.S (single buffer). For the opus path
+    // it is S_pool[parity ^ 1] (the "next" half; scatter targets it
+    // before the parity flip). Returned pointer is parity-current at
+    // call time and is correct to capture into a parity-keyed graph.
+    float* mg_S_after_scatter_ptr() const;
+
     // Returns true if the next step is eligible for the multi-GPU graph
     // fast path (no rebind, no full reduce, no scripted events). The
     // orchestrator decides which path to take before issuing the step.

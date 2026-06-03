@@ -92,6 +92,18 @@ void launch_opus_build_worklist(CellArrays& c, cudaStream_t stream = 0);
 // grid leaves most blocks idle (~30% perf regression at N=1152).
 int build_opus_work_list_host(CellArrays& c);
 
+// Post-migration lagged-moment reset. After multi-GPU cell migration,
+// the per-cell V/Ix/Iy slots are mis-aligned with the new cell layout
+// (stays are at compacted indices, arrivals carry no moments from their
+// old rank). This sets V_pool[parity][n] = π·R(n)² (the target volume)
+// and Ix_pool[parity][n] = Iy_pool[parity][n] = 0 for all n in
+// [0, num_cells). Effect on next step: volume-correction term is zero
+// (V - V_target = 0) and motility advection vanishes (Ix=Iy=0), so the
+// cell moves only via its active-polarity force for one step. Full
+// moments are re-computed by the next step's reduction.
+void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& p,
+                                     int parity, cudaStream_t stream = 0);
+
 // ---------------------------------------------------------------------------
 // Fused rebind path. Replaces the separate launch_rebind kernel and the
 // scatter_S+reduce+mirror reseed. Sequence per rebind cycle:
