@@ -658,8 +658,14 @@ __global__ void k_rebind(
         double invV = (Vn > 1e-6) ? 1.0 / Vn : 0.0;
         double mxd  = Cx[n] * invV;
         double myd  = Cy[n] * invV;
-        int sx = __double2int_rn(mxd) - Th;
-        int sy = __double2int_rn(myd) - Th;
+        // Hysteretic re-centering: only shift if COM has drifted >= 1 px
+        // from the tile center. Sub-pixel drift (< 1 px) leaves the cell
+        // put. Without this dead-zone every rebind cycle shifts by up to
+        // 0.5 px, baking ULP noise into the phi field over long runs.
+        double dx = mxd - (double)Th;
+        double dy = myd - (double)Th;
+        int sx = (fabs(dx) >= 1.0) ? (int)__double2int_rn(dx) : 0;
+        int sy = (fabs(dy) >= 1.0) ? (int)__double2int_rn(dy) : 0;
         sshift[0] = sx;
         sshift[1] = sy;
         origin[2*n + 0] += sx;

@@ -343,8 +343,16 @@ __global__ void k_opus_compute_rebind_meta(
     double invV = (Vn > 1e-6) ? 1.0 / Vn : 0.0;
     double mxd  = Cx[n] * invV;
     double myd  = Cy[n] * invV;
-    int   sx   = __double2int_rn(mxd) - Th;
-    int   sy   = __double2int_rn(myd) - Th;
+    // Hysteretic re-centering: only shift if COM has drifted past 1 pixel
+    // from the tile center. Sub-pixel drift (<1 px) leaves the cell put.
+    // Without this dead-zone every rebind cycle shifts the cell by up to
+    // 0.5 px in a randomly-flipped direction, baking ULP noise into the
+    // phi field and producing visible "jitter" in long runs. With it,
+    // most cells stay shift=(0,0) (kernel takes the fast no-shift path).
+    double dx = mxd - (double)Th;
+    double dy = myd - (double)Th;
+    int   sx = (fabs(dx) >= 1.0) ? (int)__double2int_rn(dx) : 0;
+    int   sy = (fabs(dy) >= 1.0) ? (int)__double2int_rn(dy) : 0;
     shift_xy[2*n + 0] = sx;
     shift_xy[2*n + 1] = sy;
 
