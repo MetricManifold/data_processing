@@ -134,7 +134,17 @@ __global__ void k_opus_step(
 
     // 34x34 halo load from SOURCE frame (dst + shift - 1).
     // Non-rebind: shift=0 so this is just (sx-1..sx+OW, sy-1..sy+OH) inside [0, TILE_T).
-    // Rebind: same bounds shifted; we guard against OOB defensively.
+    // Rebind: same bounds shifted.
+    //
+    // The load is ALWAYS bounds-guarded against the tile. The worklist tiles
+    // the rect with stride OW/OH, so the final sub-tile's halo can reach up to
+    // 2 px past TILE_T (e.g. rect rh=318, stride 32 -> last sy=289, halo row
+    // 321 > 319). Those over-extended rows/cols are never consumed by the
+    // compute loop (it skips slx>=rxe / sly>=rye), so reading them as 0 is
+    // exact. Crucially, the unguarded read walked past this tile into the next
+    // cell's tile for interior cells (harmless 0) but past the whole phi_pool
+    // allocation for the LAST cell -> illegal access on H100 (sm_90), silently
+    // tolerated on sm_89 where the driver rounds the allocation up to a page.
     const int hx0 = dst_sx + shf_x - 1;
     const int hy0 = dst_sy + shf_y - 1;
     #pragma unroll
@@ -143,11 +153,7 @@ __global__ void k_opus_step(
         int xi  = hx0 + lxi;
         int yi  = hy0 + lyi;
         float v = 0.0f;
-        if constexpr (DO_REBIND) {
-            if ((unsigned)xi < (unsigned)TILE_T && (unsigned)yi < (unsigned)TILE_T) {
-                v = ph[(size_t)yi * TILE_T + xi];
-            }
-        } else {
+        if ((unsigned)xi < (unsigned)TILE_T && (unsigned)yi < (unsigned)TILE_T) {
             v = ph[(size_t)yi * TILE_T + xi];
         }
         sm[lyi][lxi] = v;
