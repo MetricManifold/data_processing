@@ -832,10 +832,17 @@ void Simulation::finalize_init() {
     // point there). Mirror to parity-1 so whichever parity is current
     // on the first step has a consistent lagged-moment set. Build the
     // initial work list from the current rect.
-    if (gpus <= 1) {
-        launch_opus_seed_parity_mirror(cells, params, /*from_parity=*/0, 0);
-        build_opus_work_list_host(cells);
-    }
+    //
+    // This runs for BOTH single- and multi-GPU. The MG orchestrator only
+    // (re)builds the worklist AFTER a migration (step REBIND_EVERY); without
+    // this init build, workCount stays 0 so launch_opus_step early-returns
+    // for steps 1..REBIND_EVERY-1 (no evolve, no moment reduction) and the
+    // first rebind then divides by an unseeded V_pool -> a bogus ~-T/2 px
+    // recenter shift -> corrupted origin -> S scatter walks out of the slab
+    // window (illegal access on the device). Per-rank-local buffers
+    // (S_ext_height, N) make both helpers correct under slab decomposition.
+    launch_opus_seed_parity_mirror(cells, params, /*from_parity=*/0, 0);
+    build_opus_work_list_host(cells);
 #endif
     setup_step_stream();
     CK(cudaDeviceSynchronize());
