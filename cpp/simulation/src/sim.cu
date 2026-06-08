@@ -3289,16 +3289,26 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 // graph is invalidated after migration since pointers
                 // and per-cell counts may have shifted.
                 Simulation& sim = *sims[g];
-                // Env-guarded graph-capture disable. Useful when a kernel
-                // change interacts poorly with capture (see Win A / fused
-                // halo_add investigation).
-                static const bool no_mg_graph = []() {
-                    const char* e = std::getenv("CELL_SIM_NO_MG_GRAPH");
+                // CUDA-graph capture of the multi-GPU fast path is DISABLED
+                // by default. The fast path issues NCCL point-to-point halo
+                // exchanges (launch_halo_exchange), and NCCL collectives
+                // captured into a replayed CUDA graph do not reliably
+                // re-establish their channels on replay — the result is an
+                // illegal access / hang a few rebind cycles in. The
+                // direct-launch path below is correctness-validated (clean
+                // multi-rebind-cycle runs under --gpus 2). Graph capture
+                // saves only ~3-5 us/step of launch overhead, which is
+                // negligible at the large N where multi-GPU is used, so the
+                // default trades it for correctness. Set CELL_SIM_MG_GRAPH=1
+                // to opt back into capture for experimentation (e.g. once a
+                // graph-safe NCCL exchange is wired up).
+                static const bool mg_graph = []() {
+                    const char* e = std::getenv("CELL_SIM_MG_GRAPH");
                     return e && e[0] == '1';
                 }();
-                const bool fast = (args.gpus > 1)
-                                  && sim.mg_step_is_fast_path()
-                                  && !no_mg_graph;
+                const bool fast = mg_graph
+                                  && (args.gpus > 1)
+                                  && sim.mg_step_is_fast_path();
                 if (fast) {
                     int p = sim.parity;
                     sim.sync_pool_to_parity();
