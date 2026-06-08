@@ -1951,23 +1951,41 @@ void Simulation::launch_halo_exchange(MgWorld& world, int my_rank,
                                       float* halo_top_recv, float* halo_bot_recv,
                                       size_t halo_band_floats) {
     if (gpus < 2) return;
+    // Diagnostic gate: CELL_SIM_MG_NO_HALO=1 skips the NCCL boundary
+    // exchange entirely. Physics is WRONG (cells near slab boundaries see an
+    // incomplete S) but per-step timing isolates the halo-exchange cost.
+    // Never set in production.
+    static const bool no_halo = []() {
+        const char* e = std::getenv("CELL_SIM_MG_NO_HALO");
+        return e && e[0] == '1';
+    }();
+    if (no_halo) return;
     cudaStream_t s = step_stream;
     if (gpus == 2) {
-        // For G=2, prev == next; NCCL pair-by-order requires a 4-issue
-        // ordering (Send_top, Recv_top, Send_bot, Recv_bot) so the two
-        // boundaries are disambiguated. See orchestrator comments for the
-        // full derivation. After the exchange, halo_top_recv holds peer's
-        // top band — which is OUR bot boundary — so it adds into my_bot.
+        // For G=2, prev == next (the single peer). We need TWO independent
+        // boundary exchanges (top, bot). Issuing all four ops
+        // (Send_top, Recv_top, Send_bot, Recv_bot) in ONE NCCL group
+        // deadlocks intermittently at large band sizes: above NCCL's
+        // protocol-switch threshold the multiple same-peer transfers
+        // contend for channels and both ranks can block on a send before
+        // posting the matching recv. Splitting into two separate
+        // single-exchange groups — each a Send+Recv pair, NCCL's documented
+        // deadlock-free pairwise pattern — fixes the hang with identical
+        // semantics (matching is per-group, both ranks split the same way).
         mg_group_start();
         mg_send_bytes(world.comms[my_rank], my_top_band, prev_rank,
                       halo_band_floats * sizeof(float), s);
         mg_recv_bytes(world.comms[my_rank], halo_top_recv, prev_rank,
                       halo_band_floats * sizeof(float), s);
+        mg_group_end();
+        mg_group_start();
         mg_send_bytes(world.comms[my_rank], my_bot_band, next_rank,
                       halo_band_floats * sizeof(float), s);
         mg_recv_bytes(world.comms[my_rank], halo_bot_recv, next_rank,
                       halo_band_floats * sizeof(float), s);
         mg_group_end();
+        // halo_top_recv holds peer's top band (== our bot boundary) and
+        // halo_bot_recv holds peer's bot band (== our top boundary).
         launch_halo_add_pair(my_bot_band, halo_top_recv,
                              my_top_band, halo_bot_recv,
                              halo_band_floats, s);
@@ -3247,6 +3265,17 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
     MgBarrier start_barrier(args.gpus + 1);  // workers + main
     MgBarrier end_barrier(args.gpus + 1);
     std::atomic<bool> shutdown{false};
+    // Number of steps each worker runs between host barriers. The host
+    // barrier (start/end) is a mutex+condvar round-trip that otherwise fires
+    // TWICE PER STEP, forcing the GPUs into host-mediated lockstep and
+    // serializing through the OS scheduler — the dominant multi-GPU overhead
+    // at production sizes. The per-step NCCL halo exchange already
+    // synchronizes the rank streams on-device, so the host barrier is only
+    // needed when the MAIN thread must observe per-rank state for I/O. The
+    // main thread sets batch_steps to the gap to the next I/O/print/term
+    // boundary; workers run that many steps with zero host barriers in
+    // between. With no I/O (benchmarks) the whole run is a single batch.
+    std::atomic<int> batch_steps{1};
 
     std::vector<std::thread> workers;
     workers.reserve(args.gpus);
@@ -3273,6 +3302,8 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
             while (true) {
                 start_barrier.wait();
                 if (shutdown.load(std::memory_order_acquire)) break;
+                const int n_batch = batch_steps.load(std::memory_order_acquire);
+              for (int batch_i = 0; batch_i < n_batch; ++batch_i) {
 
                 // ---- Per-step body ----
                 // Fast path: capture polar + scatter + halo + evolve into
@@ -3358,7 +3389,18 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                 // migrate_cells is a no-op early-out). step_post_reduce
                 // ran k_rebind on this step iff (step_count is now a
                 // multiple of REBIND_EVERY) — it does the increment last.
-                if (args.gpus > 1
+                //
+                // Diagnostic gate: CELL_SIM_MG_NO_MIGRATE=1 skips the
+                // migration cycle (classify + NCCL count exchange + host
+                // sync). Safe ONLY for short runs where no cell crosses a
+                // slab boundary (drift << slab height); isolates the
+                // migration overhead. Never set in production.
+                static const bool no_migrate = []() {
+                    const char* e = std::getenv("CELL_SIM_MG_NO_MIGRATE");
+                    return e && e[0] == '1';
+                }();
+                if (!no_migrate
+                    && args.gpus > 1
                     && sim.step_count > 0
                     && (sim.step_count % REBIND_EVERY) == 0)
                 {
@@ -3417,10 +3459,31 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                     }
                 }
 
+              }  // end batch loop (n_batch steps between host barriers)
                 end_barrier.wait();
             }
         });
     }
+
+    // Next step at which the main thread must regain control for I/O,
+    // heartbeat, or termination. Workers run in one batch up to this step
+    // with no host barriers in between. Cadence boundaries are the smallest
+    // multiple of each interval strictly greater than the current step.
+    auto next_stop = [&](int cur) -> int {
+        int stop = target_step;
+        auto consider = [&](int cad) {
+            if (cad > 0) {
+                int nxt = ((cur / cad) + 1) * cad;
+                if (nxt < stop) stop = nxt;
+            }
+        };
+        consider(s0.params.save_interval);
+        consider(s0.checkpoint_interval);
+        consider(sims[0]->traj_every);
+        consider(s0.vtk_interval);
+        consider(s0.params.print_interval);
+        return stop;
+    };
 
     while (sims[0]->step_count < target_step) {
         if (termination_requested()) {
@@ -3429,9 +3492,15 @@ int run_multi_gpu(const MultiGpuRunArgs& args) {
                    sims[0]->step_count, sims[0]->cur_time);
             break;
         }
-        // Wake all workers; they advance the step count atomically.
+        // Run a whole batch of steps without per-step host barriers.
+        int sc0   = sims[0]->step_count;
+        int stop  = next_stop(sc0);
+        int batch = stop - sc0;
+        if (batch < 1) batch = 1;
+        batch_steps.store(batch, std::memory_order_release);
+        // Wake all workers; they advance the step count by `batch`.
         start_barrier.wait();
-        // Block until every worker has finished post_reduce.
+        // Block until every worker has finished the batch.
         end_barrier.wait();
 
         // ---- I/O on cadence (per-rank, segregated dirs) ----
