@@ -320,19 +320,6 @@ struct CellArrays {
     int*  shift_xy     = nullptr;  // [2 * cap]
     int*  new_rect     = nullptr;  // [4 * cap]
 
-    // Deterministic-reduce scratch for k_reduce_mb_{fast,full}. Each chunk
-    // block writes its block-wide partial into a fixed slot here. V/Ix/Iy
-    // are summed inside k_rhs_mb's per-cell prologue (single thread per
-    // cell, fixed cb-order add chain) and written to volumes/Ix/Iy above;
-    // the standalone k_finalize_reduce kernel handles the 5 host-only
-    // moments (perim, Cx, Cy, Cxx, Cyy) and runs only on full-reduce
-    // steps. Replaces an FP32 atomicAdd whose commit-order was
-    // nondeterministic between launches. Layout:
-    //   partials[(moment * REDUCE_CHUNKS_PER_CELL + cb) * cap + n]
-    // moments are V, Ix, Iy, perim, Cx, Cy, Cxx, Cyy (REDUCE_NMOMENTS=8).
-    // Sized in alloc_gpu by REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL * cap.
-    float* reduce_partials = nullptr;
-
     // Polarisation. theta is the persistent angle; (px, py) = (cos, sin).
     float* polar_theta  = nullptr; // [N]
     float* polar_x      = nullptr; // [N]

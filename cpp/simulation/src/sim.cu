@@ -364,12 +364,6 @@ void Simulation::alloc_gpu() {
     af(cells.velocities_x, cap);
     af(cells.velocities_y, cap);
 
-    // Deterministic-reduce scratch: REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL
-    // floats per cell. Size matches the (chunks_per_cell, N) launch shape
-    // in launch_evolve so each block has a private destination slot.
-    af(cells.reduce_partials,
-       (size_t)REDUCE_NMOMENTS * REDUCE_CHUNKS_PER_CELL * cap);
-
     for (auto& f : per_cell_float_state()) {
         af(*f.dev_ptr, cap);
     }

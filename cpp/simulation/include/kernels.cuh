@@ -12,15 +12,13 @@
 // step by atomic scatter and read back during evolve.
 // ---------------------------------------------------------------------------
 
-// Multi-block evolve chunking. Each block handles CHUNK_PIXELS pixels of
-// one cell's active rect; with TILE_AREA pixels per cell there are
-// REDUCE_CHUNKS_PER_CELL blocks per cell. Hoisted here so alloc_gpu can
+// Scatter chunking. Each block handles CHUNK_PIXELS pixels of one cell's
+// active rect; with TILE_AREA pixels per cell there are
+// REDUCE_CHUNKS_PER_CELL blocks per cell. Used by the init S-scatter.
 // size the deterministic-reduce partial buffer to match the launch.
 static constexpr int CHUNK_PIXELS           = 4096;
 static constexpr int REDUCE_CHUNKS_PER_CELL =
     (TILE_AREA + CHUNK_PIXELS - 1) / CHUNK_PIXELS;
-// 8 moments accumulated by k_reduce_mb_full: V, Ix, Iy, perim, Cx, Cy, Cxx, Cyy.
-static constexpr int REDUCE_NMOMENTS        = 8;
 
 // Polarity update (RTP or ABP, per p.abp). Cheap: one thread per cell.
 void launch_polar(CellArrays& c, const SimParams& p, double cur_time,
@@ -35,32 +33,9 @@ void launch_apply_scripted(CellArrays& c,
                            int count,
                            cudaStream_t stream = 0);
 
-// Zero S then scatter phi^2 into it (one CTA per cell).
-void launch_scatter_S(CellArrays& c, const SimParams& p, cudaStream_t stream = 0);
-
 // Pack origin + per-cell observables into a contiguous device buffer for
 // single-memcpy trajectory I/O. `out` must point to >= N TrajPackedCell.
 void launch_pack_traj(CellArrays& c, TrajPackedCell* out, int N, cudaStream_t stream = 0);
-
-// Fused two-pass evolve. Pass 1 reduces V/Cx/Cy/Ix/Iy, broadcasts vx/vy.
-// Pass 2 reads S again, computes laplacian/double-well/repulsion/advection,
-// and writes phi_out plus reduces perimeter. Also writes velocities,
-// volumes, Cx, Cy, perimeters into the per-cell observable arrays.
-//
-// `need_full_reduce` controls whether Cx/Cy/Cxx/Cyy and perimeter are also
-// computed. Set true on rebind steps (rebind reads Cx/Cy/Cxx/Cyy) and on
-// trajectory/VTK/checkpoint output steps (host reads V, Cx, Cy, perimeter).
-// On non-output, non-rebind steps it can be false; the mb path then skips
-// 5 atomicAdds per chunk and 4 block-reductions.
-void launch_evolve(CellArrays& c, const SimParams& p, bool need_full_reduce,
-                   cudaStream_t stream = 0);
-
-// COM-recentre: shift each cell's tile so its COM lands at (T/2, T/2).
-// Adjusts origin[n] and copies the (possibly shifted) tile into phi_out.
-// After this kernel, the *caller* must std::swap(phi_in, phi_out) so the
-// rebound tile becomes the current state.
-void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
-                   cudaStream_t stream = 0);
 
 // One-shot host helpers used only at init / resume.
 void launch_rng_init(CellArrays& c, unsigned long seed,
