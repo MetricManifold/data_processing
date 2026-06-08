@@ -253,12 +253,11 @@ struct CellArrays {
 
     // Global sum field S(x,y) = sum_n phi_n(x,y)^2. Atomic-scatter target.
     //
-    // Under the opus single-pass step (default), S is double-buffered:
+    // S is double-buffered:
     // S_pool[0] and S_pool[1] are one contiguous cudaMalloc of 2*S_bytes
     // (so a single L2 access-policy window pins both halves). `S` is an
     // alias into S_pool[parity], refreshed by Simulation::sync_pool_to_parity.
-    // Under -DCELL_SIM_LEGACY_STEP, only `S` is allocated (S_pool stays null).
-    float* S          = nullptr;     // [Nx * Ny]  (alias of S_pool[parity] in opus path)
+    float* S          = nullptr;     // [Nx * Ny]  (alias of S_pool[parity])
     float* S_pool[2]  = {nullptr, nullptr};
 
     // Slab partition descriptor for S (single-GPU defaults: covers the
@@ -280,12 +279,11 @@ struct CellArrays {
 
     // Per-cell observables produced by the multi-block reduce / RHS path.
     //
-    // Under the opus single-pass step (default), volumes/Ix/Iy are
+    // volumes/Ix/Iy are
     // double-buffered (V_pool[2], Ix_pool[2], Iy_pool[2]) so the kernel
     // can read lagged moments from one half while atomicAdding fresh
     // moments into the other. `volumes`, `Ix`, `Iy` are aliases into the
     // parity-current half, refreshed by Simulation::sync_pool_to_parity.
-    // Under -DCELL_SIM_LEGACY_STEP only the unprefixed buffers are allocated.
     // Per-cell scalar accumulators: stored as f64 so that the cross-CTA
     // atomicAdd reductions are commutative within FP precision (f32
     // atomicAdd order varies run-to-run, costing a few ULP). Read by
@@ -305,7 +303,7 @@ struct CellArrays {
     float* velocities_x = nullptr; // [N] : interaction integral + v_A * polar_x
     float* velocities_y = nullptr; // [N] : interaction integral + v_A * polar_y
 
-    // Opus single-pass step: per-CTA work list of 32x32 sub-tiles to
+    // Per-CTA work list of 32x32 sub-tiles to
     // evaluate (one CTA per item). Built host-side from cells.rect after
     // every rebind. d_work is sized for the worst-case at capacity (every
     // cell with a full TILE_T-2 rect); workCount is the active size used
@@ -315,10 +313,10 @@ struct CellArrays {
     int   d_work_cap   = 0;
     int   workCount    = 0;
 
-    // Opus fused-rebind scratch: per-cell (sx, sy) shift and (rx0, ry0, rw, rh)
-    // new-rect computed by launch_opus_compute_rebind_meta before the rebind
-    // step. Consumed by launch_opus_step_rebind, then applied to origin/rect
-    // by launch_opus_apply_rebind_meta. Sized to capacity in alloc_gpu.
+    // Fused-rebind scratch: per-cell (sx, sy) shift and (rx0, ry0, rw, rh)
+    // new-rect computed by launch_compute_rebind_meta before the rebind
+    // step. Consumed by launch_step_rebind, then applied to origin/rect
+    // by launch_apply_rebind_meta. Sized to capacity in alloc_gpu.
     int*  shift_xy     = nullptr;  // [2 * cap]
     int*  new_rect     = nullptr;  // [4 * cap]
 

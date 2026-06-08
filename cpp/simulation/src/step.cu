@@ -1,17 +1,16 @@
-// opus_step.cu — single-pass fused step kernel implementation.
+// step.cu — single-pass fused step kernel implementation.
 //
-// See opus_step.cuh for design overview. Ported from the standalone
-// reference in opus_port/cellstep.cu, integrated against cell_sim's
+// See step.cuh for the design overview. Integrated against cell_sim's
 // CellArrays + SimParams + slab_local_y conventions.
 
-#include "opus_step.cuh"
+#include "step.cuh"
 #include "kernels.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
 
-using namespace opus;
+using namespace stepk;
 
 namespace {
 
@@ -20,7 +19,7 @@ constexpr int NWARP = NTH / 32;      // 8
 constexpr int HW    = OW + 2;        // 34
 constexpr int HH    = OH + 2;        // 34
 
-#define OPUS_CK(x) do{ cudaError_t e_=(x); if(e_!=cudaSuccess){              \
+#define STEP_CK(x) do{ cudaError_t e_=(x); if(e_!=cudaSuccess){              \
     fprintf(stderr,"CUDA error %s:%d: %s\n",__FILE__,__LINE__,               \
             cudaGetErrorString(e_)); std::exit(1);} }while(0)
 
@@ -55,7 +54,7 @@ __device__ __forceinline__ float block_sum_op(float v, float* sm) {
 }
 
 template<bool DO_EXT, bool DO_REBIND>
-__global__ void k_opus_step(
+__global__ void k_step(
     const float* __restrict__ phiIn,
     float*       __restrict__ phiOut,
     const float* __restrict__ Sin,
@@ -110,7 +109,7 @@ __global__ void k_opus_step(
     const int rxe = rx0 + rw;
     const int rye = ry0 + rh;
 
-    // Shift: source = destination + shift (note: matches opus's convention,
+    // Shift: source = destination + shift (note: by the rebind convention,
     // where shiftXY = -recenter_shift, so new_origin = old_origin + (-shift)).
     int shf_x = 0, shf_y = 0;
     if constexpr (DO_REBIND) {
@@ -296,7 +295,7 @@ __global__ void k_opus_step(
     }
 }
 
-__global__ void k_opus_finalize_velocity(
+__global__ void k_finalize_velocity(
     int N,
     const double* __restrict__ Ix, const double* __restrict__ Iy,
     const float* __restrict__ vA, const float* __restrict__ dirx,
@@ -312,7 +311,7 @@ __global__ void k_opus_finalize_velocity(
 }
 
 // ---------------------------------------------------------------------------
-// k_opus_compute_rebind_meta — one thread per cell. Computes the integer
+// k_compute_rebind_meta — one thread per cell. Computes the integer
 // shift (sx, sy) so the cell's COM lands at tile-center, and the new rect
 // from second-moment width. Mirrors the math in kernels.cu's k_rebind.
 //
@@ -325,7 +324,7 @@ __global__ void k_opus_finalize_velocity(
 // shifted), since rebind uses the previous evolve's moments to shift the
 // just-evolved phi.
 // ---------------------------------------------------------------------------
-__global__ void k_opus_compute_rebind_meta(
+__global__ void k_compute_rebind_meta(
     int N,
     const double* __restrict__ V,
     const double* __restrict__ Cx,
@@ -417,12 +416,12 @@ __global__ void k_opus_compute_rebind_meta(
 }
 
 // ---------------------------------------------------------------------------
-// k_opus_apply_rebind_meta — one thread per cell. Applies the per-cell
+// k_apply_rebind_meta — one thread per cell. Applies the per-cell
 // (sx, sy) shift to origin and copies new_rect into rect. Called after the
 // fused-rebind step kernel completes so subsequent kernels see the new
 // geometry.
 // ---------------------------------------------------------------------------
-__global__ void k_opus_apply_rebind_meta(
+__global__ void k_apply_rebind_meta(
     int N,
     int* __restrict__ origin,
     int* __restrict__ rect,
@@ -441,7 +440,7 @@ __global__ void k_opus_apply_rebind_meta(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// k_opus_build_worklist — device-side worklist construction.
+// k_build_worklist — device-side worklist construction.
 //
 // One thread per cell. Each thread enumerates its cell's 32x32 sub-tiles
 // inside the cell's rect and appends them as WorkItem entries via a single
@@ -450,10 +449,10 @@ __global__ void k_opus_apply_rebind_meta(
 //
 // Sub-tile emission order is non-deterministic across runs (atomic order),
 // but within a single launch the work is identical — every WorkItem ends
-// up in the array, just at a non-deterministic slot. The opus kernel is
+// up in the array, just at a non-deterministic slot. The step kernel is
 // indifferent to work order, so this has no observable effect.
 // ---------------------------------------------------------------------------
-__global__ void k_opus_build_worklist(
+__global__ void k_build_worklist(
     int N,
     const int* __restrict__ rect,
     WorkItem*  __restrict__ out_work,
@@ -476,7 +475,7 @@ __global__ void k_opus_build_worklist(
 
 }  // namespace
 
-void launch_opus_step(CellArrays& c, const SimParams& p,
+void launch_step(CellArrays& c, const SimParams& p,
                       int parity, bool need_full, cudaStream_t stream)
 {
     const int N = c.num_cells;
@@ -485,21 +484,21 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
     const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
 
     // Zero next-step scatter/atomic targets.
-    OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
-    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
-    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
+    STEP_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
     if (need_full) {
-        OPUS_CK(cudaMemsetAsync(c.perimeters, 0, N * sizeof(double), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cx,         0, N * sizeof(double), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cy,         0, N * sizeof(double), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cxx,        0, N * sizeof(double), stream));
-        OPUS_CK(cudaMemsetAsync(c.Cyy,        0, N * sizeof(double), stream));
+        STEP_CK(cudaMemsetAsync(c.perimeters, 0, N * sizeof(double), stream));
+        STEP_CK(cudaMemsetAsync(c.Cx,         0, N * sizeof(double), stream));
+        STEP_CK(cudaMemsetAsync(c.Cy,         0, N * sizeof(double), stream));
+        STEP_CK(cudaMemsetAsync(c.Cxx,        0, N * sizeof(double), stream));
+        STEP_CK(cudaMemsetAsync(c.Cyy,        0, N * sizeof(double), stream));
     }
 
     dim3 blk(BX, BY);
     if (need_full) {
-        k_opus_step<true, false><<<c.workCount, blk, 0, stream>>>(
+        k_step<true, false><<<c.workCount, blk, 0, stream>>>(
             c.phi_in, c.phi_out,
             c.S_pool[parity], c.S_pool[q],
             c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
@@ -513,7 +512,7 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
             (float)p.lambda, (float)p.kappa, (float)p.mu,
             (float)p.xi, (float)p.dt);
     } else {
-        k_opus_step<false, false><<<c.workCount, blk, 0, stream>>>(
+        k_step<false, false><<<c.workCount, blk, 0, stream>>>(
             c.phi_in, c.phi_out,
             c.S_pool[parity], c.S_pool[q],
             c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
@@ -529,32 +528,32 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
     }
 }
 
-void launch_opus_finalize_velocity(CellArrays& c, const SimParams& p,
+void launch_finalize_velocity(CellArrays& c, const SimParams& p,
                                    int parity, cudaStream_t stream)
 {
     const int N = c.num_cells;
     if (N == 0) return;
     constexpr int BS = 128;
     int blocks = (N + BS - 1) / BS;
-    k_opus_finalize_velocity<<<blocks, BS, 0, stream>>>(
+    k_finalize_velocity<<<blocks, BS, 0, stream>>>(
         N, c.Ix_pool[parity], c.Iy_pool[parity],
         c.v_A_cell, c.polar_x, c.polar_y,
         c.velocities_x, c.velocities_y,
         (float)p.lambda, (float)p.kappa, (float)p.xi);
 }
 
-int build_opus_work_list_host(CellArrays& c)
+int build_work_list_host(CellArrays& c)
 {
     const int N = c.num_cells;
     if (N == 0) { c.workCount = 0; return 0; }
     // The cudaMemcpy below runs on the default stream; cell_sim kernels run
     // on step_stream. Make sure any pending writes to c.rect are visible.
-    OPUS_CK(cudaDeviceSynchronize());
+    STEP_CK(cudaDeviceSynchronize());
     std::vector<int> h_rect(4 * N);
-    OPUS_CK(cudaMemcpy(h_rect.data(), c.rect, 4 * N * sizeof(int),
+    STEP_CK(cudaMemcpy(h_rect.data(), c.rect, 4 * N * sizeof(int),
                        cudaMemcpyDeviceToHost));
     std::vector<WorkItem> h_work;
-    h_work.reserve(N * OPUS_MAX_WORKITEMS_PER_CELL);
+    h_work.reserve(N * MAX_WORKITEMS_PER_CELL);
     for (int n = 0; n < N; ++n) {
         const int rx0 = h_rect[4*n + 0];
         const int ry0 = h_rect[4*n + 1];
@@ -567,23 +566,23 @@ int build_opus_work_list_host(CellArrays& c)
     const int wc = (int)h_work.size();
     if (wc > c.d_work_cap) {
         fprintf(stderr,
-            "[opus] work list (%d) exceeds capacity (%d). "
+            "[step] work list (%d) exceeds capacity (%d). "
             "Increase d_work_cap in alloc_gpu.\n", wc, c.d_work_cap);
         std::exit(1);
     }
-    OPUS_CK(cudaMemcpy((WorkItem*)c.d_work, h_work.data(), wc * sizeof(WorkItem),
+    STEP_CK(cudaMemcpy((WorkItem*)c.d_work, h_work.data(), wc * sizeof(WorkItem),
                        cudaMemcpyHostToDevice));
     // Mirror count to device so the in-kernel early-exit check on
-    // k_opus_step (blockIdx.x >= *work_count) is a no-op when grid == wc.
+    // k_step (blockIdx.x >= *work_count) is a no-op when grid == wc.
     if (c.d_work_count) {
-        OPUS_CK(cudaMemcpy(c.d_work_count, &wc, sizeof(int),
+        STEP_CK(cudaMemcpy(c.d_work_count, &wc, sizeof(int),
                            cudaMemcpyHostToDevice));
     }
     c.workCount = wc;
     return wc;
 }
 
-void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
+void launch_seed_parity_mirror(CellArrays& c, const SimParams& p,
                                     int from_parity, cudaStream_t stream)
 {
     const int N = c.num_cells;
@@ -591,18 +590,18 @@ void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
     const int f = from_parity & 1;
     const int t = f ^ 1;
     const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
-    OPUS_CK(cudaMemcpyAsync(c.S_pool [t], c.S_pool [f], S_elems*sizeof(float),
+    STEP_CK(cudaMemcpyAsync(c.S_pool [t], c.S_pool [f], S_elems*sizeof(float),
                             cudaMemcpyDeviceToDevice, stream));
-    OPUS_CK(cudaMemcpyAsync(c.V_pool [t], c.V_pool [f], N*sizeof(double),
+    STEP_CK(cudaMemcpyAsync(c.V_pool [t], c.V_pool [f], N*sizeof(double),
                             cudaMemcpyDeviceToDevice, stream));
-    OPUS_CK(cudaMemcpyAsync(c.Ix_pool[t], c.Ix_pool[f], N*sizeof(double),
+    STEP_CK(cudaMemcpyAsync(c.Ix_pool[t], c.Ix_pool[f], N*sizeof(double),
                             cudaMemcpyDeviceToDevice, stream));
-    OPUS_CK(cudaMemcpyAsync(c.Iy_pool[t], c.Iy_pool[f], N*sizeof(double),
+    STEP_CK(cudaMemcpyAsync(c.Iy_pool[t], c.Iy_pool[f], N*sizeof(double),
                             cudaMemcpyDeviceToDevice, stream));
 }
 
 namespace {
-__global__ void k_opus_init_lagged_moments(
+__global__ void k_init_lagged_moments(
     int N,
     const float* __restrict__ tgt_radius,
     double* __restrict__ V_out,
@@ -618,7 +617,7 @@ __global__ void k_opus_init_lagged_moments(
 }
 }  // namespace
 
-void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& /*p*/,
+void launch_init_lagged_moments(CellArrays& c, const SimParams& /*p*/,
                                      int parity, cudaStream_t stream)
 {
     const int N = c.num_cells;
@@ -626,7 +625,7 @@ void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& /*p*/,
     const int q = parity & 1;
     constexpr int BS = 128;
     int blocks = (N + BS - 1) / BS;
-    k_opus_init_lagged_moments<<<blocks, BS, 0, stream>>>(
+    k_init_lagged_moments<<<blocks, BS, 0, stream>>>(
         N, c.tgt_radius,
         c.V_pool[q], c.Ix_pool[q], c.Iy_pool[q]);
 }
@@ -635,14 +634,14 @@ void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& /*p*/,
 // Fused-rebind launchers
 // ---------------------------------------------------------------------------
 
-void launch_opus_compute_rebind_meta(CellArrays& c, const SimParams& p,
+void launch_compute_rebind_meta(CellArrays& c, const SimParams& p,
                                      int parity, cudaStream_t stream)
 {
     const int N = c.num_cells;
     if (N == 0) return;
     constexpr int BS = 128;
     int blocks = (N + BS - 1) / BS;
-    k_opus_compute_rebind_meta<<<blocks, BS, 0, stream>>>(
+    k_compute_rebind_meta<<<blocks, BS, 0, stream>>>(
         N,
         c.V_pool [parity], c.Cx, c.Cy, c.Cxx, c.Cyy,
         c.rect,
@@ -652,13 +651,13 @@ void launch_opus_compute_rebind_meta(CellArrays& c, const SimParams& p,
         TILE_BBOX_ALIGN, TILE_BBOX_MIN);
 }
 
-void launch_opus_apply_rebind_meta(CellArrays& c, cudaStream_t stream)
+void launch_apply_rebind_meta(CellArrays& c, cudaStream_t stream)
 {
     const int N = c.num_cells;
     if (N == 0) return;
     constexpr int BS = 128;
     int blocks = (N + BS - 1) / BS;
-    k_opus_apply_rebind_meta<<<blocks, BS, 0, stream>>>(
+    k_apply_rebind_meta<<<blocks, BS, 0, stream>>>(
         N, c.origin, c.rect, c.shift_xy, c.new_rect);
 }
 
@@ -671,7 +670,7 @@ void launch_opus_apply_rebind_meta(CellArrays& c, cudaStream_t stream)
 // step + apply_meta have updated cells.rect). Resets the device counter to
 // zero, then atomic-emits one WorkItem per (cell, sub-tile-in-rect).
 //
-// We DO NOT sync to read the count back. Subsequent k_opus_step launches
+// We DO NOT sync to read the count back. Subsequent k_step launches
 // use c.d_work_cap (worst-case count) as the grid size; dead blocks
 // early-exit on the in-kernel rect check. This avoids a per-rebind stream
 // drain that would otherwise serialize ~3 ms of pending step work.
@@ -681,21 +680,21 @@ void launch_opus_apply_rebind_meta(CellArrays& c, cudaStream_t stream)
 // valid old worklist entries — the kernel safely processes or skips them
 // via the rect intersection check. The atomicAdd into S only fires for
 // in-rect pixels, so no double-counting.
-void launch_opus_build_worklist(CellArrays& c, cudaStream_t stream)
+void launch_build_worklist(CellArrays& c, cudaStream_t stream)
 {
     const int N = c.num_cells;
     if (N == 0) { c.workCount = 0; return; }
-    OPUS_CK(cudaMemsetAsync(c.d_work_count, 0, sizeof(int), stream));
+    STEP_CK(cudaMemsetAsync(c.d_work_count, 0, sizeof(int), stream));
     constexpr int BS = 128;
     int blocks = (N + BS - 1) / BS;
-    k_opus_build_worklist<<<blocks, BS, 0, stream>>>(
+    k_build_worklist<<<blocks, BS, 0, stream>>>(
         N, c.rect, (WorkItem*)c.d_work, c.d_work_count);
     // No host-readback / sync. Subsequent step launches use d_work_cap as
     // the grid size; the kernel early-exits per CTA on blockIdx.x >= count.
     c.workCount = c.d_work_cap;
 }
 
-void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
+void launch_step_rebind(CellArrays& c, const SimParams& p,
                              int parity, cudaStream_t stream)
 {
     const int N = c.num_cells;
@@ -704,13 +703,13 @@ void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
     const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
 
     // Zero next-step scatter/atomic targets.
-    OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
-    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
-    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
+    STEP_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
 
     dim3 blk(BX, BY);
-    k_opus_step<false, true><<<c.workCount, blk, 0, stream>>>(
+    k_step<false, true><<<c.workCount, blk, 0, stream>>>(
         c.phi_in, c.phi_out,
         c.S_pool[parity], c.S_pool[q],
         c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],
@@ -732,7 +731,7 @@ void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
 // the OTHER buffer ~2 parities ago) but are now outside the new rect. Without
 // this, the step after next reads stale phi at the new-rect boundary's halo.
 // S is not affected (rebuilt by scatter every step from in-rect phi only).
-void launch_opus_step_cleanup(CellArrays& c, const SimParams& p,
+void launch_step_cleanup(CellArrays& c, const SimParams& p,
                               int parity, cudaStream_t stream)
 {
     const int N = c.num_cells;
@@ -740,23 +739,23 @@ void launch_opus_step_cleanup(CellArrays& c, const SimParams& p,
     const int q = parity ^ 1;
     const size_t S_elems = (size_t)c.S_ext_height * p.Nx;
 
-    OPUS_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
-    OPUS_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
-    OPUS_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
-    OPUS_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.S_pool [q], 0, S_elems * sizeof(float), stream));
+    STEP_CK(cudaMemsetAsync(c.V_pool [q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.Ix_pool[q], 0, N * sizeof(double), stream));
+    STEP_CK(cudaMemsetAsync(c.Iy_pool[q], 0, N * sizeof(double), stream));
 
     // Allocate-once zero-shift scratch (used as the shift_xy argument).
     static int* d_zero_shift = nullptr;
     static int  d_zero_shift_cap = 0;
     if (d_zero_shift_cap < 2 * N) {
         if (d_zero_shift) cudaFree(d_zero_shift);
-        OPUS_CK(cudaMalloc(&d_zero_shift, 2 * N * sizeof(int)));
-        OPUS_CK(cudaMemset(d_zero_shift, 0, 2 * N * sizeof(int)));
+        STEP_CK(cudaMalloc(&d_zero_shift, 2 * N * sizeof(int)));
+        STEP_CK(cudaMemset(d_zero_shift, 0, 2 * N * sizeof(int)));
         d_zero_shift_cap = 2 * N;
     }
 
     dim3 blk(BX, BY);
-    k_opus_step<false, true><<<c.workCount, blk, 0, stream>>>(
+    k_step<false, true><<<c.workCount, blk, 0, stream>>>(
         c.phi_in, c.phi_out,
         c.S_pool[parity], c.S_pool[q],
         c.V_pool [parity], c.Ix_pool[parity], c.Iy_pool[parity],

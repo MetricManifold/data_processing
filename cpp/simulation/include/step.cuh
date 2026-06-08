@@ -1,9 +1,8 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// opus_step — single-pass fused step kernel.
+// step — single-pass fused step kernel.
 //
-// Replaces the legacy scatter_S + evolve pipeline with one kernel launch
-// that, per 32x32 sub-tile:
+// A single kernel launch that, per 32x32 sub-tile:
 //   1. loads a 34x34 phi halo into shared memory,
 //   2. accumulates fresh V/Ix/Iy (and on full-reduce steps perim/Cx/Cy/Cxx/Cyy)
 //      of phi_in using the matching current-step S,
@@ -14,9 +13,6 @@
 // Buffers are parity-paired: at step s with parity p the kernel reads
 // phi[p], S[p], V/Ix/Iy[p] (lagged), writes phi[p^1], S[p^1], V/Ix/Iy[p^1]
 // (fresh). Caller flips parity after the launch.
-//
-// Gated by -DCELL_SIM_LEGACY_STEP=1 to fall back to the legacy path;
-// default off (opus is the production step).
 // ---------------------------------------------------------------------------
 
 #include "types.cuh"
@@ -25,13 +21,13 @@
 
 // 32 wide x 8 high threads (256), each thread owns RY=4 stacked rows ->
 // 32x32 output sub-tile per block, 34x34 shared halo.
-namespace opus {
+namespace stepk {
 static constexpr int BX = 32;
 static constexpr int BY = 8;
 static constexpr int RY = 4;
 static constexpr int OW = BX;          // output width  = 32
 static constexpr int OH = BY * RY;     // output height = 32
-}  // namespace opus
+}  // namespace stepk
 
 // Flat work-list entry: one 32x32 sub-tile to evaluate. `tile` is the cell
 // index, (sx, sy) is the tile-local origin of the sub-tile. List is built
@@ -41,16 +37,16 @@ struct WorkItem { int tile; int sx; int sy; };
 
 // Worst-case work items per cell: ceil((TILE_T-2)/OW) * ceil((TILE_T-2)/OH).
 // At TILE_T=320 with OW=OH=32: ceil(318/32)=10 -> 100 items per cell.
-static constexpr int OPUS_MAX_WORKITEMS_PER_CELL =
-    ((TILE_T - 2 + opus::OW - 1) / opus::OW) *
-    ((TILE_T - 2 + opus::OH - 1) / opus::OH);
+static constexpr int MAX_WORKITEMS_PER_CELL =
+    ((TILE_T - 2 + stepk::OW - 1) / stepk::OW) *
+    ((TILE_T - 2 + stepk::OH - 1) / stepk::OH);
 
 // ---------------------------------------------------------------------------
 // One-step launch. parity = current half (read from [parity], write to [^1]).
 // need_full -> also accumulate perim, Cx, Cy, Cxx, Cyy of phi_in.
 // Caller must flip parity after this returns.
 // ---------------------------------------------------------------------------
-void launch_opus_step(CellArrays& c, const SimParams& p,
+void launch_step(CellArrays& c, const SimParams& p,
                       int parity, bool need_full,
                       cudaStream_t stream = 0);
 
@@ -60,7 +56,7 @@ void launch_opus_step(CellArrays& c, const SimParams& p,
 // per cell. (Inside the fused step we compute the LAGGED velocity for
 // advection but don't write it back; this kernel writes the FRESH one
 // using the just-reduced moments.)
-void launch_opus_finalize_velocity(CellArrays& c, const SimParams& p,
+void launch_finalize_velocity(CellArrays& c, const SimParams& p,
                                    int parity, cudaStream_t stream = 0);
 
 // Mirror the parity-`from` halves of S/V/Ix/Iy into the parity-`from^1`
@@ -68,7 +64,7 @@ void launch_opus_finalize_velocity(CellArrays& c, const SimParams& p,
 // after launch_initial_velocity has filled the parity-0 halves) so the
 // first step has a consistent lagged-moment set regardless of which
 // parity is current.
-void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
+void launch_seed_parity_mirror(CellArrays& c, const SimParams& p,
                                     int from_parity,
                                     cudaStream_t stream = 0);
 
@@ -81,16 +77,16 @@ void launch_opus_seed_parity_mirror(CellArrays& c, const SimParams& p,
 // Reused for BOTH regular and rebind steps: new_rect is clamped to a
 // subset of old_rect by compute_rebind_meta, so the source-frame worklist
 // over old_rect fully covers every destination pixel of the new rect.
-void launch_opus_build_worklist(CellArrays& c, cudaStream_t stream = 0);
+void launch_build_worklist(CellArrays& c, cudaStream_t stream = 0);
 
 // Host-built worklist alternative. Syncs the stream, reads c.rect D2H,
 // emits one WorkItem per (cell, sub-tile-in-rect), H2D copies the array,
 // sets c.workCount = actual count, and mirrors the count into
-// c.d_work_count (so the in-kernel early-exit on k_opus_step is a no-op
+// c.d_work_count (so the in-kernel early-exit on k_step is a no-op
 // when the launch grid equals workCount). Used in the cell_sim integration
 // because rect counts vary widely per step and launching the worst-case
 // grid leaves most blocks idle (~30% perf regression at N=1152).
-int build_opus_work_list_host(CellArrays& c);
+int build_work_list_host(CellArrays& c);
 
 // Post-migration lagged-moment reset. After multi-GPU cell migration,
 // the per-cell V/Ix/Iy slots are mis-aligned with the new cell layout
@@ -101,14 +97,14 @@ int build_opus_work_list_host(CellArrays& c);
 // (V - V_target = 0) and motility advection vanishes (Ix=Iy=0), so the
 // cell moves only via its active-polarity force for one step. Full
 // moments are re-computed by the next step's reduction.
-void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& p,
+void launch_init_lagged_moments(CellArrays& c, const SimParams& p,
                                      int parity, cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
 // Fused rebind path. Replaces the separate launch_rebind kernel and the
 // scatter_S+reduce+mirror reseed. Sequence per rebind cycle:
 //
-//   1. launch_opus_compute_rebind_meta(c, p, parity, stream)
+//   1. launch_compute_rebind_meta(c, p, parity, stream)
 //      Per cell, reads V/Cx/Cy/Cxx/Cyy from the parity-current half (which
 //      were freshly produced by the previous DO_EXT step), computes the
 //      integer shift (sx, sy) so COM lands at (T/2, T/2), and the new rect
@@ -116,8 +112,8 @@ void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& p,
 //      so the source-frame worklist remains valid. Writes c.shift_xy and
 //      c.new_rect.
 //
-//   2. launch_opus_step_rebind(c, p, parity, stream)
-//      k_opus_step<DO_EXT=false, DO_REBIND=true>. Work-item (sx, sy) is
+//   2. launch_step_rebind(c, p, parity, stream)
+//      k_step<DO_EXT=false, DO_REBIND=true>. Work-item (sx, sy) is
 //      destination-frame; source = dest + shift. Reads phi[parity] at
 //      source, writes phi[parity^1] at destination; periphery destinations
 //      get 0. S[parity^1] scatter is at the SOURCE-frame global address
@@ -126,10 +122,10 @@ void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& p,
 //
 //   3. flip parity (caller).
 //
-//   4. launch_opus_apply_rebind_meta(c, stream)
+//   4. launch_apply_rebind_meta(c, stream)
 //      Per cell, applies origin += shift_xy and rect = new_rect.
 //
-//   5. launch_opus_step_cleanup(c, p, parity, stream)
+//   5. launch_step_cleanup(c, p, parity, stream)
 //      Required: an additional DO_REBIND step with shift=0 and
 //      src_rect == dst_rect == new_rect. Clears stale order-1 phi from the
 //      OTHER ping-pong buffer's old\new periphery (those pixels were
@@ -137,17 +133,17 @@ void launch_opus_init_lagged_moments(CellArrays& c, const SimParams& p,
 //      be read as stale halo on the step-after-next). Caller flips parity
 //      after this returns.
 //
-//   6. launch_opus_build_worklist(c, stream)
+//   6. launch_build_worklist(c, stream)
 //      Rebuild the (now-tightened) worklist for the upcoming regular steps.
 // ---------------------------------------------------------------------------
 
-void launch_opus_compute_rebind_meta(CellArrays& c, const SimParams& p,
+void launch_compute_rebind_meta(CellArrays& c, const SimParams& p,
                                      int parity, cudaStream_t stream = 0);
 
-void launch_opus_step_rebind(CellArrays& c, const SimParams& p,
+void launch_step_rebind(CellArrays& c, const SimParams& p,
                              int parity, cudaStream_t stream = 0);
 
-void launch_opus_apply_rebind_meta(CellArrays& c, cudaStream_t stream = 0);
+void launch_apply_rebind_meta(CellArrays& c, cudaStream_t stream = 0);
 
-void launch_opus_step_cleanup(CellArrays& c, const SimParams& p,
+void launch_step_cleanup(CellArrays& c, const SimParams& p,
                               int parity, cudaStream_t stream = 0);

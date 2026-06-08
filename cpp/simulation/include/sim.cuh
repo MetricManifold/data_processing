@@ -131,12 +131,11 @@ struct Simulation {
     bool load_scripted_events(const std::string& path);
 
     // ---- step stream.
-    // Single-GPU opus path now uses direct kernel launches every step (no
-    // CUDA Graph cache) — the kernel sequence is short (polar + opus_step +
+    // The single-GPU path uses direct kernel launches every step (no CUDA
+    // Graph cache) — the kernel sequence is short (polar + step +
     // finalize_velocity), launch latency is sub-microsecond per kernel, and
     // graph capture's value didn't justify the bookkeeping cost. The graph
-    // path remains only for the legacy single-GPU step pipeline (kept
-    // behind -DCELL_SIM_LEGACY_STEP) and the multi-GPU mg_step_graph path.
+    // path remains only for the multi-GPU mg_step_graph path.
     //
     // mg_step_graph[parity] is the multi-GPU graph cache: captures
     // polar + scatter + (NCCL halo Send/Recv pairs) + halo_add + zero +
@@ -178,7 +177,7 @@ struct Simulation {
     // one helper now keeps the cadence rules in a single place.
     struct StepFlags {
         bool will_rebind;
-        bool will_cleanup;   // opus only: step immediately after a rebind
+        bool will_cleanup;   // step immediately after a rebind
         bool will_traj;
         bool will_save;
         bool will_ckpt;
@@ -302,9 +301,8 @@ struct Simulation {
                               size_t halo_band_floats);
 
     // Returns the S buffer that the just-launched scatter wrote into,
-    // i.e. the buffer the halo exchange needs to operate on. For the
-    // legacy path this is cells.S (single buffer). For the opus path
-    // it is S_pool[parity ^ 1] (the "next" half; scatter targets it
+    // i.e. the buffer the halo exchange needs to operate on. This is
+    // S_pool[parity ^ 1] (the "next" half; scatter targets it
     // before the parity flip). Returned pointer is parity-current at
     // call time and is correct to capture into a parity-keyed graph.
     float* mg_S_after_scatter_ptr() const;
