@@ -24,9 +24,19 @@ constexpr int HH    = OH + 2;        // 34
             cudaGetErrorString(e_)); std::exit(1);} }while(0)
 
 __device__ __forceinline__ int wrap_g(int v, int L) {
-    if (v >= L) return v - L;
-    if (v < 0)  return v + L;
-    return v;
+    // General periodic wrap, correct for ANY magnitude of v. `origin` is
+    // stored in UNWRAPPED global coordinates that random-walk unboundedly as
+    // a cell drifts across periodic boundaries over a long run, so v = gx0 +
+    // slx can exceed [-L, 2L). A single add/subtract (the previous
+    // implementation) silently returned an out-of-bounds S index once a cell
+    // wandered ~L from its start — the cause of rare single-cell NaN blow-ups
+    // in long production runs. The modulo below matches the single-wrap result
+    // bit-for-bit on the common in-range path (|v| < 2L) and only corrects the
+    // far-drift case.
+    if (v >= 0 && v <  L) return v;
+    if (v <  0 && v > -L) return v + L;
+    int m = v % L;
+    return (m < 0) ? m + L : m;
 }
 
 __device__ __forceinline__ float warp_sum_op(float v) {
