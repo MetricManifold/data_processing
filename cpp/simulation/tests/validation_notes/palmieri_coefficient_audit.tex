@@ -1,0 +1,483 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{basicstyle=\ttfamily\footnotesize, frame=single, breaklines=true,
+        columns=fullflexible, xleftmargin=1em}
+
+% Long \texttt{} identifiers (file paths, test names) cannot hyphenate;
+% give TeX room to stretch rather than overflowing the margin.
+\emergencystretch=4em
+
+\newcommand{\pn}{\phi_n}
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\OK}{{\color{blue}\textbf{matches}}}
+\newcommand{\BAD}{{\color{red}\textbf{HALF}}}
+
+\title{Audit of the repulsion coefficient in the CUDA phase-field cell simulation}
+\author{Code review note}
+\date{2026-07-28}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+The interaction (repulsion) coefficient in the $\phi$ evolution equation is
+implemented at $30\kappa/\lambda^2$, whereas Palmieri \emph{et al.}\ (2015)
+Eq.~(S15) requires $60\kappa/\lambda^2$ --- a factor of $2$ too small. The
+velocity coefficient $60\kappa/(\xi\lambda^2)$ is correct. Every other term in
+the right-hand side matches the paper exactly. The missing factor is the
+double-counting of the ordered pair sum $\sum_{n,m\neq n}$ in the interaction
+free energy, not the mobility. The discrepancy has been confirmed by direct
+black-box measurement of the compiled CUDA binary
+(Sec.~\ref{sec:measurement}). Net effect: the simulation reproduces Palmieri's
+model at $\kappa_{\rm eff}=5$, $\xi_{\rm eff}=750$ rather than the reported
+$\kappa=10$, $\xi=1500$.
+\end{abstract}
+
+\section{Provenance and confidence}
+
+The model equations below were read from the local PDFs
+\texttt{papers/10.1038\_srep11745.pdf} (main text) and
+\texttt{papers/srep11745\_SI.pdf} (supplementary), extracted with
+\texttt{pypdf} in both default and \texttt{layout} mode. PDF mathematical
+typesetting does not extract cleanly, so the confidence in each reading is
+stated explicitly:
+
+\begin{itemize}
+\item \textbf{Eq.~(S15) --- high confidence.} The \texttt{layout}-mode
+  extraction unambiguously shows a single prefactor $-30/\tilde\lambda^2$
+  applied to a bracket containing \emph{both} the double-well term and the
+  term $2\tilde\kappa\sum_{m\neq n}\phi_n\phi_m^2$. This is the operative
+  equation and it is the basis of the whole finding.
+\item \textbf{Eq.~(10) --- high confidence.} Prefactor $30\kappa/\lambda^2$ and
+  the ordered sum $\sum_{n,m\neq n}$ both extract cleanly.
+\item \textbf{Eq.~(12) --- high confidence.} Coefficient $60\kappa/(\xi\lambda^2)$
+  extracts cleanly.
+\item \textbf{Eq.~(7) volume term --- medium confidence.} The extraction is
+  garbled, but shows two $\pi$ and two $R$ tokens, consistent with the
+  normalised form $\frac{\mu_n}{\pi R^2}(\pi R^2 - \int\phi_n^2)^2$. This is
+  independently confirmed by SI Table~I, where $\mu = \gamma_0\tilde\mu /
+  (\pi\tilde R^2\Delta^4)$, and by Eq.~(S15), whose volume term is
+  $-\frac{2\tilde\mu}{\pi\tilde R^2}$.
+\end{itemize}
+
+\noindent
+Crucially, the finding does \emph{not} depend on the medium-confidence
+reading. Sec.~\ref{sec:crosschecks} gives two independent cross-checks, and
+Sec.~\ref{sec:measurement} gives a direct numerical measurement of the
+compiled binary.
+
+\section{Palmieri's model as stated}
+
+All quantities are dimensionless; the paper states that Eq.~(1) onward is
+written in dimensionless units.
+
+\subsection{Free energy}
+
+Single-cell part, Eq.~(7):
+\begin{equation}
+\mathcal{F}_0 = \sum_n\left\{
+  \int\!\!\!\int \dd x\dd y \left[
+     \gamma_n(\nabla\pn)^2
+   + \frac{30\gamma_n}{\lambda^2}\,\pn^2(1-\pn)^2
+  \right]
+  + \frac{\mu_n}{\pi R^2}\left(\pi R^2 - \int\!\!\!\int \dd x\dd y\,\pn^2\right)^{\!2}
+\right\}
+\label{eq:F0}
+\end{equation}
+
+Total free energy, Eq.~(9), and the interaction part, Eq.~(10):
+\begin{equation}
+\mathcal{F} = \mathcal{F}_0 + \mathcal{F}_{\rm int},
+\qquad
+\mathcal{F}_{\rm int} = \int\!\!\!\int \dd x\dd y
+   \sum_{n,\,m\neq n} \frac{30\kappa}{\lambda^2}\,\pn^2\phi_m^2 .
+\label{eq:Fint}
+\end{equation}
+
+\begin{quote}
+\textbf{Note the sum in Eq.~\eqref{eq:Fint} is \emph{ordered}}: it runs over
+all pairs $(n,m)$ with $m\neq n$, so every unordered pair is counted twice.
+This is the origin of the factor under dispute.
+\end{quote}
+
+\subsection{Dynamics}
+
+Equation of motion, Eq.~(1), with mobility $M=\tfrac12$:
+\begin{equation}
+\frac{\partial\pn}{\partial t} + \mathbf{v}_n\cdot\nabla\pn
+  = -\frac{1}{2}\,\frac{\delta\mathcal{F}}{\delta\pn}.
+\label{eq:eom}
+\end{equation}
+
+Velocity decomposition, Eq.~(11), and the interaction velocity, Eq.~(12):
+\begin{equation}
+\mathbf{v}_n = \mathbf{v}_{n,I} + \mathbf{v}_{n,A},
+\qquad
+\mathbf{v}_{n,I} = \frac{60\kappa}{\xi\lambda^2}
+  \int\!\!\!\int \dd x\dd y\;\pn\,(\nabla\pn)\!\!\sum_{m\neq n}\!\phi_m^2 .
+\label{eq:vI}
+\end{equation}
+
+Run-and-tumble reorientation, Eq.~(13):
+\begin{equation}
+P(t_r)\dd t_r = \frac{1}{\tau}e^{-t_r/\tau}\dd t_r .
+\label{eq:rtp}
+\end{equation}
+
+\subsection{The PDE that is actually integrated}
+
+SI Eq.~(S15) is Eq.~\eqref{eq:eom} with the functional derivative carried out.
+\textbf{This is the single most important equation in this document:}
+\begin{equation}
+\boxed{
+\begin{aligned}
+\frac{\partial\pn}{\partial t} + \mathbf{v}_n\cdot\nabla\pn
+&= \gamma_n\nabla^2\pn
+ - \frac{30}{\lambda^2}\left[
+      \gamma_n\pn(1-\pn)(1-2\pn)
+    + 2\kappa\!\!\sum_{m\neq n}\!\pn\phi_m^2
+  \right]\\[2pt]
+&\quad - \frac{2\mu}{\pi R^2}\,\pn\left[
+      \int\!\!\!\int \dd x\dd y\,\pn^2 - \pi R^2
+  \right]
+\end{aligned}}
+\label{eq:S15}
+\end{equation}
+Both the double-well term and the repulsion term sit inside \emph{one} bracket
+sharing \emph{one} prefactor $-30/\lambda^2$. Expanding:
+\begin{align}
+\text{double-well contribution} &= -\frac{30\gamma_n}{\lambda^2}\pn(1-\pn)(1-2\pn),\\
+\text{repulsion contribution}   &= -\frac{30}{\lambda^2}\cdot 2\kappa \cdot \pn\!\!\sum_{m\neq n}\!\phi_m^2
+                                 = -\frac{60\kappa}{\lambda^2}\,\pn\!\!\sum_{m\neq n}\!\phi_m^2 .
+\label{eq:target}
+\end{align}
+
+\subsection{Parameters (Table 1)}
+
+\begin{center}
+\begin{tabular}{lcccccccc}
+\toprule
+& $\gamma_n$ & $\lambda$ & $R$ & $\kappa$ & $\mu$ & $\tau$ & $v_A$ & $\xi$ \\
+\midrule
+value & 0.35 / 1 & 7 & 49 & 10 & 1 & $10^4$ & $10^{-2}$ & $1.5\times10^3$ \\
+cell type & cancer / normal & \multicolumn{7}{c}{all} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Verification that Eq.~(S15) follows from Eqs.~\eqref{eq:F0}--\eqref{eq:eom}}
+
+This confirms the paper is internally self-consistent, and isolates where the
+factor of $2$ comes from.
+
+\paragraph{1. Gradient term.}
+$\dfrac{\delta}{\delta\pn}\displaystyle\int\gamma_n(\nabla\pn)^2 = -2\gamma_n\nabla^2\pn$.
+Times $-\tfrac12$: $\;+\gamma_n\nabla^2\pn$. \OK\ Eq.~\eqref{eq:S15}.
+
+\paragraph{2. Double well.}
+Using $\dfrac{d}{d\phi}\left[\phi^2(1-\phi)^2\right] = 2\phi(1-\phi)(1-2\phi)$,
+\[
+\frac{\delta}{\delta\pn}\int\frac{30\gamma_n}{\lambda^2}\pn^2(1-\pn)^2
+ = \frac{60\gamma_n}{\lambda^2}\pn(1-\pn)(1-2\pn).
+\]
+Times $-\tfrac12$: $\;-\dfrac{30\gamma_n}{\lambda^2}\pn(1-\pn)(1-2\pn)$. \OK
+
+\paragraph{3. Volume constraint.}
+With $V_n=\int\pn^2$ and $A_0=\pi R^2$,
+\[
+\frac{\delta}{\delta\pn}\;\frac{\mu}{A_0}(A_0-V_n)^2
+ = \frac{\mu}{A_0}\cdot 2(A_0-V_n)\cdot(-2\pn)
+ = -\frac{4\mu}{A_0}(A_0-V_n)\pn .
+\]
+Times $-\tfrac12$: $\;+\dfrac{2\mu}{A_0}(A_0-V_n)\pn = -\dfrac{2\mu}{\pi R^2}\pn\!\left[V_n-\pi R^2\right]$. \OK
+
+\paragraph{4. Repulsion --- where the factor of 2 lives.}
+In the ordered sum of Eq.~\eqref{eq:Fint}, index $n$ appears in \emph{both}
+slots. Collecting all $\pn$-dependent terms:
+\[
+\mathcal{F}_{\rm int}\Big|_{\pn}
+ = \frac{30\kappa}{\lambda^2}\Big[
+     \underbrace{\sum_{m\neq n}\pn^2\phi_m^2}_{n\ \text{in first slot}}
+   + \underbrace{\sum_{m\neq n}\phi_m^2\pn^2}_{n\ \text{in second slot}}
+   \Big]
+ = 2\,\frac{30\kappa}{\lambda^2}\,\pn^2\!\!\sum_{m\neq n}\!\phi_m^2 .
+\]
+Hence
+\[
+\frac{\delta\mathcal{F}_{\rm int}}{\delta\pn}
+ = 2\cdot\frac{30\kappa}{\lambda^2}\cdot 2\pn\!\!\sum_{m\neq n}\!\phi_m^2
+ = \frac{120\kappa}{\lambda^2}\,\pn\!\!\sum_{m\neq n}\!\phi_m^2 ,
+\]
+and times $-\tfrac12$:
+\begin{equation}
+\boxed{\;-\frac{60\kappa}{\lambda^2}\,\pn\!\!\sum_{m\neq n}\!\phi_m^2\;}
+\end{equation}
+which is exactly the $2\tilde\kappa$ term printed inside the S15 bracket,
+Eq.~\eqref{eq:target}. \OK
+
+\paragraph{5. Consistency of the velocity.}
+Only $\mathcal{F}_{\rm int}$ survives in $\int(\delta\mathcal{F}/\delta\pn)\nabla\pn$
+(the single-cell terms are total derivatives and integrate to zero). With the
+same mobility $M=\tfrac12$,
+\[
+\mathbf{v}_{n,I} = \frac{1}{2\xi}\int\frac{\delta\mathcal{F}}{\delta\pn}\nabla\pn
+ = \frac{1}{2\xi}\cdot\frac{120\kappa}{\lambda^2}\int\pn(\nabla\pn)\!\!\sum_{m\neq n}\!\phi_m^2
+ = \frac{60\kappa}{\xi\lambda^2}\int\pn(\nabla\pn)\!\!\sum_{m\neq n}\!\phi_m^2 ,
+\]
+which is Eq.~\eqref{eq:vI} exactly. \OK\ \emph{The paper is internally
+consistent: Eq.~(S15) and Eq.~(12) both follow from the same
+$M\,\delta\mathcal{F}/\delta\phi$.}
+
+\section{What the code implements}
+
+\subsection{CUDA}
+
+Coefficient definitions, \texttt{include/types.cuh:26--36}:
+\begin{lstlisting}
+template <typename T> __host__ __device__ inline T bulk_coeff(T lambda) {
+    return T(30) / (lambda * lambda); }
+template <typename T> __host__ __device__ inline T interaction_coeff(T kappa, T lambda) {
+    return T(30) * kappa / (lambda * lambda); }
+template <typename T> __host__ __device__ inline T motility_coeff(T kappa, T xi, T lambda) {
+    return T(60) * kappa / (xi * lambda * lambda); }
+\end{lstlisting}
+
+Use, \texttt{src/kernels.cu:505--506}, \texttt{546}, \texttt{548}:
+\begin{lstlisting}
+505:  dwC_s  = gam * bulk_coeff(lambda_);              // 30*gamma/lambda^2
+506:  repC_s = interaction_coeff(kappa, lambda_);      // 30*kappa /lambda^2
+...
+546:  float rhs = gam*lap - dwC*dw + volC*c - repC*c*Soth;
+547:  float adv = vx*gx + vy*gy;
+548:  outp[idx] = c + dt * (rhs - adv);
+\end{lstlisting}
+There is no further scaling between line 506 and line 548: \texttt{rhs} is
+$\partial\phi/\partial t$ directly.
+
+\subsection{Reference implementations}
+
+Both CPU references use the same values, so neither is an independent oracle.
+From \texttt{tests/python/} \texttt{cpu\_reference.py}:
+\begin{lstlisting}
+132:  two_keff = 60.0 * p.kappa / (p.lambd ** 2)        # 12.245
+165:  repulsion  = two_keff * phi * S
+166:  var_deriv  = -tg * lap + bulk + constraint + repulsion
+170:  phi_new    = phi + p.dt * (-0.5 * var_deriv - advection)   # -> 6.122
+\end{lstlisting}
+\texttt{rust/cpu\_ref/src/sim.rs}: lines 199, 342, 343, 345 are structurally
+identical. Note the trap: line 132 in isolation \emph{looks} correct, because
+$60\kappa/\lambda^2$ is precisely the S15 coefficient --- but it is placed in
+\texttt{var\_deriv}, which line 170 multiplies by $-0.5$.
+
+\subsection{Side-by-side}
+
+\begin{center}\small
+\begin{tabular}{lccc}
+\toprule
+Term in $\partial\phi/\partial t$ & Palmieri (S15) & Code & Status \\
+\midrule
+Laplacian     & $+\gamma$                  & $+\gamma$                  & \OK \\
+Double well   & $-30\gamma/\lambda^2 = 0.612245$ & $0.612245$ & \OK \\
+Volume        & $-2\mu/\pi R^2$            & $-2\mu/\pi R^2$            & \OK \\
+Repulsion     & $-60\kappa/\lambda^2 = 12.244898$ & $6.122449$ & \BAD \\
+Velocity      & $60\kappa/\xi\lambda^2 = 8.16327\times10^{-3}$ & same & \OK \\
+\bottomrule
+\end{tabular}
+\end{center}
+(numerical values at $\gamma=1,\ \kappa=10,\ \lambda=7,\ \mu=1,\ \xi=1500$.)
+
+\section{Two cross-checks independent of the free-energy convention}
+\label{sec:crosschecks}
+
+Both of the following hold regardless of how one normalises
+$\mathcal{F}_{\rm int}$, so they cannot be evaded by a convention argument.
+
+\paragraph{Check A: bulk/repulsion ratio.}
+In Eq.~\eqref{eq:S15} the double-well and repulsion terms share the single
+prefactor $-30/\lambda^2$. Their ratio is therefore fixed by the paper:
+\[
+\frac{\text{repulsion coeff}}{\text{bulk coeff}} = \frac{2\kappa}{\gamma} = 20
+\quad\text{(at }\kappa=10,\gamma=1\text{)},
+\qquad\text{code: } \frac{30\kappa/\lambda^2}{30\gamma/\lambda^2} = \frac{\kappa}{\gamma} = 10 .
+\]
+In the code these two coefficients are two terms of the \emph{same sum on the
+same line} (\texttt{kernels.cu:546}), multiplied by the same \texttt{dt} on
+line 548. Any global factor --- the mobility, a units convention --- scales
+both equally and cancels in the ratio. Since the bulk coefficient
+independently matches S15, the repulsion coefficient is short by $2$.
+
+\paragraph{Check B: repulsion/velocity ratio.}
+The $\phi$-equation repulsion coefficient and the velocity coefficient are the
+same object $M\,\delta\mathcal{F}_{\rm int}/\delta\phi$, one of them divided by
+$\xi$. They must therefore differ by exactly $\xi$:
+\[
+\text{Palmieri: } \frac{60\kappa/\lambda^2}{60\kappa/\xi\lambda^2} = \xi = 1500 ,
+\qquad
+\text{code: } \frac{30\kappa/\lambda^2}{60\kappa/\xi\lambda^2} = \frac{\xi}{2} = 750 .
+\]
+
+Both checks independently demand $\text{repC} = 60\kappa/\lambda^2 = 12.2449$.
+
+\section{Direct measurement of the compiled binary}
+\label{sec:measurement}
+
+To remove any reliance on reading source code, the coefficient was measured
+from the binary's own output. Sixteen cells at $\rho=0.9$ were equilibrated to
+firm contact, then resumed with $\xi=10^{12}$ so that the interaction velocity
+(hence all advection) is $\sim10^{-11}$ and the dynamics is pure gradient flow.
+Two checkpoints one $\mathrm{d}t$ apart give $\partial\phi/\partial t$ by finite
+difference. Every term except the repulsion is independently verified, so one
+solves pointwise:
+\begin{equation}
+C = -\,\frac{\left.\dfrac{\partial\phi}{\partial t}\right|_{\rm measured}
+   - \left[\gamma\nabla^2\phi - \dfrac{30\gamma}{\lambda^2}\phi(1-\phi)(1-2\phi)
+     + \dfrac{2\mu}{A_0}(A_0-V)\phi\right]}
+  {\phi\,S_{\rm other}} .
+\end{equation}
+
+\begin{lstlisting}
+  cell  0:   1494 px   C =   6.1224  (IQR 6.1224..6.1225)
+  cell  1:   1738 px   C =   6.1224  (IQR 6.1224..6.1225)
+  cell  2:   1379 px   C =   6.1224  (IQR 6.1224..6.1225)
+  cell  3:   1176 px   C =   6.1224  (IQR 6.1224..6.1225)
+
+  pooled over 16 cells, 23265 pixels
+  MEASURED repulsion coefficient C = 6.12245
+    candidate 30k/l^2  =  6.12245   ratio C/cand = 1.00000
+    candidate 60k/l^2  = 12.24490   ratio C/cand = 0.50000
+\end{lstlisting}
+
+\noindent
+Agreement with $30\kappa/\lambda^2$ to six significant figures over
+$2.3\times10^4$ pixels. \textbf{The binary evaluates half of the
+Palmieri coefficient.}
+
+\section{Consequences and remedy}
+
+\subsection{Equivalent parameter set}
+
+Since $\kappa$ and $\xi$ enter \emph{only} through \texttt{interaction\_coeff}
+and \texttt{motility\_coeff} (verified by exhaustive grep), the implemented
+model is exactly Palmieri's model evaluated at
+\begin{equation}
+\kappa_{\rm eff} = 5, \qquad \xi_{\rm eff} = 750,
+\end{equation}
+while the runs are labelled $\kappa=10$, $\xi=1500$. Check:
+$60\cdot5/\lambda^2 = 6.1224$ \checkmark\ and
+$60\cdot5/(750\lambda^2) = 8.163\times10^{-3}$ \checkmark.
+
+\subsection{Zero-code-change workaround}
+
+By the same token, running the \emph{current unmodified binary} with
+\begin{center}
+\texttt{--kappa 20 --xi 3000}
+\end{center}
+gives repulsion $30\cdot20/\lambda^2 = 12.2449$ \checkmark\ and motility
+$60\cdot20/(3000\lambda^2) = 8.163\times10^{-3}$ \checkmark\ --- i.e.\ exactly
+Palmieri's intended physics. This permits a paired A/B comparison quantifying
+the impact on observables before any code is touched, and serves as a
+validation target for any patch.
+
+\subsection{Code fix}
+
+\begin{center}\footnotesize
+\begin{tabular}{lll}
+\toprule
+File & Current & Fixed \\
+\midrule
+\texttt{src/kernels.cu:506}  & \texttt{interaction\_coeff(kappa, lambda\_)} & \texttt{2.0f * interaction\_coeff(...)} \\
+\texttt{cpu\_reference.py:132} & \texttt{60.0 * kappa / lambd**2} & \texttt{120.0 * kappa / lambd**2} \\
+\texttt{rust/cpu\_ref/sim.rs:199} & \texttt{60.0 * kappa / lambd**2} & \texttt{120.0 * kappa / lambd**2} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\texttt{motility\_coeff} must \textbf{not} be changed.
+
+\subsection{Why no existing test caught this}
+
+The two tests that act as physics oracles ---
+\texttt{test\_isolated\_cell\_energy\_decreases} and
+\texttt{test\_single\_cell\_pde\_residual\_small} --- are both
+\textbf{single-cell}. The latter states in a comment ``No interaction term
+(single cell)''. The repulsion coefficient is the only coefficient that
+requires $\geq 2$ cells to exercise, so no oracle test ever evaluates it. All
+other physics tests compare the CUDA code against
+\texttt{cpu\_reference.py} or the Rust reference, which encode the same
+derived constants --- circular by construction.
+
+Recommended additions: (i) a convention-free assertion that
+$\text{repC}/\text{motility\_coeff} = \xi$; and (ii) a two-cell variational
+test that writes $\mathcal{F}$ explicitly and differentiates it
+\emph{numerically}, asserting $\partial_t\phi = -\tfrac12\,\delta
+\mathcal{F}/\delta\phi$ in the overlap region.
+
+\subsection{Impact on motility results}
+
+\begin{itemize}
+\item \textbf{Dilute / isolated cells: unaffected.} $\mathbf v_{n,I}\to0$, so
+  $\mathbf v = v_A\hat{\mathbf p}$ and Palmieri Eq.~(14),
+  $\langle\Delta x^2\rangle = 2v_A^2\tau^2[t/\tau - 1 + e^{-t/\tau}]$ with
+  $D_{\rm eff}=v_A^2\tau/2$, holds exactly.
+\item \textbf{Confluent monolayer: affected.} Velocities are correct for a
+  given configuration, but the configurations visited are not: cells
+  interpenetrate roughly twice as far before generating the same restoring
+  force. Palmieri chose $\kappa$ large specifically so cells ``deform when
+  brought together rather than overlap''; halving it moves the system toward
+  the regime he tuned against.
+\item Deformation observables ($L_n$, and hence $p_{\rm eff}=2\sqrt{\pi}L$)
+  are compressed toward unity; the soft/normal contrast shrinks in magnitude.
+\item Caging is weaker, so $D_{\rm eff}$ in the monolayer runs high and the
+  jamming/glass transition $\rho_c$ shifts upward --- the principal risk for
+  any finite-size-scaling analysis.
+\item Speed bursts, whose mechanism is neighbour pinching during T1 events
+  with force $\propto\kappa$, are weakened.
+\item Existing equilibration checkpoints relaxed into a more-overlapped,
+  less-deformed packing, so they are not valid initial conditions for a
+  corrected binary.
+\item Qualitative comparative conclusions driven by the elasticity contrast
+  $\gamma_c/\gamma_n=0.35$ --- which is implemented correctly --- are likely
+  to survive; quantitative comparison against Palmieri's published numbers is
+  not.
+\end{itemize}
+
+\section{Manuscript equations}
+
+For completeness, the free energy as typeset in
+\texttt{nibi\_sync/manuscript.tex} does not reproduce
+Eqs.~\eqref{eq:F0}--\eqref{eq:Fint} either, in two of three terms:
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+& Manuscript (as typeset) & vs.\ Palmieri \\
+\midrule
+$F_{\rm int}$ (line 278) & $\gamma_i|\nabla\phi_i|^2 + \tfrac{30\gamma_i}{\lambda^2}\phi_i^2(1-\phi_i)^2$ & identical \OK \\
+$F_{\rm vol}$ (line 289) & $\mu\sum_i\left(\int\phi_i^2 - A_0\right)^2$ & missing $1/A_0$ \\
+$F_{\rm rep}$ (line 298) & $\kappa\sum_{i<j}\int\phi_i^2\phi_j^2$ & missing $60/\lambda^2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Since $\sum_{n,m\neq n} = 2\sum_{i<j}$, Palmieri's Eq.~(10) equals
+$\frac{60\kappa}{\lambda^2}\sum_{i<j}$; matching it with the manuscript's form
+would require $\kappa = 12.24$, whereas the manuscript's parameter table
+(line 369) quotes Palmieri's $\kappa=10$. The manuscript states the model is
+used ``without modification'', so these two equations should be corrected to
+\[
+F_{\rm rep} = \frac{30\kappa}{\lambda^2}\sum_{i,\,j\neq i}\int\phi_i^2\phi_j^2 ,
+\qquad
+F_{\rm vol} = \frac{\mu}{A_0}\sum_i\left(\int\phi_i^2 - A_0\right)^2 .
+\]
+Note that the manuscript's error and the code's error are in \emph{different}
+directions ($-10\phi S$ implied by the manuscript, $-6.12$ evaluated by the
+code, $-12.24$ required by Palmieri), so they are independent fixes.
+
+\end{document}

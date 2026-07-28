@@ -46,6 +46,9 @@ tmp_*
 !cpp/simulation/tests/python/*.py
 !cpp/simulation/tests/python/fixtures
 !cpp/simulation/tests/python/fixtures/**
+!cpp/simulation/tests/validation_notes
+!cpp/simulation/tests/validation_notes/*.tex
+!cpp/simulation/tests/validation_notes/*.pdf
 cpp/simulation/tests/python/__pycache__/
 cpp/simulation/tests/python/.pytest_cache/
 cpp/simulation/tests/python/test_report/

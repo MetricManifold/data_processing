@@ -19,13 +19,16 @@ Equation solved per cell ``i`` on the full domain ``(x, y)``:
     dφᵢ/dt = γ ∇²φᵢ
              − (30 γ / λ²) · φᵢ · (1 − φᵢ) · (1 − 2φᵢ)    (bulk double-well)
              + (2 μ / A₀) · (A₀ − Vᵢ) · φᵢ                (volume constraint)
-             − (30 κ / λ²) · φᵢ · Σⱼ≠ᵢ φⱼ²                (soft repulsion)
+             − (60 κ / λ²) · φᵢ · Σⱼ≠ᵢ φⱼ²                (soft repulsion)
              − (vₓ · ∂φᵢ/∂x + v_y · ∂φᵢ/∂y)                (advection)
+
+This is Palmieri et al. (2015) Eq. (S15); the repulsion coefficient is
+60κ/λ² because Eq. (10) sums over ordered pairs.
 
 written in the production kernel as
 ``np = pv + dt·(−0.5·var_deriv − advection)`` with
 
-    var_deriv = −2γ·lap + 60γ/λ²·bulk + −4·(μ/A₀)·(A₀−V)·pv + 60κ/λ²·pv·S
+    var_deriv = −2γ·lap + 60γ/λ²·bulk + −4·(μ/A₀)·(A₀−V)·pv + 120κ/λ²·pv·S
 
 The velocity ``(vₓ, v_y)`` is updated at end of step to
 
@@ -129,7 +132,8 @@ def step(cells: List[CPUCell], p: CPUParams) -> List[CPUCell]:
     """Advance all cells by one ``dt``. Returns a new list of CPUCell."""
     tg  = 2.0 * p.gamma
     tgb = 60.0 * p.gamma / (p.lambd ** 2)
-    two_keff = 60.0 * p.kappa / (p.lambd ** 2)
+    # δF_rep/δφ = 120κ/λ²; ×(−1/2) below gives Eq. (S15)'s 60.
+    rep_var_coeff = 120.0 * p.kappa / (p.lambd ** 2)
     vc = p.mu / p.target_area
     mc = p.motility_coeff
 
@@ -162,7 +166,7 @@ def step(cells: List[CPUCell], p: CPUParams) -> List[CPUCell]:
 
         bulk       = tgb * phi * (1.0 - phi) * (1.0 - 2.0 * phi)
         constraint = -4.0 * vc * vd * phi
-        repulsion  = two_keff * phi * S
+        repulsion  = rep_var_coeff * phi * S
         var_deriv  = -tg * lap + bulk + constraint + repulsion
 
         vx_n, vy_n = velocities[i]

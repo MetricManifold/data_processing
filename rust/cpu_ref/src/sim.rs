@@ -196,7 +196,8 @@ pub fn step(
 
     // Pre-computed coefficients (global; gamma factors are per-cell).
     let inv_lambda2 = 1.0 / (p.lambd * p.lambd);
-    let two_keff = 60.0 * p.kappa / (p.lambd * p.lambd);
+    // dF_rep/dphi = 120 kappa/lambda^2; x(-1/2) below gives Eq. (S15)'s 60.
+    let rep_var_coeff = 120.0 * p.kappa / (p.lambd * p.lambd);
     let area_target = p.target_area();
     let vc = p.mu / area_target;
     let mc = p.motility_coeff();
@@ -339,7 +340,7 @@ pub fn step(
                     let bulk = tgb * phi_k * one_minus * one_minus_2;
                     let constraint = -4.0 * vc * vd * phi_k;
                     let s_local = s_total[k] - psq_i[k];
-                    let repulsion = two_keff * phi_k * s_local;
+                    let repulsion = rep_var_coeff * phi_k * s_local;
                     let var_deriv = -two_g * lap + bulk + constraint + repulsion;
                     let advection = vxn * gx + vyn * gy;
                     phi_new_i[k] = phi_k + dt * (-0.5 * var_deriv - advection);

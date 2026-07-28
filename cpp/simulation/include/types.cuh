@@ -10,17 +10,17 @@
 // Physics coefficient helpers (single source of truth)
 // ---------------------------------------------------------------------------
 // Free `__host__ __device__` templates so both SimParams (double, host)
-// and GPU kernels (float, device) call into one definition. The literal
-// constants `30` and `60` come from the variational derivative of the
-// Cahn-Hilliard + repulsion + advection free energy at Palmieri's
-// scaling; see study/adhesion/manuscript.tex Eq. (S15). Both kernels
-// and SimParams used to recompute these inline, drifting silently if
-// the physics changed.
+// and GPU kernels (float, device) call into one definition. Both kernels
+// and SimParams used to recompute these inline, drifting silently if the
+// physics changed.
 //
-// Note: the Rust CPU reference (rust/cpu_ref/src/sim.rs) uses a
-// factor-of-2 different form because it integrates the raw -delta F /
-// delta phi while the GPU integrates -1/2 delta F / delta phi. That
-// split is deliberate (independent oracle) — don't fold them.
+// Each returns the coefficient as it appears in dphi/dt, i.e. already
+// multiplied by the mobility M = 1/2 — do not rescale at the call site.
+// Values are Palmieri et al. (2015) Eq. (S15). The 60 in
+// interaction_coeff (not 30) is the ordered pair sum of Eq. (10).
+//
+// Invariant, independent of how F_int is normalised:
+//   interaction_coeff / motility_coeff == xi
 // ---------------------------------------------------------------------------
 template <typename T>
 __host__ __device__ inline T bulk_coeff(T lambda) {
@@ -28,7 +28,7 @@ __host__ __device__ inline T bulk_coeff(T lambda) {
 }
 template <typename T>
 __host__ __device__ inline T interaction_coeff(T kappa, T lambda) {
-    return T(30) * kappa / (lambda * lambda);
+    return T(60) * kappa / (lambda * lambda);
 }
 template <typename T>
 __host__ __device__ inline T motility_coeff(T kappa, T xi, T lambda) {
