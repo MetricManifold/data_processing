@@ -58,3 +58,22 @@ Used by `test_cutover_parity.py::TestCutoverParitySoft::test_2tau_soft_scripted_
 - If the IC layout or the GAMA sidecar format changes.
 - Re-tune the absolute thresholds in `test_cutover_parity.py` only when
   the f64 Rust path or the GPU integration order changes.
+
+## Regenerated 2026-07-30 (repulsion-coefficient fix)
+
+Superseded by the fix in commit `1637b7c`: the repulsion coefficient in
+`dphi/dt` was `30k/l^2` and is now `60k/l^2` (Palmieri Eq. S15). The previous
+reference data encoded the old physics, so `test_cutover_parity` would have
+failed against it for the wrong reason.
+
+Regenerated with the corrected `rust/cpu_ref` built from commit `1ac93f2`
+(cpp/simulation and rust/cpu_ref identical at `1637b7c`), single-threaded,
+nibi slurm job `18732646`, ~14h20m wall. Same IC, same `events.txt`, same
+command as the original protocol above.
+
+NOTE: the cpu_ref npz writer now emits every saved snapshot
+(`phi` shape `(nsnap,16,H,W)`) plus 7 extra metadata keys, where the original
+fixture holds only the final frame (`phi` shape `(16,H,W)`) with 7 keys.
+The raw output was therefore trimmed to the final frame and recompressed
+(3.6 GB -> 2.3 MB) via `~/trim_fixture.py` on nibi. Verified against the old
+fixture: identical key set, shapes, dtypes and final `t` (19950.01).
