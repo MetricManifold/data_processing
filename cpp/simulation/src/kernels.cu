@@ -49,6 +49,7 @@ void read_bbox_telemetry(int* max_raw, int* clamps) {
 // All kernels assume a fixed power-of-two tile (TILE_T) and a unified phi
 // pool of N*TILE_AREA floats.  No neighbour list, no halo, no spatial hash.
 
+#include <cmath>
 #include "kernels.cuh"
 #include <curand_kernel.h>
 #include <algorithm>
@@ -800,6 +801,14 @@ void launch_rebind(CellArrays& c, float bbox_k, float gamma_ref,
 // derived unit vector. ABP: theta diffuses each step. RTP: with prob
 // (1 - exp(-dt/tau)) re-randomise theta uniformly.
 //
+// Both rates are constants of the run, so they are computed once on the host
+// in double and passed in. Computing 1 - exp(-dt/tau) in float on device is
+// catastrophic cancellation: at dt/tau = 1e-6 the answer is 1e-6 while float
+// spacing near 1.0 is 2^-24 = 6e-8, giving a 1.33% error in the tumble rate
+// and an effective tau of 9869 instead of 10000. tau sets every timescale in
+// the analysis, and the bias is identical in every run, so it does not
+// average out over seeds.
+//
 // One thread per cell. Skipped entirely when v_A == 0 (no motility) or
 // when tau <= 0 (sentinel: hold polarity fixed forever).
 // ---------------------------------------------------------------------------
@@ -807,7 +816,7 @@ __global__ void k_polar(
     curandState* __restrict__ st,
     float* __restrict__ theta_arr,
     float* __restrict__ px, float* __restrict__ py,
-    float dt, float tau, bool abp, int N)
+    double tumble_prob, double abp_sigma, bool abp, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -815,10 +824,10 @@ __global__ void k_polar(
     float theta = theta_arr[i];
     bool changed = false;
     if (abp) {
-        theta += sqrtf(2.0f * dt / tau) * curand_normal(&s);
+        theta = (float)((double)theta + abp_sigma * (double)curand_normal(&s));
         changed = true;
     } else {
-        if (curand_uniform(&s) < 1.0f - expf(-dt / tau)) {
+        if ((double)curand_uniform(&s) < tumble_prob) {
             theta = curand_uniform(&s) * 2.0f * PI;
             changed = true;
         }
@@ -834,10 +843,13 @@ __global__ void k_polar(
 void launch_polar(CellArrays& c, const SimParams& p, cudaStream_t stream) {
     const int N = c.num_cells;
     if (N == 0 || p.v_A == 0.0 || p.tau <= 0.0) return;
+    // -expm1(-x) == 1 - exp(-x) without the cancellation.
+    const double tumble_prob = -std::expm1(-p.dt / p.tau);
+    const double abp_sigma   = std::sqrt(2.0 * p.dt / p.tau);
     k_polar<<<(N + 255) / 256, 256, 0, stream>>>(
         (curandState*)c.rng_states,
         c.polar_theta, c.polar_x, c.polar_y,
-        (float)p.dt, (float)p.tau, p.abp, N);
+        tumble_prob, abp_sigma, p.abp, N);
 }
 
 // ---------------------------------------------------------------------------
