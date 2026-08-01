@@ -622,8 +622,8 @@ __global__ void k_rebind(
     int* __restrict__ origin,
     int* __restrict__ rect,
     const float* __restrict__ V,
-    const float* __restrict__ Cx,
-    const float* __restrict__ Cy,
+    float* __restrict__ Cx,
+    float* __restrict__ Cy,
     const float* __restrict__ Cxx,
     const float* __restrict__ Cyy,
     const float* __restrict__ tgt_radius,
@@ -733,6 +733,16 @@ __global__ void k_rebind(
         sunion[1] = uy0;
         sunion[2] = ux1 - ux0;
         sunion[3] = uy1 - uy0;
+
+        // Rebase the first moments into the shifted frame. `origin` moves by
+        // +s and the tile contents by -s, so a Cx left in the old frame makes
+        // every consumer of `origin + Cx/V` -- trajectory, checkpoint cx/cy,
+        // --gamma nearest()/cluster() -- read s pixels off. Must come after
+        // varx/vary, which use the pre-shift mx/my. Cxx/Cyy are deliberately
+        // not rebased: nothing reads them past this point and the next full
+        // reduce overwrites them.
+        Cx[n] -= (float)sx * Vn;
+        Cy[n] -= (float)sy * Vn;
     }
     __syncthreads();
     const int sx = sshift[0];
