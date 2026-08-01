@@ -368,3 +368,69 @@ mod tests {
         assert_ne!(d.find(0), d.find(3));
     }
 }
+
+#[cfg(test)]
+mod adjacency_tests {
+    use super::*;
+
+    /// Cells on a triangular lattice are each other's Gabriel neighbours in
+    /// the 6 nearest directions and nothing further.
+    #[test]
+    fn hex_lattice_gives_six_neighbours() {
+        // Row pitch is a*sqrt(3)/2, so the box height must be ny times that
+        // for the lattice to tile periodically. ny must be even so the
+        // half-cell row offset also matches across the seam.
+        let (a, nx, ny) = (10.0_f64, 6usize, 6usize);
+        let (lx, ly) = (a * nx as f64, a * 3.0_f64.sqrt() * 0.5 * ny as f64);
+        let (mut wx, mut wy) = (Vec::new(), Vec::new());
+        for j in 0..ny {
+            for i in 0..nx {
+                let off = if j % 2 == 0 { 0.0 } else { a * 0.5 };
+                wx.push((i as f64 * a + off).rem_euclid(lx));
+                wy.push(j as f64 * a * 3.0_f64.sqrt() * 0.5);
+            }
+        }
+        let nb = gabriel_neighbours(&wx, &wy, lx, ly, 3.0 * a);
+        for (i, v) in nb.iter().enumerate() {
+            assert_eq!(v.len(), 6, "cell {i} had {} neighbours, expected 6", v.len());
+        }
+    }
+
+    /// The defect the fix targets: a cell sitting between two others must
+    /// break their adjacency. A blanket distance cutoff joins them anyway.
+    #[test]
+    fn blocker_breaks_adjacency() {
+        let (lx, ly) = (1000.0, 1000.0);
+        // 0 and 2 are 100 apart; 1 sits exactly between them.
+        let wx = vec![400.0, 450.0, 500.0];
+        let wy = vec![500.0, 500.0, 500.0];
+        let nb = gabriel_neighbours(&wx, &wy, lx, ly, 400.0);
+        assert!(!nb[0].contains(&2), "0-2 joined through the blocker at 1");
+        assert!(nb[0].contains(&1) && nb[1].contains(&2), "adjacent pairs missing");
+        // Without the blocker the same pair *is* adjacent.
+        let nb2 = gabriel_neighbours(&vec![400.0, 500.0], &vec![500.0, 500.0], lx, ly, 400.0);
+        assert!(nb2[0].contains(&1), "isolated pair should be adjacent");
+    }
+
+    /// Adjacency must wrap across the periodic boundary.
+    #[test]
+    fn adjacency_wraps_periodically() {
+        let (lx, ly) = (100.0, 100.0);
+        let wx = vec![2.0, 98.0];      // 4 apart across the seam, 96 the long way
+        let wy = vec![50.0, 50.0];
+        let nb = gabriel_neighbours(&wx, &wy, lx, ly, 20.0);
+        assert!(nb[0].contains(&1), "pair across the periodic seam not adjacent");
+    }
+
+    /// Edges are symmetric and no cell is its own neighbour.
+    #[test]
+    fn graph_is_symmetric_and_irreflexive() {
+        let wx = vec![10.0, 30.0, 55.0, 20.0, 70.0];
+        let wy = vec![10.0, 15.0, 12.0, 40.0, 45.0];
+        let nb = gabriel_neighbours(&wx, &wy, 200.0, 200.0, 100.0);
+        for (i, v) in nb.iter().enumerate() {
+            assert!(!v.contains(&i), "cell {i} is its own neighbour");
+            for &j in v { assert!(nb[j].contains(&i), "edge {i}-{j} not symmetric"); }
+        }
+    }
+}
