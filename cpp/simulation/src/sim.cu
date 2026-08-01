@@ -1297,6 +1297,26 @@ bool Simulation::init_from_checkpoint(const std::string& path_in,
                             / params.trajectory_samples);
         if (traj_every < 1) traj_every = 1;
     }
+    // --trajectory-interval is a cadence in steps, so apply it directly now
+    // that the checkpoint's t_end/dt are known. main.cu deliberately skips its
+    // interval -> sample-count conversion when resuming: there p.t_end/p.dt are
+    // still the CLI defaults, so the count is sized against the wrong horizon
+    // (e.g. interval 18000 against a t_end=2080000 checkpoint gave samples=1,
+    // i.e. one trajectory point for the entire leg).
+    if (trajectory_interval > 0) {
+        traj_every = trajectory_interval;
+        long long total_steps = (long long)(params.t_end / params.dt + 0.5);
+        long long samples = (total_steps + trajectory_interval - 1)
+                            / trajectory_interval;
+        if (samples < 1) samples = 1;
+        if (samples > INT_MAX) samples = INT_MAX;
+        // Keep the persisted count consistent, so a later chained leg that
+        // does not pass --trajectory-interval inherits the same cadence.
+        params.trajectory_samples = (int)samples;
+        printf("[SIM] trajectory cadence from --trajectory-interval: every %d "
+               "steps (%lld samples over t_end=%.1f)\n",
+               traj_every, samples, params.t_end);
+    }
 
     // ---- Build host cell vector from payload ----
     h_cells.resize(nc);

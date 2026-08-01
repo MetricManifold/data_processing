@@ -423,7 +423,14 @@ int main(int argc, char** argv) {
     // Translate --trajectory-interval into --trajectory-samples now that
     // dt and t_end are known. We round up so the user gets at least one
     // sample per requested interval.
-    if (trajectory_interval > 0) {
+    // FRESH runs only: here p.t_end and p.dt are the values the run will use,
+    // so the conversion is sound. On a resume they are still the CLI defaults
+    // (the checkpoint's are not read until init_from_checkpoint), so the same
+    // arithmetic would size the cadence against the wrong total step count --
+    // e.g. --trajectory-interval 18000 resuming a t_end=2080000 checkpoint
+    // yielded samples=1, i.e. a single trajectory point for the whole leg.
+    // The interval is threaded to the Simulation and applied directly there.
+    if (trajectory_interval > 0 && ckpt_path.empty()) {
         long long total_steps = (long long)(p.t_end / p.dt + 0.5);
         int samples = (int)((total_steps + trajectory_interval - 1) /
                             trajectory_interval);
@@ -476,6 +483,7 @@ int main(int argc, char** argv) {
     sim.out_dir = outdir;
     sim.save_final_checkpoint = save_final;
     sim.checkpoint_interval = checkpoint_interval;
+    sim.trajectory_interval = trajectory_interval;
     sim.gamma_spec = gamma_spec;
     sim.v_A_sigma = v_A_sigma;
     sim.vtk_interval = vtk_interval;

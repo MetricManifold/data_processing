@@ -92,6 +92,13 @@ struct Simulation {
     bool traj_writer_stop = false;
     bool save_final_checkpoint = true;
     int checkpoint_interval = 0;  // steps; 0 = disabled
+    // --trajectory-interval, in steps; 0 = unset. Host-only, deliberately NOT
+    // in SimParams (that struct is fwritten verbatim, so adding a field would
+    // break the v8 checkpoint layout). On resume this is applied directly as
+    // traj_every, instead of round-tripping through trajectory_samples via
+    // t_end/dt -- which at CLI-parse time are still the defaults, not the
+    // checkpoint's values.
+    int trajectory_interval = 0;
     std::string gamma_spec;       // e.g. "0.35", "0.35:cell0", "0.35:20%"
     // Log-normal disorder σ on v_A, applied at fresh init only. Per-cell
     // values are persisted in the VA_A checkpoint sidecar.
