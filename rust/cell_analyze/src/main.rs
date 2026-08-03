@@ -97,6 +97,11 @@ enum Commands {
         /// Emit a JSON sidecar with all banner metadata next to the PNG.
         #[arg(long)]
         emit_metadata: bool,
+        /// Suppress the metadata banner. For figures going into a paper, where
+        /// the provenance belongs in the caption rather than burned into the
+        /// image. Pair with --emit-metadata to keep the provenance alongside.
+        #[arg(long)]
+        no_banner: bool,
         /// Skip the validation pre-pass on the input directory. By
         /// default `snapshot` validates the run that contains the input
         /// checkpoint/VTK before rendering (same checks as
@@ -195,7 +200,8 @@ fn main() -> Result<()> {
             }
             analysis::studies::run_study(&config, &data_dir, skip_validation)?;
         }
-        Commands::Snapshot { input, output, width: _, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata, skip_validation } => {
+        Commands::Snapshot { input, output, width, label_cells, movie, skip, fps, color_by, shade_speed, speed_window, show_polarity, show_energy, emit_metadata,
+            no_banner, skip_validation } => {
             // Validation pre-pass: if the input is a checkpoint inside a
             // run directory, validate that directory first. We don't try
             // to validate VTK paths or movie directories — those have a
@@ -390,7 +396,9 @@ fn main() -> Result<()> {
                                         ckpt.header.num_cells, ckpt.header.time,
                                         ckpt.header.time / 10000.0, nx, ny);
 
-                    if label_cells {
+                    // Centroids carry the soft-cell flag, which the gamma tint needs even
+                    // when labels are off, so load them for either.
+                    if label_cells || color_by == "gamma" {
                         // Determine which cells are "soft" by comparing per-cell gamma
                         // to the majority (mode) gamma. Cells with lower gamma are soft.
                         let gammas = &ckpt.per_cell_gamma;
@@ -465,8 +473,24 @@ fn main() -> Result<()> {
                 let polarity_data = overlays.as_ref().map(|(p, _)| p.as_slice()).unwrap_or(&[]);
                 let energy_data = overlays.as_ref().map(|(_, e)| e.as_slice()).unwrap_or(&[]);
 
+                // Mask of the soft cells' own phase fields, so the tint traces
+                // the true interface rather than a Voronoi approximation to it.
+                let soft_phi: Vec<f32> = if !is_vtk && centroids.iter().any(|c| c.3) {
+                    use analysis::checkpoint::load_checkpoint;
+                    match load_checkpoint(&input) {
+                        Ok(ck) => {
+                            let soft_ids: std::collections::HashSet<u32> = centroids
+                                .iter().filter(|c| c.3).map(|c| c.0).collect();
+                            let want: Vec<bool> = ck.cells.iter()
+                                .map(|c| soft_ids.contains(&(c.id as u32))).collect();
+                            ck.composite_phi_subset(&want)
+                        }
+                        Err(_) => Vec::new(),
+                    }
+                } else { Vec::new() };
+
                 let (img_data, _, _) = render_phi_to_rgb(&phi, nx, ny, label_cells, &centroids,
-                    polarity_data, energy_data, &gamma_labels);
+                    polarity_data, energy_data, &gamma_labels, &soft_phi);
 
                 // Build metadata banner for checkpoint snapshots
                 let (final_img, final_w, final_h) = if !is_vtk {
@@ -536,8 +560,13 @@ fn main() -> Result<()> {
                         eprintln!("Metadata saved: {}", json_path.display());
                     }
 
-                    let (banner_img, bw, bh) = compose_with_banner(&img_data, nx, ny, &lines);
-                    (banner_img, bw, bh)
+                    if no_banner {
+                        (img_data.clone(), nx, ny)
+                    } else {
+                        let (banner_img, bw, bh) =
+                            compose_with_banner(&img_data, nx, ny, &lines);
+                        (banner_img, bw, bh)
+                    }
                 } else {
                     (img_data, nx, ny)
                 };
@@ -547,8 +576,19 @@ fn main() -> Result<()> {
                 } else {
                     output.clone()
                 };
+                // Upscale to the requested width. The phase field is rendered
+                // at grid resolution, which is well below what a print figure
+                // needs; integer-factor nearest-neighbour keeps the interfaces
+                // crisp rather than smearing them the way interpolation would.
+                let (final_img, final_w, final_h) = if width as usize > final_w {
+                    let f = (width as usize) / final_w.max(1);
+                    if f > 1 { upscale_nn(&final_img, final_w, final_h, f) }
+                    else { (final_img, final_w, final_h) }
+                } else {
+                    (final_img, final_w, final_h)
+                };
                 write_png(&out_path, &final_img, final_w, final_h)?;
-                eprintln!("Snapshot saved: {} ({}×{} native)", out_path.display(), final_w, final_h);
+                eprintln!("Snapshot saved: {} ({}×{})", out_path.display(), final_w, final_h);
             }
         }
         Commands::Check { dir, n_cells, expected_frames, t_start, t_end, fast, json } => {
@@ -1033,11 +1073,11 @@ fn render_single_vtk(
             owned_centroids = load_centroids_for_vtk(vtk_path, time);
             &owned_centroids
         };
-        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents, &[], &[], &std::collections::HashMap::new());
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, true, cents, &[], &[], &std::collections::HashMap::new(), &[]);
         Ok((img_data, nx, ny, title))
     } else {
         let empty_centroids = Vec::new();
-        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids, &[], &[], &std::collections::HashMap::new());
+        let (img_data, _, _) = render_phi_to_rgb(phi_field, nx, ny, false, &empty_centroids, &[], &[], &std::collections::HashMap::new(), &[]);
         Ok((img_data, nx, ny, title))
     }
 }
@@ -1049,6 +1089,7 @@ fn render_phi_to_rgb(
     polarity: &[(f64, f64, f64, f64)],   // (cx, cy, px, py)
     energy: &[(f64, f64, f64)],           // (cx, cy, ke)
     cell_above_text: &std::collections::HashMap<u32, String>,
+    soft_phi: &[f32],
 ) -> (Vec<u8>, usize, usize) {
     let mut img_data = vec![0u8; nx * ny * 3];
 
@@ -1061,9 +1102,20 @@ fn render_phi_to_rgb(
             let (r, g, b) = phi_colormap(val.clamp(0.0, 1.0));
             let iy = ny - 1 - y;
             let idx = (iy * nx + x) * 3;
-            img_data[idx] = r;
-            img_data[idx + 1] = g;
-            img_data[idx + 2] = b;
+            // A soft cell is tinted by its OWN field, so the colour follows the
+            // diffuse interface exactly and fades out through it just as the
+            // phase field does.
+            let sv = soft_phi.get(y * nx + x).copied().unwrap_or(0.0) as f64;
+            if sv > 0.01 {
+                let a = sv.clamp(0.0, 1.0);
+                img_data[idx]     = ((1.0 - a) * r as f64 + a *  31.0) as u8;
+                img_data[idx + 1] = ((1.0 - a) * g as f64 + a * 138.0) as u8;
+                img_data[idx + 2] = ((1.0 - a) * b as f64 + a * 152.0) as u8;
+            } else {
+                img_data[idx] = r;
+                img_data[idx + 1] = g;
+                img_data[idx + 2] = b;
+            }
         }
     }
 
@@ -1466,6 +1518,26 @@ fn build_metadata_lines(
 }
 
 /// Write RGB image data to a PNG file.
+/// Nearest-neighbour upscale by an integer factor. Used to bring a
+/// grid-resolution phase-field render up to print resolution without
+/// softening the interfaces.
+fn upscale_nn(src: &[u8], w: usize, h: usize, f: usize) -> (Vec<u8>, usize, usize) {
+    let (nw, nh) = (w * f, h * f);
+    let mut out = vec![0u8; nw * nh * 3];
+    for y in 0..nh {
+        let sy = y / f;
+        for x in 0..nw {
+            let sx = x / f;
+            let s = (sy * w + sx) * 3;
+            let d = (y * nw + x) * 3;
+            out[d] = src[s];
+            out[d + 1] = src[s + 1];
+            out[d + 2] = src[s + 2];
+        }
+    }
+    (out, nw, nh)
+}
+
 fn write_png(path: &std::path::Path, img_data: &[u8], nx: usize, ny: usize) -> Result<()> {
     let file = std::fs::File::create(path)?;
     let w = std::io::BufWriter::new(file);
@@ -1825,6 +1897,21 @@ impl MovieContext {
                         let intensity = (speed / self.speed_max).clamp(0.08, 1.0);
                         let brightness = (intensity * phi[idx].clamp(0.0, 1.0) * 255.0) as u8;
                         rgb[dst] = brightness; rgb[dst + 1] = brightness; rgb[dst + 2] = brightness;
+                    } else if self.color_by == ColorBy::Gamma
+                        && (cid as usize) < self.per_cell_color.len()
+                        && self.color_range > 0.0
+                    {
+                        // Tint the interior by stiffness. Colouring only the
+                        // boundary ring leaves a soft cell indistinguishable at
+                        // figure scale -- the ring is a few pixels wide -- so a
+                        // reader cannot see which cell the figure is about.
+                        let val = self.per_cell_color[cid as usize];
+                        let t = ((val - self.color_min) / self.color_range).clamp(0.0, 1.0);
+                        let (cr, cg, cb) = coolwarm(t as f64);
+                        let shade = phi[idx].clamp(0.0, 1.0) * 0.55 + 0.45;
+                        rgb[dst] = (cr as f32 * shade) as u8;
+                        rgb[dst + 1] = (cg as f32 * shade) as u8;
+                        rgb[dst + 2] = (cb as f32 * shade) as u8;
                     } else {
                         // Default interior: muted phi heatmap
                         let val = phi[idx].clamp(0.0, 1.0) as f64;

@@ -96,6 +96,38 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// Composite only the given cells' phi fields, max-blended, on the full
+    /// Nx×Ny grid. Used to obtain a mask of a cell subset with its true
+    /// phase-field boundary -- attributing pixels by nearest centroid instead
+    /// yields a Voronoi polygon that cuts across the real interface.
+    pub fn composite_phi_subset(&self, want: &[bool]) -> Vec<f32> {
+        let nx = self.params.nx as usize;
+        let ny = self.params.ny as usize;
+        let halo = self.params.halo_width;
+        let mut phi = vec![0.0f32; ny * nx];
+        for (i, cell) in self.cells.iter().enumerate() {
+            if !want.get(i).copied().unwrap_or(false) { continue; }
+            let bx0 = cell.bbox.x0 - halo;
+            let by0 = cell.bbox.y0 - halo;
+            let inner_w = cell.bbox.width() + 2 * halo;
+            let inner_h = cell.bbox.height() + 2 * halo;
+            let fw = cell.phi_w as usize;
+            let fh = cell.phi_h as usize;
+            let use_h = (inner_h as usize).min(fh);
+            let use_w = (inner_w as usize).min(fw);
+            for ly in 0..use_h {
+                let gy = ((by0 + ly as i32) % ny as i32 + ny as i32) as usize % ny;
+                for lx in 0..use_w {
+                    let gx = ((bx0 + lx as i32) % nx as i32 + nx as i32) as usize % nx;
+                    let val = cell.phi[ly * fw + lx];
+                    let idx = gy * nx + gx;
+                    if val > phi[idx] { phi[idx] = val; }
+                }
+            }
+        }
+        phi
+    }
+
     /// Composite all cell phi fields into a single Nx×Ny image using max blending.
     pub fn composite_phi(&self) -> Vec<f32> {
         let nx = self.params.nx as usize;
