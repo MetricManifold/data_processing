@@ -204,3 +204,75 @@ Status key: `[ ]` open · `[~]` in progress · `[x]` done
   R ∈ {49,36,20,10} with `--subdomain-padding` raised 3× and 6×: volumes
   identical to five significant figures. The `TILE_BBOX_MIN = 32` floor
   already exceeds the interface decay length.
+
+---
+
+## Handoff — 2026-08-05
+
+**Scope now understood.** Supervisor's plan found at
+`~/Downloads/palmieri_model_2d_extensions.pdf` ("Research Plan: Jamming and
+Cancer Cell Migration", 11pp; text in scratchpad `plan.txt`). Five phases; this
+paper is Phase 1 + Phase 3 plus a minimal Phase 2 subset (§3.2.3 b, d, e, f).
+Phase 2 (g) energy barriers and (h) vibrational DOS are out. Phases 4 (adhesion)
+and 5 (polydispersity) are out.
+
+**Manuscript = skeleton.** Methods written; all 9 results subsections and 4
+abstract fields are `\TODO`. Scope notes added in `nibi_sync/manuscript.tex` for
+§5.4 (ρ sweep — no data, no compute) and §6.5 (clustered vs dispersed — no data,
+cheap to rescue, deferred not abandoned).
+
+**Buckets.** (1) free analysis on existing trajectories: §5.2 bursts, §5.3
+velocity distributions, §6.4 pairwise, ξ_T1 for §6.3. (2) free on nibi RRG
+(≤N=1600): κ=10 redo ~2900 GPU-h, percolation N=800+1600 ~1600 GPU-h. Note the
+budget doc prices the latter at 195k BU assuming Mahti; it is small-N and free
+on nibi. (3) BU-blocked: N=3200/6400/12800, ~670k BU, balance −219k.
+
+**Headline risk.** §5.1 ratios still rising (1.11 → 1.15 → 1.28 at N=100/200/400);
+3200/6400 are n=2 and truncated. Cannot yet say converges/diverges/vanishes.
+N=800/1600 queued on nibi will largely decide it.
+
+**Working assumption.** Treat existing κ_eff=5 data as κ=10 for argument
+development — measured shift at N=100 was 1.156 → 1.176 against ±0.18. Holds for
+D_eff conclusions; flag as provisional if shape index enters an argument.
+
+### Next action: cage-relative observable (NOT YET WRITTEN)
+
+Gates §6.2 (defines f_mobile) and improves §6.3 (T1s fall out of |Δr_cage|).
+A workflow attempt on 2026-08-03 lost its implementer agent mid-run; nothing was
+written. `cage_relative.rs` does not exist in any branch, stash or worktree.
+
+Design decisions, literature-grounded (see memory
+`cage-relative-design-decisions`):
+- Neighbour set: distance shell at the **first minimum of g(r)**, fixed at t0 and
+  tracked forward. Cited (Shiba, Dey, Shen 2026). Gabriel z≈4 is noisier than
+  Delaunay z≈6 via CR-MSD = MSD(1 + 1/z); choice affects noise, not bias.
+- Threshold: **absolute**, at the first minimum of the van Hove function
+  (Gao/Dyre, Nat. Phys. 21, 471 (2025), doi:10.1038/s41567-024-02762-z), so
+  f_mobile floats.
+- Formula (plan §3.2.3e): Δr_cage(τ) = Δr_n(τ) − (1/z_n) Σ_{m∈nbrs} Δr_m(τ).
+- Verification: uniform translation ⇒ exactly 0; uncorrelated limit ⇒
+  CR-MSD/MSD = 1 + 1/z exactly.
+
+### Defects found in percolation_cluster.rs (verified, NOT yet fixed)
+
+- [ ] `percolation_cluster.rs:55-56` defaults to `ThresholdMode::Percentile,
+  mobile_threshold_pct: 50.0`, pinning frac_mobile ≈ 0.5 for every f_c and
+  destroying the transition. Must default to `Absolute`.
+- [ ] `percolation_cluster.rs:180` sources mobility from `PerCellDiffusion`
+  (absolute lab-frame D_eff) — the Mermin-Wagner-contaminated quantity. Must use
+  cage-relative once it exists.
+- [ ] `percolation_cluster` has no `metric_registry()` entry, so `frac_mobile`
+  cannot feed an aggregate.
+- [ ] Trap for the implementation: `ctx.positions` is ALREADY unwrapped
+  (`io.rs:539-554`). Do not apply `periodic_delta` to a time-displacement — it
+  would clamp to L/2, delete the mobile tail, and bias f_mobile more at small L.
+- [ ] `analyze_run.rs:120` subsamples BEFORE `:136` unwraps. Latent: at current
+  parameters (L=916, ~1 px/sample) there is ~450× headroom, but it mis-images
+  any cell moving > L/2 between retained frames.
+
+### Go/no-go before any new percolation runs
+
+On existing N=400 data, confirm f_mobile sweeps through ~0.5 as f_c goes
+0.05 → 0.50. Site percolation on a 2D contact network sits near there. If it
+saturates at 0.2 or starts above 0.5, there is no crossing and no compute
+creates one. Free.
