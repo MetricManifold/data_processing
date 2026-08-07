@@ -11,6 +11,7 @@ cpp/simulation/**/*
 **/agent_test_runs
 
 # Directories kept local only
+audit/
 papers/
 cluster_results/
 results/
@@ -49,6 +50,8 @@ tmp_*
 !cpp/simulation/tests/validation_notes
 !cpp/simulation/tests/validation_notes/*.tex
 !cpp/simulation/tests/validation_notes/*.pdf
+!cpp/simulation/tests/validation_notes/*.md
+!cpp/simulation/tests/validation_notes/*.py
 cpp/simulation/tests/python/__pycache__/
 cpp/simulation/tests/python/.pytest_cache/
 cpp/simulation/tests/python/test_report/
