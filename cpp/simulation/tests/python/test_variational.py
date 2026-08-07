@@ -11,6 +11,7 @@ repulsion term survive.
 These tests assume no coefficient from the implementation under test.
 """
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -95,6 +96,38 @@ def test_rhs_is_half_the_variational_derivative():
         f"{rel:.2%}, median got/expected = {np.median(got / expected):.4f}")
 
 
+def _measure_repulsion_coeff(p):
+    """Recover C in ``dphi/dt = ... - C * phi_0 * S_other`` from step() itself.
+
+    Two steps that differ ONLY in the neighbour amplitude are differenced, so
+    every term of cell 0 that does not involve S -- Laplacian, double well,
+    volume constraint -- cancels identically. Nothing is assumed about the
+    coefficient, and no free energy is written down, so this cannot inherit an
+    ordered-vs-unordered mistake the way test_rhs_is_half_the_variational_
+    derivative can. p.xi must be huge so advection vanishes.
+    """
+    yy, xx = np.mgrid[0:p.Ny, 0:p.Nx].astype(float)
+    cy, w = p.Ny / 2.0, 0.5164 * p.lambd
+
+    def disc(cx, amp):
+        r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        return amp * 0.5 * (1.0 - np.tanh((r - p.target_radius) / w))
+
+    phi0 = disc(p.Nx / 2.0 - 10.0, 1.0)
+
+    def rhs(neigh):
+        cells = [CPUCell(phi=f.copy(), vol=float((f * f).sum()) * p.dA)
+                 for f in (phi0, neigh)]
+        return (step(cells, p)[0].phi - phi0) / p.dt
+
+    n_a, n_b = disc(p.Nx / 2.0 + 10.0, 1.0), disc(p.Nx / 2.0 + 10.0, 0.5)
+    dS = n_a ** 2 - n_b ** 2
+    num, den = rhs(n_a) - rhs(n_b), phi0 * dS      # num = -C * phi0 * dS
+    live = np.abs(den) > 1e-4 * np.abs(den).max()
+    assert live.sum() > 50, "no overlap pixels; adjust geometry"
+    return float(np.median(-num[live] / den[live]))
+
+
 @pytest.mark.parametrize("kappa,lambd,xi",
                          [(10.0, 7.0, 1500.0), (3.0, 4.0, 250.0)])
 def test_repulsion_over_motility_equals_xi(kappa, lambd, xi):
@@ -102,10 +135,41 @@ def test_repulsion_over_motility_equals_xi(kappa, lambd, xi):
 
     Holds for any normalisation of F_int, so this needs no reference to the
     paper. Mirrors the invariant asserted in include/types.cuh.
+
+    The repulsion coefficient is *measured* from step() rather than written
+    down here; an earlier version of this test hardcoded it, which made the
+    assertion an identity between two literals that could never fail.
     """
+    probe = CPUParams(Nx=96, Ny=96, dt=1e-7, lambd=lambd, gamma=1.0,
+                      kappa=kappa, mu=1.0, xi=1e14, target_radius=12.0)
+    C = _measure_repulsion_coeff(probe)             # independent of xi
     p = CPUParams(Nx=8, Ny=8, lambd=lambd, kappa=kappa, xi=xi)
-    rhs_rep = 0.5 * (120.0 * p.kappa / p.lambd**2)   # rhs = -0.5*var_deriv
-    ratio = rhs_rep / p.motility_coeff
-    assert abs(ratio - xi) / xi < 1e-12, (
-        f"repulsion/motility ratio is {ratio:.1f} but must be xi={xi}; "
-        f"off by a factor of {ratio / xi:.3f}")
+    ratio = C / p.motility_coeff
+    assert abs(ratio - xi) / xi < 1e-3, (
+        f"measured repulsion coeff {C:.6f} over motility coeff is {ratio:.1f} "
+        f"but must be xi={xi}; off by a factor of {ratio / xi:.3f}")
+
+
+def test_cuda_coefficients_satisfy_the_same_invariant():
+    """Guard the CUDA constants directly -- no GPU, no compiler needed.
+
+    test_relaxation_fields_match covers types.cuh only transitively, by
+    comparing the built binary against cpu_reference.py, and it needs a GPU.
+    This reads the literals so a lone edit to types.cuh fails on any machine.
+    """
+    src = (pathlib.Path(__file__).parents[2]
+           / "include" / "types.cuh").read_text()
+
+    def literal(fn, denom):
+        m = re.search(
+            r"T\s+" + fn + r"\s*\([^)]*\)\s*\{\s*return\s+T\((\d+(?:\.\d+)?)\)"
+            r"\s*\*\s*kappa\s*/\s*\(\s*" + denom + r"\s*\)", src)
+        assert m, f"could not read {fn} out of types.cuh"
+        return float(m.group(1))
+
+    rep = literal("interaction_coeff", r"lambda \* lambda")
+    mot = literal("motility_coeff", r"xi \* lambda \* lambda")
+    assert rep == mot, (
+        f"interaction_coeff has {rep} and motility_coeff has {mot}; both are "
+        f"M dF_int/dphi so the numerators must match and differ only by xi. "
+        f"A mismatch means one of them is off by {mot / rep:.2f}x.")

@@ -16,7 +16,9 @@
 //!   gy  = (N − S) / (2·dy)
 //!
 //! Update:
-//!   var_deriv = −2γ·lap + 60γ/λ²·φ(1−φ)(1−2φ) − 4(μ/A₀)(A₀−V)·φ + 60κ/λ²·φ·S_local
+//!   var_deriv = −2γ·lap + 60γ/λ²·φ(1−φ)(1−2φ) − 4(μ/A₀)(A₀−V)·φ + 120κ/λ²·φ·S_local
+//!   (every entry above is δF/δφ, i.e. 2× its dφ/dt coefficient; the repulsion
+//!    term is 120κ/λ² so ×(−1/2) yields Palmieri Eq. (S15)'s 60κ/λ².)
 //!   v_n_x     = mc·Σ(φ·gx·S_local)·dA + v_A·pₓ,   mc = 60κ/(ξ·λ²)
 //!   φ_new     = φ + dt·(−0.5·var_deriv − (v_n_x·gx + v_n_y·gy))
 //!   vol_new   = Σ φ_new² · dA
