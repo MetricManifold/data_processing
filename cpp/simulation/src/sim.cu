@@ -8,11 +8,13 @@
 //   * Reads:  v3, v4, v5, v6 (legacy variable-W/H tiles), v7 (TILE_T
 //             uniform tiles), and v8 (TILE_T tiles + rank trailer). Legacy
 //             versions are re-tiled into a centred TILE_T x TILE_T buffer.
-//   * Writes: current = ckpt::VERSION_CURRENT (v8). See checkpoint_format.cuh
-//             for the record layout and version bump procedure.
+//   * Writes: current = ckpt::VERSION_CURRENT (v8). See
+//             cpp/common/checkpoint_format.h for the record layout and the
+//             version bump procedure. That header is SHARED with the GH200
+//             engine (cpp/gh200_sim) — it is not this tree's private copy.
 
 #include "sim.cuh"
-#include "checkpoint_format.cuh"
+#include "checkpoint_format.h"
 #include "multi_gpu.cuh"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -36,6 +38,36 @@
 // loop. Sequential consistency is fine — this is once-per-step polling,
 // not a hot path.
 static std::atomic<bool> g_terminate_requested{false};
+
+// ---------------------------------------------------------------------------
+// Drift guard: the v8 SimParams blob is this struct fwritten verbatim, and
+// cpp/common/checkpoint_format.h mirrors its layout so that readers which do
+// NOT share this type (the GH200 engine, the three Rust parsers) have one
+// authoritative statement of the field order. Tie the two together at compile
+// time; anything that moves a field here now fails to build until the mirror
+// and ckpt::VERSION_CURRENT are updated too.
+// ---------------------------------------------------------------------------
+static_assert(sizeof(SimParams) == sizeof(ckpt::SimParamsV8),
+              "SimParams no longer matches the v8 on-disk blob "
+              "(cpp/common/checkpoint_format.h): bump ckpt::VERSION_CURRENT");
+#define CKPT_SAME_OFFSET(field)                                               \
+    static_assert(offsetof(SimParams, field) ==                               \
+                  offsetof(ckpt::SimParamsV8, field),                         \
+                  "SimParams::" #field " moved relative to the v8 on-disk "   \
+                  "blob (cpp/common/checkpoint_format.h)")
+CKPT_SAME_OFFSET(Nx);            CKPT_SAME_OFFSET(Ny);
+CKPT_SAME_OFFSET(dx);            CKPT_SAME_OFFSET(dy);
+CKPT_SAME_OFFSET(dt);            CKPT_SAME_OFFSET(t_end);
+CKPT_SAME_OFFSET(lambda);        CKPT_SAME_OFFSET(gamma);
+CKPT_SAME_OFFSET(kappa);         CKPT_SAME_OFFSET(target_radius);
+CKPT_SAME_OFFSET(mu);            CKPT_SAME_OFFSET(v_A);
+CKPT_SAME_OFFSET(xi);            CKPT_SAME_OFFSET(tau);
+CKPT_SAME_OFFSET(subdomain_padding);
+CKPT_SAME_OFFSET(halo);          CKPT_SAME_OFFSET(save_interval);
+CKPT_SAME_OFFSET(print_interval);CKPT_SAME_OFFSET(trajectory_samples);
+CKPT_SAME_OFFSET(seed);          CKPT_SAME_OFFSET(polarity_seed);
+CKPT_SAME_OFFSET(abp);
+#undef CKPT_SAME_OFFSET
 
 void request_termination() {
     g_terminate_requested.store(true, std::memory_order_seq_cst);
@@ -2341,7 +2373,7 @@ void Simulation::write_vtk() {
 // ---------------------------------------------------------------------------
 // save_checkpoint — writes the current v8 format.
 //
-// Schema and POD records live in include/checkpoint_format.cuh. Bump
+// Schema and POD records live in cpp/common/checkpoint_format.h. Bump
 // ckpt::VERSION_CURRENT there to start a new version and add a branch
 // here + in init_from_checkpoint.
 // ---------------------------------------------------------------------------

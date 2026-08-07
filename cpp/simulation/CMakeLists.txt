@@ -72,7 +72,9 @@ endif()
 
 add_executable(cell_sim ${CELL_SIM_SOURCES})
 
-target_include_directories(cell_sim PRIVATE include)
+# ../common holds checkpoint_format.h — the ONE definition of the on-disk
+# checkpoint layout, shared with cpp/gh200_sim. Do not copy it into a tree.
+target_include_directories(cell_sim PRIVATE include ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 target_compile_definitions(cell_sim PRIVATE CELL_SIM_TILE_T=${CELL_SIM_TILE_T})
 message(STATUS "cell_sim: TILE_T=${CELL_SIM_TILE_T}")
 target_compile_options(cell_sim PRIVATE
