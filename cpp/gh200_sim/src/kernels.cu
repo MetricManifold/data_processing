@@ -40,7 +40,7 @@ __device__ __forceinline__ float s_other(uint32_t qS, float phi_self,
                                          uint32_t* flags) {
     const uint32_t qc = q_of(phi_self);
     if (qS >= qc) return (float)(qS - qc) * kQInvF;
-    PF_ALARM_ADD(flags, FLAG_S_NEGATIVE);
+    PF_FATAL_ADD(flags, FLAG_S_NEGATIVE);
     return 0.0f;
 }
 
@@ -163,7 +163,18 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
     // exactly WX*WY per cell per step, with no halo at all.
     // =====================================================================
     if (tid == 0) {
-        const CellState cs = A.cell[n];
+        // REFERENCE, not a by-value copy. CellState is 192 B, of which this
+        // block reads 17 scalars and never touches reserved[18] (72 B). The
+        // by-value copy materialised the whole aggregate, which ptxas could not
+        // hold in the 85-register budget a 768-thread CTA allows (65536/768),
+        // so it placed the record on the stack: 368 B frame with spill traffic,
+        // against a README that gates on zero spill. Binding a reference lets
+        // the compiler issue loads only for the members actually read.
+        //
+        // Safe here because this whole block is READ-ONLY on A.cell[n]: the
+        // fused path publishes its CellState update in P3, after the barrier.
+        // (process_cell_rhs writes in P0 and therefore snapshots explicitly.)
+        const CellState& cs = A.cell[n];
 
         // --- run and tumble: P(t_r) = (1/tau) exp(-t_r/tau) ---------------
         // A.p_tumble is -expm1(-dt/tau) computed in double on the host.
@@ -197,7 +208,8 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         //     demote margin -> move after kDemoteDwell consecutive checks;
         //   no class holds it -> FLAG_CLASS_EXHAUSTED and stay put. With
         //     kClassLarge in the table that now means an extent above
-        //     192 - kPromoteSlack = 184 px on an axis, not the far tighter
+        //     selected large edge - kPromoteSlack (184 or 200 px), not the
+        //     far tighter
         //     "no class is larger than the round one in both axes" it used to
         //     mean. Truncating phi to fake a fit is still not an option.
         const int ex = cs.bb_hi_x - cs.bb_lo_x + 1;
@@ -208,7 +220,14 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
             if (ex + kPromoteSlack > WX || ey + kPromoteSlack > WY) {
                 const int grow = class_containing(ex, ey, kPromoteSlack);
                 if (grow >= 0) dcls = grow;
-                else PF_ALARM_ADD(A.flags, FLAG_CLASS_EXHAUSTED);
+                // ADD, not OR. Both are sticky (the counter only ever grows
+                // from zero) and both make flag_is_fatal() stop the run, but OR
+                // saturates at 1 and throws away the only quantitative evidence
+                // there is. Job 666491 reported class_exhausted=1 and nothing
+                // else: not how many cells, not for how many steps, not how far
+                // past the limit. The atomic is on a path that fires only once
+                // the run is already invalid, so its cost is irrelevant.
+                else PF_FATAL_ADD(A.flags, FLAG_CLASS_EXHAUSTED);
                 pctr = 0u;
             } else {
                 const int small = class_containing(ex, ey, kDemoteSlack);
@@ -244,7 +263,7 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
                 sy = max(-WY, min(WY, sy));
             }
         } else {
-            PF_ALARM_OR(A.flags, FLAG_V_NONPOS);
+            PF_FATAL_OR(A.flags, FLAG_V_NONPOS);
         }
 
         // (step + 1), not step. Launch k reads phi^k and writes phi^{k+1}, and P3
@@ -623,8 +642,8 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
                 pn = tile_out[(size_t)(dty0 + b) * kTilePitch + dtx0 + a];
             }
 
-            if (!isfinite(pn)) PF_ALARM_OR(A.flags, FLAG_NONFINITE);
-            if (pn * pn > kQClampPhiSq) PF_ALARM_OR(A.flags, FLAG_Q_CLAMP);
+            if (!isfinite(pn)) PF_FATAL_OR(A.flags, FLAG_NONFINITE);
+            if (pn * pn > kQClampPhiSq) PF_FATAL_OR(A.flags, FLAG_Q_CLAMP);
             const int pb = (int)__float_as_uint(fabsf(pn));
             pmaxb = max(pmaxb, pb);
 
@@ -633,7 +652,7 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
                 int gx = gx0n + a;
                 if (gx >= A.L) gx -= A.L;
                 const uint32_t old = atomicAdd(&A.S_sc[(size_t)gy * A.P + gx], q);
-                if (old > 0xFFFFFFFFu - q) PF_ALARM_OR(A.flags, FLAG_S_OVERFLOW);
+                if (old > 0xFFFFFFFFu - q) PF_FATAL_OR(A.flags, FLAG_S_OVERFLOW);
             }
 
             // V(phi^{n+1}) is accumulated over the frame actually stored, so
@@ -747,7 +766,7 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         A.cell_cls[n] = (uint8_t)dcls;
         if (Bhix >= 0 && (Blox == 0 || Bhix == dwx - 1 ||
                           Bloy == 0 || Bhiy == dwy - 1))
-            PF_ALARM_ADD(A.flags, FLAG_SUPPORT_CLIP);
+            PF_ADVISORY_ADD(A.flags, FLAG_SUPPORT_CLIP);
     }
     __syncthreads();   // smem is reused by the next cell in this CTA
 }
@@ -1219,7 +1238,14 @@ __device__ void process_cell_rhs(int n, const StepArgs& A, char* smem,
     // plus the publish of the geometry/RNG half of the CellState update.
     // =====================================================================
     if (tid == 0) {
-        const CellState cs = A.cell[n];
+        // Reference for the same reason as the fused path (see process_cell).
+        // This body DOES write A.cell[n] at the end, so the two counters that
+        // are read-modify-written are snapshotted here, explicitly, instead of
+        // relying on a whole-record copy to do it implicitly. Every other field
+        // is read before its corresponding store.
+        const CellState& cs = A.cell[n];
+        const uint32_t prev_shift_ctr  = cs.shift_ctr;
+        const uint32_t prev_tumble_ctr = cs.tumble_ctr;
 
         // --- run and tumble: P(t_r) = (1/tau) exp(-t_r/tau) ---------------
         const Philox4 r = philox4x32_10(
@@ -1250,7 +1276,14 @@ __device__ void process_cell_rhs(int n, const StepArgs& A, char* smem,
             if (ex + kPromoteSlack > WX || ey + kPromoteSlack > WY) {
                 const int grow = class_containing(ex, ey, kPromoteSlack);
                 if (grow >= 0) dcls = grow;
-                else PF_ALARM_ADD(A.flags, FLAG_CLASS_EXHAUSTED);
+                // ADD, not OR. Both are sticky (the counter only ever grows
+                // from zero) and both make flag_is_fatal() stop the run, but OR
+                // saturates at 1 and throws away the only quantitative evidence
+                // there is. Job 666491 reported class_exhausted=1 and nothing
+                // else: not how many cells, not for how many steps, not how far
+                // past the limit. The atomic is on a path that fires only once
+                // the run is already invalid, so its cost is irrelevant.
+                else PF_FATAL_ADD(A.flags, FLAG_CLASS_EXHAUSTED);
                 pctr = 0u;
             } else {
                 const int small = class_containing(ex, ey, kDemoteSlack);
@@ -1281,7 +1314,7 @@ __device__ void process_cell_rhs(int n, const StepArgs& A, char* smem,
                 sy = max(-WY, min(WY, sy));
             }
         } else {
-            PF_ALARM_OR(A.flags, FLAG_V_NONPOS);
+            PF_FATAL_OR(A.flags, FLAG_V_NONPOS);
         }
 
         // (step + 1), not step. Launch k reads phi^k and writes phi^{k+1}, and P3
@@ -1327,8 +1360,8 @@ __device__ void process_cell_rhs(int n, const StepArgs& A, char* smem,
         csw->cls_written[A.parity_out] = (uint8_t)dcls;
         csw->theta = theta;
         csw->promote_ctr = (uint32_t)pctr;
-        csw->shift_ctr = cs.shift_ctr + ((sx | sy) ? 1u : 0u);
-        csw->tumble_ctr = cs.tumble_ctr + (uint32_t)tumbled;
+        csw->shift_ctr = prev_shift_ctr + ((sx | sy) ? 1u : 0u);
+        csw->tumble_ctr = prev_tumble_ctr + (uint32_t)tumbled;
         A.cell_cls[n] = (uint8_t)dcls;
     }
 
@@ -1706,8 +1739,8 @@ void k_step_post(PF_GRID_CONSTANT const StepArgs A)
         for (int a = lane; a < dwx; a += 32) {
             const float pn = row[a];
 
-            if (!isfinite(pn)) PF_ALARM_OR(A.flags, FLAG_NONFINITE);
-            if (pn * pn > kQClampPhiSq) PF_ALARM_OR(A.flags, FLAG_Q_CLAMP);
+            if (!isfinite(pn)) PF_FATAL_OR(A.flags, FLAG_NONFINITE);
+            if (pn * pn > kQClampPhiSq) PF_FATAL_OR(A.flags, FLAG_Q_CLAMP);
             const int pb = (int)__float_as_uint(fabsf(pn));
             pmaxb = max(pmaxb, pb);
 
@@ -1716,7 +1749,7 @@ void k_step_post(PF_GRID_CONSTANT const StepArgs A)
                 int gx = gx0n + a;
                 if (gx >= A.L) gx -= A.L;
                 const uint32_t old = atomicAdd(&A.S_sc[(size_t)gy * A.P + gx], q);
-                if (old > 0xFFFFFFFFu - q) PF_ALARM_OR(A.flags, FLAG_S_OVERFLOW);
+                if (old > 0xFFFFFFFFu - q) PF_FATAL_OR(A.flags, FLAG_S_OVERFLOW);
             }
 
             const double d = (double)pn * (double)pn;
@@ -1805,7 +1838,7 @@ void k_step_post(PF_GRID_CONSTANT const StepArgs A)
         cs->phi_max = __uint_as_float((uint32_t)Pmax);
         if (Bhix >= 0 && (Blox == 0 || Bhix == dwx - 1 ||
                           Bloy == 0 || Bhiy == dwy - 1))
-            PF_ALARM_ADD(A.flags, FLAG_SUPPORT_CLIP);
+            PF_ADVISORY_ADD(A.flags, FLAG_SUPPORT_CLIP);
     }
 }
 

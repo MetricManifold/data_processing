@@ -203,8 +203,45 @@ constexpr float kSupportEps = 1e-5f;
 // below). A support that fits in no class at all is still reported
 // (FLAG_CLASS_EXHAUSTED), never clipped.
 // ---------------------------------------------------------------------------
-constexpr int kTilePitch = 256;
+#if defined(PF_GH200_CMAKE_BUILD) && !defined(PF_EXTENDED_SUPPORT_LAYOUT)
+#error "CMake target omitted pf_shape_config: PF_EXTENDED_SUPPORT_LAYOUT is undefined"
+#endif
+#ifndef PF_EXTENDED_SUPPORT_LAYOUT
+#define PF_EXTENDED_SUPPORT_LAYOUT 1
+#endif
+#if PF_EXTENDED_SUPPORT_LAYOUT != 0 && PF_EXTENDED_SUPPORT_LAYOUT != 1
+#error "PF_EXTENDED_SUPPORT_LAYOUT must be exactly 0 or 1"
+#endif
+
+// The EXTENDED pair (tile 288, terminal class 224) is the DEFAULT: it raises
+// the containable support from 200 to 216 px/axis, which is what the N=800 soft
+// branch exhausted (job 666491, class_exhausted at extent >= 201).
+//
+// Permitting either quantity to change alone would break the aligned-origin /
+// zero-ring contract, so the two are selected as one audited pair. This is a
+// representation choice only: no physical parameter or update equation depends
+// on it.
+//
+// GPU evidence for the extended pair, Roihu job 687115 (gputest, free queue,
+// 2026-08-16), receipt schema pf-n800-extended-gate-v7:
+//   - device probe reports tile=288 terminal=224 capacity=216 on a real GH200;
+//   - synthetic supports 201..216 select class 4 with class_exhausted=0, and
+//     217 fails closed (class=-1, class_exhausted=1) with no clipping;
+//   - restart cuts at 1/10/100 steps reload PASS_EXACT on both the ctrl and
+//     soft N=800 branches, max_phi_abs_difference 0.0, checkpoint SHA equal.
+// NOT established by that gate: a full-length production segment, and general
+// (unconstrained) restart parity -- see promote_ctr below and
+// EXTENDED_SUPPORT_LAYOUT.md. Build the compact pair with
+// -DPF_EXTENDED_SUPPORT_LAYOUT=OFF to reproduce a pre-2026-08-16 geometry.
+constexpr bool kExtendedSupportLayout = PF_EXTENDED_SUPPORT_LAYOUT != 0;
+constexpr int kTilePitch = kExtendedSupportLayout ? 288 : 256;
+constexpr int kLargeClassEdge = kExtendedSupportLayout ? 224 : 208;
 constexpr int kTileArea  = kTilePitch * kTilePitch;
+static_assert((kTilePitch == 256 && kLargeClassEdge == 208) ||
+              (kTilePitch == 288 && kLargeClassEdge == 224),
+              "support layout must be one of the two audited tile/class pairs");
+static_assert(kTilePitch % 32 == 0,
+              "tile rows must remain 128-byte aligned in float storage");
 
 struct ShapeClass {
     int wx, wy, tx0, ty0;
@@ -226,34 +263,28 @@ struct ShapeClass {
 // rho=0.89, over 1 tau: cls 163/76/157/0, support_clip 2.33% and
 // class_exhausted 0.17% of cell-steps, i.e. INVALID. See RESULTS.md 7d.
 //
-// Class 4 (192x192) is the fix, and it is affordable ONLY because it does not
-// stage S: class_smem_large(192,192) = kScalarBytes + phi_bytes(192,192)
-//   = 2,176 + (192+2)*phi_pitch(192)*4 = 2,176 + 194*200*4 = 157,376 B,
-// which is 56,064 B BELOW the 213,440 B that class 3 already costs. Adding it
-// therefore does not move kSmemRaw at all (static_assert'd below).
+// Class 4 is the terminal phi-only class. It is 208x208 in the compact layout
+// and 224x224 in the extended candidate. Their raw footprints are 183,616 B
+// and 211,904 B, both below the staged-class maximum of 213,440 B, so neither
+// changes the fused launch request (static_assert'd below).
 //
 // tx0 = ty0 = 32 is forced, not chosen: class_ok() requires the origin to be a
 // multiple of 32 (128 B aligned tile rows), at least 1 (the tile's zero ring)
-// and to satisfy tx0 + wx <= kTilePitch - 1 = 255. For wx = 192 the only
-// multiple of 32 in [32, 63] is 32 -- and it happens to centre the window in
-// the tile exactly (32 left, 256-32-192 = 32 right).
+// and to satisfy tx0 + wx <= kTilePitch - 1. The audited pairs are 256/208
+// (32 pixels left, 16 right) and 288/224 (32 pixels on both sides).
 //
-// 224x224 was considered and REJECTED as illegal, not merely large: it needs
-// tx0 <= 31 to fit the tile with its ring, and the only multiple of 32 there is
-// 0, which has no room for the zero ring. Its 211,904 B would have fitted the
-// budget; the tile geometry is what refuses it. If 192 - kPromoteSlack = 184 px
-// of containable extent ever turns out to be too little, the next LEGAL step is
-// 208x208 (tx0 = ty0 = 32, 32+208 = 240 <= 255, 208 % kStripRows == 0,
-// class_smem_large = 2,176 + 210*216*4 = 183,616 B, still 29,824 B under
-// kSmemRaw). That is a one-line change to the table below; every static_assert
-// in this file re-checks it automatically.
+// A 224x224 class is illegal in the compact tile because its aligned origin
+// cannot retain the zero ring. Enlarging the tile to 288 makes the pair legal
+// without relaxing any execution rule. It raises containable support extent
+// after kPromoteSlack from 200 to 216 pixels; anything wider still fails closed.
 constexpr int kNumClasses = 5;
 constexpr ShapeClass kClasses[kNumClasses] = {
     {144, 144, 64, 64},   // 0: round
     {176, 144, 32, 64},   // 1: wide
     {144, 176, 64, 32},   // 2: tall
     {160, 160, 32, 32},   // 3: big    (larger than round in BOTH axes)
-    {192, 192, 32, 32},   // 4: large  (phi only in smem; S read from global)
+    {kLargeClassEdge, kLargeClassEdge, 32, 32},
+                           // 4: large  (phi only in smem; S read from global)
 };
 
 constexpr int kClassRound = 0;
@@ -269,6 +300,26 @@ static_assert(kClassLarge == kNumClasses - 1,
               "the non-staged classes must be the LAST ones: k_step_rhs refuses "
               "them through `default:`, which catches everything above "
               "kClassBig");
+
+// The selector may alter only the storage tile and terminal edge. Classes 0..3
+// and the terminal class's aligned origin remain pinned.
+static_assert(kClasses[0].wx == 144 && kClasses[0].wy == 144 &&
+              kClasses[0].tx0 == 64 && kClasses[0].ty0 == 64,
+              "support-layout selector changed class 0 geometry");
+static_assert(kClasses[1].wx == 176 && kClasses[1].wy == 144 &&
+              kClasses[1].tx0 == 32 && kClasses[1].ty0 == 64,
+              "support-layout selector changed class 1 geometry");
+static_assert(kClasses[2].wx == 144 && kClasses[2].wy == 176 &&
+              kClasses[2].tx0 == 64 && kClasses[2].ty0 == 32,
+              "support-layout selector changed class 2 geometry");
+static_assert(kClasses[3].wx == 160 && kClasses[3].wy == 160 &&
+              kClasses[3].tx0 == 32 && kClasses[3].ty0 == 32,
+              "support-layout selector changed class 3 geometry");
+static_assert(kClasses[kClassLarge].wx == kLargeClassEdge &&
+              kClasses[kClassLarge].wy == kLargeClassEdge &&
+              kClasses[kClassLarge].tx0 == 32 &&
+              kClasses[kClassLarge].ty0 == 32,
+              "terminal class must retain its audited aligned origin");
 
 // Does class `c` stage S (and, in P2, phi^{n+1}) in shared memory?
 //
@@ -324,6 +375,31 @@ __host__ __device__ __forceinline__ constexpr int class_containing(int ex, int e
         const ShapeClass sc = class_of(c);
         const int area = sc.wx * sc.wy;
         if (ex + slack <= sc.wx && ey + slack <= sc.wy &&
+            (best < 0 || area < best_area)) {
+            best = c;
+            best_area = area;
+        }
+    }
+    return best;
+}
+
+// Smallest native class that contains the measured support and every nonzero
+// source pixel at the class's canonical tile offset. The checkpoint reader uses
+// this to decide whether a foreign tile can be copied without moving a global
+// coordinate or discarding even a sub-threshold tail. Source coordinates beyond
+// a smaller on-disk tile are exactly zero and need not be represented here.
+__host__ __device__ __forceinline__ constexpr int class_preserving_nonzero(
+    int ex, int ey, int slack,
+    int nz_lo_x, int nz_hi_x, int nz_lo_y, int nz_hi_y) {
+    int best = -1, best_area = 0;
+    for (int c = 0; c < kNumClasses; ++c) {
+        const ShapeClass sc = class_of(c);
+        const int area = sc.wx * sc.wy;
+        const bool support_fits = ex + slack <= sc.wx && ey + slack <= sc.wy;
+        const bool nonzero_fits =
+            nz_lo_x >= sc.tx0 && nz_hi_x < sc.tx0 + sc.wx &&
+            nz_lo_y >= sc.ty0 && nz_hi_y < sc.ty0 + sc.wy;
+        if (support_fits && nonzero_fits &&
             (best < 0 || area < best_area)) {
             best = c;
             best_area = area;
@@ -433,6 +509,19 @@ constexpr int smem_raw_staged_only() {
 }
 constexpr int kSmemRaw = smem_raw_all();
 constexpr int kSmemBytes = align_up(kSmemRaw, 128);
+constexpr int kLargeClassSmemRaw = class_smem_of(kClassLarge);
+constexpr int kLargeClassSmemBytes = align_up(kLargeClassSmemRaw, 128);
+constexpr int kExpectedLargeClassSmemRaw =
+    kExtendedSupportLayout ? 211904 : 183616;
+
+static_assert(kLargeClassSmemRaw == kExpectedLargeClassSmemRaw,
+              "terminal class shared-memory calculation changed");
+static_assert(kLargeClassSmemBytes ==
+                  (kExtendedSupportLayout ? 211968 : 183680),
+              "terminal class 128-byte shared-memory alignment changed");
+static_assert(kSmemRaw == 213440 && kSmemBytes == 213504,
+              "support-layout selector must not change the staged-class launch "
+              "shared-memory request");
 
 // THE load-bearing assertion for the large class. The whole point of not
 // staging S is that the largest-window class costs LESS than the staged classes
@@ -441,7 +530,8 @@ constexpr int kSmemBytes = align_up(kSmemRaw, 128);
 // is untouched by its existence. If a future edit makes the large class the
 // binding constraint, this fires instead of silently costing occupancy.
 //   staged max : class 3, 160x160 -> 2,176 + 108,864 + 102,400 = 213,440 B
-//   large      : class 4, 192x192 -> 2,176 + 155,200           = 157,376 B
+//   compact    : class 4, 208x208 -> 2,176 + 181,440           = 183,616 B
+//   extended   : class 4, 224x224 -> 2,176 + 209,728           = 211,904 B
 static_assert(kSmemRaw == smem_raw_staged_only(),
               "the large class raised kSmemRaw: it must fit inside the budget "
               "the staged classes already set, or it is not free");
@@ -455,6 +545,15 @@ constexpr int kSmemPerBlockOptinSm90 = 232448;
 static_assert(kSmemBytes <= kSmemPerBlockOptinSm90,
               "dynamic shared memory request exceeds the sm_90 per-block "
               "opt-in maximum");
+constexpr int kSmemLaunchMarginSm90 = kSmemPerBlockOptinSm90 - kSmemBytes;
+constexpr int kLargeClassMarginToStaged = kSmemRaw - kLargeClassSmemRaw;
+static_assert(kSmemLaunchMarginSm90 == 18944,
+              "unexpected sm_90 per-block shared-memory margin");
+static_assert(kLargeClassMarginToStaged ==
+                  (kExtendedSupportLayout ? 1536 : 29824),
+              "unexpected terminal-to-staged shared-memory margin");
+static_assert(kLargeClassSmemBytes <= kSmemPerBlockOptinSm90,
+              "terminal class exceeds the sm_90 per-block opt-in maximum");
 
 // ---------------------------------------------------------------------------
 // SPLIT execution path (--split): two kernels per step instead of one.
@@ -614,7 +713,7 @@ constexpr bool class_ok(ShapeClass c) {
 // particular the 32-alignment of tx0/ty0 is what keeps the cp.async SOURCE
 // rows 128 B aligned; the DESTINATION alignment the 16 B copies need comes from
 // kScalarBytes % 16 == 0 and phi_pitch(wx) % 4 == 0 (checked below), which hold
-// for 192 exactly as they do for 144.
+// for both audited terminal layouts exactly as they do for 144.
 static_assert(class_ok(kClasses[0]), "shape class 0 violates a layout rule");
 static_assert(class_ok(kClasses[1]), "shape class 1 violates a layout rule");
 static_assert(class_ok(kClasses[2]), "shape class 2 violates a layout rule");
@@ -661,8 +760,8 @@ static_assert(class_not_narrower(kClasses[4]),
 // The large class must strictly dominate every other class on both axes,
 // otherwise it is not the terminal destination class_containing() falls back to
 // and a support could still fit nothing. This is what makes
-// FLAG_CLASS_EXHAUSTED mean "bigger than 192 - kPromoteSlack = 184 px on an
-// axis" and nothing subtler.
+// FLAG_CLASS_EXHAUSTED mean "bigger than the selected terminal edge minus
+// kPromoteSlack on an axis" and nothing subtler.
 constexpr bool dominated_by_large(ShapeClass c) {
     return c.wx <= kClasses[kClassLarge].wx && c.wy <= kClasses[kClassLarge].wy;
 }
@@ -699,7 +798,8 @@ enum : int {
     // A CTA was handed a shape class its execution path cannot process, and
     // SKIPPED the cell rather than running it with the wrong geometry. Raised
     // by the split path when a cell reaches kClassLarge (k_step_rhs cannot hold
-    // a 192x192 rect within kSplitSmemBudget), and by either path's dispatch
+    // the selected 192/208 square within kSplitSmemBudget), and by either
+    // path's dispatch
     // default, which is unreachable by construction. Counted, and the run is
     // reported INVALID -- the previous behaviour was to fall through `default:`
     // into process_cell<kClassTall>, i.e. to read a 160x160 window as 144x176.
@@ -707,39 +807,51 @@ enum : int {
     FLAG_COUNT      = 8
 };
 // ---------------------------------------------------------------------------
-// Alarm counters, and how to compile them OUT for production.
+// Fatal alarms are always enabled. Only the high-frequency support_clip
+// advisory is optional; opt it in with -DPF_ALARMS.
 //
-// Build with -DPF_NO_ALARMS and every counter below disappears from the PTX --
-// not predicated off, gone. This is safe because both high-frequency alarms
-// have been MEASURED to be advisory-grade rather than diagnostic:
-//
-//   support_clip     fires on ~1.4% of cell-steps; the phi^2 mass actually
-//                    truncated is 1.3e-12 of the total (measured over 800
-//                    cells at N=800, 208 tau).
-//   class_exhausted  same story: only 8/800 cells ever carry border phi above
-//                    1e-5, and they lose 8e-10 of their mass.
-//
-// FLAG_CLASS_UNSUPPORTED is NOT compiled out: it is one atomic per CTA (not
-// per pixel), it means a CellState carried a shape class outside [0,kNumClasses)
-// -- i.e. memory corruption, not physics -- and it gates a fatal stop.
-//
-// Keep alarms ON for validation and any new regime; turn them off only for
-// production runs whose geometry you have already characterised.
+// support_clip fires when the phi > kSupportEps bounding box merely touches a
+// window edge. Direct border-ring measurements put the affected phi^2 mass at
+// ~1e-13 of the total, so it remains advisory. class_exhausted is different: no
+// available class can contain the support, which means real field truncation.
+// It is therefore an always-on sticky atomicOr. Every other non-advisory flag
+// is likewise always compiled in and fatal.
 // ---------------------------------------------------------------------------
-#if defined(PF_NO_ALARMS)
-#define PF_ALARM_ADD(flags, idx) ((void)0)
-#define PF_ALARM_OR(flags, idx)  ((void)0)
-#define PF_ALARMS_ENABLED 0
+#if defined(PF_ALARMS) && defined(PF_NO_ALARMS)
+#error "PF_ALARMS and PF_NO_ALARMS are mutually exclusive; pass at most one."
+#endif
+
+#define PF_FATAL_ADD(flags, idx) atomicAdd(&(flags)[idx], 1u)
+#define PF_FATAL_OR(flags, idx)  atomicOr(&(flags)[idx], 1u)
+
+#if defined(PF_ALARMS)
+#define PF_ADVISORY_ADD(flags, idx) atomicAdd(&(flags)[idx], 1u)
+#define PF_SUPPORT_CLIP_ENABLED 1
 #else
-#define PF_ALARM_ADD(flags, idx) atomicAdd(&(flags)[idx], 1u)
-#define PF_ALARM_OR(flags, idx)  atomicOr(&(flags)[idx], 1u)
-#define PF_ALARMS_ENABLED 1
+#define PF_ADVISORY_ADD(flags, idx) ((void)0)
+#define PF_SUPPORT_CLIP_ENABLED 0
 #endif
 
 // FLAG_COUNT is pinned at 8 because DumpHeader carries uint32_t flags[FLAG_COUNT]
 // inline: changing it changes the on-disk dump layout that dump_phi and the
 // Python oracle parse. Bump kDumpVersion if that ever has to move.
 static_assert(FLAG_CLASS_UNSUPPORTED < FLAG_COUNT, "flag index out of range");
+
+constexpr bool flag_is_fatal(int i) {
+    return i >= 0 && i < FLAG_COUNT && i != FLAG_SUPPORT_CLIP;
+}
+static_assert(!flag_is_fatal(FLAG_SUPPORT_CLIP),
+              "support_clip is the sole advisory flag");
+static_assert(flag_is_fatal(FLAG_S_OVERFLOW), "S_overflow must stop production");
+static_assert(flag_is_fatal(FLAG_Q_CLAMP), "q_clamp must stop production");
+static_assert(flag_is_fatal(FLAG_CLASS_EXHAUSTED),
+              "class_exhausted must stop production");
+static_assert(flag_is_fatal(FLAG_S_NEGATIVE),
+              "S_other_negative must stop production");
+static_assert(flag_is_fatal(FLAG_NONFINITE), "phi_nonfinite must stop production");
+static_assert(flag_is_fatal(FLAG_V_NONPOS), "V_nonpositive must stop production");
+static_assert(flag_is_fatal(FLAG_CLASS_UNSUPPORTED),
+              "class_unsupported must stop production");
 
 inline const char* flag_name(int i) {
     switch (i) {
@@ -947,12 +1059,24 @@ inline void print_params(const SimParams& p, int side, int pitch, bool split) {
                 p.interaction() / p.motility());
     std::printf("  vol   2mu/A0     %.9g\n", p.volume());
     std::printf("  p_tumble         %.9e   (-expm1(-dt/tau))\n", p.p_tumble());
+    std::printf("  fatal alarms     ENABLED (all non-advisory flags)\n");
+    std::printf("  support_clip     %s\n",
+                PF_SUPPORT_CLIP_ENABLED
+                    ? "ENABLED (-DPF_ALARMS; advisory only)"
+                    : "NOT INSTRUMENTED (default; advisory only)");
+    std::printf("  support layout   %s  (tile %d, max support %d px/axis)\n",
+                kExtendedSupportLayout
+                    ? "EXTENDED (default; support+restart GPU-gated 687115)"
+                    : "COMPACT LEGACY (pre-2026-08-16 geometry)",
+                kTilePitch, kLargeClassEdge - kPromoteSlack);
     std::printf("  smem/CTA         %d B of %d B opt-in max\n",
                 kSmemBytes, kSmemPerBlockOptinSm90);
-    std::printf("  large class      %d: %d x %d, %d B (phi only, S from global)"
-                "   -- budget set by the staged classes at %d B\n",
+    std::printf("  large class      %d: %d x %d, %d B raw / %d B aligned "
+                "(phi only, S from global) -- staged max %d B, "
+                "sm_90 launch margin %d B\n",
                 kClassLarge, kClasses[kClassLarge].wx, kClasses[kClassLarge].wy,
-                class_smem_of(kClassLarge), smem_raw_staged_only());
+                kLargeClassSmemRaw, kLargeClassSmemBytes,
+                smem_raw_staged_only(), kSmemLaunchMarginSm90);
     if (!split) {
         std::printf("  exec path        FUSED   (k_step, 1 kernel/step, "
                     "%d threads, %d B smem/CTA)\n",

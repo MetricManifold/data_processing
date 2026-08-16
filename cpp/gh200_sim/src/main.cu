@@ -43,11 +43,15 @@ static void usage(const char* argv0) {
 "numerics / run control\n"
 "  --dt <f>               time step                          (0.01)\n"
 "  --t-end <f>            end time                           (100)\n"
-"  --seed <u64>           RNG seed for placement             (1234)\n"
+"  --seed <u64>           grid-placement/per-cell RNG seed   (1234)\n"
 "  --polarity-seed <u64>  RNG stream for initial polarity AND every\n"
 "                         tumble, independent of --seed. 0 = follow --seed.\n"
 "                         Matched pairs share this so both branches\n"
 "                         reorient at the same times and angles.\n"
+"  --initial-centres <csv>  fresh-start accepted centres, exact header\n"
+"                         global_id,x,y. Strictly validated; when absent the\n"
+"                         historical grid+jitter initializer remains active.\n"
+"                         Matched branches must load the same CSV bytes.\n"
 "  --print-interval <int> steps between status lines         (100)\n"
 "  --full-moment <int>    steps between perimeter updates    (100)\n"
 "  --verify-every <int>   steps between strict-mode checks    (4096)\n"
@@ -72,6 +76,8 @@ static void usage(const char* argv0) {
 "  --out <path>           trajectory.txt, legacy cell_sim format (cell_analyze reads it)\n"
 "  --trajectory-samples <int>  evenly spaced trajectory frames         (100)\n"
 "  --trajectory-interval <int> steps between frames (overrides samples)\n"
+"  --dual-centroid-out <path>  validation-only sidecar: phi and phi^2 periodic\n"
+"                              centroids on each legacy trajectory frame\n"
 "  --dump-state <path>    binary state dump for the CPU-reference comparison\n"
 "  --self-test            run the coefficient / RNG / sign validation gates\n"
 "  -h, --help             this message\n"
@@ -134,6 +140,17 @@ static bool parse_u64(const char* flag, const char* s, unsigned long long* out) 
     }
     *out = v;
     return true;
+}
+
+static bool same_output_path(const std::string& lhs, const std::string& rhs) {
+    std::error_code lhs_ec, rhs_ec;
+    const std::filesystem::path lhs_path =
+        std::filesystem::weakly_canonical(std::filesystem::path(lhs), lhs_ec);
+    const std::filesystem::path rhs_path =
+        std::filesystem::weakly_canonical(std::filesystem::path(rhs), rhs_ec);
+    if (!lhs_ec && !rhs_ec) return lhs_path == rhs_path;
+    return std::filesystem::path(lhs).lexically_normal()
+        == std::filesystem::path(rhs).lexically_normal();
 }
 
 // ===========================================================================
@@ -389,6 +406,13 @@ int main(int argc, char** argv) {
             if (!parse_u64(a, need(), &p.polarity_seed)) return 2;
             ov.polarity_seed = true;
         }
+        else if (!std::strcmp(a, "--initial-centres")) {
+            opt.initial_centres_path = need();
+            if (opt.initial_centres_path.empty()) {
+                std::fprintf(stderr, "[fatal] --initial-centres requires a non-empty path\n");
+                return 2;
+            }
+        }
         else if (!std::strcmp(a, "--print-interval")) {
             if (!parse_i(a, need(), &iv, 0, 1000000000)) return 2;
             p.print_interval = (int)iv;
@@ -436,6 +460,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--no-l2"))    opt.l2_persist = false;
         else if (!std::strcmp(a, "--strict"))   opt.strict = true;
         else if (!std::strcmp(a, "--out"))        opt.out_path = need();
+        else if (!std::strcmp(a, "--dual-centroid-out")) opt.dual_centroid_path = need();
         else if (!std::strcmp(a, "--dump-state")) opt.dump_path = need();
         else if (!std::strcmp(a, "--self-test"))  self_test = true;
         else {
@@ -443,12 +468,40 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (!opt.dual_centroid_path.empty()) {
+        if (opt.out_path.empty()) {
+            std::fprintf(stderr,
+                "[fatal] --dual-centroid-out requires --out: the validation "
+                "sidecar is defined only on legacy trajectory sampling frames\n");
+            return 2;
+        }
+        if (opt.bench_steps > 0) {
+            std::fprintf(stderr,
+                "[fatal] --dual-centroid-out cannot be combined with --bench, "
+                "which intentionally performs no trajectory I/O\n");
+            return 2;
+        }
+        if (same_output_path(opt.out_path, opt.dual_centroid_path)) {
+            std::fprintf(stderr,
+                "[fatal] --dual-centroid-out must differ from --out; the "
+                "validation rows cannot be mixed into the legacy file\n");
+            return 2;
+        }
+        std::printf("  dual centroids   %s  (validation-only; trajectory cadence)\n",
+                    opt.dual_centroid_path.c_str());
+    }
     // ---- resume, or fresh -------------------------------------------------
     // The two differ in exactly one place: where SimParams and the initial
     // condition come from. Everything downstream is identical, which is why
     // the override mask exists rather than a second code path.
     CheckpointData ckpt;
     if (!ckpt_in.empty()) {
+        if (!opt.initial_centres_path.empty()) {
+            std::fprintf(stderr,
+                "[fatal] --initial-centres is valid only for a fresh start. "
+                "A checkpoint already contains the complete initialised microstate.\n");
+            return 2;
+        }
         if (ov.num_cells || ov.rho) {
             std::fprintf(stderr,
                 "[fatal] --N and --rho cannot be overridden on resume: they set "
@@ -526,7 +579,7 @@ int main(int argc, char** argv) {
         // everything written up to that point instead of losing the whole run.
         std::signal(SIGTERM, Sim::request_termination);
         std::signal(SIGINT,  Sim::request_termination);
-        sim.run();
+        if (!sim.run()) return 9;
     }
 
     if (!opt.dump_path.empty()) {

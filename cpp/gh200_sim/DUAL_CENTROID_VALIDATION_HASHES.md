@@ -1,0 +1,19 @@
+# Dual-centroid validation file hashes
+# Base: origin/main c130ce95de61ae7b1006255773f67cb094336464
+# Context: composed initializer/pairing + 192/208 edge + dual-centroid overlay
+# Algorithm: SHA-256 of UTF-8 text after CRLF/CR -> LF normalization.
+# This manifest intentionally does not hash itself.
+
+a51104264729e7b362ea8c739de0ada29ba6e4f6047580ec3a3fd330ad20fd47  .gitignore
+46d3dcd3ce48d22292ffee394cb8396fbb4657abd8892dcfc13bbe52e3d014ad  CMakeLists.txt
+ede181ca93f7d3091e5e8662e03f335a25b8e9b235ff231d653efdb668f2e01d  README.md
+fedac19de8d509d481c8ec437eebfacc5fae6f3b1f76ed0ee68b7d3ce0e07d2f  DUAL_CENTROID_VALIDATION.md
+b7d618027b8aa68eff8620a7c07339954c5d184d6d809d1dedf19eaaf59f9bac  include/sim.cuh
+0b86bc8d39e8c6a5d9d7be70aa650480b529801b54731d7097984c29fe2eaa43  include/validation_centroid.cuh
+896cde9986dd855c26c9b156a66c8e8ab204c9567390ff8cf3f2cf78e3a00d57  scripts/compare_dual_centroids.py
+847554755932089085b9e0fddca68d2bff75237a4e785c9a291fd68dfd73eb78  src/main.cu
+e40ed7157e9a75f1c0c8ee45f7c23db98122995c702bba06ff32c5d5e8e73d85  src/sim.cu
+39dc0bcc202b2629cf2c729a6734ab30fcc70673c7498c43af7f1cb182e7f6ba  src/validation_centroid.cu
+f9ebce4ae004edbdc6bab757ea2d093a5f94266a6bddd716ffbaf5d168bc50c8  tests/test_dual_centroid_contract.py
+740e73b0e1240a295047f2ca010b0d5d5b0c765b916b49ffcb3d26cb4146c796  include/kernels.cuh
+d139b89bac0b96266b53862f7c22fe5a31e0092df34a61443b6bcf50651d3f65  src/kernels.cu

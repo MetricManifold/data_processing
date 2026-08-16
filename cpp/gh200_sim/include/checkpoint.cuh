@@ -11,11 +11,12 @@
 //
 // ---- what this layer has to reconcile -------------------------------------
 // The v8 format was written by a solver with ONE uniform tile edge (TILE_T,
-// 320 by default) per cell. This engine uses kTilePitch = 256 with per-cell
+// 320 by default) per cell. This engine uses a compile-time kTilePitch of 256
+// for the compact production layout or 288 for the extended candidate, with per-cell
 // SHAPE CLASSES and a window offset (tx0, ty0) inside the tile, under the
 // invariant that phi is exactly 0.0f outside the window (I1).
 //
-//   WRITE  emits tile_t = kTilePitch (256) and the tile verbatim, zeros and
+//   WRITE  emits tile_t = kTilePitch (256 or 288) and the tile verbatim, zeros and
 //          all. Compact and lossless — see checkpoint.cu for why 256 rather
 //          than 320 is safe for every known consumer.
 //   READ   accepts any tile_t, locates the phi > kSupportEps support bbox,
@@ -108,6 +109,11 @@ struct CheckpointData {
     // corresponding CkptCell field at the params-derived default, which is
     // the "sidecar > params" half of the CLI > sidecar > params precedence.
     bool had_gamma = false, had_vA = false, had_radius = false, had_polr = false;
+    // An RNGS block was present and skipped. Recorded rather than ignored: it
+    // means the file was written by a solver with a mutable cuRAND stream, so
+    // the tumble SEQUENCE across the join is this engine's Philox sequence, not
+    // the writer's. Reported at load so it is never inferred later.
+    bool had_rngs = false;
 
     std::vector<CkptCell> cells;      // n entries
     std::vector<float>    phi;        // n * kTileArea, native 256 tiles

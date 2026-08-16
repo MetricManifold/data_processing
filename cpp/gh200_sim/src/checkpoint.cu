@@ -4,7 +4,7 @@
 // Record definitions come from cpp/common/checkpoint_format.h, which the old
 // tree includes too. Nothing in this file duplicates a layout constant.
 //
-// ---- WHY THIS FILE EMITS tile_t = 256 AND NOT 320 -------------------------
+// ---- WHY THIS FILE EMITS ITS NATIVE tile_t AND NOT 320 --------------------
 // The v8 format stores the tile edge in the file (int32 tile_t, right after
 // the SimParams blob). Every consumer that matters reads it from there rather
 // than assuming a build-time constant, verified by reading each parser:
@@ -18,18 +18,13 @@
 //                                                        re-tiles when it
 //                                                        differs from TILE_T
 //
-// So 256 is read correctly everywhere, and it is the right choice on three
-// counts: it is this engine's NATIVE geometry, so writing costs one contiguous
-// D2H and zero repacking; it is 36% fewer bytes per cell than 320 (256 KB vs
-// 400 KB), which matters when the rolling checkpoint is written on a cadence;
-// and it is lossless, because invariant I1 guarantees the tile is exactly
-// 0.0f outside the active window, so nothing is dropped by the smaller edge.
+// Both native values (compact 256 and extended 288) are therefore read from the
+// file rather than inferred. Writing costs one contiguous D2H and zero
+// repacking, and it is lossless because invariant I1 guarantees the tile is
+// exactly 0.0f outside the active window.
 //
-// The one consumer-side cost is that the old simulator, built with TILE_T=320,
-// takes its re-tile path on load: dx = (320-256)/2 = 32, origin -= 32, and the
-// 256 tile is copied into the centre of a 320 one. That path is exercised and
-// prints "[ckpt] v8 TILE_T re-tile: file=256 build=320". If a caller ever
-// needs 320 for a consumer we have not found, it is one constant here.
+// The old simulator, built with TILE_T=320, takes its existing re-tile path on
+// load. Its offset is computed from the file's tile_t, not hard-coded to 256.
 //
 // ---- RNGS ------------------------------------------------------------------
 // This engine has NO RNG state: tumbles come from counter-based Philox keyed
@@ -159,6 +154,9 @@ void params_to_v8(const SimParams& p, int trajectory_samples,
     // would silently re-derive the stream from `seed` on resume and break the
     // pairing for any run whose polarity seed differs from its placement seed.
     f->polarity_seed = (uint32_t)(p.polarity_stream() & 0xFFFFFFFFull);
+    // Truthful, not a coercion: this engine integrates run-and-tumble only, so
+    // the state it just produced IS abp = 0. The READ side refuses a nonzero
+    // abp rather than silently reinterpreting it (see checkpoint_read).
     f->abp = 0;
 }
 
@@ -223,12 +221,14 @@ bool tile_bboxes(const float* tile, int T, int sup_lo[kCkptDims],
 // foreign tile read as 0.0f, which is exact: the support is strictly inside
 // that tile (we just measured it), so nothing outside it was ever nonzero.
 //
-// An EXACT fast path runs first when the file's tile edge is our own: if the
-// tile's whole nonzero content already sits inside some class's canonical
-// window, that placement is adopted verbatim, the tile is copied pixel for
-// pixel and not one value is lost. That is what makes save -> load -> save
-// idempotent for this engine's own files, which is the case a chained SLURM
-// campaign hits thousands of times.
+// An EXACT fast path runs first whenever the tile's whole nonzero content sits
+// inside some native class at that class's canonical offset. Equality of the
+// file and build tile edges is unnecessary: the file records the global origin
+// of pixel (0,0), and source coordinates outside a smaller tile are exactly
+// zero. Adopting the canonical source offset therefore preserves every stored
+// value and its global coordinate. Besides keeping save -> load -> save
+// idempotent, this makes a compatible 256-pixel checkpoint load losslessly into
+// the opt-in 288-pixel layout.
 //
 // Returns false, loudly, when no class contains the support. There is
 // deliberately no clipping fallback anywhere on this path: silently truncating
@@ -282,31 +282,18 @@ bool repack_tile(const float* src, int T, int cell_id,
     }
 
     // --- exact path -------------------------------------------------------
-    // Only when the source tile has our own pitch, because only then is a
-    // class's (tx0, ty0) a meaningful coordinate in the SOURCE. Smallest area
-    // wins, exactly as class_containing() decides, so a state that had demoted
-    // does not get stuck in the larger class it was last written from.
-    bool exact = false;
-    if (T == kTilePitch) {
-        int best_area = 0;
-        for (int c = 0; c < kNumClasses; ++c) {
-            const ShapeClass s = class_of(c);
-            const int w0[kCkptDims] = {s.wx, s.wy};
-            const int t0[kCkptDims] = {s.tx0, s.ty0};
-            bool fits = true;
-            for (int d = 0; d < kCkptDims; ++d)
-                fits = fits && (ext[d] + kPromoteSlack <= w0[d])
-                            && (nz_lo[d] >= t0[d])
-                            && (nz_hi[d] <= t0[d] + w0[d] - 1);
-            const int area = s.wx * s.wy;
-            if (fits && (!exact || area < best_area)) {
-                exact = true;
-                best_area = area;
-                cls = c;
-                off[0] = s.tx0;
-                off[1] = s.ty0;
-            }
-        }
+    // Smallest area wins, exactly as class_containing() decides. The shared
+    // helper is exercised by both CPU layout contracts and proves every
+    // nonzero source pixel lies inside the rectangle copied below.
+    const int exact_cls = class_preserving_nonzero(
+        ext[0], ext[1], kPromoteSlack,
+        nz_lo[0], nz_hi[0], nz_lo[1], nz_hi[1]);
+    const bool exact = exact_cls >= 0;
+    if (exact) {
+        cls = exact_cls;
+        const ShapeClass s = class_of(cls);
+        off[0] = s.tx0;
+        off[1] = s.ty0;
     }
 
     const ShapeClass sc = class_of(cls);
@@ -373,11 +360,36 @@ bool read_sidecars(std::FILE* f, int n, CheckpointData* out) {
             return false;
         }
         if (sh.magic == ckpt::MAGIC_RNGS) {
-            std::printf("[ckpt] RNGS sidecar present (%d entries) and ignored: "
-                        "this engine's tumble stream is counter-based Philox "
-                        "keyed on (seed, global_id, step), all restored.\n",
-                        sh.count);
-            break;
+            // SKIP BY SIZE, do not break.
+            //
+            // This used to `break`, which was correct only by accident: the
+            // historical writer happens to emit RNGS last
+            // (cpp/simulation/src/sim.cu, after per_cell_float_state()). That
+            // made the reader silently dependent on the block ORDER of a writer
+            // in a different tree, and it meant nothing past that point was ever
+            // validated -- a truncated or corrupt tail read as a clean file.
+            //
+            // sizeof(curandStateXORWOW_t) is 48 and is fixed by the cuRAND ABI,
+            // so the payload length is knowable without linking cuRAND. Skipping
+            // it lets the loop continue to EOF and lets any later sidecar be
+            // read, in any order.
+            constexpr long kCurandStateBytes = 48;
+            const long payload = (long)sh.count * kCurandStateBytes;
+            if (std::fseek(f, payload, SEEK_CUR) != 0) {
+                std::fprintf(stderr,
+                    "[ckpt] RNGS sidecar claims %d entries (%ld B) but the file "
+                    "ends before that. The file is truncated or its RNGS "
+                    "element size is not the 48 B cuRAND XORWOW state.\n",
+                    sh.count, payload);
+                return false;
+            }
+            std::printf("[ckpt] RNGS sidecar (%d entries, %ld B) skipped: this "
+                        "engine's tumble stream is counter-based Philox keyed "
+                        "on (polarity_seed, global_id, step), all restored, so "
+                        "there is no curand state to continue.\n",
+                        sh.count, payload);
+            out->had_rngs = true;
+            continue;
         }
         if (sh.magic != ckpt::MAGIC_VA_A && sh.magic != ckpt::MAGIC_GAMA &&
             sh.magic != ckpt::MAGIC_RADI && sh.magic != ckpt::MAGIC_POLR) {
@@ -622,6 +634,29 @@ bool checkpoint_read(const std::string& path, CheckpointData* out) {
     out->params = SimParams{};
     params_from_v8(sp, n, &out->params);
 
+    // ABP: REFUSE, do not coerce.
+    //
+    // The v8 blob carries an `abp` flag selecting active-Brownian-particle
+    // polarity dynamics (a rotational-diffusion update) instead of run and
+    // tumble. This engine implements run and tumble ONLY. Silently loading an
+    // ABP state and integrating it as RTP changes the polarity model without
+    // changing a single line of the log, which is the exact class of failure
+    // the rest of this engine refuses to allow (no silent clamps, no silent
+    // truncation). So it is a hard error, not a warning.
+    if (sp.abp != 0) {
+        std::fprintf(stderr,
+            "[ckpt] %s was written with abp = %u (active Brownian particle "
+            "polarity). This engine implements run-and-tumble only:\n"
+            "       theta is resampled uniformly with probability "
+            "-expm1(-dt/tau) per step, not rotationally diffused.\n"
+            "       Loading it here would silently change the polarity model. "
+            "Refusing. Continue this branch with the solver that wrote it, or\n"
+            "       start a new run and label it as a different polarity "
+            "convention.\n",
+            path.c_str(), (unsigned)sp.abp);
+        return false;
+    }
+
     if (out->params.Nx <= 0 || out->params.Nx != out->params.Ny) {
         std::fprintf(stderr, "[ckpt] checkpoint domain %d x %d is not a valid "
                      "square\n", out->params.Nx, out->params.Ny);
@@ -828,6 +863,45 @@ bool checkpoint_write(const CheckpointWriteView& v,
             "without an explicit --seed gets a DIFFERENT Philox key.\n",
             (unsigned long long)v.p->seed,
             (unsigned)(v.p->seed & 0xFFFFFFFFull));
+
+    // ---- restart-exactness, decided per FILE rather than assumed -----------
+    //
+    // The only piece of CellState that a reload cannot reconstruct is
+    // promote_ctr, the shape-class DEMOTE DWELL counter. Everything else is
+    // either stored (origin, theta, gamma, v_A, R_tgt, the field itself),
+    // recomputed exactly from the stored field (V, Cx, Cy, bbox, phi_max), or a
+    // pure diagnostic the RHS never reads (shift_ctr, tumble_ctr, perim,
+    // Ix, Iy). The Philox counter is the step number, which is stored.
+    //
+    // So the correct statement is not "restarts are unproven pending a new
+    // sidecar". It is: a reload is EXACT whenever no cell was mid-dwell at save
+    // time, and that is a property of this file which we can simply check.
+    // promote_ctr is zero except while a cell is continuously eligible to demote
+    // into a strictly smaller class, so it is zero for the overwhelming majority
+    // of steps. Checking costs one pass over an array already in host memory and
+    // needs no format change and no per-step tracking.
+    int mid_dwell = 0;
+    uint32_t max_dwell = 0u;
+    for (int i = 0; i < v.N; ++i) {
+        const uint32_t d = v.cell[(size_t)i].promote_ctr;
+        if (d != 0u) { ++mid_dwell; if (d > max_dwell) max_dwell = d; }
+    }
+    if (mid_dwell == 0) {
+        std::printf("[ckpt] restart-exact: no cell is mid-demote-dwell, so a "
+                    "resume from this file reproduces the uninterrupted "
+                    "trajectory bit for bit.\n");
+    } else {
+        std::fprintf(stderr,
+            "[ckpt] warning: %d of %d cells are mid-demote-dwell (max %u of %d "
+            "checks). promote_ctr is not carried by the v8 format, so a resume\n"
+            "       from this file restarts those dwell counters at zero. The "
+            "physics state is unaffected; the only consequence is that a\n"
+            "       demotion those cells were %u/%d of the way toward is "
+            "deferred. Trajectories will differ from the uninterrupted run in\n"
+            "       the last bits from the first deferred demotion onward. Save "
+            "one step later for an exact-restart file.\n",
+            mid_dwell, v.N, max_dwell, kDemoteDwell, max_dwell, kDemoteDwell);
+    }
 
     FanOutWriter w;
     if (!w.open(paths)) return false;

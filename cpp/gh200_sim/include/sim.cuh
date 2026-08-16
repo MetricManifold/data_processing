@@ -8,6 +8,7 @@
 #include "checkpoint.cuh"
 #include "kernels.cuh"
 #include "params.cuh"
+#include "validation_centroid.cuh"
 
 #include <csignal>
 #include <cstdio>
@@ -24,6 +25,11 @@ namespace pf {
 // body instead of 6. Graph capture is fully supported for --split.
 constexpr int kGraphBody = 6;
 constexpr int kMortonEvery = kGraphBody;   // aligned to the graph body
+// Production-fatal device flags are copied to the host at least this often.
+// The bound is independent of print/trajectory/checkpoint cadence so an
+// invalid sparse-I/O run cannot consume the rest of a long allocation.
+constexpr long long kFatalPollEvery = 10000;
+static_assert(kFatalPollEvery > 0, "fatal-alarm polling cadence must be positive");
 
 struct RunOptions {
     bool use_graph = true;
@@ -38,7 +44,13 @@ struct RunOptions {
     int  traj_samples  = 100;     // evenly spaced samples across the run
     long long traj_interval = 0;  // steps between samples; overrides traj_samples
     std::string out_path;
+    // Validation-only sidecar sampled on exactly the same frames as out_path.
+    // Empty means no allocation, kernel launch, or file operation.
+    std::string dual_centroid_path;
     std::string dump_path;
+    // Fresh starts only. Empty preserves the historical grid+jitter default;
+    // a path loads one pre-generated, strictly validated accepted-centre CSV.
+    std::string initial_centres_path;
 
     // ---- checkpointing -----------------------------------------------------
     // Empty ckpt_dir disables checkpointing entirely, including the final one.
@@ -65,7 +77,9 @@ public:
     // params precedence is likewise resolved before we get here.
     bool init_from_checkpoint(const SimParams& p, const CheckpointData& d,
                               const RunOptions& opt, int device);
-    void run();
+    // False means a production-fatal alarm, alarm-readback failure,
+    // trajectory/validation-sidecar open failure, or checkpoint failure.
+    bool run();
     bool bench(int steps, double* ms_per_step);
     bool dump_state(const std::string& path);
     // Gather the current state and write it to every path given. Public so a
@@ -100,14 +114,13 @@ private:
     void     launch_one(int slot);
     void     print_path_report() const;
     bool     build_graph();
-    void     seed_positions(std::vector<float>& cx, std::vector<float>& cy,
+    bool     seed_positions(std::vector<float>& cx, std::vector<float>& cy,
                             std::vector<float>& gam, std::vector<float>& va,
                             std::vector<int32_t>& gid);
     void     print_line();
-    // True when a flag is set that means the remaining steps cannot produce a
-    // valid result, so the run should stop NOW rather than at t_end. Only
-    // FLAG_CLASS_UNSUPPORTED qualifies: the other alarms are counters whose
-    // magnitude is the point, and stopping would destroy the measurement.
+    // True when any non-advisory flag is set, or when flag readback itself
+    // fails. The remaining steps cannot produce a valid result, so run() stops
+    // and performs its final checkpoint attempt immediately.
     bool     fatal_flag_set();
 
     SimParams  p_{};
@@ -131,6 +144,8 @@ private:
     uint32_t*   d_smax_   = nullptr;
     TrajPackedCell* h_traj_ = nullptr;         // pinned
     TrajPackedCell* d_traj_ = nullptr;         // device alias of h_traj_
+    ValidationCentroidCell* h_dual_centroid_ = nullptr;  // pinned, opt-in
+    ValidationCentroidCell* d_dual_centroid_ = nullptr;  // mapped alias
 
     cudaStream_t stream_ = nullptr;
     cudaGraph_t  graph_  = nullptr;
@@ -150,6 +165,15 @@ private:
     bool open_trajectory(const std::string& path);
     void append_trajectory_frame(long long step_at);
     void close_trajectory();
+
+    // Separate validation stream. Keeping this outside the legacy writer is a
+    // structural guarantee that the old file's formatting and bytes are
+    // untouched when --dual-centroid-out is absent.
+    std::FILE* dual_centroid_fp_ = nullptr;
+    long long  dual_centroid_frames_ = 0;
+    bool open_dual_centroid(const std::string& path);
+    void append_dual_centroid_frame(long long step_at);
+    void close_dual_centroid();
 };
 
 }  // namespace pf

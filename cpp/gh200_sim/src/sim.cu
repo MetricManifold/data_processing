@@ -9,11 +9,13 @@
 // ===========================================================================
 
 #include "../include/sim.cuh"
+#include "../include/palmieri_initializer.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace pf {
 
@@ -37,6 +39,7 @@ namespace pf {
     } while (0)
 
 Sim::~Sim() {
+    if (dual_centroid_fp_) std::fclose(dual_centroid_fp_);
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (graph_)      cudaGraphDestroy(graph_);
     if (stream_)     cudaStreamDestroy(stream_);
@@ -53,49 +56,76 @@ Sim::~Sim() {
     cudaFree(d_ochk_);
     cudaFree(d_smax_);
     if (h_traj_) cudaFreeHost(h_traj_);
+    if (h_dual_centroid_) cudaFreeHost(h_dual_centroid_);
 }
 
 // ---------------------------------------------------------------------------
-// Initial condition: a square lattice with alternate rows offset by half a
-// spacing (the closest simple approximation to the jammed hexagonal packing
-// the rect size was derived from), plus a small deterministic jitter so the
-// relaxation does not start from an exactly symmetric configuration.
+// Initial condition. The historical default is the grid+jitter layout. A
+// fresh run may instead load one pre-generated Palmieri accepted-centre table;
+// paired branches then consume the same bytes rather than merely regenerating
+// from equal integer seeds.
 // ---------------------------------------------------------------------------
-void Sim::seed_positions(std::vector<float>& cx, std::vector<float>& cy,
+bool Sim::seed_positions(std::vector<float>& cx, std::vector<float>& cy,
                          std::vector<float>& gam, std::vector<float>& va,
                          std::vector<int32_t>& gid)
 {
     const int N = p_.num_cells;
     cx.resize(N); cy.resize(N); gam.resize(N); va.resize(N); gid.resize(N);
 
-    const int nx = (int)std::ceil(std::sqrt((double)N));
-    const double sp = (double)side_ / (double)nx;
-    const int n_cancer = (int)std::llround(p_.cancer_fraction * (double)N);
-
-    for (int i = 0; i < N; ++i) {
-        const int gxi = i % nx;
-        const int gyi = i / nx;
-        // Counter domains are declared in kernels.cuh; the polarity and v_A
-        // draws go through ic_theta()/ic_v_A() so a resume that has to
-        // re-derive them lands on exactly the same numbers.
-        const Philox4 r = philox4x32_10((uint32_t)i, kIcDomainJitter, 0u, 0u,
-                                        (uint32_t)(p_.seed & 0xFFFFFFFFull),
-                                        (uint32_t)(p_.seed >> 32));
-        const double jx = (philox_uniform53(r.v[0], r.v[1]) - 0.5) * 0.10 * sp;
-        const double jy = (philox_uniform53(r.v[2], r.v[3]) - 0.5) * 0.10 * sp;
-        double x = ((double)gxi + 0.5 + ((gyi & 1) ? 0.5 : 0.0)) * sp + jx;
-        double y = ((double)gyi + 0.5) * sp + jy;
-        x -= std::floor(x / (double)side_) * (double)side_;
-        y -= std::floor(y / (double)side_) * (double)side_;
-        cx[i] = (float)x;
-        cy[i] = (float)y;
-
-        gam[i] = (float)((i < n_cancer) ? p_.gamma_cancer : p_.gamma_normal);
-
-        // Per-cell v_A disorder: lognormal, median p_.v_A.
-        va[i] = (float)ic_v_A(i, p_.seed, p_.v_A, p_.v_A_sigma);
-        gid[i] = i;
+    if (!opt_.initial_centres_path.empty()) {
+        PalmieriCentresCsvDiagnostics diag{};
+        std::string error;
+        if (!palmieri_read_centres_csv(opt_.initial_centres_path, N,
+                                        (double)side_, p_.target_radius,
+                                        &cx, &cy, &diag, &error)) {
+            std::fprintf(stderr, "[fatal] invalid --initial-centres '%s': %s\n",
+                         opt_.initial_centres_path.c_str(), error.c_str());
+            return false;
+        }
+        std::printf("  initializer      %s\n", kPalmieriInitializerMethod);
+        std::printf("  initial centres  %s  (%zu rows, min distance %.9g, "
+                    "table FNV-1a %016llx)\n",
+                    opt_.initial_centres_path.c_str(), diag.accepted_count,
+                    diag.minimum_periodic_distance,
+                    (unsigned long long)diag.table_fnv1a64);
+    } else {
+        const int nx = (int)std::ceil(std::sqrt((double)N));
+        const double sp = (double)side_ / (double)nx;
+        for (int i = 0; i < N; ++i) {
+            const int gxi = i % nx;
+            const int gyi = i / nx;
+            // Counter domains are declared in kernels.cuh; the polarity and
+            // v_A draws go through shared helpers so checkpoint re-derivation
+            // lands on the same numbers.
+            const Philox4 r = philox4x32_10(
+                (uint32_t)i, kIcDomainJitter, 0u, 0u,
+                (uint32_t)(p_.seed & 0xFFFFFFFFull),
+                (uint32_t)(p_.seed >> 32));
+            const double jx =
+                (philox_uniform53(r.v[0], r.v[1]) - 0.5) * 0.10 * sp;
+            const double jy =
+                (philox_uniform53(r.v[2], r.v[3]) - 0.5) * 0.10 * sp;
+            double x = ((double)gxi + 0.5 + ((gyi & 1) ? 0.5 : 0.0))
+                       * sp + jx;
+            double y = ((double)gyi + 0.5) * sp + jy;
+            x -= std::floor(x / (double)side_) * (double)side_;
+            y -= std::floor(y / (double)side_) * (double)side_;
+            cx[(std::size_t)i] = (float)x;
+            cy[(std::size_t)i] = (float)y;
+        }
+        std::printf("  initializer      grid+jitter (historical default)\n");
     }
+
+    const int n_cancer = (int)std::llround(p_.cancer_fraction * (double)N);
+    for (int i = 0; i < N; ++i) {
+        gam[(std::size_t)i] =
+            (float)((i < n_cancer) ? p_.gamma_cancer : p_.gamma_normal);
+        // Per-cell v_A disorder: lognormal, median p_.v_A.
+        va[(std::size_t)i] =
+            (float)ic_v_A(i, p_.seed, p_.v_A, p_.v_A_sigma);
+        gid[(std::size_t)i] = i;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +189,13 @@ bool Sim::alloc_device(const SimParams& p, const RunOptions& opt, int device) {
     CU_CHECK(cudaHostAlloc((void**)&h_traj_, (size_t)N * sizeof(TrajPackedCell),
                            cudaHostAllocMapped));
     CU_CHECK(cudaHostGetDevicePointer((void**)&d_traj_, h_traj_, 0));
+    if (!opt_.dual_centroid_path.empty()) {
+        CU_CHECK(cudaHostAlloc((void**)&h_dual_centroid_,
+                               (size_t)N * sizeof(ValidationCentroidCell),
+                               cudaHostAllocMapped));
+        CU_CHECK(cudaHostGetDevicePointer((void**)&d_dual_centroid_,
+                                           h_dual_centroid_, 0));
+    }
 
     CU_CHECK(cudaStreamCreate(&stream_));
 
@@ -248,13 +285,20 @@ bool Sim::configure_and_capture() {
 
 // ---------------------------------------------------------------------------
 bool Sim::init(const SimParams& p, const RunOptions& opt, int device) {
+    // Prepare and validate the host initial condition before cudaSetDevice or
+    // any allocation. A malformed shared table therefore fails without
+    // opening a GPU context or consuming simulation time.
+    p_ = p;
+    opt_ = opt;
+    side_ = p.Nx;
+    std::vector<float> cx, cy, gam, va;
+    std::vector<int32_t> gid;
+    if (!seed_positions(cx, cy, gam, va, gid)) return false;
+
     if (!alloc_device(p, opt, device)) return false;
     const int N = p_.num_cells;
 
     // --- per-cell state ----------------------------------------------------
-    std::vector<float> cx, cy, gam, va;
-    std::vector<int32_t> gid;
-    seed_positions(cx, cy, gam, va, gid);
 
     std::vector<CellState> h_cell((size_t)N);
     std::memset(h_cell.data(), 0, h_cell.size() * sizeof(CellState));
@@ -707,37 +751,57 @@ void Sim::print_line() {
     std::fflush(stdout);
 }
 
-// Checked at every print interval, not only at the end: a run that has hit this
-// is structurally unable to produce a valid trajectory, and letting it burn the
-// remaining 999,000 steps helps nobody. The counters (support_clip,
-// class_exhausted, S_negative, ...) deliberately do NOT stop the run -- their
-// MAGNITUDE is the diagnostic, and stopping at the first event would destroy it.
+// Called on a bounded cadence independent of output cadence. Every flag except
+// support_clip is production-fatal. A failed D2H read is also fatal because the
+// host can no longer prove that the run remains valid.
 bool Sim::fatal_flag_set() {
     uint32_t f[FLAG_COUNT] = {0};
-    if (cudaMemcpy(f, d_flags_, sizeof(f), cudaMemcpyDeviceToHost) != cudaSuccess)
-        return false;
-    if (f[FLAG_CLASS_UNSUPPORTED] == 0u) return false;
+    const cudaError_t e =
+        cudaMemcpy(f, d_flags_, sizeof(f), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr,
+            "\n*** STOPPING AT STEP %lld: fatal-alarm readback failed: %s ***\n"
+            "    Run validity can no longer be established.\n",
+            steps_done_, cudaGetErrorString(e));
+        return true;
+    }
+
+    bool fatal = false;
+    for (int i = 0; i < FLAG_COUNT; ++i)
+        fatal = fatal || (f[i] != 0u && flag_is_fatal(i));
+    if (!fatal) return false;
+
     std::fprintf(stderr,
-        "\n*** STOPPING AT STEP %lld: %s = %u ***\n"
-        "    %d CTA-visits were handed a shape class this execution path "
-        "cannot process and SKIPPED the cell.\n"
-        "    %s\n"
-        "    THE TRAJECTORY IS INVALID FROM THE FIRST SUCH STEP. Nothing "
-        "written after it means anything.\n",
-        steps_done_, flag_name(FLAG_CLASS_UNSUPPORTED),
-        f[FLAG_CLASS_UNSUPPORTED], (int)f[FLAG_CLASS_UNSUPPORTED],
-        opt_.split
-            ? "Cause: --split cannot hold the large shape class. Re-run "
-              "WITHOUT --split; the fused path handles it."
-            : "Cause: a CellState carried a shape class outside "
-              "[0, kNumClasses). That is memory corruption, not a shape.");
+        "\n*** STOPPING AT STEP %lld: PRODUCTION-FATAL ALARM ***\n",
+        steps_done_);
+    for (int i = 0; i < FLAG_COUNT; ++i)
+        if (f[i] != 0u && flag_is_fatal(i))
+            std::fprintf(stderr, "    %-18s %u\n", flag_name(i), f[i]);
+    if (f[FLAG_CLASS_EXHAUSTED] != 0u)
+        std::fprintf(stderr,
+            "    A cell outgrew every available shape class; its field can no "
+            "longer be represented without truncation.\n");
+    if (f[FLAG_CLASS_UNSUPPORTED] != 0u)
+        std::fprintf(stderr, "    %s\n",
+            opt_.split
+                ? "The split path cannot process the selected shape class."
+                : "A CellState carried a shape class outside the supported range.");
+    std::fprintf(stderr,
+        "    THE TRAJECTORY IS INVALID FROM THE FIRST SUCH STEP. A final "
+        "checkpoint will be attempted for diagnosis, then the process will "
+        "return nonzero.\n");
     return true;
 }
 
 void Sim::report_flags() const {
     uint32_t f[FLAG_COUNT] = {0};
-    if (cudaMemcpy(f, d_flags_, sizeof(f), cudaMemcpyDeviceToHost) != cudaSuccess)
+    const cudaError_t e =
+        cudaMemcpy(f, d_flags_, sizeof(f), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "[alarms] readback failed: %s\n",
+                     cudaGetErrorString(e));
         return;
+    }
     // FLAG_SUPPORT_CLIP is ADVISORY, everything else is FATAL.
     //
     // It fires when the phi > kSupportEps (1e-5) bounding box merely TOUCHES the
@@ -758,14 +822,14 @@ void Sim::report_flags() const {
     for (int i = 0; i < FLAG_COUNT; ++i) {
         if (!f[i]) continue;
         if (i == FLAG_SUPPORT_CLIP) advisory = true;
-        else                        fatal = true;
+        else if (flag_is_fatal(i)) fatal = true;
     }
     if (!fatal && !advisory) { std::printf("alarms: all clear\n"); return; }
 
     if (fatal) {
         std::printf("*** ALARMS SET -- THE RUN IS INVALID, NOT MERELY SLOW ***\n");
         for (int i = 0; i < FLAG_COUNT; ++i)
-            if (f[i] && i != FLAG_SUPPORT_CLIP)
+            if (f[i] && flag_is_fatal(i))
                 std::printf("  %-18s %u\n", flag_name(i), f[i]);
     } else {
         std::printf("alarms: no fatal flags\n");
@@ -779,6 +843,9 @@ void Sim::report_flags() const {
                     "    Dump a state and check the border ring if you need the magnitude.\n",
                     flag_name(FLAG_SUPPORT_CLIP), f[FLAG_SUPPORT_CLIP], 100.0 * frac);
     }
+#if !PF_SUPPORT_CLIP_ENABLED
+    std::printf("  advisory: support_clip NOT INSTRUMENTED in this build\n");
+#endif
 }
 
 bool Sim::verify(double* max_rel_V, float* max_outside, uint32_t* max_S) {
@@ -816,9 +883,10 @@ bool Sim::verify(double* max_rel_V, float* max_outside, uint32_t* max_S) {
 }
 
 // ---------------------------------------------------------------------------
-void Sim::run() {
+bool Sim::run() {
     const long long total = p_.total_steps();
     const long long pi = p_.print_interval > 0 ? p_.print_interval : total;
+    bool run_failed = false;
 
     // The verify cadence must be a THRESHOLD, not a divisibility test.
     // steps_done_ advances in jumps of kGraphBody = 6 on a graph replay, so it
@@ -859,13 +927,20 @@ void Sim::run() {
     const long long save_every = ckpt_on ? opt_.save_interval : 0;
     long long next_ckpt = ckpt_every > 0 ? steps_done_ + ckpt_every : total + 1;
     long long next_save = save_every > 0 ? steps_done_ + save_every : total + 1;
+    long long next_fatal_poll = steps_done_ + kFatalPollEvery;
 
-    if (!open_trajectory(opt_.out_path)) return;
+    if (!open_trajectory(opt_.out_path)) return false;
+    if (!opt_.dual_centroid_path.empty()) {
+        if (!open_dual_centroid(opt_.dual_centroid_path)) {
+            close_trajectory();
+            return false;
+        }
+    }
 
     while (steps_done_ < total) {
         const long long next_stop =
             std::min({total, ((steps_done_ / pi) + 1) * pi, next_traj,
-                      next_ckpt, next_save});
+                      next_ckpt, next_save, next_fatal_poll});
 
         if (graph_ready_ && (steps_done_ % kGraphBody) == 0 &&
             steps_done_ + kGraphBody <= next_stop) {
@@ -880,25 +955,46 @@ void Sim::run() {
         const bool do_traj  = !opt_.out_path.empty() && steps_done_ >= next_traj;
         const bool do_ckpt  = ckpt_every > 0 && steps_done_ >= next_ckpt;
         const bool do_save  = save_every > 0 && steps_done_ >= next_save;
+        const bool do_fatal_poll = steps_done_ >= next_fatal_poll;
 
-        if (do_print || do_traj || do_ckpt || do_save) {
+        if (do_print || do_traj || do_ckpt || do_save || do_fatal_poll) {
             CU_WARN(cudaStreamSynchronize(stream_));
+            if (fatal_flag_set()) {
+                run_failed = true;
+                break;
+            }
+            if (do_fatal_poll)
+                next_fatal_poll = steps_done_ + kFatalPollEvery;
             if (do_print) print_line();
             if (do_traj) {
                 const int N = p_.num_cells;
                 k_pack_traj<<<(N + 127) / 128, 128, 0, stream_>>>(d_cell_, d_cls_,
                                                                   d_traj_, N, side_);
+                if (d_dual_centroid_) {
+                    const int pin = (int)(steps_done_ & 1LL);
+                    launch_validation_centroids(d_phi_[pin], d_cell_, d_cls_,
+                                                d_dual_centroid_, N, side_, stream_);
+                    CU_WARN(cudaGetLastError());
+                }
                 CU_WARN(cudaStreamSynchronize(stream_));
                 append_trajectory_frame(steps_done_);
+                if (d_dual_centroid_)
+                    append_dual_centroid_frame(steps_done_);
                 next_traj = steps_done_ + traj_every;
             }
             // One gather feeds both files when both fall due on the same step.
             if (do_ckpt || do_save) {
-                save_checkpoint(checkpoint_paths(do_ckpt, do_save));
+                if (!save_checkpoint(checkpoint_paths(do_ckpt, do_save))) {
+                    std::fprintf(stderr,
+                        "[ckpt] checkpoint failed at step %lld; stopping to "
+                        "avoid an unresumable allocation.\n",
+                        steps_done_);
+                    run_failed = true;
+                    break;
+                }
                 if (do_ckpt) next_ckpt = steps_done_ + ckpt_every;
                 if (do_save) next_save = steps_done_ + save_every;
             }
-            if (fatal_flag_set()) break;
         }
 
         // Cooperative shutdown. SLURM sends SIGTERM before SIGKILL at walltime;
@@ -921,22 +1017,36 @@ void Sim::run() {
         }
     }
     CU_WARN(cudaStreamSynchronize(stream_));
+    if (!run_failed && fatal_flag_set())
+        run_failed = true;
     if (traj_fp_)
         std::printf("trajectory -> %lld frames x %d cells (streamed)\n",
                     traj_frames_, p_.num_cells);
+    if (dual_centroid_fp_)
+        std::printf("dual centroids -> %lld frames x %d cells (streamed)\n",
+                    dual_centroid_frames_, p_.num_cells);
     close_trajectory();
-    // The final checkpoint is written on EVERY exit from the loop -- reaching
-    // t_end, a fatal flag, and SIGTERM alike. That is the whole point: SLURM
+    if (dual_centroid_fp_) close_dual_centroid();
+    // The final checkpoint is written on every configured normal/SIGTERM exit.
+    // A fatal alarm or earlier checkpoint failure forces one final diagnostic
+    // rolling-checkpoint attempt even under --no-final-checkpoint. SLURM
     // sends SIGTERM before SIGKILL at walltime, and a chained job that cannot
     // pick up where the previous leg stopped has burned its allocation for a
     // trajectory it cannot extend. It goes to the ROLLING name, so the next
     // leg's `-c <dir>/checkpoint.bin` needs no bookkeeping.
-    if (ckpt_on && opt_.final_checkpoint) {
-        if (!save_checkpoint(checkpoint_paths(true, false)))
+    if (ckpt_on && (opt_.final_checkpoint || run_failed)) {
+        if (!save_checkpoint(checkpoint_paths(true, false))) {
             std::fprintf(stderr, "[ckpt] FINAL CHECKPOINT FAILED. The run "
                          "cannot be resumed from where it stopped.\n");
+            run_failed = true;
+        }
+    } else if (run_failed && !ckpt_on) {
+        std::fprintf(stderr,
+            "[ckpt] fatal run has no checkpoint directory; no diagnostic "
+            "checkpoint can be written.\n");
     }
     report_flags();
+    return !run_failed;
 }
 
 bool Sim::bench(int steps, double* ms_per_step) {
@@ -1069,6 +1179,58 @@ void Sim::close_trajectory() {
     std::fflush(traj_fp_);
     std::fclose(traj_fp_);
     traj_fp_ = nullptr;
+}
+
+// --- validation-only dual-centroid writer ---------------------------------
+bool Sim::open_dual_centroid(const std::string& path) {
+    if (path.empty()) return true;
+    dual_centroid_fp_ = std::fopen(path.c_str(), "a");
+    if (!dual_centroid_fp_) {
+        std::fprintf(stderr, "[error] cannot open %s for append\n", path.c_str());
+        return false;
+    }
+    std::fseek(dual_centroid_fp_, 0, SEEK_END);
+    if (std::ftell(dual_centroid_fp_) == 0) {
+        std::fprintf(dual_centroid_fp_, "# Validation-only dual centroids\n");
+        std::fprintf(dual_centroid_fp_,
+            "# Format: time cell_id x_phi y_phi x_phi2_scan y_phi2_scan "
+            "sum_phi sum_phi2_scan valid_phi valid_phi2_scan\n");
+        std::fprintf(dual_centroid_fp_,
+            "# periodic_lift=cell_rect phi_buffer=current "
+            "phi2_source=independent_field_scan reduction=fixed_warp_order "
+            "N=%d L=%d dt=%.17g\n",
+            p_.num_cells, side_, p_.dt);
+        std::fprintf(dual_centroid_fp_,
+            "# x_phi/y_phi use weights phi; *_phi2_scan use independently "
+            "rescanned phi^2, not legacy packed moments. Sums are unscaled "
+            "lattice sums. Invalid centroids are nan.\n");
+    }
+    return true;
+}
+
+void Sim::append_dual_centroid_frame(long long step_at) {
+    if (!dual_centroid_fp_ || !h_dual_centroid_) return;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    for (int i = 0; i < p_.num_cells; ++i) {
+        const ValidationCentroidCell& c = h_dual_centroid_[i];
+        const bool valid_phi = (c.valid_mask & kCentroidPhiValid) != 0u;
+        const bool valid_phi2 = (c.valid_mask & kCentroidPhi2Valid) != 0u;
+        std::fprintf(dual_centroid_fp_,
+            "%.6f %d %.17g %.17g %.17g %.17g %.17g %.17g %d %d\n",
+            (double)step_at * p_.dt, c.global_id,
+            valid_phi ? c.cx_phi : nan, valid_phi ? c.cy_phi : nan,
+            valid_phi2 ? c.cx_phi2 : nan, valid_phi2 ? c.cy_phi2 : nan,
+            c.sum_phi, c.sum_phi2, valid_phi ? 1 : 0, valid_phi2 ? 1 : 0);
+    }
+    ++dual_centroid_frames_;
+    std::fflush(dual_centroid_fp_);
+}
+
+void Sim::close_dual_centroid() {
+    if (!dual_centroid_fp_) return;
+    std::fflush(dual_centroid_fp_);
+    std::fclose(dual_centroid_fp_);
+    dual_centroid_fp_ = nullptr;
 }
 
 bool Sim::dump_state(const std::string& path) {

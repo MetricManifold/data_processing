@@ -24,6 +24,11 @@ cmake /path/to/cpp/gh200_sim -DCMAKE_BUILD_TYPE=Release \
 cmake --build . -- -j 8
 ```
 
+The terminal square shape class defaults to `192 x 192`. Configure
+`-DPF_LARGE_CLASS_EDGE=208` to select the only supported larger alternative.
+CMake and `params.cuh` independently reject every value other than 192 or 208;
+startup prints the compiled selector and its shared-memory accounting.
+
 Products: `cell_gh200` (solver) and `dump_phi` (state-dump converter).
 
 **Gate the build on the register report.** `-Xptxas -v` is on by default; the
@@ -65,6 +70,16 @@ The domain is square by construction: `L = ceil(sqrt(N*A0/rho))`, and `Nx == Ny`
 and `dx == dy == 1` are asserted at startup — the run refuses to start otherwise,
 with a message explaining why (the 9-point Laplacian, the `1/(2h)` gradients and
 the `dA = 1` quadrature are all hard-coded for `h = 1`).
+
+### Validation-only dual centroids
+
+`--dual-centroid-out <path>` writes independently recomputed `phi`- and
+`phi^2`-weighted periodic centroids on the same frames as `--out`. It is an
+opt-in validation sidecar, not a production observable; absent the option,
+there is no added allocation, launch, or file operation and the legacy
+trajectory formatter is unchanged. Exact definitions, output columns,
+overhead scope, and the remaining GH200 gates are in
+[`DUAL_CENTROID_VALIDATION.md`](DUAL_CENTROID_VALIDATION.md).
 
 ### Benchmarking on Roihu
 
@@ -208,7 +223,7 @@ aligned). The rect window inside a tile is **fixed per shape class, forever**:
 | 1 wide  | 176 x 144 | 32, 64 | 211,008 | phi + S | 168 x 136 |
 | 2 tall  | 144 x 176 | 64, 32 | 211,776 | phi + S | 136 x 168 |
 | 3 big   | 160 x 160 | 32, 32 | 213,440 | phi + S | 152 x 152 |
-| 4 large | 192 x 192 | 32, 32 | **157,376** | **phi only** | 184 x 184 |
+| 4 large | E x E | 32, 32 | **157,376** (E=192) / **183,616** (E=208) | **phi only** | 184 x 184 / 200 x 200 |
 
 The **short** side of the elongated classes is 144, never less: a class change
 must not shrink the window on the axis that did *not* trigger it. The
@@ -243,6 +258,11 @@ capped by tile geometry, not by shared memory: 224 x 224 would need `tx0 <= 31`
 and the only multiple of 32 there is 0, which leaves no room for the tile's zero
 ring. 208 x 208 (183,616 B) is the next legal step if 184 px of containable
 extent turns out to be too little.
+
+`PF_LARGE_CLASS_EDGE` makes exactly those two edges selectable. At E=208 the
+large class is still 29,824 B below the staged 213,440 B maximum, so both
+settings retain the same aligned 213,504 B launch request and its 18,944 B
+margin below the sm_90 per-block opt-in cap.
 
 Recentring is applied by *reading shared memory at a shifted index* during the
 store, so a rebind costs **0 extra HBM traffic** and this invariant is
@@ -553,9 +573,12 @@ fusing P2 and P3 (+5%); W=128 after a long-run diff against W=192 (−21%).
 | `include/params.cuh` | every physics coefficient, tile/rect geometry, Q5.27, the flag enum, startup validation |
 | `include/kernels.cuh` | `CellState`, `StepArgs`, Philox, dump format, kernel declarations |
 | `include/sim.cuh` | host-side `Sim` interface |
+| `include/validation_centroid.cuh` | validation sidecar record and read-only launch interface |
 | `src/kernels.cu` | `k_step` and the init/verify/observability kernels |
+| `src/validation_centroid.cu` | opt-in `phi`/`phi^2` sampling-frame reduction |
 | `src/sim.cu` | allocation, init, launch sequence, L2 policy, graph capture, dump |
 | `src/main.cu` | CLI and the self-test validation gates |
+| `scripts/compare_dual_centroids.py` | host-only aligned legacy/independent-`phi^2` agreement gate |
 | `tools/dump_phi.cu` | `--dump-state` binary → `.npy` + CSV for the CPU oracle |
 | `tools/gh200_probe.cu` | the hardware probe behind `CALIBRATION.md` |
 | `CALIBRATION.md` | measured GH200/Roihu numbers; supersedes spec sheets |
