@@ -59,14 +59,6 @@ static void usage(const char* argv0) {
 "\n"
 "performance switches (A/B matrix -- sweep these inside ONE job)\n"
 "  --bench <int>          run <int> timed steps and exit\n"
-"  --split                two kernels per step (k_step_rhs + k_step_post) at\n"
-"                         512 threads instead of the fused k_step at 768. Frees\n"
-"                         S_s from shared memory and lowers the register budget\n"
-"                         so more than one CTA can share an SM. NOT the default,\n"
-"                         and NOT bit-comparable with the fused path: the fp64\n"
-"                         reductions run over 16 warp slots instead of 24, so\n"
-"                         the two are different (equally valid, individually\n"
-"                         reproducible) trajectories. Do not cross-compare dumps.\n"
 "  --no-graph             per-step launches instead of a 6-step CUDA graph\n"
 "  --morton               Morton-order cell traversal (helps only at large N)\n"
 "  --no-l2                do not pin S in the L2 persisting carve-out\n"
@@ -331,17 +323,6 @@ static int gate_geometry(const SimParams& p) {
                 kSmemBytes, kSmemPerBlockOptinSm90,
                 100.0 * kSmemBytes / kSmemPerBlockOptinSm90,
                 smem_raw_staged_only(), class_smem_of(kClassLarge));
-    // The split path's budget is a compile-time property, so it is reported by
-    // the same gate whether or not --split was passed. static_asserts in
-    // params.cuh already make a violation a build error; this is the readout.
-    std::printf("            split path: k_step_rhs %d B/CTA of %d B budget "
-                "for %d CTAs/SM (%.1f%%), k_step_post %d B static; "
-                "REFUSES class %d (%d B > budget)\n",
-                kSmemRhsBytes, kSplitSmemBudget, kSplitRhsCtasPerSm,
-                100.0 * kSmemRhsBytes / kSplitSmemBudget, kSmemPostBytes,
-                kClassLarge,
-                class_smem_rhs(kClasses[kClassLarge].wx,
-                               kClasses[kClassLarge].wy));
     return ok ? 0 : 1;
 }
 
@@ -454,7 +435,6 @@ int main(int argc, char** argv) {
             if (!parse_i(a, need(), &iv, 1, 100000000)) return 2;
             opt.bench_steps = (int)iv;
         }
-        else if (!std::strcmp(a, "--split"))    opt.split = true;
         else if (!std::strcmp(a, "--no-graph")) opt.use_graph = false;
         else if (!std::strcmp(a, "--morton"))   opt.morton = true;
         else if (!std::strcmp(a, "--no-l2"))    opt.l2_persist = false;
@@ -522,7 +502,7 @@ int main(int argc, char** argv) {
 
     if (!validate(p)) return 3;
     const int pitch = s_pitch_for(p.Nx);
-    print_params(p, p.Nx, pitch, opt.split);
+    print_params(p, p.Nx, pitch);
 
     if (self_test) {
         const int rc = run_self_test(p);

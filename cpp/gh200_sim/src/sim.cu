@@ -219,8 +219,6 @@ bool Sim::configure_and_capture() {
     // is a launch failure, not a slowdown.
     configure_k_step_smem();
     CU_CHECK(cudaGetLastError());
-    configure_split_smem();
-    CU_CHECK(cudaGetLastError());
 
     cudaFuncAttributes fa{};
     CU_CHECK(cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(k_step)));
@@ -228,10 +226,17 @@ bool Sim::configure_and_capture() {
                 "%d B dynamic smem requested\n",
                 fa.numRegs, (size_t)fa.localSizeBytes,
                 (int)fa.sharedSizeBytes, kSmemBytes);
-    if (fa.localSizeBytes > 0)
+    // cudaFuncGetAttributes reports LOCAL MEMORY PER THREAD, which is the whole
+    // stack frame, not the spill traffic: ptxas alone separates the two. A small
+    // ABI frame is normal and zero-cost, so warning on any nonzero value cried
+    // wolf on a kernel that had already been made spill-free. Gate on a budget
+    // and say what the number actually is.
+    if (fa.localSizeBytes > kLocalBytesBudget)
         std::fprintf(stderr,
-            "[warn] k_step spills %zu B to local memory. The performance model "
-            "assumes zero spill; check -Xptxas -v.\n", (size_t)fa.localSizeBytes);
+            "[warn] k_step uses %zu B/thread of local memory, over the %zu B "
+            "budget. That is the stack frame INCLUDING any spill; grep the "
+            "build log for 'spill stores' for the breakdown.\n",
+            (size_t)fa.localSizeBytes, kLocalBytesBudget);
 
     print_path_report();
 
@@ -527,7 +532,7 @@ bool Sim::save_checkpoint(const std::vector<std::string>& paths) {
 // file and shared memory can pin a kernel to 1 CTA/SM independently, and the
 // fused kernel is capped by both (80 regs x 768 threads = 61,440 of 65,536
 // registers; 211,840 of 233,472 B of shared memory). Freeing only one of the
-// two would change nothing, so the split path is reported against both.
+// two would change nothing.
 // ---------------------------------------------------------------------------
 void Sim::print_path_report() const {
     auto report = [&](const char* name, const void* fn, int threads,
@@ -546,9 +551,9 @@ void Sim::print_path_report() const {
                     "occupancy);  register ceiling %d CTAs/SM;  target %d\n",
                     "", s.ctas_per_sm, s.warps_per_sm, 100.0 * s.occupancy,
                     s.reg_limited_ctas, target_ctas);
-        if (s.local_bytes > 0)
+        if (s.local_bytes > kLocalBytesBudget)
             std::fprintf(stderr,
-                "[warn] %s spills %zu B/thread to local memory to meet its "
+                "[warn] %s uses %zu B/thread of local memory to meet its "
                 "register budget. Spilling to buy occupancy has already been\n"
                 "       measured SLOWER on this kernel (the 1024-thread "
                 "experiment). Compare against the fused path before trusting "
@@ -562,45 +567,10 @@ void Sim::print_path_report() const {
                                                  : "shared-memory-limited");
     };
 
-    if (!opt_.split) {
-        std::printf("  exec path: FUSED (default) -- k_step, 1 kernel/step\n");
-        report("k_step", reinterpret_cast<const void*>(k_step),
-               kBlockThreads, kSmemBytes, 1,
-               kRegsPerSmSm90 / kBlockThreads);   // __launch_bounds__(768, 1)
-    } else {
-        std::printf("  exec path: SPLIT (--split) -- k_step_rhs + k_step_post, "
-                    "2 kernels/step\n");
-        report("k_step_rhs", reinterpret_cast<const void*>(k_step_rhs),
-               kSplitBlockThreads, kSmemRhsBytes, kSplitRhsCtasPerSm,
-               kSplitRhsRegBudget);
-        report("k_step_post", reinterpret_cast<const void*>(k_step_post),
-               kSplitBlockThreads, 0, kSplitPostCtasPerSm,
-               kSplitPostRegBudget);
-        // Loud, before a single step runs: the split path cannot hold the large
-        // class, and a run that reaches it stops being valid at that moment.
-        // It cannot be refused here outright, because whether any cell ever
-        // deforms that far is a property of the trajectory, not of the CLI.
-        std::fprintf(stderr,
-            "[warn] --split CANNOT process shape class %d (%d x %d).\n"
-            "       k_step_rhs requests %d B of shared memory, sized for the "
-            "classes it accepts so that %d CTAs share an SM; that class needs "
-            "%d B.\n"
-            "       If any cell deforms far enough to reach it the cell is "
-            "SKIPPED, %s is counted and the run is reported INVALID.\n"
-            "       The fused path (the default) handles it. Use --split for "
-            "A/B timing on uniform-gamma cases only.\n",
-            kClassLarge, kClasses[kClassLarge].wx, kClasses[kClassLarge].wy,
-            kSmemRhsBytes, kSplitRhsCtasPerSm,
-            class_smem_rhs(kClasses[kClassLarge].wx, kClasses[kClassLarge].wy),
-            flag_name(FLAG_CLASS_UNSUPPORTED));
-        std::printf("  note: --split is a DIFFERENT (equally valid) trajectory "
-                    "from the fused path -- the fp64\n"
-                    "        reduction runs over %d warp slots instead of %d, "
-                    "so the two differ in the last ulp\n"
-                    "        and drift apart. Both are bitwise reproducible "
-                    "run to run. Do not cross-compare dumps.\n",
-                    kSplitWarps, kWarpsPerBlock);
-    }
+    std::printf("  exec path: FUSED -- k_step, 1 kernel/step\n");
+    report("k_step", reinterpret_cast<const void*>(k_step),
+           kBlockThreads, kSmemBytes, 1,
+           kRegsPerSmSm90 / kBlockThreads);   // __launch_bounds__(768, 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -685,16 +655,9 @@ void Sim::launch_one(int slot) {
     }
     const void* base = nullptr; size_t nb = 0; float hit = 0.0f;
     l2_window_for_slot(slot, &base, &nb, &hit);
-    if (opt_.split)
-        launch_step_split(args_for_slot(slot), grid_, stream_, base, nb, hit);
-    else
-        launch_step(args_for_slot(slot), grid_, stream_, base, nb, hit);
+    launch_step(args_for_slot(slot), grid_, stream_, base, nb, hit);
 }
 
-// The split path is captured exactly like the fused one. Both of its launches
-// go on the captured stream, so the body simply gains a second kernel node per
-// step with an implicit dependency on the first; the 6-step period is set by
-// the phi-parity / S-rotation lcm, which the split does not change.
 bool Sim::build_graph() {
     CU_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
     for (int s = 0; s < kGraphBody; ++s) launch_one(s);
@@ -703,7 +666,7 @@ bool Sim::build_graph() {
     graph_ready_ = true;
     std::printf("  CUDA graph: %d-step body captured, %d kernel nodes (lcm of 2 "
                 "phi parities and 3 S rotation slots)%s\n", kGraphBody,
-                kGraphBody * (opt_.split ? 2 : 1),
+                kGraphBody,
                 opt_.morton ? " + Morton sort at slot 0" : "");
     return true;
 }
@@ -782,10 +745,8 @@ bool Sim::fatal_flag_set() {
             "    A cell outgrew every available shape class; its field can no "
             "longer be represented without truncation.\n");
     if (f[FLAG_CLASS_UNSUPPORTED] != 0u)
-        std::fprintf(stderr, "    %s\n",
-            opt_.split
-                ? "The split path cannot process the selected shape class."
-                : "A CellState carried a shape class outside the supported range.");
+        std::fprintf(stderr, "    A CellState carried a shape class "
+                             "outside the supported range.\n");
     std::fprintf(stderr,
         "    THE TRAJECTORY IS INVALID FROM THE FIRST SUCH STEP. A final "
         "checkpoint will be attempted for diagnosis, then the process will "
@@ -1090,7 +1051,7 @@ bool Sim::bench(int steps, double* ms_per_step) {
     std::printf("bench: %lld steps in %.3f ms -> %.6f ms/step "
                 "(%.2f us/step, %d cells, L=%d, %s, %s)\n",
                 done, (double)ms, *ms_per_step, *ms_per_step * 1000.0,
-                p_.num_cells, side_, opt_.split ? "split" : "fused",
+                p_.num_cells, side_, "fused",
                 graph_ready_ ? "graph" : "per-step launch");
     report_flags();
     return true;

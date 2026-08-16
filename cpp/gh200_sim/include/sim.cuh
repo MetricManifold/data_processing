@@ -21,14 +21,19 @@ namespace pf {
 // replays forever with every pointer and parity baked per node.
 //
 // This is a property of the ARGUMENT rotation, not of the launch count, so it
-// is 6 for both paths: the split path just puts 12 kernel nodes in the captured
-// body instead of 6. Graph capture is fully supported for --split.
+// property of the ARGUMENT rotation, not of the launch count.
 constexpr int kGraphBody = 6;
 constexpr int kMortonEvery = kGraphBody;   // aligned to the graph body
 // Production-fatal device flags are copied to the host at least this often.
 // The bound is independent of print/trajectory/checkpoint cadence so an
 // invalid sparse-I/O run cannot consume the rest of a long allocation.
 constexpr long long kFatalPollEvery = 10000;
+
+// Local memory per thread that is accepted without comment. This is the whole
+// stack frame as cudaFuncGetAttributes reports it, not spill traffic; the two
+// are only separable in the ptxas log. k_step measures 32 B with zero spill on
+// nvhpc 26.3 / sm_90, so a small frame is the normal, healthy case.
+constexpr size_t kLocalBytesBudget = 64;
 static_assert(kFatalPollEvery > 0, "fatal-alarm polling cadence must be positive");
 
 struct RunOptions {
@@ -36,7 +41,6 @@ struct RunOptions {
     bool morton = false;
     bool l2_persist = true;
     bool strict = false;          // run k_verify every step
-    bool split = false;           // --split: k_step_rhs + k_step_post per step
     int  bench_steps = 0;         // >0: timed benchmark, no I/O
     // Trajectory sampling is INDEPENDENT of --print-interval. Tying the two
     // together meant a large print interval silently produced a single-frame

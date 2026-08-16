@@ -264,27 +264,6 @@ struct DumpCell {
 __global__ __launch_bounds__(kBlockThreads, 1)
 void k_step(PF_GRID_CONSTANT const StepArgs A);
 
-// ---------------------------------------------------------------------------
-// SPLIT path (--split). Same StepArgs, same physics, two kernels per step.
-//
-// k_step_rhs  : P0, P1, P1b, P2 + the shifted store of phi^{n+1} STRAIGHT TO
-//               GLOBAL. Shared memory holds phi_s and the scalar/reduction
-//               region only -- S is read pointwise from global. Persistent
-//               grid + work cursor, exactly like k_step; also carries phase C
-//               (clear-ahead) and the step-counter/cursor bookkeeping.
-// k_step_post : P3, P3b. One CTA per cell, grid = N. Re-reads phi^{n+1} from
-//               global, scatters into S_next, accumulates V/Cx/Cy/perim, the
-//               integer bbox and phi_max, and writes those CellState fields.
-//
-// The launch-bounds min-blocks arguments are load-bearing: they are what force
-// ptxas to a register budget that permits the target CTAs/SM (see params.cuh).
-// ---------------------------------------------------------------------------
-__global__ __launch_bounds__(kSplitBlockThreads, kSplitRhsCtasPerSm)
-void k_step_rhs(PF_GRID_CONSTANT const StepArgs A);
-
-__global__ __launch_bounds__(kSplitBlockThreads, kSplitPostCtasPerSm)
-void k_step_post(PF_GRID_CONSTANT const StepArgs A);
-
 __global__ void k_init_tiles(float* phi_a, float* phi_b, CellState* cell,
                              const uint8_t* cls, int N, int L,
                              const float* seed_cx, const float* seed_cy,
@@ -320,18 +299,12 @@ __global__ void k_morton_sort(const CellState* cell, uint32_t* perm,
 // Host-side launchers.
 // ---------------------------------------------------------------------------
 void configure_k_step_smem();                // cudaFuncSetAttribute opt-in
-void configure_split_smem();                 // opt-in for k_step_rhs
 void configure_morton_smem(int smem_bytes);
 int  k_step_grid(int device);                 // = numSMs
 
 void launch_step(const StepArgs& A, int grid, cudaStream_t stream,
                  const void* l2_base, size_t l2_bytes, float l2_hit_ratio);
 
-// Two launches on `stream`: k_step_rhs on `grid` persistent CTAs, then
-// k_step_post on A.N CTAs. Stream-ordered, so the kernel boundary is the only
-// synchronisation the split needs.
-void launch_step_split(const StepArgs& A, int grid, cudaStream_t stream,
-                       const void* l2_base, size_t l2_bytes, float l2_hit_ratio);
 
 // ---------------------------------------------------------------------------
 // Runtime occupancy report. `regs` and `local_bytes` come from

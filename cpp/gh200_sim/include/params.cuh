@@ -293,11 +293,12 @@ constexpr int kClassTall  = 2;
 constexpr int kClassBig   = 3;
 constexpr int kClassLarge = 4;
 static_assert(kNumClasses == 5, "class_of() below enumerates exactly 5 classes");
-// k_step_rhs's dispatch has explicit cases for 0..kClassBig and a `default:`
-// that refuses everything else, so every class the split path cannot run must
-// sort AFTER the ones it can. Today that is exactly kClassLarge.
+// k_step's dispatch has an explicit case for every class and a `default:`
+// that refuses everything else. `default:` is unreachable by construction and
+// exists only to make a corrupt class id a counted refusal rather than a wrong
+// geometry.
 static_assert(kClassLarge == kNumClasses - 1,
-              "the non-staged classes must be the LAST ones: k_step_rhs refuses "
+              "the non-staged classes must be the LAST ones: the dispatch refuses "
               "them through `default:`, which catches everything above "
               "kClassBig");
 
@@ -480,10 +481,7 @@ constexpr int class_smem(int wx, int wy) {
     return kScalarBytes + phi_bytes(wx, wy) + s_bytes(wx, wy);
 }
 // The large class's footprint: phi_s and the scalar/reduction region, nothing
-// else. Identical formula to class_smem_rhs() further down -- deliberately, and
-// they are NOT merged, because they are two independent design decisions that
-// happen to coincide (the split path drops S_s to fit two CTAs on an SM; the
-// large class drops it to fit one very big rect on one).
+// else.
 constexpr int class_smem_large(int wx, int wy) {
     return kScalarBytes + phi_bytes(wx, wy);
 }
@@ -556,147 +554,21 @@ static_assert(kLargeClassSmemBytes <= kSmemPerBlockOptinSm90,
               "terminal class exceeds the sm_90 per-block opt-in maximum");
 
 // ---------------------------------------------------------------------------
-// SPLIT execution path (--split): two kernels per step instead of one.
-//
-//   k_step_rhs   P0, P1, P1b, P2. Holds ONLY phi_s (plus the scalar/reduction
-//                region) in shared memory: S is read straight from global at
-//                the two pointwise sites that need it (S needs no stencil), and
-//                phi^{n+1} goes straight to global from the P2 sweep. That
-//                removes S_s (up to 101,376 B) so two CTAs fit on one SM.
-//   k_step_post  P3, P3b. Re-reads phi^{n+1} from global and does the S
-//                scatter, the moment/bbox accumulation and the fp64 fixed-order
-//                reductions. It needs only the reduction region, declared
-//                STATICALLY -- so it needs no cudaFuncSetAttribute opt-in at
-//                all (the 48 KB static cap is the relevant one, and 1 KB is
-//                nowhere near it).
-//
-// The fused path is unchanged and remains the default.
-//
-// ---- Occupancy: TWO independent limits, and shared memory is not the tight
-// ---- one. Both were measured on the fused kernel with Nsight Compute:
-//        launch__occupancy_limit_shared_mem = 1 block
-//        launch__occupancy_limit_registers  = 1 block   <-- also 1
-//
-//   shared memory: 233,472 B/SM / 2 CTAs  ->  <= 116,736 B/CTA.
-//                  kSmemRhsBytes is 111,104, set by class 3 (160x160,
-//                  phi_bytes = 108,864). Before class 3 existed the worst class
-//                  was 144x176, NOT 176x144: phi_bytes(144,176) = 108,224 >
-//                  phi_bytes(176,144) = 107,456, because the 4-float left pad
-//                  and the pitch round-up are charged per ROW and the tall
-//                  class has 32 more rows. static_assert'd below over all the
-//                  classes the split path actually accepts -- which EXCLUDES
-//                  kClassLarge, whose 157,376 B would blow the budget by
-//                  40,640 B; see the note at kSmemRhsRaw.
-//
-//   register file: 65,536 regs/SM. The ceiling is
-//                      warps/SM <= 65536 / (32 * regs_per_thread)
-//                  and the CTA count that follows is
-//                      CTAs/SM  <= 65536 / (regs_per_thread * threads_per_CTA).
-//                  The fused kernel measures 80 regs at 768 threads = 61,440
-//                  registers for ONE CTA; two would need 122,880. So freeing
-//                  shared memory ALONE leaves the split path pinned at 1 CTA/SM
-//                  and buys nothing.
-//
-// Hence kSplitBlockThreads = 512, not kBlockThreads = 768:
-//
-//   threads | min CTAs | reg budget/thread |  warps/SM  | occupancy
-//   --------+----------+-------------------+------------+-----------
-//      768  |    2     |  42.7 -> 40       | 2x24 = 48  |  75%   <- needs 40
-//      512  |    2     |  64.0 -> 64       | 2x16 = 32  |  50%   <- chosen
-//      384  |    2     |  85.3 -> 80       | 2x12 = 24  |  37.5% <- no gain
-//
-// 40 registers is not a credible target for a kernel whose fused superset needs
-// 80; 64 is. And this exact trade has already backfired once on this code: the
-// 1024-thread experiment forced 64 registers, spilled (stack 304 -> 432 B) and
-// ran ~40% SLOWER everywhere. So the budget is set where ptxas has a realistic
-// chance of hitting it WITHOUT spilling, and the outcome is verified two ways
-// rather than assumed:
-//   - grep the -Xptxas -v build log for "spill" (0 B is the gate), and
-//   - read the achieved regs / CTAs per SM that the runtime queries from
-//     cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor and
-//     prints in the startup config dump.
-// Set kSplitRhsCtasPerSm to 1 to recover the unconstrained register allocation
-// for a clean A/B if the 64-register budget does turn out to spill.
-//
-// NOTE (determinism, read before comparing dumps): 512 threads means the P1b
-// Ix/Iy reduction runs over 16 warp slots instead of 24 and each thread
-// accumulates a different subset of pixels. The order is still FIXED by
-// compile-time constants, so the split path is bitwise reproducible run to run
-// -- but its fp64 rounding differs from the fused path's in the last ulp, so
-// the two paths are different (equally valid) trajectories and will drift
-// apart. Never compare a --split dump against a fused dump step for step.
 // ---------------------------------------------------------------------------
-constexpr int kSplitBlockThreads   = 512;
-constexpr int kSplitWarps          = kSplitBlockThreads / 32;      // 16
-constexpr int kSplitRhsCtasPerSm   = 2;   // k_step_rhs  -> 64 regs, 32 warps/SM
-constexpr int kSplitPostCtasPerSm  = 3;   // k_step_post -> 42 regs, 48 warps/SM
+// sm_90 hardware constants, used by the startup occupancy report.
+//
+// A --split execution path (k_step_rhs + k_step_post at 512 threads) used to
+// live here, trading a third HBM pass over phi for 2-3 CTAs/SM instead of 1.
+// It was removed after being measured 46-95% SLOWER than the fused kernel at
+// every N from 132 to 2112 on a GH200 (Roihu job 689689, free gputest queue),
+// in the ONLY regime it could run: it refused the terminal shape class, which
+// is exactly where soft cells end up, and its 512-thread reduction made it a
+// different trajectory that could not be compared against the fused path
+// anyway. `git log` has it if the occupancy idea is ever revisited.
+// ---------------------------------------------------------------------------
 constexpr int kSmemPerSmSm90       = 233472;
 constexpr int kRegsPerSmSm90       = 65536;
 constexpr int kMaxThreadsPerSmSm90 = 2048;
-constexpr int kSplitSmemBudget     = kSmemPerSmSm90 / kSplitRhsCtasPerSm; // 116736
-
-constexpr int class_smem_rhs(int wx, int wy) {
-    return kScalarBytes + phi_bytes(wx, wy);          // no S_s
-}
-
-// The max is taken over the STAGED classes only, i.e. over exactly the classes
-// k_step_rhs will process. The split path REFUSES kClassLarge:
-// class_smem_rhs(192,192) = 157,376 B, which is 40,640 B over kSplitSmemBudget
-// (116,736 B), so admitting it would pin k_step_rhs at 1 CTA/SM and destroy the
-// only reason the split path exists. It is refused loudly, not silently -- see
-// the dispatch switch in k_step_rhs, which increments FLAG_CLASS_UNSUPPORTED.
-// Sizing the launch for the small classes and then letting a large cell run
-// would overrun the CTA's shared memory by 157,376 - 111,104 = 46,272 B, so
-// this is a correctness requirement, not a performance one.
-constexpr int smem_rhs_raw_staged_only() {
-    int m = 0;
-    for (int c = 0; c < kNumClasses; ++c)
-        if (class_stages_S(c))
-            m = cmax(m, class_smem_rhs(kClasses[c].wx, kClasses[c].wy));
-    return m;
-}
-constexpr int kSmemRhsRaw = smem_rhs_raw_staged_only();
-constexpr int kSmemRhsBytes = align_up(kSmemRhsRaw, 128);
-
-static_assert(class_smem_rhs(kClasses[kClassLarge].wx,
-                             kClasses[kClassLarge].wy) > kSplitSmemBudget,
-              "if the large class ever DOES fit the split path's per-CTA "
-              "budget, stop refusing it in k_step_rhs and instantiate "
-              "process_cell_rhs<kClassLarge> instead");
-
-static_assert(kSmemRhsBytes <= kSplitSmemBudget,
-              "k_step_rhs shared memory exceeds the per-CTA budget that lets "
-              "kSplitRhsCtasPerSm CTAs share one sm_90 SM (233472 B / CTAs)");
-static_assert(kSmemRhsBytes <= kSmemPerBlockOptinSm90,
-              "k_step_rhs exceeds the sm_90 per-block opt-in maximum");
-static_assert(kSmemRhsBytes < kSmemBytes,
-              "the split path must need strictly less shared memory than the "
-              "fused path, otherwise it buys nothing");
-static_assert(kSplitRhsCtasPerSm * kSplitBlockThreads <= kMaxThreadsPerSmSm90,
-              "k_step_rhs asks for more resident threads than an sm_90 SM has");
-static_assert(kSplitPostCtasPerSm * kSplitBlockThreads <= kMaxThreadsPerSmSm90,
-              "k_step_post asks for more resident threads than an sm_90 SM has");
-
-// The register budget __launch_bounds__ will impose, so it appears in the
-// config dump next to the register count ptxas actually achieved.
-constexpr int split_reg_budget(int ctas) {
-    return kRegsPerSmSm90 / (ctas * kSplitBlockThreads);
-}
-constexpr int kSplitRhsRegBudget  = split_reg_budget(kSplitRhsCtasPerSm);   // 64
-constexpr int kSplitPostRegBudget = split_reg_budget(kSplitPostCtasPerSm);  // 42
-
-// The split kernels reuse the EXISTING scalar/broadcast layout unchanged (so
-// phi_s keeps its offset and its 16 B alignment); they simply leave the last
-// 8 reduction slots unused. This is the check that they fit.
-static_assert(kSplitWarps * kRedSlots * (int)sizeof(double) <= kRedBytes,
-              "the split kernels' reduction slots must fit in the fused "
-              "layout's kRedBytes region");
-static_assert(kSplitBlockThreads % 32 == 0, "block must be whole warps");
-
-// k_step_post's shared memory: its own reduction region only, and STATIC.
-constexpr int kSmemPostBytes = kSplitWarps * kRedSlots * (int)sizeof(double);
-static_assert(kSmemPostBytes <= 49152,
-              "k_step_post uses STATIC shared memory, capped at 48 KB");
 
 // --- per-class structural invariants ---------------------------------------
 namespace detail {
@@ -797,9 +669,7 @@ enum : int {
     FLAG_V_NONPOS   = 6,   // carried V <= 0, recentring skipped
     // A CTA was handed a shape class its execution path cannot process, and
     // SKIPPED the cell rather than running it with the wrong geometry. Raised
-    // by the split path when a cell reaches kClassLarge (k_step_rhs cannot hold
-    // the selected 192/208 square within kSplitSmemBudget), and by either
-    // path's dispatch
+    // by the dispatch
     // default, which is unreachable by construction. Counted, and the run is
     // reported INVALID -- the previous behaviour was to fall through `default:`
     // into process_cell<kClassTall>, i.e. to read a 160x160 window as 144x176.
@@ -1036,7 +906,7 @@ inline bool validate(const SimParams& p) {
     return ok;
 }
 
-inline void print_params(const SimParams& p, int side, int pitch, bool split) {
+inline void print_params(const SimParams& p, int side, int pitch) {
     std::printf("--- FUSE-1R configuration ---\n");
     std::printf("  cells            %d\n", p.num_cells);
     std::printf("  domain           %d x %d  (rho = %.4f)\n", side, side, p.rho);
@@ -1077,31 +947,9 @@ inline void print_params(const SimParams& p, int side, int pitch, bool split) {
                 kClassLarge, kClasses[kClassLarge].wx, kClasses[kClassLarge].wy,
                 kLargeClassSmemRaw, kLargeClassSmemBytes,
                 smem_raw_staged_only(), kSmemLaunchMarginSm90);
-    if (!split) {
-        std::printf("  exec path        FUSED   (k_step, 1 kernel/step, "
-                    "%d threads, %d B smem/CTA)\n",
-                    kBlockThreads, kSmemBytes);
-    } else {
-        std::printf("  exec path        SPLIT   (k_step_rhs + k_step_post, "
-                    "2 kernels/step, %d threads)\n", kSplitBlockThreads);
-        std::printf("    k_step_rhs     %6d B dynamic smem  (budget %d B for "
-                    "%d CTAs/SM)   reg budget %d\n",
-                    kSmemRhsBytes, kSplitSmemBudget, kSplitRhsCtasPerSm,
-                    kSplitRhsRegBudget);
-        std::printf("    k_step_post    %6d B static  smem  (no opt-in needed) "
-                    "        %d CTAs/SM   reg budget %d\n",
-                    kSmemPostBytes, kSplitPostCtasPerSm, kSplitPostRegBudget);
-        std::printf("    target occupancy  rhs %d x %d = %d warps/SM (%.1f%%), "
-                    "post %d x %d = %d warps/SM (%.1f%%)\n",
-                    kSplitRhsCtasPerSm, kSplitWarps,
-                    kSplitRhsCtasPerSm * kSplitWarps,
-                    100.0 * kSplitRhsCtasPerSm * kSplitBlockThreads
-                          / kMaxThreadsPerSmSm90,
-                    kSplitPostCtasPerSm, kSplitWarps,
-                    kSplitPostCtasPerSm * kSplitWarps,
-                    100.0 * kSplitPostCtasPerSm * kSplitBlockThreads
-                          / kMaxThreadsPerSmSm90);
-    }
+    std::printf("  exec path        FUSED   (k_step, 1 kernel/step, "
+                "%d threads, %d B smem/CTA)\n",
+                kBlockThreads, kSmemBytes);
 }
 
 }  // namespace pf
