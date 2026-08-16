@@ -1,2 +1,19 @@
 __pycache__/
 .pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Re-include tools/.
+#
+# The repository root .gitignore has a blanket `tools/` rule (line 20), aimed at
+# scratch tooling elsewhere in the tree. It also matched cpp/gh200_sim/tools/,
+# so dump_phi.cu, palmieri_centres.cpp and the initializer goldens were never
+# committable -- while CMakeLists.txt declared `add_executable(dump_phi
+# tools/dump_phi.cu)` unconditionally. The files existed on the author's disk,
+# the build worked there, and every fresh clone died at CMake generate time with
+# "Cannot find source file". That is the root cause of the branch never having
+# been buildable, and it was invisible from inside a working copy.
+#
+# Un-ignoring a directory requires re-including the directory itself before its
+# contents: git does not descend into an ignored directory to find negations.
+!tools/
+!tools/**
