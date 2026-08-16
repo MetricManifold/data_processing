@@ -375,13 +375,30 @@ bool read_sidecars(std::FILE* f, int n, CheckpointData* out) {
             // read, in any order.
             constexpr long kCurandStateBytes = 48;
             const long payload = (long)sh.count * kCurandStateBytes;
-            if (std::fseek(f, payload, SEEK_CUR) != 0) {
-                std::fprintf(stderr,
-                    "[ckpt] RNGS sidecar claims %d entries (%ld B) but the file "
-                    "ends before that. The file is truncated or its RNGS "
-                    "element size is not the 48 B cuRAND XORWOW state.\n",
-                    sh.count, payload);
-                return false;
+            // CONSUME with checked reads, do NOT fseek.
+            //
+            // fseek past end-of-file is well defined and SUCCEEDS: the standard
+            // only makes the following read fail. Seeking therefore cannot
+            // detect a truncated payload, which is the entire reason this block
+            // is being skipped by size rather than by `break` in the first
+            // place. Measured: a checkpoint truncated in the middle of its RNGS
+            // payload was accepted and resumed. Reading it is what proves the
+            // bytes are actually there.
+            char discard[4096];
+            long left = payload;
+            while (left > 0) {
+                const size_t want =
+                    (size_t)(left < (long)sizeof(discard) ? left
+                                                          : (long)sizeof(discard));
+                if (std::fread(discard, 1, want, f) != want) {
+                    std::fprintf(stderr,
+                        "[ckpt] RNGS sidecar claims %d entries (%ld B) but the "
+                        "file ends %ld B short. The file is truncated, or its "
+                        "RNGS element is not the 48 B cuRAND XORWOW state.\n",
+                        sh.count, payload, left);
+                    return false;
+                }
+                left -= (long)want;
             }
             std::printf("[ckpt] RNGS sidecar (%d entries, %ld B) skipped: this "
                         "engine's tumble stream is counter-based Philox keyed "
