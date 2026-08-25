@@ -35,9 +35,14 @@ static_assert(kClasses[3].wx == 160 && kClasses[3].wy == 160 &&
 static_assert(kClasses[4].wx == kLargeClassEdge &&
               kClasses[4].wy == kLargeClassEdge &&
               kClasses[4].tx0 == 32 && kClasses[4].ty0 == 32);
+static_assert(kClasses[5].wx == kTilePitch - 2 &&
+              kClasses[5].wy == kTilePitch - 2 &&
+              kClasses[5].tx0 == 1 && kClasses[5].ty0 == 1);
 
 static_assert(detail::class_ok(kClasses[kClassLarge]));
 static_assert(detail::cpasync_dst_ok(kClasses[kClassLarge]));
+static_assert(detail::fallback_class_ok(kClasses[kClassFallback]));
+static_assert(class_smem_of(kClassFallback) == kScalarBytes);
 static_assert(kTilePitch % 32 == 0);
 static_assert(kTileArea == (kExtendedSupportLayout ? 82944 : 65536));
 static_assert(kSmemRaw == 213440);
@@ -57,12 +62,24 @@ static_assert(class_containing(kLargeClassEdge - kPromoteSlack,
                                kPromoteSlack) == kClassLarge);
 static_assert(class_containing(kLargeClassEdge - kPromoteSlack + 1,
                                kLargeClassEdge - kPromoteSlack + 1,
-                               kPromoteSlack) == -1);
+                               kPromoteSlack) == kClassFallback);
 static_assert(class_containing(200, 113, kPromoteSlack) == kClassLarge);
 static_assert(class_containing(201, 113, kPromoteSlack) ==
-              (kExtendedSupportLayout ? kClassLarge : -1));
+              (kExtendedSupportLayout ? kClassLarge : kClassFallback));
 static_assert(class_containing(208, 113, kPromoteSlack) ==
-              (kExtendedSupportLayout ? kClassLarge : -1));
+              (kExtendedSupportLayout ? kClassLarge : kClassFallback));
+static_assert(class_containing(217, 134, kPromoteSlack) == kClassFallback);
+static_assert(class_containing(kTilePitch - 2 - kPromoteSlack,
+                               kTilePitch - 2 - kPromoteSlack,
+                               kPromoteSlack) == kClassFallback);
+static_assert(class_containing(kTilePitch - 1 - kPromoteSlack,
+                               kTilePitch - 1 - kPromoteSlack,
+                               kPromoteSlack) == -1);
+static_assert(class_containing_storage(kTilePitch - 2,
+                                       kTilePitch - 2,
+                                       kPromoteSlack) == kClassFallback);
+static_assert(class_containing_storage(kTilePitch - 1, 100,
+                                       kPromoteSlack) == -1);
 
 // The compact checkpoint's terminal window is source coordinates 32..239.
 // Both layouts preserve a 200-pixel boundary state exactly; only the extended
@@ -71,10 +88,10 @@ static_assert(class_preserving_nonzero(
                   200, 113, kPromoteSlack, 32, 239, 32, 239) == kClassLarge);
 static_assert(class_preserving_nonzero(
                   201, 113, kPromoteSlack, 32, 239, 32, 239) ==
-              (kExtendedSupportLayout ? kClassLarge : -1));
+              (kExtendedSupportLayout ? kClassLarge : kClassFallback));
 static_assert(class_preserving_nonzero(
                   208, 113, kPromoteSlack, 32, 239, 32, 239) ==
-              (kExtendedSupportLayout ? kClassLarge : -1));
+              (kExtendedSupportLayout ? kClassLarge : kClassFallback));
 
 // tile_t is data in v8; changing its value does not change the schema.
 static_assert(ckpt::VERSION_CURRENT == 8);
@@ -136,7 +153,12 @@ int main() {
                 pf::kTilePitch -
                     (pf::kClasses[pf::kClassLarge].tx0 + pf::kLargeClassEdge));
     std::printf("max_support_extent=%d\n",
-                pf::kLargeClassEdge - pf::kPromoteSlack);
+                pf::class_support_capacity(pf::kClassFallback,
+                                           pf::kPromoteSlack));
+    std::printf("fallback_physical_extent=%d\n",
+                pf::kClasses[pf::kClassFallback].wx);
+    std::printf("failed_seed_class=%d\n",
+                pf::class_containing(217, 134, pf::kPromoteSlack));
     std::printf("extent201_class=%d\n",
                 pf::class_containing(201, 113, pf::kPromoteSlack));
     std::printf("extent208_class=%d\n",

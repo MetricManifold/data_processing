@@ -1,8 +1,8 @@
 #pragma once
 // ===========================================================================
-// FUSE-1R host-side simulation object: allocation, initialisation, the
-// per-step launch sequence (one kernel per step, optionally as a replayed
-// 6-step CUDA graph), L2 residency policy, diagnostics and state dump.
+// Host-side simulation object: allocation, initialisation, the ordered normal
+// and sparse-fallback launches (optionally replayed as a 6-step CUDA graph),
+// L2 residency policy, diagnostics and state dump.
 // ===========================================================================
 
 #include "checkpoint.cuh"
@@ -155,6 +155,8 @@ private:
     cudaGraph_t  graph_  = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
     bool graph_ready_ = false;
+    bool fallback_reported_ = false;
+    bool fallback_no_margin_reported_ = false;
 
     long long steps_done_ = 0;
     size_t l2_persist_max_ = 0;

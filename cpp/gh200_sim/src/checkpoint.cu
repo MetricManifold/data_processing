@@ -258,11 +258,11 @@ bool repack_tile(const float* src, int T, int cell_id,
         out_ext[d] = ext[d];
     }
 
-    int cls = class_containing(ext[0], ext[1], kPromoteSlack);
+    int cls = class_containing_storage(ext[0], ext[1], kPromoteSlack);
     if (cls < 0) {
         std::fprintf(stderr,
-            "[ckpt] cell %d has a phi > %.1e support of %d x %d px, which fits "
-            "NO shape class with the %d px promote slack.\n"
+            "[ckpt] cell %d has a phi > %.1e support of %d x %d px, which "
+            "exceeds the fixed tile fallback.\n"
             "       Widest representable support is %d x %d px. Refusing to "
             "load: clipping phi here would cut a step discontinuity into the\n"
             "       interface and destroy the phi^2 mass the volume term is "
@@ -275,9 +275,9 @@ bool repack_tile(const float* src, int T, int cell_id,
             "lambda * d). A support far wider than that means the field in the\n"
             "       file is NOT on that stationary profile -- an unrelaxed "
             "initial condition, or a different interface normalisation.\n",
-            cell_id, (double)kSupportEps, ext[0], ext[1], kPromoteSlack,
-            kClasses[kClassLarge].wx - kPromoteSlack,
-            kClasses[kClassLarge].wy - kPromoteSlack);
+            cell_id, (double)kSupportEps, ext[0], ext[1],
+            kClasses[kClassFallback].wx,
+            kClasses[kClassFallback].wy);
         return false;
     }
 
@@ -755,10 +755,10 @@ bool checkpoint_read(const std::string& path, CheckpointData* out) {
     // stationary profile of the 30/lambda^2 bulk term, and will burn the large
     // class (or be refused) for reasons that have nothing to do with crowding.
     std::printf("       widest phi > %.0e support %d x %d px  "
-                "(round class holds %d, the largest class %d before refusal)\n",
+                "(round guarded capacity %d, fallback physical capacity %d)\n",
                 (double)kSupportEps, max_ext[0], max_ext[1],
                 kClasses[kClassRound].wx - kPromoteSlack,
-                kClasses[kClassLarge].wx - kPromoteSlack);
+                kClasses[kClassFallback].wx);
     std::printf("       %d of %d cells reloaded EXACTLY (whole nonzero tile "
                 "inside a class window, copied pixel for pixel)\n",
                 n_exact, n);

@@ -1,8 +1,8 @@
 // ===========================================================================
 // FUSE-1R solver kernels.
 //
-// k_step is the ONLY kernel in the steady-state loop. One CTA per cell, the
-// cell's whole rect resident in shared memory:
+// k_step handles shared-memory classes; k_step_fallback follows it in the same
+// stream and handles only cells in the rare whole-tile global path.
 //
 //   P0  scalar setup + run-and-tumble + synthesised stencil ring
 //   P1  3-stage cp.async strip pipeline; exact Ix/Iy over this step's phi & S
@@ -206,12 +206,9 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
         //     extents (this is also the only wide<->tall path);
         //   fits here, and a strictly smaller window holds it with the wider
         //     demote margin -> move after kDemoteDwell consecutive checks;
-        //   no class holds it -> FLAG_CLASS_EXHAUSTED and stay put. With
-        //     kClassLarge in the table that now means an extent above
-        //     selected large edge - kPromoteSlack (184 or 200 px), not the
-        //     far tighter
-        //     "no class is larger than the round one in both axes" it used to
-        //     mean. Truncating phi to fake a fit is still not an option.
+        //   no shared class holds it -> enter the global fallback;
+        //   no class holds it -> FLAG_CLASS_EXHAUSTED and stay put.
+        // Truncating phi to fake a fit is never an option.
         const int ex = cs.bb_hi_x - cs.bb_lo_x + 1;
         const int ey = cs.bb_hi_y - cs.bb_lo_y + 1;
         int dcls = CLS;
@@ -772,7 +769,324 @@ __device__ void process_cell(int n, const StepArgs& A, char* smem,
 }
 
 // ---------------------------------------------------------------------------
-// k_step -- the only kernel in the steady-state loop.
+// Rare whole-tile fallback. The 286x286 active window uses global memory for
+// both phi and S; tile rows/columns 0 and 287 remain the stencil's zero ring.
+// Keeping this out of process_cell preserves the shared-memory code generated
+// for classes 0--4.
+// ---------------------------------------------------------------------------
+__device__ __noinline__ void process_cell_fallback(
+    int n, const StepArgs& A, char* smem, unsigned long long step)
+{
+    constexpr int CLS = kClassFallback;
+    constexpr int WX  = kClasses[CLS].wx;
+    constexpr int WY  = kClasses[CLS].wy;
+    constexpr int TX0 = kClasses[CLS].tx0;
+    constexpr int TY0 = kClasses[CLS].ty0;
+    constexpr int RB  = (WY + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    static_assert(WX == kTilePitch - 2 && WY == kTilePitch - 2);
+    static_assert(TX0 == 1 && TY0 == 1);
+
+    double* red_s = reinterpret_cast<double*>(smem);
+    int*    bci   = reinterpret_cast<int*>(smem + kRedBytes);
+    float*  bcf   = reinterpret_cast<float*>(smem + kRedBytes);
+    const int tid  = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    if (tid == 0) {
+        const CellState& cs = A.cell[n];
+        const Philox4 r = philox4x32_10(
+            (uint32_t)(step & 0xFFFFFFFFull), (uint32_t)(step >> 32),
+            (uint32_t)cs.global_id, 0xA5A5A5A5u,
+            (uint32_t)(A.polarity_seed & 0xFFFFFFFFull),
+            (uint32_t)(A.polarity_seed >> 32));
+        float theta = cs.theta;
+        int tumbled = 0;
+        if (philox_uniform53(r.v[0], r.v[1]) < A.p_tumble) {
+            theta = (float)(2.0 * kPi * philox_uniform53(r.v[2], r.v[3]));
+            tumbled = 1;
+        }
+        float ph_sin, ph_cos;
+        sincosf(theta, &ph_sin, &ph_cos);
+
+        const float gam  = cs.gamma;
+        const float dwC  = A.bulk_scale * gam;
+        const float volC = (float)(A.vol_scale * (A.A0 - cs.V));
+
+        const int ex = cs.bb_hi_x - cs.bb_lo_x + 1;
+        const int ey = cs.bb_hi_y - cs.bb_lo_y + 1;
+        int dcls = CLS;
+        int no_margin = 0;
+        unsigned pctr = cs.promote_ctr;
+        if (ex > 0) {
+            if (ex + kPromoteSlack > WX || ey + kPromoteSlack > WY) {
+                const int grow = class_containing(ex, ey, kPromoteSlack);
+                if (grow >= 0) {
+                    dcls = grow;
+                } else if (ex <= WX && ey <= WY) {
+                    // The field still fits the tile interior, but no longer has
+                    // the ordinary promotion margin. Keep integrating it and
+                    // expose the condition in the geometry summary.
+                    no_margin = 1;
+                } else {
+                    PF_FATAL_ADD(A.flags, FLAG_CLASS_EXHAUSTED);
+                }
+                pctr = 0u;
+            } else {
+                const int small = class_containing(ex, ey, kDemoteSlack);
+                if (small >= 0 && small != CLS
+                    && class_of(small).wx * class_of(small).wy < WX * WY) {
+                    if (++pctr >= (unsigned)kDemoteDwell) {
+                        dcls = small;
+                        pctr = 0u;
+                    }
+                } else {
+                    pctr = 0u;
+                }
+            }
+        }
+        const ShapeClass dc = class_of(dcls);
+        const int dwx = dc.wx, dwy = dc.wy;
+
+        int sx = 0, sy = 0;
+        if (cs.V > 0.0) {
+            sx = __double2int_rn(cs.Cx / cs.V - 0.5 * (double)(dwx - 1));
+            sy = __double2int_rn(cs.Cy / cs.V - 0.5 * (double)(dwy - 1));
+            if (dcls == CLS) {
+                sx = max(-kMaxShiftPerStep, min(kMaxShiftPerStep, sx));
+                sy = max(-kMaxShiftPerStep, min(kMaxShiftPerStep, sy));
+            } else {
+                sx = max(-WX, min(WX, sx));
+                sy = max(-WY, min(WY, sy));
+            }
+        } else {
+            PF_FATAL_OR(A.flags, FLAG_V_NONPOS);
+        }
+
+        const int fm = (A.full_moment_every > 0 &&
+                        ((step + 1ull) %
+                         (unsigned long long)A.full_moment_every) == 0ull);
+        bci[0] = sx; bci[1] = sy;
+        bci[2] = cs.gx0; bci[3] = cs.gy0;
+        bci[4] = wrapi(cs.gx0 + sx, A.L);
+        bci[5] = wrapi(cs.gy0 + sy, A.L);
+        bci[6] = dcls;
+        bci[7] = (dcls != (int)cs.cls_written[A.parity_out]);
+        bcf[8] = gam; bcf[9] = dwC; bcf[10] = volC; bcf[11] = cs.v_A;
+        bcf[12] = ph_cos; bcf[13] = ph_sin; bcf[16] = theta;
+        bci[17] = fm; bci[18] = (int)pctr; bci[19] = tumbled;
+        bci[20] = dwx; bci[21] = dwy; bci[22] = dc.tx0; bci[23] = dc.ty0;
+        bci[24] = no_margin;
+    }
+    __syncthreads();
+
+    const int gx0 = bci[2], gy0 = bci[3];
+    const int split = min(WX, A.L - gx0);
+    const float* tile_in = A.phi_in + (size_t)n * kTileArea;
+
+    double aIx = 0.0, aIy = 0.0;
+    for (int y = warp; y < WY; y += kWarpsPerBlock) {
+        int gy = gy0 + y;
+        if (gy >= A.L) gy -= A.L;
+        for (int x = lane; x < WX; x += 32) {
+            const float* p = &tile_in[(size_t)(TY0 + y) * kTilePitch + TX0 + x];
+            const float c = p[0];
+            const float gx = 0.5f * (p[1] - p[-1]);
+            const float gy_phi = 0.5f * (p[kTilePitch] - p[-kTilePitch]);
+            const int gx_global = (x < split) ? gx0 + x : x - split;
+            const float So = s_other(A.S_rd[(size_t)gy * A.P + gx_global],
+                                     c, A.flags);
+            aIx += (double)(c * gx * So);
+            aIy += (double)(c * gy_phi * So);
+        }
+    }
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+        aIx += __shfl_down_sync(0xFFFFFFFFu, aIx, d);
+        aIy += __shfl_down_sync(0xFFFFFFFFu, aIy, d);
+    }
+    if (lane == 0) {
+        red_s[warp * kRedSlots] = aIx;
+        red_s[warp * kRedSlots + 1] = aIy;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double sIx = 0.0, sIy = 0.0;
+        for (int w = 0; w < kWarpsPerBlock; ++w) {
+            sIx += red_s[w * kRedSlots];
+            sIy += red_s[w * kRedSlots + 1];
+        }
+        const double vxd = (double)bcf[11] * (double)bcf[12]
+                         + (double)A.mot_coeff * sIx;
+        const double vyd = (double)bcf[11] * (double)bcf[13]
+                         + (double)A.mot_coeff * sIy;
+        bcf[14] = (float)vxd; bcf[15] = (float)vyd;
+        CellState* cs = &A.cell[n];
+        cs->vx = (float)vxd; cs->vy = (float)vyd;
+        cs->Ix = sIx; cs->Iy = sIy;
+    }
+    __syncthreads();
+
+    float* tile_out = A.phi_out + (size_t)n * kTileArea;
+    if (bci[7]) {
+        for (int i = tid; i < kTileArea; i += kBlockThreads)
+            tile_out[i] = 0.0f;
+        __syncthreads();
+    }
+
+    const float gam = bcf[8], dwC = bcf[9], volC = bcf[10];
+    const float vxf = bcf[14], vyf = bcf[15];
+    const int sx = bci[0], sy = bci[1];
+    const int dwx = bci[20], dwy = bci[21];
+    const int dtx0 = bci[22], dty0 = bci[23];
+    const int y0 = warp * RB;
+    if (y0 < WY) {
+        const int y1 = min(y0 + RB, WY);
+        for (int xb = 0; xb < WX; xb += 32) {
+            const int x = lane + xb;
+            if (x >= WX) break;
+            const float* p = &tile_in[(size_t)(TY0 + y0 - 1) * kTilePitch
+                                      + TX0 + x];
+            float sW = p[-1], sC = p[0], sE = p[1];
+            p += kTilePitch;
+            float cW = p[-1], cC = p[0], cE = p[1];
+            const int gx_global = (x < split) ? gx0 + x : x - split;
+            for (int y = y0; y < y1; ++y) {
+                p += kTilePitch;
+                const float nW = p[-1], nC = p[0], nE = p[1];
+                const float lap = ((float)kLapEdgeW * (nC + sC + cE + cW)
+                                 + (float)kLapDiagW * (nE + nW + sE + sW)
+                                 + (float)kLapCentreW * cC)
+                                * (float)(1.0 / kLapDenom);
+                const float gx = 0.5f * (cE - cW);
+                const float gy_phi = 0.5f * (nC - sC);
+                int gy = gy0 + y;
+                if (gy >= A.L) gy -= A.L;
+                const float So = s_other(
+                    A.S_rd[(size_t)gy * A.P + gx_global], cC, A.flags);
+                const float rhs = gam * lap
+                                - dwC * (cC * (1.0f - cC) * (1.0f - 2.0f * cC))
+                                + volC * cC
+                                - A.rep_coeff * cC * So
+                                - (vxf * gx + vyf * gy_phi);
+                const float pnew = cC + A.dt * rhs;
+                const int a = x - sx, b = y - sy;
+                if ((unsigned)a < (unsigned)dwx &&
+                    (unsigned)b < (unsigned)dwy)
+                    tile_out[(size_t)(dty0 + b) * kTilePitch + dtx0 + a] = pnew;
+                sW = cW; sC = cC; sE = cE;
+                cW = nW; cC = nC; cE = nE;
+            }
+        }
+    }
+    for (int b = warp; b < dwy; b += kWarpsPerBlock) {
+        const int j = b + sy;
+        const bool jin = (unsigned)j < (unsigned)WY;
+        for (int a = lane; a < dwx; a += 32) {
+            const int i = a + sx;
+            if (!(jin && (unsigned)i < (unsigned)WX))
+                tile_out[(size_t)(dty0 + b) * kTilePitch + dtx0 + a] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int gx0n = bci[4], gy0n = bci[5];
+    const int dcls = bci[6], fm = bci[17];
+    double aV = 0.0, aCx = 0.0, aCy = 0.0, aPer = 0.0;
+    int blox = dwx, bhix = -1, bloy = dwy, bhiy = -1, pmaxb = 0;
+    for (int b = warp; b < dwy; b += kWarpsPerBlock) {
+        int gy = gy0n + b;
+        if (gy >= A.L) gy -= A.L;
+        const size_t row = (size_t)(dty0 + b) * kTilePitch + dtx0;
+        for (int a = lane; a < dwx; a += 32) {
+            const float pn = tile_out[row + a];
+            if (!isfinite(pn)) PF_FATAL_OR(A.flags, FLAG_NONFINITE);
+            if (pn * pn > kQClampPhiSq) PF_FATAL_OR(A.flags, FLAG_Q_CLAMP);
+            pmaxb = max(pmaxb, (int)__float_as_uint(fabsf(pn)));
+            const uint32_t q = q_of(pn);
+            if (q) {
+                int gx = gx0n + a;
+                if (gx >= A.L) gx -= A.L;
+                const uint32_t old = atomicAdd(&A.S_sc[(size_t)gy * A.P + gx], q);
+                if (old > 0xFFFFFFFFu - q)
+                    PF_FATAL_OR(A.flags, FLAG_S_OVERFLOW);
+            }
+            const double d = (double)pn * (double)pn;
+            aV += d; aCx += d * (double)a; aCy += d * (double)b;
+            if (pn > kSupportEps) {
+                blox = min(blox, a); bhix = max(bhix, a);
+                bloy = min(bloy, b); bhiy = max(bhiy, b);
+            }
+            if (fm) {
+                const float e = a + 1 < dwx ? tile_out[row + a + 1] : 0.0f;
+                const float w = a > 0 ? tile_out[row + a - 1] : 0.0f;
+                const float nn = b + 1 < dwy
+                    ? tile_out[row + kTilePitch + a] : 0.0f;
+                const float ss = b > 0
+                    ? tile_out[row - kTilePitch + a] : 0.0f;
+                const float pgx = 0.5f * (e - w), pgy = 0.5f * (nn - ss);
+                aPer += (double)sqrtf(pgx * pgx + pgy * pgy);
+            }
+        }
+    }
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+        aV += __shfl_down_sync(0xFFFFFFFFu, aV, d);
+        aCx += __shfl_down_sync(0xFFFFFFFFu, aCx, d);
+        aCy += __shfl_down_sync(0xFFFFFFFFu, aCy, d);
+        aPer += __shfl_down_sync(0xFFFFFFFFu, aPer, d);
+        blox = min(blox, __shfl_down_sync(0xFFFFFFFFu, blox, d));
+        bhix = max(bhix, __shfl_down_sync(0xFFFFFFFFu, bhix, d));
+        bloy = min(bloy, __shfl_down_sync(0xFFFFFFFFu, bloy, d));
+        bhiy = max(bhiy, __shfl_down_sync(0xFFFFFFFFu, bhiy, d));
+        pmaxb = max(pmaxb, __shfl_down_sync(0xFFFFFFFFu, pmaxb, d));
+    }
+    if (lane == 0) {
+        double* rw = red_s + warp * kRedSlots;
+        rw[0] = aV; rw[1] = aCx; rw[2] = aCy; rw[3] = aPer;
+        int* iw = reinterpret_cast<int*>(rw + 4);
+        iw[0] = blox; iw[1] = bhix; iw[2] = bloy; iw[3] = bhiy;
+        iw[4] = pmaxb;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double sV = 0.0, sCx = 0.0, sCy = 0.0, sPer = 0.0;
+        int Blox = dwx, Bhix = -1, Bloy = dwy, Bhiy = -1, Pmax = 0;
+        for (int w = 0; w < kWarpsPerBlock; ++w) {
+            const double* rw = red_s + w * kRedSlots;
+            sV += rw[0]; sCx += rw[1]; sCy += rw[2]; sPer += rw[3];
+            const int* iw = reinterpret_cast<const int*>(rw + 4);
+            Blox = min(Blox, iw[0]); Bhix = max(Bhix, iw[1]);
+            Bloy = min(Bloy, iw[2]); Bhiy = max(Bhiy, iw[3]);
+            Pmax = max(Pmax, iw[4]);
+        }
+        CellState* cs = &A.cell[n];
+        cs->gx0 = gx0n; cs->gy0 = gy0n;
+        cs->cls = (uint8_t)dcls;
+        cs->cls_written[A.parity_out] = (uint8_t)dcls;
+        cs->theta = bcf[16]; cs->V = sV; cs->Cx = sCx; cs->Cy = sCy;
+        if (fm) cs->perim = sPer;
+        cs->bb_lo_x = Blox; cs->bb_hi_x = Bhix;
+        cs->bb_lo_y = Bloy; cs->bb_hi_y = Bhiy;
+        cs->promote_ctr = (uint32_t)bci[18];
+        cs->shift_ctr += (sx | sy) ? 1u : 0u;
+        cs->tumble_ctr += (uint32_t)bci[19];
+        cs->phi_max = __uint_as_float((uint32_t)Pmax);
+        cs->reserved[0] = 1u;  // sticky, diagnostic only
+        A.cell_cls[n] = (uint8_t)dcls;
+        const bool edge = Bhix >= 0 &&
+            (Blox == 0 || Bhix == dwx - 1 ||
+             Bloy == 0 || Bhiy == dwy - 1);
+        if (bci[24] || (dcls == kClassFallback && edge))
+            ++cs->reserved[1];
+        if (edge)
+            PF_ADVISORY_ADD(A.flags, FLAG_SUPPORT_CLIP);
+    }
+    __syncthreads();
+}
+
+// ---------------------------------------------------------------------------
+// k_step -- shared-memory portion of the steady-state update.
 // ---------------------------------------------------------------------------
 __global__ __launch_bounds__(kBlockThreads, 1)
 void k_step(PF_GRID_CONSTANT const StepArgs A)
@@ -835,7 +1149,7 @@ void k_step(PF_GRID_CONSTANT const StepArgs A)
         // was never selected. `default:` is now unreachable by construction
         // (cell_cls is only ever written from a validated dcls) and is a loud,
         // counted refusal rather than a wrong geometry.
-        static_assert(kNumClasses == 5,
+        static_assert(kNumClasses == 6,
                       "k_step's dispatch switch must enumerate every class");
         switch (cls) {
             case kClassRound: process_cell<kClassRound>(n, A, smem, step); break;
@@ -843,6 +1157,10 @@ void k_step(PF_GRID_CONSTANT const StepArgs A)
             case kClassTall:  process_cell<kClassTall >(n, A, smem, step); break;
             case kClassBig:   process_cell<kClassBig  >(n, A, smem, step); break;
             case kClassLarge: process_cell<kClassLarge>(n, A, smem, step); break;
+            // The global fallback is processed by k_step_fallback after this
+            // kernel. Keeping the large routine out of this call graph avoids
+            // register spills in the normal production kernel.
+            case kClassFallback: __syncthreads(); break;
             default:
                 if (tid == 0) atomicAdd(&A.flags[FLAG_CLASS_UNSUPPORTED], 1u);
                 // process_cell ends with a __syncthreads() that protects ctrl
@@ -851,6 +1169,26 @@ void k_step(PF_GRID_CONSTANT const StepArgs A)
                 __syncthreads();
                 break;
         }
+    }
+}
+
+// Runs after k_step in the same stream. cls_written[input parity] is the source
+// class snapshot: unlike cell_cls it is not changed when another class promotes
+// into the fallback while k_step is running, so no cell is updated twice.
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback(PF_GRID_CONSTANT const StepArgs A)
+{
+    extern __shared__ uint4 smem_raw[];
+    char* smem = reinterpret_cast<char*>(smem_raw);
+    const int input_parity = A.parity_out ^ 1;
+    const unsigned long long step = *A.step_rd;
+    for (int n = (int)blockIdx.x; n < A.N; n += (int)gridDim.x) {
+        const bool active =
+            A.cell[n].cls_written[input_parity] == (uint8_t)kClassFallback;
+        if (active)
+            process_cell_fallback(n, A, smem, step);
+        else
+            __syncthreads();
     }
 }
 
@@ -1167,6 +1505,8 @@ void launch_step(const StepArgs& A, int grid, cudaStream_t stream,
     cfg.numAttrs = (unsigned)nattr;
 
     cudaLaunchKernelEx(&cfg, k_step, A);
+    cfg.dynamicSmemBytes = (size_t)kScalarBytes;
+    cudaLaunchKernelEx(&cfg, k_step_fallback, A);
 }
 
 // ---------------------------------------------------------------------------

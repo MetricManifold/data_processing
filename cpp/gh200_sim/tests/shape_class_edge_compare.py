@@ -55,11 +55,14 @@ def expected(extended):
             "tile_area": "82944",
             "large_edge": "224",
             "class4": "224,224,32,32",
+            "class5": "286,286,1,1",
             "large_raw": "211904",
             "large_aligned": "211968",
             "large_to_staged_margin": "1536",
             "tile_right_margin": "32",
-            "max_support_extent": "216",
+            "max_support_extent": "278",
+            "fallback_physical_extent": "286",
+            "failed_seed_class": "5",
             "extent201_class": "4",
             "extent208_class": "4",
             "old_tile_exact_208": "4",
@@ -71,14 +74,17 @@ def expected(extended):
             "tile_area": "65536",
             "large_edge": "208",
             "class4": "208,208,32,32",
+            "class5": "254,254,1,1",
             "large_raw": "183616",
             "large_aligned": "183680",
             "large_to_staged_margin": "29824",
             "tile_right_margin": "16",
-            "max_support_extent": "200",
-            "extent201_class": "-1",
-            "extent208_class": "-1",
-            "old_tile_exact_208": "-1",
+            "max_support_extent": "246",
+            "fallback_physical_extent": "254",
+            "failed_seed_class": "5",
+            "extent201_class": "5",
+            "extent208_class": "5",
+            "old_tile_exact_208": "5",
         }
     result = dict(COMMON)
     result.update(specific)
@@ -98,9 +104,10 @@ def main():
         raise RuntimeError("extended audit differs from the locked contract")
 
     geometry = {
-        "layout", "tile_pitch", "tile_area", "large_edge", "class4",
+        "layout", "tile_pitch", "tile_area", "large_edge", "class4", "class5",
         "large_raw", "large_aligned", "large_to_staged_margin",
         "tile_right_margin", "max_support_extent", "extent201_class",
+        "fallback_physical_extent", "failed_seed_class",
         "extent208_class", "old_tile_exact_208",
     }
     if {k: v for k, v in compact.items() if k not in geometry} != {

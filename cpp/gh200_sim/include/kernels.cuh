@@ -3,10 +3,9 @@
 // FUSE-1R kernel ABI: per-cell state, the single per-step argument block, the
 // counter-based RNG, and the kernel / launcher declarations.
 //
-// One kernel per step. One CTA per cell. The cell's whole rect is resident in
-// shared memory, so the EXACT (non-lagged) interaction velocity is available to
-// the RHS in the same pass -- the interaction velocity is ~7x v_A, so lagging
-// it by a step would change the integrator for the dominant transport term.
+// Shared-memory classes use k_step; the rare fixed-tile global class follows in
+// k_step_fallback. Both compute the exact, non-lagged interaction velocity for
+// the RHS of the same step.
 // ===========================================================================
 
 #include "params.cuh"
@@ -263,6 +262,9 @@ struct DumpCell {
 // 85-register budget the peak live set (~45) was sized against.
 __global__ __launch_bounds__(kBlockThreads, 1)
 void k_step(PF_GRID_CONSTANT const StepArgs A);
+
+__global__ __launch_bounds__(kBlockThreads, 1)
+void k_step_fallback(PF_GRID_CONSTANT const StepArgs A);
 
 __global__ void k_init_tiles(float* phi_a, float* phi_b, CellState* cell,
                              const uint8_t* cls, int N, int L,

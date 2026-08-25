@@ -238,6 +238,14 @@ bool Sim::configure_and_capture() {
             "build log for 'spill stores' for the breakdown.\n",
             (size_t)fa.localSizeBytes, kLocalBytesBudget);
 
+    cudaFuncAttributes fallback_fa{};
+    CU_CHECK(cudaFuncGetAttributes(
+        &fallback_fa, reinterpret_cast<const void*>(k_step_fallback)));
+    std::printf("  k_step_fallback: %d regs, %zu B local, %d B static smem, "
+                "%d B dynamic smem requested\n",
+                fallback_fa.numRegs, (size_t)fallback_fa.localSizeBytes,
+                (int)fallback_fa.sharedSizeBytes, kScalarBytes);
+
     print_path_report();
 
     // --- L2 persistence carve-out -----------------------------------------
@@ -567,10 +575,14 @@ void Sim::print_path_report() const {
                                                  : "shared-memory-limited");
     };
 
-    std::printf("  exec path: FUSED -- k_step, 1 kernel/step\n");
+    std::printf("  exec path: k_step + sparse global-fallback filter, "
+                "2 ordered launches/step\n");
     report("k_step", reinterpret_cast<const void*>(k_step),
            kBlockThreads, kSmemBytes, 1,
            kRegsPerSmSm90 / kBlockThreads);   // __launch_bounds__(768, 1)
+    report("fallback", reinterpret_cast<const void*>(k_step_fallback),
+           kBlockThreads, kScalarBytes, 1,
+           kRegsPerSmSm90 / kBlockThreads);
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +692,8 @@ void Sim::print_line() {
     long long shifts = 0, tumbles = 0;
     int cls_count[kNumClasses] = {};
     int cls_bad = 0;
+    int fallback_seen = 0;
+    unsigned long long no_margin_steps = 0;
     for (const CellState& c : h) {
         vsum += c.V;
         vmin = std::min(vmin, c.V);
@@ -689,6 +703,8 @@ void Sim::print_line() {
         shifts += c.shift_ctr;
         tumbles += c.tumble_ctr;
         if (c.cls < kNumClasses) cls_count[c.cls]++; else cls_bad++;
+        fallback_seen += c.reserved[0] != 0u;
+        no_margin_steps += c.reserved[1];
     }
     const double n = (double)p_.num_cells;
     // cls prints round/wide/tall/big/large -- one field per class, generated
@@ -711,6 +727,20 @@ void Sim::print_line() {
                 "tumbles %lld\n",
                 steps_done_, time(), vsum / n / p_.area0(), vmin, vmax,
                 spd / n, pmax, cls_str, shifts, tumbles);
+    if (fallback_seen && !fallback_reported_) {
+        std::printf("[geometry] global fallback used by %d cell(s): "
+                    "%dx%d interior in the %dx%d tile\n",
+                    fallback_seen, kClasses[kClassFallback].wx,
+                    kClasses[kClassFallback].wy, kTilePitch, kTilePitch);
+        fallback_reported_ = true;
+    }
+    if (no_margin_steps && !fallback_no_margin_reported_) {
+        std::printf("[geometry] fallback margin/boundary reached; output is "
+                    "retained, but boundary dynamics may be clipped and require "
+                    "review (cell-steps %llu)\n",
+                    no_margin_steps);
+        fallback_no_margin_reported_ = true;
+    }
     std::fflush(stdout);
 }
 
@@ -988,15 +1018,17 @@ bool Sim::run() {
                     dual_centroid_frames_, p_.num_cells);
     close_trajectory();
     if (dual_centroid_fp_) close_dual_centroid();
-    // The final checkpoint is written on every configured normal/SIGTERM exit.
-    // A fatal alarm or earlier checkpoint failure forces one final diagnostic
-    // rolling-checkpoint attempt even under --no-final-checkpoint. SLURM
-    // sends SIGTERM before SIGKILL at walltime, and a chained job that cannot
-    // pick up where the previous leg stopped has burned its allocation for a
-    // trajectory it cannot extend. It goes to the ROLLING name, so the next
-    // leg's `-c <dir>/checkpoint.bin` needs no bookkeeping.
+    // A valid exit advances checkpoint.bin. A fatal state is written under a
+    // distinct diagnostic name: overwriting the last accepted rolling state
+    // with the first invalid frame would destroy the recovery point.
     if (ckpt_on && (opt_.final_checkpoint || run_failed)) {
-        if (!save_checkpoint(checkpoint_paths(true, false))) {
+        std::vector<std::string> final_paths;
+        if (run_failed) {
+            final_paths.emplace_back(opt_.ckpt_dir + "/checkpoint_failed.bin");
+        } else {
+            final_paths = checkpoint_paths(true, false);
+        }
+        if (!save_checkpoint(final_paths)) {
             std::fprintf(stderr, "[ckpt] FINAL CHECKPOINT FAILED. The run "
                          "cannot be resumed from where it stopped.\n");
             run_failed = true;

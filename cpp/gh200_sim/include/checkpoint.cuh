@@ -21,8 +21,8 @@
 //          than 320 is safe for every known consumer.
 //   READ   accepts any tile_t, locates the phi > kSupportEps support bbox,
 //          picks the smallest shape class that CONTAINS it via
-//          class_containing(), and re-centres it in that class's window.
-//          A support that fits no class is a hard error — never clipped.
+//          class_containing_storage(), and re-centres it in that class's
+//          window. A support wider than the fixed tile interior is refused.
 //
 // ---- dimensionality -------------------------------------------------------
 // The v8 FORMAT is 2-D only; cpp/common/checkpoint_format.h says exactly
@@ -116,7 +116,7 @@ struct CheckpointData {
     bool had_rngs = false;
 
     std::vector<CkptCell> cells;      // n entries
-    std::vector<float>    phi;        // n * kTileArea, native 256 tiles
+    std::vector<float>    phi;        // n * kTileArea, native build tiles
 };
 
 // Read `path` and repack it into this engine's geometry. Returns false and

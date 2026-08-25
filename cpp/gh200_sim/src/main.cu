@@ -293,10 +293,7 @@ static int gate_geometry(const SimParams& p) {
     std::printf("            required half-width %.2f px on both axes of every "
                 "class; support extent of a relaxed cell %.2f px\n",
                 need, 2.0 * (R + d_supp));
-    // Per class: the sizing margin, the shared-memory cost, whether it stages S
-    // and the largest support extent it can be promoted INTO. That last column
-    // is the one the soft-gamma campaign cares about: FLAG_CLASS_EXHAUSTED
-    // means "bigger than the largest number in it, on some axis".
+    // Per class: sizing margin, storage path, and guarded promotion capacity.
     int max_ex = 0, max_ey = 0;
     for (int c = 0; c < kNumClasses; ++c) {
         const int wmin = std::min(kClasses[c].wx, kClasses[c].wy);
@@ -308,18 +305,21 @@ static int gate_geometry(const SimParams& p) {
                     "<= %d x %d%s\n",
                     c, kClasses[c].wx, kClasses[c].wy, hw,
                     (double)hw - need, class_smem_of(c),
-                    class_stages_S(c) ? "phi+S " : "phi   (S from global)",
+                    class_stages_S(c) ? "phi+S in shared"
+                    : class_stages_phi(c) ? "phi shared; S global"
+                                          : "phi+S global",
                     kClasses[c].wx - kPromoteSlack,
                     kClasses[c].wy - kPromoteSlack,
                     ((double)hw >= need) ? "" : "   <-- TOO SMALL, would clip");
     }
-    std::printf("            widest representable support %d x %d px "
-                "(kPromoteSlack = %d); anything past that is "
-                "FLAG_CLASS_EXHAUSTED, never clipped\n",
-                max_ex, max_ey, kPromoteSlack);
+    std::printf("            guarded support capacity %d x %d px "
+                "(kPromoteSlack = %d); fallback physical interior %d x %d\n",
+                max_ex, max_ey, kPromoteSlack,
+                kClasses[kClassFallback].wx,
+                kClasses[kClassFallback].wy);
     std::printf("            shared memory per CTA %d B of %d B opt-in max "
                 "(%.1f%%);  set by the staged classes at %d B, NOT by the "
-                "large class at %d B\n",
+                "largest shared-phi class at %d B\n",
                 kSmemBytes, kSmemPerBlockOptinSm90,
                 100.0 * kSmemBytes / kSmemPerBlockOptinSm90,
                 smem_raw_staged_only(), class_smem_of(kClassLarge));

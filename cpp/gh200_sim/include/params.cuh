@@ -200,8 +200,8 @@ constexpr float kSupportEps = 1e-5f;
 // Dropping s_bytes(W,W) from its budget is the ONLY reason a class larger than
 // 144 in both axes is possible at all; it fits inside the budget the staged
 // classes already set, so it costs zero extra shared memory (static_assert'd
-// below). A support that fits in no class at all is still reported
-// (FLAG_CLASS_EXHAUSTED), never clipped.
+// below). A sixth, rare fallback class uses the complete native tile without
+// staging phi or S. Only contact with that physical boundary is exhaustion.
 // ---------------------------------------------------------------------------
 #if defined(PF_GH200_CMAKE_BUILD) && !defined(PF_EXTENDED_SUPPORT_LAYOUT)
 #error "CMake target omitted pf_shape_config: PF_EXTENDED_SUPPORT_LAYOUT is undefined"
@@ -213,9 +213,9 @@ constexpr float kSupportEps = 1e-5f;
 #error "PF_EXTENDED_SUPPORT_LAYOUT must be exactly 0 or 1"
 #endif
 
-// The EXTENDED pair (tile 288, terminal class 224) is the DEFAULT: it raises
-// the containable support from 200 to 216 px/axis, which is what the N=800 soft
-// branch exhausted (job 666491, class_exhausted at extent >= 201).
+// The EXTENDED pair (tile 288, shared-phi class 224) is the default. Class 5
+// adds a 286x286 global-memory fallback inside the same tile; it does not alter
+// a physical parameter or allocate a larger per-cell field.
 //
 // Permitting either quantity to change alone would break the aligned-origin /
 // zero-ring contract, so the two are selected as one audited pair. This is a
@@ -224,9 +224,8 @@ constexpr float kSupportEps = 1e-5f;
 //
 // GPU evidence for the extended pair, Roihu job 687115 (gputest, free queue,
 // 2026-08-16), receipt schema pf-n800-extended-gate-v7:
-//   - device probe reports tile=288 terminal=224 capacity=216 on a real GH200;
-//   - synthetic supports 201..216 select class 4 with class_exhausted=0, and
-//     217 fails closed (class=-1, class_exhausted=1) with no clipping;
+//   - device probe reports tile=288 shared-phi edge=224 on a real GH200;
+//   - synthetic supports 201..216 select class 4 with class_exhausted=0;
 //   - restart cuts at 1/10/100 steps reload PASS_EXACT on both the ctrl and
 //     soft N=800 branches, max_phi_abs_difference 0.0, checkpoint SHA equal.
 // NOT established by that gate: a full-length production segment, and general
@@ -263,7 +262,7 @@ struct ShapeClass {
 // rho=0.89, over 1 tau: cls 163/76/157/0, support_clip 2.33% and
 // class_exhausted 0.17% of cell-steps, i.e. INVALID. See RESULTS.md 7d.
 //
-// Class 4 is the terminal phi-only class. It is 208x208 in the compact layout
+// Class 4 is the largest shared-phi class. It is 208x208 in the compact layout
 // and 224x224 in the extended candidate. Their raw footprints are 183,616 B
 // and 211,904 B, both below the staged-class maximum of 213,440 B, so neither
 // changes the fused launch request (static_assert'd below).
@@ -276,8 +275,9 @@ struct ShapeClass {
 // A 224x224 class is illegal in the compact tile because its aligned origin
 // cannot retain the zero ring. Enlarging the tile to 288 makes the pair legal
 // without relaxing any execution rule. It raises containable support extent
-// after kPromoteSlack from 200 to 216 pixels; anything wider still fails closed.
-constexpr int kNumClasses = 5;
+// after kPromoteSlack from 200 to 216 pixels. Wider supports use class 5's
+// global-memory path within the already allocated tile.
+constexpr int kNumClasses = 6;
 constexpr ShapeClass kClasses[kNumClasses] = {
     {144, 144, 64, 64},   // 0: round
     {176, 144, 32, 64},   // 1: wide
@@ -285,6 +285,8 @@ constexpr ShapeClass kClasses[kNumClasses] = {
     {160, 160, 32, 32},   // 3: big    (larger than round in BOTH axes)
     {kLargeClassEdge, kLargeClassEdge, 32, 32},
                            // 4: large  (phi only in smem; S read from global)
+    {kTilePitch - 2, kTilePitch - 2, 1, 1},
+                           // 5: fallback (phi and S read from global)
 };
 
 constexpr int kClassRound = 0;
@@ -292,18 +294,17 @@ constexpr int kClassWide  = 1;
 constexpr int kClassTall  = 2;
 constexpr int kClassBig   = 3;
 constexpr int kClassLarge = 4;
-static_assert(kNumClasses == 5, "class_of() below enumerates exactly 5 classes");
+constexpr int kClassFallback = 5;
+static_assert(kNumClasses == 6, "class_of() below enumerates exactly 6 classes");
 // k_step's dispatch has an explicit case for every class and a `default:`
 // that refuses everything else. `default:` is unreachable by construction and
 // exists only to make a corrupt class id a counted refusal rather than a wrong
 // geometry.
-static_assert(kClassLarge == kNumClasses - 1,
-              "the non-staged classes must be the LAST ones: the dispatch refuses "
-              "them through `default:`, which catches everything above "
-              "kClassBig");
+static_assert(kClassFallback == kNumClasses - 1,
+              "the global fallback must be the final shape class");
 
-// The selector may alter only the storage tile and terminal edge. Classes 0..3
-// and the terminal class's aligned origin remain pinned.
+// The selector may alter only the storage tile and shared-phi edge. Classes 0..3
+// and the largest shared-phi class's aligned origin remain pinned.
 static_assert(kClasses[0].wx == 144 && kClasses[0].wy == 144 &&
               kClasses[0].tx0 == 64 && kClasses[0].ty0 == 64,
               "support-layout selector changed class 0 geometry");
@@ -320,7 +321,12 @@ static_assert(kClasses[kClassLarge].wx == kLargeClassEdge &&
               kClasses[kClassLarge].wy == kLargeClassEdge &&
               kClasses[kClassLarge].tx0 == 32 &&
               kClasses[kClassLarge].ty0 == 32,
-              "terminal class must retain its audited aligned origin");
+              "largest shared-phi class must retain its aligned origin");
+static_assert(kClasses[kClassFallback].wx == kTilePitch - 2 &&
+              kClasses[kClassFallback].wy == kTilePitch - 2 &&
+              kClasses[kClassFallback].tx0 == 1 &&
+              kClasses[kClassFallback].ty0 == 1,
+              "the fallback must retain the tile's one-pixel stencil ring");
 
 // Does class `c` stage S (and, in P2, phi^{n+1}) in shared memory?
 //
@@ -328,15 +334,17 @@ static_assert(kClasses[kClassLarge].wx == kLargeClassEdge &&
 // It is a compile-time property of the class, never a runtime branch: the fused
 // path takes it through `if constexpr (kStagesS<CLS>)`, so classes 0..3 compile
 // to exactly the code they compiled to before class 4 existed.
-constexpr bool class_stages_S(int c) { return c != kClassLarge; }
+constexpr bool class_stages_S(int c) { return c >= 0 && c <= kClassBig; }
+constexpr bool class_stages_phi(int c) { return c != kClassFallback; }
 template <int CLS>
 inline constexpr bool kStagesS = class_stages_S(CLS);
 
 // Runtime-indexed access to the class table from DEVICE code. A constexpr
 // namespace-scope array cannot be indexed with a runtime value on the device,
 // but every member read below has a literal index and is therefore an integral
-// constant expression, so the whole thing folds into five immediates.
+// constant expression, so the whole thing folds into six immediates.
 __host__ __device__ __forceinline__ constexpr ShapeClass class_of(int c) {
+    if (c == kClassFallback) return kClasses[kClassFallback];
     return ShapeClass{
         c == 1 ? kClasses[1].wx  : c == 2 ? kClasses[2].wx
                : c == 3 ? kClasses[3].wx  : c == 4 ? kClasses[4].wx
@@ -352,8 +360,20 @@ __host__ __device__ __forceinline__ constexpr ShapeClass class_of(int c) {
                : kClasses[0].ty0};
 }
 
+// All classes use the same safety margin during ordinary promotion.
+__host__ __device__ __forceinline__ constexpr bool class_contains_support(
+    int c, int ex, int ey, int slack) {
+    const ShapeClass sc = class_of(c);
+    return ex + slack <= sc.wx && ey + slack <= sc.wy;
+}
+
+__host__ __device__ __forceinline__ constexpr int class_support_capacity(
+    int c, int slack) {
+    return class_of(c).wx - slack;
+}
+
 // Smallest-window shape class that contains an (ex, ey) support with `slack`
-// pixels to spare on BOTH axes; -1 if no class does.
+// pixels to spare on both axes; -1 if even the fallback lacks that margin.
 //
 // Containment is tested on both axes, never inferred from which extent is
 // larger. Choosing the destination from ex >= ey alone moves a cell into a
@@ -362,7 +382,8 @@ __host__ __device__ __forceinline__ constexpr ShapeClass class_of(int c) {
 // phi is truncated on a live face, a step discontinuity is cut into the
 // interface profile, and the phi^2 mass the volume term is holding at A0
 // disappears. When nothing contains the support the caller must report it
-// (FLAG_CLASS_EXHAUSTED); there is no clipping fallback.
+// The caller may keep an already-active fallback in its measured no-margin
+// regime; it must never clip the field into a smaller class.
 //
 // __host__ too, and constexpr, because the checkpoint reader has to make
 // EXACTLY this decision when it repacks a foreign tile into a native one. Two
@@ -375,13 +396,26 @@ __host__ __device__ __forceinline__ constexpr int class_containing(int ex, int e
     for (int c = 0; c < kNumClasses; ++c) {
         const ShapeClass sc = class_of(c);
         const int area = sc.wx * sc.wy;
-        if (ex + slack <= sc.wx && ey + slack <= sc.wy &&
+        if (class_contains_support(c, ex, ey, slack) &&
             (best < 0 || area < best_area)) {
             best = c;
             best_area = area;
         }
     }
     return best;
+}
+
+// Checkpoint recovery and an already-active fallback may use the fallback's
+// remaining safety margin instead of refusing a representable field. This does
+// not enlarge the numerical window: the 286x286 interior and its one-pixel
+// tile ring remain unchanged. A support wider than 286 on either axis is true
+// storage exhaustion and is still refused.
+__host__ __device__ __forceinline__ constexpr int class_containing_storage(
+    int ex, int ey, int slack) {
+    const int normal = class_containing(ex, ey, slack);
+    if (normal >= 0) return normal;
+    const ShapeClass fb = class_of(kClassFallback);
+    return ex <= fb.wx && ey <= fb.wy ? kClassFallback : -1;
 }
 
 // Smallest native class that contains the measured support and every nonzero
@@ -396,7 +430,9 @@ __host__ __device__ __forceinline__ constexpr int class_preserving_nonzero(
     for (int c = 0; c < kNumClasses; ++c) {
         const ShapeClass sc = class_of(c);
         const int area = sc.wx * sc.wy;
-        const bool support_fits = ex + slack <= sc.wx && ey + slack <= sc.wy;
+        const bool support_fits = c == kClassFallback
+            ? ex <= sc.wx && ey <= sc.wy
+            : class_contains_support(c, ex, ey, slack);
         const bool nonzero_fits =
             nz_lo_x >= sc.tx0 && nz_hi_x < sc.tx0 + sc.wx &&
             nz_lo_y >= sc.ty0 && nz_hi_y < sc.ty0 + sc.wy;
@@ -486,7 +522,8 @@ constexpr int class_smem_large(int wx, int wy) {
     return kScalarBytes + phi_bytes(wx, wy);
 }
 constexpr int class_smem_of(int c) {
-    return class_stages_S(c) ? class_smem(kClasses[c].wx, kClasses[c].wy)
+    return !class_stages_phi(c) ? kScalarBytes
+         : class_stages_S(c) ? class_smem(kClasses[c].wx, kClasses[c].wy)
                              : class_smem_large(kClasses[c].wx, kClasses[c].wy);
 }
 
@@ -513,10 +550,10 @@ constexpr int kExpectedLargeClassSmemRaw =
     kExtendedSupportLayout ? 211904 : 183616;
 
 static_assert(kLargeClassSmemRaw == kExpectedLargeClassSmemRaw,
-              "terminal class shared-memory calculation changed");
+              "largest shared-phi class memory calculation changed");
 static_assert(kLargeClassSmemBytes ==
                   (kExtendedSupportLayout ? 211968 : 183680),
-              "terminal class 128-byte shared-memory alignment changed");
+              "largest shared-phi class alignment changed");
 static_assert(kSmemRaw == 213440 && kSmemBytes == 213504,
               "support-layout selector must not change the staged-class launch "
               "shared-memory request");
@@ -536,6 +573,8 @@ static_assert(kSmemRaw == smem_raw_staged_only(),
 static_assert(class_smem_of(kClassLarge) < smem_raw_staged_only(),
               "the large class must be strictly cheaper than the staged "
               "classes, otherwise there is no reason for it to skip S_s");
+static_assert(class_smem_of(kClassFallback) == kScalarBytes,
+              "the global fallback must not reserve a shared phi or S field");
 
 // True per-BLOCK opt-in maximum on sm_90 (cudaDevAttrMaxSharedMemoryPerBlockOptin).
 // 233472 B is the per-SM figure and must not be budgeted against.
@@ -549,9 +588,9 @@ static_assert(kSmemLaunchMarginSm90 == 18944,
               "unexpected sm_90 per-block shared-memory margin");
 static_assert(kLargeClassMarginToStaged ==
                   (kExtendedSupportLayout ? 1536 : 29824),
-              "unexpected terminal-to-staged shared-memory margin");
+              "unexpected large-to-staged shared-memory margin");
 static_assert(kLargeClassSmemBytes <= kSmemPerBlockOptinSm90,
-              "terminal class exceeds the sm_90 per-block opt-in maximum");
+              "largest shared-phi class exceeds the sm_90 opt-in maximum");
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -561,7 +600,7 @@ static_assert(kLargeClassSmemBytes <= kSmemPerBlockOptinSm90,
 // live here, trading a third HBM pass over phi for 2-3 CTAs/SM instead of 1.
 // It was removed after being measured 46-95% SLOWER than the fused kernel at
 // every N from 132 to 2112 on a GH200 (Roihu job 689689, free gputest queue),
-// in the ONLY regime it could run: it refused the terminal shape class, which
+// in the ONLY regime it could run: it refused the largest shared-phi class, which
 // is exactly where soft cells end up, and its 512-thread reduction made it a
 // different trajectory that could not be compared against the fused path
 // anyway. `git log` has it if the occupancy idea is ever revisited.
@@ -585,13 +624,19 @@ constexpr bool class_ok(ShapeClass c) {
 // particular the 32-alignment of tx0/ty0 is what keeps the cp.async SOURCE
 // rows 128 B aligned; the DESTINATION alignment the 16 B copies need comes from
 // kScalarBytes % 16 == 0 and phi_pitch(wx) % 4 == 0 (checked below), which hold
-// for both audited terminal layouts exactly as they do for 144.
+// for both audited shared-phi layouts exactly as they do for 144.
 static_assert(class_ok(kClasses[0]), "shape class 0 violates a layout rule");
 static_assert(class_ok(kClasses[1]), "shape class 1 violates a layout rule");
 static_assert(class_ok(kClasses[2]), "shape class 2 violates a layout rule");
 static_assert(class_ok(kClasses[3]), "shape class 3 violates a layout rule");
 static_assert(class_ok(kClasses[4]), "shape class 4 violates a layout rule");
-static_assert(kNumClasses == 5, "add a class_ok() static_assert for the new class");
+static_assert(kNumClasses == 6, "add a layout static_assert for the new class");
+constexpr bool fallback_class_ok(ShapeClass c) {
+    return c.wx == kTilePitch - 2 && c.wy == kTilePitch - 2
+        && c.tx0 == 1 && c.ty0 == 1;
+}
+static_assert(fallback_class_ok(kClasses[kClassFallback]),
+              "fallback must leave a one-pixel ring in the native tile");
 static_assert(kClasses[0].wx == kClasses[0].wy, "class 0 must be the square one");
 
 // 16 B cp.async destinations: every copied row starts at
@@ -628,12 +673,11 @@ static_assert(class_not_narrower(kClasses[3]),
 static_assert(class_not_narrower(kClasses[4]),
               "shape class 4 is narrower than class 0 on one axis: promoting "
               "into it would truncate the support on that axis");
+static_assert(class_not_narrower(kClasses[5]),
+              "fallback is narrower than class 0");
 
-// The large class must strictly dominate every other class on both axes,
-// otherwise it is not the terminal destination class_containing() falls back to
-// and a support could still fit nothing. This is what makes
-// FLAG_CLASS_EXHAUSTED mean "bigger than the selected terminal edge minus
-// kPromoteSlack on an axis" and nothing subtler.
+// The large shared-phi class must dominate classes 0--3; the global fallback
+// separately dominates it below.
 constexpr bool dominated_by_large(ShapeClass c) {
     return c.wx <= kClasses[kClassLarge].wx && c.wy <= kClasses[kClassLarge].wy;
 }
@@ -641,6 +685,13 @@ static_assert(dominated_by_large(kClasses[0]), "class 0 is not covered by the la
 static_assert(dominated_by_large(kClasses[1]), "class 1 is not covered by the large class");
 static_assert(dominated_by_large(kClasses[2]), "class 2 is not covered by the large class");
 static_assert(dominated_by_large(kClasses[3]), "class 3 is not covered by the large class");
+
+constexpr bool dominated_by_fallback(ShapeClass c) {
+    return c.wx <= kClasses[kClassFallback].wx
+        && c.wy <= kClasses[kClassFallback].wy;
+}
+static_assert(dominated_by_fallback(kClasses[kClassLarge]),
+              "fallback must contain the largest shared-memory class");
 
 // The large class must also be the LARGEST by area, because class_containing()
 // picks the smallest containing class: if some other class had a bigger area,
@@ -653,6 +704,9 @@ static_assert(smaller_area_than_large(kClasses[0]), "class 0 is not smaller in a
 static_assert(smaller_area_than_large(kClasses[1]), "class 1 is not smaller in area than the large class");
 static_assert(smaller_area_than_large(kClasses[2]), "class 2 is not smaller in area than the large class");
 static_assert(smaller_area_than_large(kClasses[3]), "class 3 is not smaller in area than the large class");
+static_assert(kClasses[kClassLarge].wx * kClasses[kClassLarge].wy
+                  < kClasses[kClassFallback].wx * kClasses[kClassFallback].wy,
+              "fallback must be more expensive than the shared-phi classes");
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -934,11 +988,14 @@ inline void print_params(const SimParams& p, int side, int pitch) {
                 PF_SUPPORT_CLIP_ENABLED
                     ? "ENABLED (-DPF_ALARMS; advisory only)"
                     : "NOT INSTRUMENTED (default; advisory only)");
-    std::printf("  support layout   %s  (tile %d, max support %d px/axis)\n",
+    std::printf("  support layout   %s  (tile %d, guarded support %d px/axis, "
+                "physical interior %d)\n",
                 kExtendedSupportLayout
                     ? "EXTENDED (default; support+restart GPU-gated 687115)"
                     : "COMPACT LEGACY (pre-2026-08-16 geometry)",
-                kTilePitch, kLargeClassEdge - kPromoteSlack);
+                kTilePitch,
+                class_support_capacity(kClassFallback, kPromoteSlack),
+                kClasses[kClassFallback].wx);
     std::printf("  smem/CTA         %d B of %d B opt-in max\n",
                 kSmemBytes, kSmemPerBlockOptinSm90);
     std::printf("  large class      %d: %d x %d, %d B raw / %d B aligned "
@@ -947,9 +1004,14 @@ inline void print_params(const SimParams& p, int side, int pitch) {
                 kClassLarge, kClasses[kClassLarge].wx, kClasses[kClassLarge].wy,
                 kLargeClassSmemRaw, kLargeClassSmemBytes,
                 smem_raw_staged_only(), kSmemLaunchMarginSm90);
-    std::printf("  exec path        FUSED   (k_step, 1 kernel/step, "
-                "%d threads, %d B smem/CTA)\n",
-                kBlockThreads, kSmemBytes);
+    std::printf("  fallback class   %d: %d x %d at (1,1), phi+S from global, "
+                "%d B smem/CTA\n",
+                kClassFallback, kClasses[kClassFallback].wx,
+                kClasses[kClassFallback].wy,
+                class_smem_of(kClassFallback));
+    std::printf("  exec path        k_step + sparse fallback filter "
+                "(%d threads; %d / %d B smem)\n",
+                kBlockThreads, kSmemBytes, kScalarBytes);
 }
 
 }  // namespace pf

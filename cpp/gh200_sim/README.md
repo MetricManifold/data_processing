@@ -1,8 +1,9 @@
 # FUSE-1R — GH200 phase-field cell engine
 
-One kernel per step. One CTA per cell. The cell's whole rect resident in shared
-memory, so the **exact** (non-lagged) interaction velocity is available to the
-RHS in the same pass.
+The normal path uses one CTA per cell with the active field in shared memory.
+A second sparse kernel handles only cells that outgrow those classes, using the
+same fixed per-cell tile through global memory. Both compute the exact
+(non-lagged) interaction velocity for the current step.
 
 Physics: Palmieri et al. 2015, *Sci Rep* **5**:11745, Eq. (S15), dimensionless
 units, mobility `M = 1/2`, explicit Euler, periodic BCs, `h = dx = dy = 1`.
@@ -24,10 +25,10 @@ cmake /path/to/cpp/gh200_sim -DCMAKE_BUILD_TYPE=Release \
 cmake --build . -- -j 8
 ```
 
-The terminal square shape class defaults to `192 x 192`. Configure
-`-DPF_LARGE_CLASS_EDGE=208` to select the only supported larger alternative.
-CMake and `params.cuh` independently reject every value other than 192 or 208;
-startup prints the compiled selector and its shared-memory accounting.
+The default layout uses a `288 x 288` per-cell tile, a `224 x 224` largest
+shared-phi class, and a rare `286 x 286` global-memory fallback at offset
+`(1,1)`. The outer tile pixels remain the stencil's zero ring. Configure
+`-DPF_EXTENDED_SUPPORT_LAYOUT=OFF` only for the compact `256/208/254` layout.
 
 Products: `cell_gh200` (solver) and `dump_phi` (state-dump converter).
 
@@ -204,18 +205,17 @@ Step *n* reads exactly the phi buffer that step *n−1* scattered from, with the
 same `q_of` and the same rect→global map, so the result is provably
 non-negative — the old `if (Soth < 0) Soth = 0;` is deleted, not ported. If the
 subtraction ever does go negative that is a broken invariant, so it is
-**counted** in `FLAG_S_NEGATIVE` and reported, never floored away. Same for
-Q5.27 overflow (detected exactly from the `atomicAdd` return value), the
-`phi^2 <= 4` per-contribution clamp, support clipping, class exhaustion,
-non-finite `phi`, and non-positive carried `V`. Any nonzero flag means the run is
-**invalid, not merely slow**, and `cell_gh200` says so in those words.
+**counted** in `FLAG_S_NEGATIVE` and reported, never floored away. Q5.27
+overflow, the `phi^2 <= 4` bound, non-finite `phi`, and non-positive carried
+`V` are likewise fatal. Touching a class boundary is advisory; a support that
+outgrows the shared classes moves into the fixed-tile fallback.
 
 ## 5. Design rationale (what the code is doing and why)
 
 ### 5.1 Fixed windows, zero-cost rebind
 
-The phi pool is `[N][256][256]` floats, so every tile row is 1024 B (128 B
-aligned). The rect window inside a tile is **fixed per shape class, forever**:
+The default phi pool is `[N][288][288]` floats. The rect window inside a tile is
+fixed per shape class:
 
 | class | WX x WY | TX0, TY0 | smem/CTA | staged in smem | holds extent up to |
 |---|---|---|---:|---|---|
@@ -223,15 +223,17 @@ aligned). The rect window inside a tile is **fixed per shape class, forever**:
 | 1 wide  | 176 x 144 | 32, 64 | 211,008 | phi + S | 168 x 136 |
 | 2 tall  | 144 x 176 | 64, 32 | 211,776 | phi + S | 136 x 168 |
 | 3 big   | 160 x 160 | 32, 32 | 213,440 | phi + S | 152 x 152 |
-| 4 large | E x E | 32, 32 | **157,376** (E=192) / **183,616** (E=208) | **phi only** | 184 x 184 / 200 x 200 |
+| 4 large | 224 x 224 | 32, 32 | **211,904** | **phi only** | 216 x 216 |
+| 5 fallback | 286 x 286 | 1, 1 | **2,176** | global phi + S | 278 x 278 guarded; 286 physical |
 
 The **short** side of the elongated classes is 144, never less: a class change
 must not shrink the window on the axis that did *not* trigger it. The
 destination is therefore chosen by **containment on both axes**
 (`class_containing()` in `kernels.cu`), not by comparing `ex` to `ey` — which
-also makes wide↔tall a legal one-step transition. A support that no class holds
-with `kPromoteSlack` to spare raises `FLAG_CLASS_EXHAUSTED` and the cell stays
-put; it is never truncated to fake a fit.
+also makes wide↔tall a legal one-step transition. A support beyond class 4
+enters class 5. If it later consumes the ordinary eight-pixel margin, output is
+retained and the condition is reported for review; boundary-touching dynamics
+may be clipped and are not claimed to be lossless.
 
 Class 4 is the one that breaks the shared-memory ceiling, and it does it by
 **not staging S**. Every other class keeps both `phi_s` (with its halo ring) and
@@ -252,17 +254,10 @@ only, `process_cell<CLS>` compiles a second body — selected by
 * P3 **re-reads `phi^{n+1}` from global** for the S scatter and the
   V/Cx/Cy/perim/bbox moments. That extra HBM read is what the large path costs.
 
-The result is 157,376 B — **less** than the 213,440 B class 3 already costs, so
-`kSmemRaw` does not move and neither does the 1 CTA/SM occupancy. The size is
-capped by tile geometry, not by shared memory: 224 x 224 would need `tx0 <= 31`
-and the only multiple of 32 there is 0, which leaves no room for the tile's zero
-ring. 208 x 208 (183,616 B) is the next legal step if 184 px of containable
-extent turns out to be too little.
-
-`PF_LARGE_CLASS_EDGE` makes exactly those two edges selectable. At E=208 the
-large class is still 29,824 B below the staged 213,440 B maximum, so both
-settings retain the same aligned 213,504 B launch request and its 18,944 B
-margin below the sm_90 per-block opt-in cap.
+Class 4 remains below the 213,440 B class-3 maximum, so `kSmemRaw` and the normal
+path's 1 CTA/SM occupancy do not move. Class 5 stages neither field; its
+286-pixel interior leaves rows and columns 0 and 287 as the stencil ring and
+uses the existing tile allocation rather than increasing it.
 
 Recentring is applied by *reading shared memory at a shifted index* during the
 store, so a rebind costs **0 extra HBM traffic** and this invariant is
@@ -315,6 +310,13 @@ instead of the staged rect. The class-change tile zeroing moves ahead of P2
 there, because in that path P2 *is* the store. Everything else — the physics,
 the reduction order, the flags, the hysteresis — is the same code.
 
+For the **fallback class** (5), `k_step` deliberately skips the cell and
+`k_step_fallback` processes it immediately afterward in the same stream. The
+input-parity `cls_written` value selects cells, preventing a class-4 cell that
+has just promoted from being advanced twice. Phi and S are read from global
+memory; the equations, run-and-tumble key, S rotation/scatter, moments, bbox,
+and checkpoint representation are unchanged.
+
 ### 5.3 Shared memory
 
 ```
@@ -331,7 +333,8 @@ S_s     uint32 WY x WX               (absent for the large class)
 | 1 | 146 x 184 x 4 = 107,456 | 101,376 | 211,008 |
 | 2 | 178 x 152 x 4 = 108,224 | 101,376 | 211,776 |
 | 3 | 162 x 168 x 4 = 108,864 | 102,400 | **213,440** |
-| 4 | 194 x 200 x 4 = 155,200 | — | 157,376 |
+| 4 | 226 x 232 x 4 = 209,728 | — | 211,904 |
+| 5 | — | — | 2,176 scalar/reduction region |
 
 `kSmemRaw` is the **max** over classes, not the sum: 213,440 B, set by class 3.
 Requested (rounded to 128 B): **213,504 B**, opted in with
